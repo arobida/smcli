@@ -99,6 +99,18 @@ def run_shell(shell):
                 assert time.monotonic() < deadline, "background record never arrived"
                 time.sleep(0.05)
             assert (home / "prompt-status").read_text().splitlines()[-1] == "0"
+            # Leading-space commands and likely secrets stay out, even when the shell drops the space itself;
+            # duplicates the shell leaves out of its own history are still recorded.
+            send("set -o history; HISTCONTROL=ignoreboth" if shell == "bash" else "setopt HIST_IGNORE_SPACE HIST_IGNORE_DUPS")
+            send(" printf hidden")
+            send("echo AKIAABCDEFGHIJKLMNOP")
+            send("printf dup")
+            send("printf dup")
+            deadline = time.monotonic() + 10
+            while [r["command"] for r in read_records(env)][-2:] != ["printf dup", "printf dup"]:
+                assert time.monotonic() < deadline, read_records(env)
+                time.sleep(0.05)
+            assert not any("hidden" in r["command"] or "AKIA" in r["command"] for r in read_records(env)), (shell, [r["command"] for r in read_records(env)][-6:])
             os.write(fd, b"exit 7\n")
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
@@ -115,7 +127,7 @@ def run_shell(shell):
                 time.sleep(0.05)
             assert not alive, "shell exit timed out"
             records = read_records(env)
-            assert len(records) == 12 and records[-1]["command"] == "exit 7" and records[-1]["exitCode"] == 7, records
+            assert len(records) == 15 and records[-1]["command"] == "exit 7" and records[-1]["exitCode"] == 7, records
             print(f"{shell} interactive metadata capture passed.")
         finally:
             os.close(fd)

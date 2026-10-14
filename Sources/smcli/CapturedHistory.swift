@@ -79,6 +79,14 @@ struct CommandBreakdown: Codable, Equatable {
     }
 }
 
+/// Option names in a command (`--amend`, `-m`), without their values. Lines the parser refuses
+/// (pipes, substitutions) fall back to whitespace-separated words that start with `-`.
+func commandFlags(_ command: String) -> [String] {
+    if let breakdown = CommandBreakdown.parse(command) { return breakdown.flags.map(\.name) }
+    return command.split(whereSeparator: \.isWhitespace).map(String.init).filter { $0.hasPrefix("-") && $0 != "-" && $0 != "--" }
+        .map { $0.split(separator: "=", maxSplits: 1).first.map(String.init) ?? $0 }
+}
+
 // Tokenize without executing or expanding anything. Compound shell syntax is deliberately not guessed.
 func shellWords(_ command: String) -> [String]? {
     let characters = Array(command)
@@ -128,6 +136,8 @@ func shellWords(_ command: String) -> [String]? {
 /// A captured command as presented to readers. `runCount` and `breakdown` are derived at read time,
 /// so they reflect the whole log and the current parser rather than whatever was true when written.
 struct CapturedCommand: Codable, Equatable {
+    /// Stable UUID, shared with Atuin for imported rows so re-imports deduplicate.
+    let id: String?
     let timestamp: String
     let durationMs: Int?
     let user: String
@@ -137,6 +147,9 @@ struct CapturedCommand: Codable, Equatable {
     let shell: String
     let command: String
     let exitCode: Int
+    /// Who wrote the command (a person or an agent), and why; both optional, as in Atuin.
+    let author: String?
+    let intent: String?
     let runCount: Int
     let breakdown: CommandBreakdown?
 }
@@ -146,6 +159,9 @@ struct CommandStats: Equatable {
     let lastRun: Double
     let lastDirectory: String
     let lastExitCode: Int
+    var author: String? = nil
+    var intent: String? = nil
+    var flags: [String] = []
 }
 
 struct Suggestion: Codable, Equatable {
@@ -185,6 +201,9 @@ final class SQLiteDatabase {
 
     deinit { sqlite3_close(db) }
 
+    /// Rows changed by the most recent INSERT, UPDATE, or DELETE.
+    var changes: Int { Int(sqlite3_changes(db)) }
+
     func execute(_ sql: String) throws {
         try check(sqlite3_exec(db, sql, nil, nil, nil))
     }
@@ -221,6 +240,10 @@ private func text(_ statement: OpaquePointer, _ column: Int32) -> String {
     sqlite3_column_text(statement, column).map { String(cString: $0) } ?? ""
 }
 
+private func optionalText(_ statement: OpaquePointer, _ column: Int32) -> String? {
+    sqlite3_column_type(statement, column) == SQLITE_NULL ? nil : text(statement, column)
+}
+
 struct CapturedHistory {
     let url: URL
 
@@ -235,8 +258,32 @@ struct CapturedHistory {
         );
         CREATE INDEX commands_by_command ON commands(command, started_at);
         CREATE INDEX commands_by_directory ON commands(directory, started_at);
-        PRAGMA user_version = 1;
+        """ + migrationToV2 + migrationToV3
+
+    /// Fields borrowed from Atuin's history table: a UUID for deduplication, soft deletion, and authorship.
+    static let migrationToV2 = """
+        ALTER TABLE commands ADD COLUMN uuid TEXT;
+        ALTER TABLE commands ADD COLUMN deleted_at REAL;
+        ALTER TABLE commands ADD COLUMN author TEXT;
+        ALTER TABLE commands ADD COLUMN intent TEXT;
+        CREATE UNIQUE INDEX commands_by_uuid ON commands(uuid);
+        PRAGMA user_version = 2;
         """
+    /// Option names, space-separated (empty when none), so flags can be read without re-parsing.
+    /// Existing rows are filled in by `backfillFlags`.
+    static let migrationToV3 = """
+        ALTER TABLE commands ADD COLUMN flags TEXT;
+        PRAGMA user_version = 3;
+        """
+    static let version = 3
+
+    static func atuinLocation(home: URL, environment: [String: String]) -> URL {
+        if let path = environment["ATUIN_DB_PATH"], !path.isEmpty { return URL(fileURLWithPath: path) }
+        if let data = environment["XDG_DATA_HOME"], !data.isEmpty {
+            return URL(fileURLWithPath: data).appendingPathComponent("atuin/history.db")
+        }
+        return home.appendingPathComponent(".local/share/atuin/history.db")
+    }
 
     static func location(home: URL, environment: [String: String]) -> URL {
         if let path = environment["SMCLI_DB"], !path.isEmpty { return URL(fileURLWithPath: path) }
@@ -266,7 +313,63 @@ struct CapturedHistory {
             }
         }
         try insert(into: db, session: session, user: NSUserName(), host: ProcessInfo.processInfo.hostName, shell: shell,
-                   startedAt: start, durationMs: duration, directory: directory, command: command, exitCode: exitCode)
+                   startedAt: start, durationMs: duration, directory: directory, command: command, exitCode: exitCode,
+                   uuid: UUID().uuidString.lowercased())
+    }
+
+    /// Imports Atuin's history.db, keeping its UUIDs so repeated imports skip rows already present.
+    /// Atuin stores times as Unix nanoseconds, uses -1 for unknown durations, and `user:host` hostnames.
+    /// With `replace`, existing smcli history is deleted in the same transaction, so a failed import keeps it.
+    /// Returns the number of new records.
+    func importAtuin(from file: URL, replace: Bool = false) throws -> Int {
+        guard FileManager.default.fileExists(atPath: file.path), let resolved = realpath(file.path, nil) else {
+            throw HistoryError(message: "No Atuin database at \(file.path)")
+        }
+        let source = try SQLiteDatabase(path: String(cString: resolved), readOnly: true)
+        free(resolved)
+        var columns: Set<String> = []
+        try source.run("PRAGMA table_info(history)") { columns.insert(text($0, 1)) }
+        guard columns.isSuperset(of: ["id", "timestamp", "duration", "exit", "command", "cwd", "session", "hostname"]) else {
+            throw HistoryError(message: "Not an Atuin history database: \(file.path)")
+        }
+        // Newer Atuin versions add these; older databases lack them.
+        let optional = ["deleted_at", "shell", "author", "intent"].map { columns.contains($0) ? $0 : "NULL" }
+        let db = try connect(write: true)
+        var imported = 0
+        try db.execute("BEGIN IMMEDIATE")
+        do {
+            if replace { try db.execute("DELETE FROM commands; DELETE FROM sessions;") }
+            try source.run("""
+                SELECT id, timestamp, duration, exit, command, cwd, session, hostname, \(optional.joined(separator: ", "))
+                FROM history ORDER BY timestamp
+                """) { row in
+                let hostname = text(row, 7)
+                let (host, user) = hostname.firstIndex(of: ":").map {
+                    (String(hostname[..<$0]), String(hostname[hostname.index(after: $0)...]))
+                } ?? (hostname, "unknown")
+                let duration = sqlite3_column_int64(row, 2)
+                let deletedAt = sqlite3_column_type(row, 8) == SQLITE_NULL ? nil : Double(sqlite3_column_int64(row, 8)) / 1e9
+                let shell = optionalText(row, 9).flatMap { $0.isEmpty ? nil : $0 } ?? "unknown"
+                try insert(into: db, session: "atuin-\(text(row, 6))", user: user.isEmpty ? "unknown" : user,
+                           host: host.isEmpty ? "unknown" : host, shell: shell,
+                           startedAt: Double(sqlite3_column_int64(row, 1)) / 1e9,
+                           durationMs: duration < 0 ? nil : Int(duration / 1_000_000),
+                           directory: text(row, 5), command: text(row, 4), exitCode: Int(sqlite3_column_int64(row, 3)),
+                           uuid: text(row, 0), deletedAt: deletedAt, author: optionalText(row, 10),
+                           intent: optionalText(row, 11), transaction: false)
+                imported += db.changes
+            }
+            try db.execute("COMMIT")
+        } catch {
+            try? db.execute("ROLLBACK")
+            throw error
+        }
+        if replace {
+            // Reclaim the old rows' pages so replaced history is not left on disk.
+            try db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            try db.execute("VACUUM")
+        }
+        return imported
     }
 
     /// Imports records from the JSONL log written by earlier smcli versions. Returns the number imported.
@@ -294,6 +397,34 @@ struct CapturedHistory {
         return legacy.count
     }
 
+    /// Permanently deletes stored commands the filter would now reject (like `atuin history prune`).
+    /// With `dryRun`, only reports them. Returns the matching commands in time order.
+    func prune(filter: CaptureFilter, dryRun: Bool) throws -> [String] {
+        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
+        let db = try connect(write: !dryRun)
+        var ids: [Int] = []
+        var commands: [String] = []
+        try db.run("SELECT id, command, directory FROM commands ORDER BY started_at, id") { row in
+            if !filter.allows(command: text(row, 1), directory: text(row, 2)) {
+                ids.append(Int(sqlite3_column_int64(row, 0)))
+                commands.append(text(row, 1))
+            }
+        }
+        guard !dryRun, !ids.isEmpty else { return commands }
+        try db.execute("BEGIN IMMEDIATE")
+        do {
+            for id in ids { try db.run("DELETE FROM commands WHERE id = ?", [.integer(id)]) }
+            try db.execute("COMMIT")
+        } catch {
+            try? db.execute("ROLLBACK")
+            throw error
+        }
+        // Deleted text can linger in free pages and the WAL until they are rewritten.
+        try db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        try db.execute("VACUUM")
+        return commands
+    }
+
     func records() throws -> [CapturedCommand] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [] }
         let db = try connect(write: false)
@@ -302,32 +433,40 @@ struct CapturedHistory {
         var records: [CapturedCommand] = []
         try db.run("""
             SELECT c.started_at, c.duration_ms, s.user, s.host, s.id, s.shell, c.directory, c.command, c.exit_code,
-                   COUNT(*) OVER (PARTITION BY c.command ORDER BY c.started_at, c.id)
+                   COUNT(*) OVER (PARTITION BY c.command ORDER BY c.started_at, c.id), c.uuid, c.author, c.intent
             FROM commands c JOIN sessions s ON s.id = c.session
+            WHERE c.deleted_at IS NULL
             ORDER BY c.started_at, c.id
             """) { row in
             let command = text(row, 7)
             records.append(CapturedCommand(
+                id: optionalText(row, 10),
                 timestamp: formatter.string(from: Date(timeIntervalSince1970: sqlite3_column_double(row, 0))),
                 durationMs: sqlite3_column_type(row, 1) == SQLITE_NULL ? nil : Int(sqlite3_column_int64(row, 1)),
                 user: text(row, 2), host: text(row, 3), session: text(row, 4), directory: text(row, 6), shell: text(row, 5),
-                command: command, exitCode: Int(sqlite3_column_int64(row, 8)), runCount: Int(sqlite3_column_int64(row, 9)),
+                command: command, exitCode: Int(sqlite3_column_int64(row, 8)),
+                author: optionalText(row, 11), intent: optionalText(row, 12), runCount: Int(sqlite3_column_int64(row, 9)),
                 breakdown: CommandBreakdown.parse(command)
             ))
         }
         return records
     }
 
-    /// One row per distinct command: run count plus the most recent run's time, directory, and exit code.
+    /// One row per distinct command: run count, its flags, and the most recent run's time, directory, exit code, author, and intent.
     func commandStats() throws -> [String: CommandStats] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
         let db = try connect(write: false)
         var stats: [String: CommandStats] = [:]
         // SQLite returns the bare columns from the row holding MAX(started_at).
-        try db.run("SELECT command, COUNT(*), MAX(started_at), directory, exit_code FROM commands GROUP BY command") { row in
+        try db.run("""
+            SELECT command, COUNT(*), MAX(started_at), directory, exit_code, author, intent, flags
+            FROM commands WHERE deleted_at IS NULL GROUP BY command
+            """) { row in
             stats[text(row, 0)] = CommandStats(
                 runs: Int(sqlite3_column_int64(row, 1)), lastRun: sqlite3_column_double(row, 2),
-                lastDirectory: text(row, 3), lastExitCode: Int(sqlite3_column_int64(row, 4)))
+                lastDirectory: text(row, 3), lastExitCode: Int(sqlite3_column_int64(row, 4)),
+                author: optionalText(row, 5), intent: optionalText(row, 6),
+                flags: text(row, 7).split(separator: " ").map(String.init))
         }
         return stats
     }
@@ -344,7 +483,7 @@ struct CapturedHistory {
         try db.run("""
             SELECT c.command, c.directory, c.started_at, c.exit_code
             FROM commands c JOIN sessions s ON s.id = c.session
-            WHERE s.user = ? AND substr(c.command, 1, length(?)) = ?
+            WHERE s.user = ? AND c.deleted_at IS NULL AND substr(c.command, 1, length(?)) = ?
             ORDER BY c.started_at, c.id
             """, [.text(user), .text(prefix), .text(prefix)]) { row in
             guard !isSmcliCommand(text(row, 0)) else { return }
@@ -383,6 +522,7 @@ struct CapturedHistory {
 
     private func insert(into db: SQLiteDatabase, session: String, user: String, host: String, shell: String,
                         startedAt: Double, durationMs: Int?, directory: String, command: String, exitCode: Int,
+                        uuid: String? = nil, deletedAt: Double? = nil, author: String? = nil, intent: String? = nil,
                         transaction: Bool = true) throws {
         // One transaction means one WAL commit per command.
         if transaction { try db.execute("BEGIN IMMEDIATE") }
@@ -390,14 +530,26 @@ struct CapturedHistory {
             try db.run("INSERT OR IGNORE INTO sessions (id, user, host, shell) VALUES (?, ?, ?, ?)",
                        [.text(session), .text(user), .text(host), .text(shell)])
             try db.run("""
-                INSERT INTO commands (session, started_at, duration_ms, directory, command, exit_code)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT OR IGNORE INTO commands
+                    (session, started_at, duration_ms, directory, command, exit_code, uuid, deleted_at, author, intent, flags)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [.text(session), .real(startedAt), durationMs.map(SQLValue.integer) ?? .null,
-                      .text(directory), .text(command), .integer(exitCode)])
+                      .text(directory), .text(command), .integer(exitCode), uuid.map(SQLValue.text) ?? .null,
+                      deletedAt.map(SQLValue.real) ?? .null, author.map(SQLValue.text) ?? .null,
+                      intent.map(SQLValue.text) ?? .null, .text(commandFlags(command).joined(separator: " "))])
             if transaction { try db.execute("COMMIT") }
         } catch {
             if transaction { try? db.execute("ROLLBACK") }
             throw error
+        }
+    }
+
+    /// Fills the flags column for rows written before it existed. Runs inside the migration's transaction.
+    private func backfillFlags(_ db: SQLiteDatabase) throws {
+        var rows: [(Int, String)] = []
+        try db.run("SELECT id, command FROM commands WHERE flags IS NULL") { rows.append((Int(sqlite3_column_int64($0, 0)), text($0, 1))) }
+        for (id, command) in rows {
+            try db.run("UPDATE commands SET flags = ? WHERE id = ?", [.text(commandFlags(command).joined(separator: " ")), .integer(id)])
         }
     }
 
@@ -425,13 +577,27 @@ struct CapturedHistory {
         let db = try SQLiteDatabase(path: path, readOnly: !write)
         var version = 0
         try db.run("PRAGMA user_version") { version = Int(sqlite3_column_int64($0, 0)) }
+        if version > Self.version { throw HistoryError(message: "History database was written by a newer smcli: \(url.path)") }
+        if !write && version != 0 && version < Self.version {
+            // Readers need the current columns; upgrade once through a writable connection.
+            return try connect(write: true)
+        }
         if write {
-            if version == 0 {
+            if version < Self.version {
                 try db.execute("BEGIN IMMEDIATE")
-                // Another terminal may have created the schema while this one waited for the lock.
+                // Another terminal may have created or upgraded the schema while this one waited for the lock.
                 var tables = 0
                 try db.run("SELECT count(*) FROM sqlite_master") { tables = Int(sqlite3_column_int64($0, 0)) }
-                if tables == 0 { try db.execute(Self.schema) }
+                try db.run("PRAGMA user_version") { version = Int(sqlite3_column_int64($0, 0)) }
+                if tables == 0 {
+                    try db.execute(Self.schema)
+                } else {
+                    if version == 1 { try db.execute(Self.migrationToV2) }
+                    if version <= 2 {
+                        try db.execute(Self.migrationToV3)
+                        try backfillFlags(db)
+                    }
+                }
                 try db.execute("COMMIT")
                 try db.execute("PRAGMA journal_mode = WAL")
             }
@@ -440,7 +606,6 @@ struct CapturedHistory {
         } else if version == 0 {
             throw HistoryError(message: "Not an smcli history database: \(url.path)")
         }
-        if version > 1 { throw HistoryError(message: "History database was written by a newer smcli: \(url.path)") }
         return db
     }
 }

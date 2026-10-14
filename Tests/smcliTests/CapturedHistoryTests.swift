@@ -91,6 +91,116 @@ struct CapturedHistoryTests {
         #expect(try log.records().count == 2)
     }
 
+    @Test func `Import Atuin history once, keeping its metadata`() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let atuin = home.appendingPathComponent("atuin.db")
+        let source = try fixtureDatabase(atuin)
+        try source.execute("""
+            CREATE TABLE history (id TEXT PRIMARY KEY, timestamp INTEGER NOT NULL, duration INTEGER NOT NULL,
+                exit INTEGER NOT NULL, command TEXT NOT NULL, cwd TEXT NOT NULL, session TEXT NOT NULL,
+                hostname TEXT NOT NULL, deleted_at INTEGER, author TEXT, intent TEXT);
+            INSERT INTO history VALUES ('a1', 1760000000000000000, 1500000000, 0, 'ls', '/tmp', 's1', 'mac:alice', NULL, 'alice', NULL);
+            INSERT INTO history VALUES ('a2', 1760000001000000000, -1, 1, 'make', '/src', 's1', 'mac:alice', NULL, 'claude', 'build it');
+            INSERT INTO history VALUES ('a3', 1760000002000000000, 0, 0, 'secret', '/', 's1', 'mac:alice', 1760000003000000000, NULL, NULL);
+            """)
+        let log = CapturedHistory(url: home.appendingPathComponent("captured.db"))
+        #expect(try log.importAtuin(from: atuin) == 3)
+        #expect(try log.importAtuin(from: atuin) == 0)
+        let records = try log.records()
+        #expect(records.map(\.command) == ["ls", "make"])
+        #expect(records.map(\.id) == ["a1", "a2"])
+        #expect(records[0].user == "alice" && records[0].host == "mac" && records[0].durationMs == 1500)
+        #expect(records[0].timestamp == "2025-10-09T08:53:20.000Z")
+        #expect(records[1].durationMs == nil && records[1].author == "claude" && records[1].intent == "build it")
+        #expect(records[1].shell == "unknown" && records[1].session == "atuin-s1")
+        #expect(throws: (any Error).self) { try log.importAtuin(from: home.appendingPathComponent("missing.db")) }
+        try log.append(command: "local only", shell: "zsh", directory: "/", exitCode: 0, nativeFile: "")
+        #expect(throws: (any Error).self) { try log.importAtuin(from: home.appendingPathComponent("missing.db"), replace: true) }
+        #expect(try log.records().count == 3)
+        #expect(try log.importAtuin(from: atuin, replace: true) == 3)
+        #expect(try log.records().map(\.command) == ["ls", "make"])
+    }
+
+    @Test func `Filter leading-space commands, secrets, and configured patterns`() throws {
+        var config = SmcliConfig()
+        let defaults = try CaptureFilter(config: config)
+        #expect(defaults.allows(command: "git status", directory: "/"))
+        #expect(!defaults.allows(command: " git status", directory: "/"))
+        #expect(!defaults.allows(command: "export GITHUB_TOKEN=ghp_" + String(repeating: "a", count: 36), directory: "/"))
+        #expect(!defaults.allows(command: "curl -H 'x-api-key: sk-ant-api03-abcdefghijklmnopqrstuvwxyz'", directory: "/"))
+        config.secretsFilter = false
+        config.historyFilter = ["^vault "]
+        config.cwdFilter = ["^/secret(/|$)"]
+        let custom = try CaptureFilter(config: config)
+        #expect(custom.allows(command: "echo AKIAABCDEFGHIJKLMNOP", directory: "/"))
+        #expect(!custom.allows(command: "vault login", directory: "/"))
+        #expect(!custom.allows(command: "ls", directory: "/secret/keys"))
+        #expect(custom.allows(command: "ls", directory: "/secrets"))
+        config.historyFilter = ["("]
+        #expect(throws: (any Error).self) { try CaptureFilter(config: config) }
+    }
+
+    @Test func `Prune removes stored commands the filter now rejects`() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let log = CapturedHistory(url: home.appendingPathComponent("captured.db"))
+        for command in ["ls", "echo AKIAABCDEFGHIJKLMNOP", "vault login", "pwd"] {
+            try log.append(command: command, shell: "zsh", directory: "/", exitCode: 0, nativeFile: "")
+        }
+        var config = SmcliConfig()
+        config.historyFilter = ["^vault "]
+        let filter = try CaptureFilter(config: config)
+        #expect(try log.prune(filter: filter, dryRun: true) == ["echo AKIAABCDEFGHIJKLMNOP", "vault login"])
+        #expect(try log.records().count == 4)
+        #expect(try log.prune(filter: filter, dryRun: false).count == 2)
+        #expect(try log.records().map(\.command) == ["ls", "pwd"])
+        let bytes = try Data(contentsOf: log.url)
+        #expect(bytes.range(of: Data("AKIAABCDEFGHIJKLMNOP".utf8)) == nil)
+    }
+
+    @Test func `Upgrade version 1 databases in place`() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let url = home.appendingPathComponent("captured.db")
+        let old = try fixtureDatabase(url)
+        try old.execute("""
+            CREATE TABLE sessions (id TEXT PRIMARY KEY, user TEXT NOT NULL, host TEXT NOT NULL, shell TEXT NOT NULL) WITHOUT ROWID;
+            CREATE TABLE commands (id INTEGER PRIMARY KEY, session TEXT NOT NULL REFERENCES sessions(id),
+                started_at REAL NOT NULL, duration_ms INTEGER, directory TEXT NOT NULL, command TEXT NOT NULL, exit_code INTEGER NOT NULL);
+            INSERT INTO sessions VALUES ('s', 'bob', 'h', 'zsh');
+            INSERT INTO commands (session, started_at, directory, command, exit_code) VALUES ('s', 1, '/', 'old', 0);
+            PRAGMA user_version = 1;
+            """)
+        chmod(url.path, 0o600)
+        let log = CapturedHistory(url: url)
+        #expect(try log.records().map(\.command) == ["old"])
+        try log.append(command: "new", shell: "zsh", directory: "/", exitCode: 0, nativeFile: "")
+        let records = try log.records()
+        #expect(records.map(\.command) == ["old", "new"])
+        #expect(records[0].id == nil && records[1].id != nil)
+    }
+
+    @Test func `Store flags on capture and backfill them when upgrading`() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let url = home.appendingPathComponent("captured.db")
+        let old = try fixtureDatabase(url)
+        try old.execute(CapturedHistory.schema.replacingOccurrences(of: CapturedHistory.migrationToV3, with: "") + """
+            INSERT INTO sessions VALUES ('s', 'bob', 'h', 'zsh');
+            INSERT INTO commands (session, started_at, directory, command, exit_code) VALUES ('s', 1, '/', 'git commit --amend -m x', 0);
+            """)
+        chmod(url.path, 0o600)
+        let log = CapturedHistory(url: url)
+        try log.append(command: "ls -la", shell: "zsh", directory: "/", exitCode: 0, nativeFile: "")
+        let stats = try log.commandStats()
+        #expect(stats["git commit --amend -m x"]?.flags == ["--amend", "-m"])
+        #expect(stats["ls -la"]?.flags == ["-la"])
+    }
+
     @Test func `Reject corrupt public and symlinked databases without rewriting them`() throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: home) }
@@ -151,4 +261,12 @@ struct CapturedHistoryTests {
         #expect(try log.suggestions(user: NSUserName(), directory: "/repo", prefix: "swift ", limit: 1).map(\.command) == ["swift build"])
         #expect(try log.suggestions(user: "someone-else", directory: "/repo").isEmpty)
     }
+}
+
+/// Creates an empty database file and opens it by its real path (SQLiteDatabase neither creates nor follows symlinks).
+private func fixtureDatabase(_ url: URL) throws -> SQLiteDatabase {
+    FileManager.default.createFile(atPath: url.path, contents: nil)
+    let resolved = realpath(url.path, nil)!
+    defer { free(resolved) }
+    return try SQLiteDatabase(path: String(cString: resolved), readOnly: false)
 }

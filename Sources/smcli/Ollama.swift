@@ -9,6 +9,11 @@ struct SmcliConfig: Codable, Equatable {
     var ollamaModel: String?
     /// The model's vector size, recorded at init so the index can be opened without a network call.
     var ollamaDimension: Int?
+    /// Regexes; commands matching any, or run in a directory matching any of `cwdFilter`, are not recorded.
+    var historyFilter: [String]?
+    var cwdFilter: [String]?
+    /// Skip commands containing likely API keys and tokens; on unless set to false.
+    var secretsFilter: Bool?
 
     static func location(home: URL, environment: [String: String]) -> URL {
         if let path = environment["SMCLI_CONFIG"], !path.isEmpty { return URL(fileURLWithPath: path) }
@@ -65,7 +70,8 @@ struct Ollama: Sendable {
     }
 
     func embed(_ texts: [String], model: String) async throws -> [[Float]] {
-        struct Request: Encodable { let model: String; let input: [String] }
+        // truncate: inputs past the model's context are cut rather than rejected.
+        struct Request: Encodable { let model: String; let input: [String]; var truncate = true }
         struct Response: Decodable { let embeddings: [[Float]] }
         let response = try await request("api/embed", body: Request(model: model, input: texts), as: Response.self)
         guard response.embeddings.count == texts.count else {
@@ -158,26 +164,52 @@ func initialize(_ arguments: [String], configURL: URL, environment: [String: Str
     if config.ollamaModel != nil { print("The next search re-embeds your history with it.") }
 }
 
+/// Consecutive ranges of `texts` holding at most `maxCount` texts and `maxCharacters` characters each;
+/// a single text longer than the budget gets a range of its own.
+func embeddingBatches(_ texts: [String], maxCharacters: Int, maxCount: Int) -> [Range<Int>] {
+    var ranges: [Range<Int>] = []
+    var start = 0
+    var characters = 0
+    for (index, text) in texts.enumerated() {
+        if index > start && (index - start >= maxCount || characters + text.count > maxCharacters) {
+            ranges.append(start..<index)
+            start = index
+            characters = 0
+        }
+        characters += text.count
+    }
+    if start < texts.count { ranges.append(start..<texts.count) }
+    return ranges
+}
+
 #if canImport(ProximaKit)
 import ProximaKit
 
-/// Embeds through Ollama; each ProximaKit batch is one HTTP request.
+/// Embeds through Ollama, splitting each ProximaKit batch into requests small enough for the model's
+/// runner: one request carrying hundreds of long commands can exhaust its memory and crash it.
 struct OllamaEmbedder: TextEmbedder {
     let client: Ollama
     let model: String
     let dimension: Int
+    var maxRequestCharacters = 16_000
+    var maxRequestInputs = 32
 
     func embed(_ text: String) async throws -> Vector {
         try await embedBatch([text])[0]
     }
 
     func embedBatch(_ texts: [String]) async throws -> [Vector] {
-        try await client.embed(texts, model: model).map {
-            guard $0.count == dimension else {
-                throw HistoryError(message: "Ollama model \(model) now returns \($0.count) dimensions, not \(dimension); rerun `smcli init`.")
+        var vectors: [Vector] = []
+        vectors.reserveCapacity(texts.count)
+        for range in embeddingBatches(texts, maxCharacters: maxRequestCharacters, maxCount: maxRequestInputs) {
+            for embedding in try await client.embed(Array(texts[range]), model: model) {
+                guard embedding.count == dimension else {
+                    throw HistoryError(message: "Ollama model \(model) now returns \(embedding.count) dimensions, not \(dimension); rerun `smcli init`.")
+                }
+                vectors.append(Vector(embedding))
             }
-            return Vector($0)
         }
+        return vectors
     }
 }
 #endif

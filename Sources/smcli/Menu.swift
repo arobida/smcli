@@ -26,6 +26,10 @@ struct Menu {
                  prompt: nil, inputRequired: false) { _ in ["shell-init", shell] },
             Item(icon: "⇪", title: "Import legacy history", detail: "Load records from a .jsonl file",
                  prompt: "Path to .jsonl", inputRequired: true) { ["import", ($0 as NSString).expandingTildeInPath] },
+            Item(icon: "↻", title: "Rebuild search index", detail: "Re-embed every command with the current model",
+                 prompt: nil, inputRequired: false) { _ in ["reindex"] },
+            Item(icon: "♥", title: "Check index health", detail: "Index coverage, size, and embedding model status",
+                 prompt: nil, inputRequired: false) { _ in ["health"] },
             Item(icon: "?", title: "Help", detail: "Show command-line usage",
                  prompt: nil, inputRequired: false) { _ in ["--help"] },
         ]

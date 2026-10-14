@@ -1,8 +1,10 @@
 # `smcli`
 
-Read your saved Bash and Zsh history as-is, and — with an opt-in shell hook — record
-what plain history drops: the working directory, exit code, wall-clock time, and
-terminal session. Then search and rank it all, entirely on-device.
+Read your saved Bash and Zsh commands, and — with an opt-in shell hook — record
+metadata native history doesn't reliably keep: the working directory, exit code,
+start time, duration, user, host, and terminal session. Search commands with keyword
+and semantic matching, or rank captured commands for your current directory.
+Search uses Apple's on-device embeddings by default; Ollama is optional.
 
 > [!NOTE]
 > Native shell history stores the command line and little else. smcli never rewrites
@@ -20,15 +22,16 @@ git push origin main
 
 $ .build/release/smcli search undo last commit
 git reset --soft HEAD~1
-    runs=4  last=2026-10-12T09:14:03Z  exit=0  /Users/you/project
-# ^^ keyword + semantic; the first search embeds history (~20s per 5,000 commands), later ones are fast
+    runs=4  native history
+# ^^ illustrative output; native history has no captured time, exit code, or directory
+# ^^ the first search embeds distinct commands; later searches index new commands
 ```
 
 ## Remember more than your shell does
 
 ```sh
 $ .build/release/smcli suggest
-# ^^ empty — native history has no user or directory to rank on
+# ^^ no output if you haven't captured or imported any commands
 
 $ eval "$("$PWD/.build/release/smcli" shell-init zsh)"
 
@@ -37,21 +40,31 @@ $ ./run-tests.sh
 $ git commit -am 'fix login'
 
 $ .build/release/smcli suggest
-./run-tests.sh
 git commit -am 'fix login'
+./run-tests.sh
 git status
-# ^^ ranked for this user and directory: runs here count 4x, parent/subdir 2x, failures 0.25x
+# ^^ illustrative order, assuming successful runs and no earlier captured history
+# ^^ ranked for this user and directory: runs here count 4x, ancestor/descendant 2x, failures 0.25x
 ```
 
 Nothing installs itself: `shell-init` prints the hooks, you `eval` them. Add the line
 to `~/.zshrc` (or `~/.bashrc`) with the binary's absolute path to keep capturing in new
-terminals. Each finished command becomes one row in SQLite at
-`~/.local/share/smcli/history.db`.
+terminals. Use `shell-init bash` for Bash. Finished interactive command lines are
+saved in SQLite at `~/.local/share/smcli/history.db`; recording normally happens in
+the background, so the newest command may not appear immediately. Set `SMCLI_SYNC=1`
+in the shell to make recording synchronous.
+
+`shell-init` also binds **Up**, **Ctrl-R**, **Ctrl-Right**, **Alt-;**, and **Left** (on an empty prompt only) to `smcli pick`. It opens on suggestions
+for the current directory; start typing to filter every captured and native command
+(all words must match), press Tab for semantic search, Enter to put the command on your
+prompt, Esc to cancel. Text already on the prompt becomes the initial query. Set
+`SMCLI_NO_KEYS=1` before the `eval` to keep your shell's own keys. Bash needs 4.0+. On macOS, Alt-; needs your terminal's Option key set to send Meta/Esc+.
 
 ## Install
 
-Requires Swift 6.0+. Search needs macOS 14+ (Apple's on-device embeddings) and is
-unavailable on Linux.
+Requires Swift 6.0+ and macOS 14+ on macOS. Linux needs SQLite development headers
+(e.g. `libsqlite3-dev` on Debian/Ubuntu); search is unavailable on Linux, even with
+Ollama configured.
 
 ```sh
 $ swift build -c release
@@ -62,12 +75,21 @@ The binary is `.build/release/smcli`. There's no installer yet.
 ## Usage
 
 ```sh
-smcli history                 # native history, all files
+smcli history                 # native history by file, then captured records
 smcli history --json          # captured records only, as JSON
-smcli search <query...>       # --limit N, --json
+smcli search [query...]       # --limit N, --json, filters below
 smcli suggest [prefix...]     # --dir PATH, --limit N, --json
-smcli init                    # pick an Ollama embedding model for search
-smcli import legacy.jsonl     # one-time migration from older JSONL logs
+smcli shell-init bash|zsh     # print opt-in hooks; eval for your shell
+smcli pick [query...]         # interactive picker; prints the chosen command
+smcli init                    # choose from installed Ollama embedding models
+smcli init --model NAME       # verify and select an Ollama model
+smcli init --builtin          # return to Apple's built-in embeddings
+smcli reindex                 # discard the search index and re-embed every command
+smcli health [--json]         # index coverage, size, and embedding model check (exit 1 if broken)
+smcli import legacy.jsonl     # import older smcli JSONL logs (not native history)
+smcli import --atuin [db]     # import Atuin history (default ~/.local/share/atuin/history.db)
+smcli import --atuin --replace [db]  # discard existing smcli history, then import
+smcli prune [--dry-run]       # delete stored commands that current filters reject
 ```
 
 Run `smcli` with no arguments in a terminal for an interactive menu. For the rest:
@@ -82,28 +104,68 @@ $ smcli --help
   `.history`/`.historynew` files in `~/.bash_sessions`/`~/.zsh_sessions`, plus an
   exported `HISTFILE`. It's grouped by file, not merged chronologically — most native
   files carry no timestamps.
-- Search ranks distinct commands by fusing BM25 keywords (whole words like `--soft` and
-  their pieces) with Apple's sentence embeddings, so wording that isn't in the command
-  can still match (`extract archive` → `tar -xzf …`). The index lives next to the
-  database at `history.db.search/` and is a rebuildable cache — delete it to reclaim space.
-- `suggest` reads captured history only; each run is scored by recency (halves every 14
-  days), directory, and exit status.
+- Native history is decoded for display: Bash timestamp lines and Zsh extended-history
+  prefixes are removed, and Zsh escaped bytes are decoded. The source files aren't changed.
+- Search combines captured commands and native history, treating each native line as an
+  entry (not reconstructing multiline commands). It ranks distinct commands by fusing
+  BM25 keywords (whole words like `--soft` and their pieces) with Apple's English sentence
+  embeddings, or the configured Ollama model. Semantic matches aren't guaranteed.
+  For commands with captured metadata, run counts come only from captured records;
+  otherwise they count occurrences across native files.
+- Each command is embedded with labels — `command:`, `subcommand:`, `flags:`, `directory:`,
+  `author:` and `intent:` (from the last captured run) — so queries naming a
+  tool, option or project rank closer. Time and frequency are filters, not labels.
+  Captured commands store their option names in a `flags` column (filled in for existing rows on upgrade).
+- Hard filters drop non-matching results: `--command git`, `--subcommand commit`,
+  `--since 7d`, `--before 2026-10-01`, `--min-runs 5`, `--author NAME`, `--dir PATH`
+  (last run in PATH or below), `--flag NAME` (exact option name, e.g. `--flag --amend`). Times are `30m`/`12h`/`7d`/`2w`,
+  `YYYY-MM-DD`, or ISO 8601, compared with the command's last run, so time filters exclude
+  native-only history. With filters the query may be empty: matches list by last run.
+- The index lives next to the database at `history.db.search/` and is a rebuildable
+  cache — delete it to reclaim space. Separate model indexes can be reused when switching
+  back to a previously selected model.
+- `suggest` reads captured/imported history only and filters to the current user;
+  each run is scored by recency (halves every 14 days), directory, and exit status.
+  An optional prefix matches the start of the command literally. `--dir` requires an
+  absolute path. Search and suggestions exclude commands recognized as invoking smcli.
 
 ## Caveats
 
 > [!WARNING]
-> History contains passwords, tokens, and other secrets. smcli never uploads anything
-> and never redacts captured commands — don't share the database or the search index.
+> History can contain passwords, tokens, and other secrets. smcli does not redact
+> captured commands — don't share the database or the search index. Apple's built-in
+> search embeds on-device. With Ollama configured, command text and search queries are
+> sent to the Ollama server (default `http://127.0.0.1:11434`). `OLLAMA_HOST` can point to
+> a remote server; only use an endpoint you trust.
 
 > [!NOTE]
 > Capture is best-effort, not an audit. It records finished interactive commands;
-> scripts, functions, `exec`, force-killed shells, and terminal crashes can escape it.
+> commands inside scripts/functions aren't logged individually, and `exec`, force-killed
+> shells, and terminal crashes can escape it. Bash hooks refuse installation if DEBUG/EXIT
+> traps, functrace, or extdebug are already enabled. Older Bash versions time commands
+> with whole-second precision.
 
 - Keep `SMCLI_DB` separate from your native `HISTFILE` — the CLI rejects the same file,
   symlink, or hard link.
-- The first search embeds every distinct command. Switch embedding models
-  (`smcli init --model embeddinggemma`) and it re-embeds once; return to the built-in
-  model with `smcli init --builtin`.
+- `SMCLI_DB` overrides the database path. Search model settings are stored in
+  `~/.config/smcli/config.json` (or `$XDG_CONFIG_HOME/smcli/config.json`);
+  `SMCLI_CONFIG` overrides that file's path. `init` configures search, not capture,
+  and is not required for the built-in model.
+- Ollama must be running and the model already installed (e.g. `ollama pull embeddinggemma`)
+  before `smcli init --model embeddinggemma`. It must remain available for searches
+  using that model. Initialization does not download models.
+- `import` of legacy JSONL is transactional but does not deduplicate: importing the same
+  file again adds duplicate records. Run each migration only once.
+- Like Atuin, capture skips commands typed with a leading space, commands containing likely
+  secrets (AWS, GitHub, GitLab, Slack, Stripe, Google, npm, Anthropic/OpenAI keys), and any
+  matching regexes in the config file: `"historyFilter": ["^vault "]` for commands,
+  `"cwdFilter": ["^/Users/me/secret"]` for directories. Set `"secretsFilter": false` to turn
+  off the secret patterns. `prune` applies the current filters to already-stored history
+  and compacts the database so deleted text is not left on disk.
+- `import --atuin` keeps Atuin's record UUIDs, so re-running it only adds new commands.
+  It also carries over soft deletions (hidden from history, search, and suggestions) and
+  Atuin's optional `author`/`intent` fields. `ATUIN_DB_PATH` or `XDG_DATA_HOME` override
+  the default source path. Existing smcli databases are upgraded to the new schema on first use.
 
 ## Test
 
