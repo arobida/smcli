@@ -1,0 +1,8 @@
+{
+  "producer" : "coreai-core 1.0.0b2",
+  "creationDate" : "20261015T103434Z",
+  "license" : "Apache-2.0",
+  "assetVersion" : "2.0",
+  "description" : "F2LLM-v2-80M text embedding model (pruned Qwen3 backbone, last-token pooling, L2-normalized 320-d). Source: https:\/\/huggingface.co\/codefuse-ai\/F2LLM-v2-80M",
+  "author" : "codefuse-ai"
+}
