@@ -162,6 +162,11 @@ struct CommandStats: Equatable {
     var author: String? = nil
     var intent: String? = nil
     var flags: [String] = []
+    /// Runs weighted by age (a run two weeks old counts half), so current habits outrank old ones.
+    var frecency: Double = 0
+    var successes: Int = 0
+    /// Runs in the directory passed to `commandStats`, or below it.
+    var runsHere: Int = 0
 }
 
 struct Suggestion: Codable, Equatable {
@@ -258,7 +263,7 @@ struct CapturedHistory {
         );
         CREATE INDEX commands_by_command ON commands(command, started_at);
         CREATE INDEX commands_by_directory ON commands(directory, started_at);
-        """ + migrationToV2 + migrationToV3
+        """ + migrationToV2 + migrationToV3 + migrationToV4
 
     /// Fields borrowed from Atuin's history table: a UUID for deduplication, soft deletion, and authorship.
     static let migrationToV2 = """
@@ -275,7 +280,20 @@ struct CapturedHistory {
         ALTER TABLE commands ADD COLUMN flags TEXT;
         PRAGMA user_version = 3;
         """
-    static let version = 3
+    /// Per-command usage decayed exponentially (half-life `usageHalfLife`): `score` is as of `at`, the newest run.
+    /// Maintained on every insert so ranking never rescans runs; rebuilt by `rebuildUsage` after deletions.
+    static let migrationToV4 = """
+        CREATE TABLE usage (command TEXT PRIMARY KEY, score REAL NOT NULL, at REAL NOT NULL) WITHOUT ROWID;
+        PRAGMA user_version = 4;
+        """
+    static let version = 4
+    static let usageHalfLife = 14.0 * 86_400
+
+    /// Adds a run at `time` to a decayed score held as of `at`; runs may arrive out of order (imports).
+    static func addRun(score: Double, at: Double, time: Double) -> (score: Double, at: Double) {
+        time >= at ? (score * pow(0.5, (time - at) / usageHalfLife) + 1, time)
+                   : (score + pow(0.5, (at - time) / usageHalfLife), at)
+    }
 
     static func atuinLocation(home: URL, environment: [String: String]) -> URL {
         if let path = environment["ATUIN_DB_PATH"], !path.isEmpty { return URL(fileURLWithPath: path) }
@@ -338,7 +356,7 @@ struct CapturedHistory {
         var imported = 0
         try db.execute("BEGIN IMMEDIATE")
         do {
-            if replace { try db.execute("DELETE FROM commands; DELETE FROM sessions;") }
+            if replace { try db.execute("DELETE FROM commands; DELETE FROM sessions; DELETE FROM usage;") }
             try source.run("""
                 SELECT id, timestamp, duration, exit, command, cwd, session, hostname, \(optional.joined(separator: ", "))
                 FROM history ORDER BY timestamp
@@ -414,6 +432,7 @@ struct CapturedHistory {
         try db.execute("BEGIN IMMEDIATE")
         do {
             for id in ids { try db.run("DELETE FROM commands WHERE id = ?", [.integer(id)]) }
+            try rebuildUsage(db)
             try db.execute("COMMIT")
         } catch {
             try? db.execute("ROLLBACK")
@@ -453,20 +472,29 @@ struct CapturedHistory {
     }
 
     /// One row per distinct command: run count, its flags, and the most recent run's time, directory, exit code, author, and intent.
-    func commandStats() throws -> [String: CommandStats] {
+    /// One row per distinct command. Usage aggregates are computed in the same grouped query, so ranking
+    /// never rescans individual runs; `directory` scopes `runsHere`.
+    func commandStats(directory: String? = nil, now: Double = Date().timeIntervalSince1970) throws -> [String: CommandStats] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
         let db = try connect(write: false)
         var stats: [String: CommandStats] = [:]
-        // SQLite returns the bare columns from the row holding MAX(started_at).
+        let here = directory.map { $0.count > 1 && $0.hasSuffix("/") ? String($0.dropLast()) : $0 } ?? ""
+        // SQLite returns the bare columns from the row holding MAX(started_at). The stored usage score is
+        // decayed from its last run to `now` here, since SQLite has no portable pow().
         try db.run("""
-            SELECT command, COUNT(*), MAX(started_at), directory, exit_code, author, intent, flags
-            FROM commands WHERE deleted_at IS NULL GROUP BY command
-            """) { row in
+            SELECT c.command, COUNT(*), MAX(c.started_at), c.directory, c.exit_code, c.author, c.intent, c.flags,
+                   u.score, u.at, SUM(c.exit_code = 0),
+                   SUM(? <> '' AND (c.directory = ? OR (? <> '/' AND substr(c.directory, 1, length(?) + 1) = ? || '/')))
+            FROM commands c LEFT JOIN usage u ON u.command = c.command
+            WHERE c.deleted_at IS NULL GROUP BY c.command
+            """, [.text(here), .text(here), .text(here), .text(here), .text(here)]) { row in
             stats[text(row, 0)] = CommandStats(
                 runs: Int(sqlite3_column_int64(row, 1)), lastRun: sqlite3_column_double(row, 2),
                 lastDirectory: text(row, 3), lastExitCode: Int(sqlite3_column_int64(row, 4)),
                 author: optionalText(row, 5), intent: optionalText(row, 6),
-                flags: text(row, 7).split(separator: " ").map(String.init))
+                flags: text(row, 7).split(separator: " ").map(String.init),
+                frecency: sqlite3_column_double(row, 8) * pow(0.5, max(0, now - sqlite3_column_double(row, 9)) / Self.usageHalfLife),
+                successes: Int(sqlite3_column_int64(row, 10)), runsHere: Int(sqlite3_column_int64(row, 11)))
         }
         return stats
     }
@@ -537,10 +565,32 @@ struct CapturedHistory {
                       .text(directory), .text(command), .integer(exitCode), uuid.map(SQLValue.text) ?? .null,
                       deletedAt.map(SQLValue.real) ?? .null, author.map(SQLValue.text) ?? .null,
                       intent.map(SQLValue.text) ?? .null, .text(commandFlags(command).joined(separator: " "))])
+            if db.changes > 0 && deletedAt == nil {
+                var current: (score: Double, at: Double)?
+                try db.run("SELECT score, at FROM usage WHERE command = ?", [.text(command)]) {
+                    current = (sqlite3_column_double($0, 0), sqlite3_column_double($0, 1))
+                }
+                let updated = current.map { Self.addRun(score: $0.score, at: $0.at, time: startedAt) } ?? (score: 1, at: startedAt)
+                try db.run("INSERT OR REPLACE INTO usage (command, score, at) VALUES (?, ?, ?)",
+                           [.text(command), .real(updated.score), .real(updated.at)])
+            }
             if transaction { try db.execute("COMMIT") }
         } catch {
             if transaction { try? db.execute("ROLLBACK") }
             throw error
+        }
+    }
+
+    /// Recomputes every usage score from the live runs, after deletions or when the table is first added.
+    private func rebuildUsage(_ db: SQLiteDatabase) throws {
+        var usage: [String: (score: Double, at: Double)] = [:]
+        try db.run("SELECT command, started_at FROM commands WHERE deleted_at IS NULL") { row in
+            let time = sqlite3_column_double(row, 1)
+            usage[text(row, 0)] = usage[text(row, 0)].map { Self.addRun(score: $0.score, at: $0.at, time: time) } ?? (1, time)
+        }
+        try db.execute("DELETE FROM usage")
+        for (command, value) in usage {
+            try db.run("INSERT INTO usage (command, score, at) VALUES (?, ?, ?)", [.text(command), .real(value.score), .real(value.at)])
         }
     }
 
@@ -596,6 +646,10 @@ struct CapturedHistory {
                     if version <= 2 {
                         try db.execute(Self.migrationToV3)
                         try backfillFlags(db)
+                    }
+                    if version <= 3 {
+                        try db.execute(Self.migrationToV4)
+                        try rebuildUsage(db)
                     }
                 }
                 try db.execute("COMMIT")

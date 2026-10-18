@@ -189,7 +189,7 @@ struct CapturedHistoryTests {
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         let url = home.appendingPathComponent("captured.db")
         let old = try fixtureDatabase(url)
-        try old.execute(CapturedHistory.schema.replacingOccurrences(of: CapturedHistory.migrationToV3, with: "") + """
+        try old.execute(CapturedHistory.schema.replacingOccurrences(of: CapturedHistory.migrationToV3 + CapturedHistory.migrationToV4, with: "") + """
             INSERT INTO sessions VALUES ('s', 'bob', 'h', 'zsh');
             INSERT INTO commands (session, started_at, directory, command, exit_code) VALUES ('s', 1, '/', 'git commit --amend -m x', 0);
             """)
@@ -199,6 +199,31 @@ struct CapturedHistoryTests {
         let stats = try log.commandStats()
         #expect(stats["git commit --amend -m x"]?.flags == ["--amend", "-m"])
         #expect(stats["ls -la"]?.flags == ["-la"])
+    }
+
+    @Test func `Aggregate usage per command for ranking`() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let log = CapturedHistory(url: home.appendingPathComponent("captured.db"))
+        let now = 1_700_000_000.0
+        try log.append(command: "make", shell: "zsh", directory: "/repo", exitCode: 0, nativeFile: "", startedAt: now, endedAt: now)
+        try log.append(command: "make", shell: "zsh", directory: "/repo/sub", exitCode: 2, nativeFile: "",
+                       startedAt: now - 14 * 86_400, endedAt: now - 14 * 86_400)
+        try log.append(command: "make", shell: "zsh", directory: "/repository", exitCode: 0, nativeFile: "",
+                       startedAt: now - 1, endedAt: now - 1)
+        let stats = try #require(try log.commandStats(directory: "/repo/", now: now)["make"])
+        #expect(stats.runs == 3 && stats.successes == 2 && stats.runsHere == 2)
+        #expect(abs(stats.frecency - (1 + 0.5 + pow(0.5, 1 / 1_209_600.0))) < 1e-9)
+        #expect(try log.commandStats(now: now)["make"]?.runsHere == 0)
+        // Old habits fade: 500 runs two years ago count for almost nothing.
+        for day in 0..<500 {
+            let time = now - 730 * 86_400 - Double(day)
+            try log.append(command: "old", shell: "zsh", directory: "/", exitCode: 0, nativeFile: "", startedAt: time, endedAt: time)
+        }
+        #expect(try log.commandStats(now: now)["old"]!.frecency < 1e-9)
+        // Pruning rebuilds the scores from the remaining runs.
+        _ = try log.prune(filter: CaptureFilter(config: SmcliConfig(historyFilter: ["^make$"])), dryRun: false)
+        #expect(try log.commandStats(now: now)["make"] == nil)
     }
 
     @Test func `Reject corrupt public and symlinked databases without rewriting them`() throws {

@@ -3,7 +3,7 @@ import Foundation
 @main
 struct Smcli {
     static let usage = """
-    Usage: smcli init [--model NAME | --builtin]
+    Usage: smcli init [--model NAME | --potion [DIR] | --builtin]
            smcli history [--json]
            smcli shell-init bash|zsh
            smcli search [query...] [--command NAME] [--subcommand NAME] [--since TIME] [--before TIME]
@@ -19,7 +19,7 @@ struct Smcli {
     search filters are exact; TIME is 30m, 12h, 7d, 2w, YYYY-MM-DD, or ISO 8601, matched against the last run.
     reindex re-embeds every command for search; health checks the index and the embedding model.
     pick opens the history picker that shell-init binds to Up and Ctrl-R (SMCLI_NO_KEYS=1 to skip).
-    init picks an Ollama embedding model for search (saved to ~/.config/smcli/config.json, or SMCLI_CONFIG).
+    init picks the search embedding model: Ollama, local potion-code-16M-v2 (--potion, default: Hugging Face cache), or Apple's (saved to ~/.config/smcli/config.json, or SMCLI_CONFIG).
     Commands with a leading space, likely secrets, or matching historyFilter/cwdFilter in the config are not recorded;
     prune removes already-stored ones. import --atuin --replace discards existing smcli history first.
     SMCLI_DB selects the metadata database (default: ~/.local/share/smcli/history.db).
@@ -158,8 +158,10 @@ func search(_ arguments: [String], captured: CapturedHistory, home: URL, environ
         index += 1
     }
     #if canImport(ProximaKit)
+    // Loading the embedding model overlaps reading history.
+    async let loading = searchEngine(captured: captured, home: home, environment: environment)
     let corpus = try searchCorpus(captured: captured, home: home, environment: environment)
-    let engine = try searchEngine(captured: captured, home: home, environment: environment)
+    let engine = try await loading
     let hits = try await engine.search(words.joined(separator: " "), corpus: corpus, limit: limit, filter: filter) {
         FileHandle.standardError.write(Data("\($0)\n".utf8))
     }
@@ -175,9 +177,11 @@ func search(_ arguments: [String], captured: CapturedHistory, home: URL, environ
             if let lastRun = hit.lastRun { details.append("last=\(lastRun)") }
             if let code = hit.lastExitCode { details.append("exit=\(code)") }
             if let directory = hit.lastDirectory { details.append(directory) }
+            if hit.runsHere > 0 { details.append("here=\(hit.runsHere)") }
             if hit.source == "native" { details.append("native history") }
             print(hit.command)
             print("    " + details.joined(separator: "  "))
+            if let why = hit.why, !why.isEmpty { print("    why: " + why.joined(separator: ", ")) }
         }
     }
     #else
@@ -191,14 +195,21 @@ func search(_ arguments: [String], captured: CapturedHistory, home: URL, environ
 func searchCorpus(captured: CapturedHistory, home: URL, environment: [String: String]) throws -> [String: SearchEntry] {
     let native = try historyFiles(home: home, environment: environment)
         .flatMap { (try? $0.read())?.components(separatedBy: "\n") ?? [] }
-    return searchCorpus(captured: try captured.commandStats(), native: native)
+    return searchCorpus(captured: try captured.commandStats(directory: workingDirectory(environment)), native: native)
+}
+
+/// The shell's $PWD keeps symlinked paths as typed, matching what the capture hooks recorded.
+func workingDirectory(_ environment: [String: String]) -> String {
+    environment["PWD"].flatMap { $0.hasPrefix("/") ? $0 : nil } ?? FileManager.default.currentDirectoryPath
 }
 
 /// The search index next to the history database, using the model chosen by `smcli init`.
 func searchEngine(captured: CapturedHistory, home: URL, environment: [String: String]) throws -> HistorySearch {
     var engine = HistorySearch(directory: captured.url.appendingPathExtension("search"))
     let config = try SmcliConfig.load(from: SmcliConfig.location(home: home, environment: environment))
-    if let model = config.ollamaModel, let dimension = config.ollamaDimension {
+    if let path = config.potionPath {
+        engine.potion = PotionEmbedder(model: try PotionModel(directory: URL(fileURLWithPath: path)))
+    } else if let model = config.ollamaModel, let dimension = config.ollamaDimension {
         engine.ollama = OllamaEmbedder(client: Ollama(environment: environment), model: model, dimension: dimension)
     }
     return engine

@@ -10,6 +10,13 @@ struct PickerTests {
                             native: ["ls", "smcli search x", "", "vim a", "ls"])
         #expect(picker.candidates == ["git push", "make", "git status", "ls", "vim a"])
         #expect(picker.matches == picker.candidates)
+        #expect(picker.rows(picker.matches) == [.header("Suggested here"), .command(0), .command(1),
+                                                 .header("History"), .command(2), .command(3), .command(4)])
+    }
+
+    @Test func `Headers only for sections present`() {
+        let picker = Picker(suggestions: ["git push"], captured: [:], native: ["ls"], query: "ls")
+        #expect(picker.rows(picker.matches) == [.header("History"), .command(0)])
     }
 
     @Test func `Typing filters on every word, ignoring case`() {

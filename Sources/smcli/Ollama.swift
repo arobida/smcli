@@ -9,6 +9,8 @@ struct SmcliConfig: Codable, Equatable {
     var ollamaModel: String?
     /// The model's vector size, recorded at init so the index can be opened without a network call.
     var ollamaDimension: Int?
+    /// Directory of a local potion-code-16M-v2 model (safetensors + tokenizer); used instead of Ollama when set.
+    var potionPath: String?
     /// Regexes; commands matching any, or run in a directory matching any of `cwdFilter`, are not recorded.
     var historyFilter: [String]?
     var cwdFilter: [String]?
@@ -102,7 +104,7 @@ struct Ollama: Sendable {
     }
 }
 
-/// `smcli init`: choose the search embedding model, interactively or with --model/--builtin.
+/// `smcli init`: choose the search embedding model, interactively or with --model/--potion/--builtin.
 func initialize(_ arguments: [String], configURL: URL, environment: [String: String]) async throws {
     var config = try SmcliConfig.load(from: configURL)
     let ollama = Ollama(environment: environment)
@@ -141,8 +143,24 @@ func initialize(_ arguments: [String], configURL: URL, environment: [String: Str
             }
         }
     case ["--builtin"]: choice = ""
+    case let arguments where arguments.first == "--potion" && arguments.count <= 2:
+        let home = environment["HOME"].map { URL(fileURLWithPath: $0) } ?? FileManager.default.homeDirectoryForCurrentUser
+        guard let directory = arguments.count == 2 ? URL(fileURLWithPath: arguments[1]).standardizedFileURL
+                : PotionModel.cachedSnapshot(home: home, environment: environment) else {
+            throw HistoryError(message: "No \(PotionModel.name) in the Hugging Face cache; download it (e.g. `hf download minishlab/\(PotionModel.name)`) or pass its directory.")
+        }
+        // Loading and embedding once verifies the files before they are saved as the choice.
+        let model = try PotionModel(directory: directory)
+        guard model.embed("smcli") != nil else { throw HistoryError(message: "Potion model in \(directory.path) cannot embed text.") }
+        config.potionPath = directory.path
+        config.ollamaModel = nil
+        config.ollamaDimension = nil
+        try config.save(to: configURL)
+        print("Search will use \(PotionModel.name) (\(model.dimension) dimensions) from \(directory.path). Saved \(configURL.path).")
+        print("The next search re-embeds your history with it.")
+        return
     case let arguments where arguments.count == 2 && arguments[0] == "--model": choice = arguments[1]
-    default: throw HistoryError(message: "Usage: smcli init [--model NAME | --builtin]")
+    default: throw HistoryError(message: "Usage: smcli init [--model NAME | --potion [DIR] | --builtin]")
     }
 
     guard let choice else { return }  // Nothing offered: keep any existing choice.
@@ -154,9 +172,11 @@ func initialize(_ arguments: [String], configURL: URL, environment: [String: Str
         }
         config.ollamaModel = model
         config.ollamaDimension = dimension
+        config.potionPath = nil
     } else {
         config.ollamaModel = nil
         config.ollamaDimension = nil
+        config.potionPath = nil
     }
     try config.save(to: configURL)
     let summary = config.ollamaModel.map { "Ollama model \($0) (\(config.ollamaDimension!) dimensions)" } ?? "built-in Apple model"

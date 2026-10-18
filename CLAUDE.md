@@ -8,3 +8,12 @@ Rules:
 - Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
 - After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
 - A committed graphify-out/graph.json is rewritten whole on every build, so a large diff to it in a pull request is expected. Do not flag it as churn or suggest skipping the graph rebuild or its hooks.
+
+## Building
+
+Use the Makefile for builds; don't hand-roll `swift build` commands.
+- `make fresh` — clean release build for the user to test. Output: `dist/smcli-<timestamp>-<commit>`, with `dist/smcli` symlinked to the latest. It also prints the `eval` line that loads the zsh hooks from the new build; relay those commands to the user. Run this after changes the user will try out.
+- `make release` — same, without cleaning (faster).
+- `make build` — debug build; `make run ARGS="..."` builds and runs.
+- `make test` — full test suite (`scripts/test.sh`).
+- `make clean` — remove build output.

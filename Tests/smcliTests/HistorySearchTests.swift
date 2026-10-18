@@ -26,21 +26,21 @@ struct HistorySearchTests {
         #expect(Array(corpus.keys) == ["git status"])
     }
 
-    @Test func `Label search documents with command, subcommand, flags, and directory`() {
+    @Test func `Label search documents with command, subcommand, and flags`() {
         let entry = SearchEntry(command: "/usr/bin/git commit --amend", runs: 12, lastRun: "2023-11-12T22:13:20Z",
                                 lastDirectory: "/repo", lastExitCode: 0, source: "captured", flags: ["--amend"])
         #expect(searchDocument(entry) ==
-                "/usr/bin/git commit --amend\ncommand: git\nsubcommand: commit\nflags: --amend\ndirectory: /repo")
+                "/usr/bin/git commit --amend\ncommand: git\nsubcommand: commit\nflags: --amend")
         var authored = entry
         authored.author = "claude"
         authored.intent = "fix the\ntypo"
-        #expect(searchDocument(authored).hasSuffix("directory: /repo\nauthor: claude\nintent: fix the typo"))
+        #expect(searchDocument(authored).hasSuffix("flags: --amend\nauthor: claude\nintent: fix the typo"))
         let native = SearchEntry(command: "ls -la | less", runs: 1, lastRun: nil, lastDirectory: nil, lastExitCode: nil,
                                  source: "native")
         #expect(searchDocument(native) == "ls -la | less\ncommand: ls")
         let long = SearchEntry(command: "echo " + String(repeating: "x", count: 3_000), runs: 1, lastRun: nil,
                                lastDirectory: "/d", lastExitCode: nil, source: "captured")
-        #expect(searchDocument(long).hasSuffix(String(repeating: "x", count: 1_495) + "\ncommand: echo\ndirectory: /d"))
+        #expect(searchDocument(long).hasSuffix(String(repeating: "x", count: 1_495) + "\ncommand: echo"))
         #expect(searchCorpus(captured: [:], native: ["ls -la | grep -i --color=auto x"])["ls -la | grep -i --color=auto x"]?.flags
                 == ["-la", "-i", "--color"])
     }
@@ -105,7 +105,21 @@ struct HistorySearchTests {
         #expect(ShellTokenizer().tokenize("git reset --soft HEAD~1") ==
                 ["git", "reset", "--soft", "soft", "head~1", "head", "1"])
         #expect(ShellTokenizer().tokenize("git push -f\ncommand: git\nflags: -f") == ["git", "push", "-f", "f"])
-        #expect(ShellTokenizer().tokenize("ls\ndirectory: /a\nintent: list files") == ["ls", "intent:", "intent", "list", "files"])
+        #expect(ShellTokenizer().tokenize("ls\nflags: -a\nintent: list files") == ["ls", "intent:", "intent", "list", "files"])
+    }
+
+    @Test func `Keep intent keywords searchable after the index reopens`() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var corpus = searchCorpus(captured: [:], native: ["git push", "docker ps", "ls -la", "make test"])
+        corpus["kubectl rollout restart"] = SearchEntry(command: "kubectl rollout restart", runs: 1, lastRun: nil,
+                                                        lastDirectory: nil, lastExitCode: nil, source: "native",
+                                                        intent: "zanzibar outage fix")
+        // The first engine builds the index; the second opens it from disk as a new process would.
+        #expect(try await HistorySearch(directory: directory).search("zanzibar", corpus: corpus, limit: 1).map(\.command)
+                == ["kubectl rollout restart"])
+        #expect(try await HistorySearch(directory: directory).search("zanzibar", corpus: corpus, limit: 1).map(\.command)
+                == ["kubectl rollout restart"])
     }
 
     @Test func `Search finds exact flags and keeps the index in sync with history`() async throws {

@@ -4,7 +4,7 @@ Read your saved Bash and Zsh commands, and — with an opt-in shell hook — rec
 metadata native history doesn't reliably keep: the working directory, exit code,
 start time, duration, user, host, and terminal session. Search commands with keyword
 and semantic matching, or rank captured commands for your current directory.
-Search uses Apple's on-device embeddings by default; Ollama is optional.
+Search uses Apple's on-device embeddings by default; a local potion-code-16M-v2 static model or Ollama is optional.
 
 > [!NOTE]
 > Native shell history stores the command line and little else. smcli never rewrites
@@ -83,6 +83,7 @@ smcli shell-init bash|zsh     # print opt-in hooks; eval for your shell
 smcli pick [query...]         # interactive picker; prints the chosen command
 smcli init                    # choose from installed Ollama embedding models
 smcli init --model NAME       # verify and select an Ollama model
+smcli init --potion [DIR]     # use local potion-code-16M-v2 (default: Hugging Face cache)
 smcli init --builtin          # return to Apple's built-in embeddings
 smcli reindex                 # discard the search index and re-embed every command
 smcli health [--json]         # index coverage, size, and embedding model check (exit 1 if broken)
@@ -109,7 +110,18 @@ $ smcli --help
 - Search combines captured commands and native history, treating each native line as an
   entry (not reconstructing multiline commands). It ranks distinct commands by fusing
   BM25 keywords (whole words like `--soft` and their pieces) with Apple's English sentence
-  embeddings, or the configured Ollama model. Semantic matches aren't guaranteed.
+  embeddings, potion-code-16M-v2, or the configured Ollama model. Semantic matches aren't guaranteed.
+- Literal queries (flags, paths, revisions like `HEAD~1`, or a short query led by a program in
+  your history) weight keywords more; plain-language requests fuse both legs by rank.
+- A bounded pool of matches is reranked with usage aggregates computed in the same SQL
+  query as the stats: age-weighted runs (a run two weeks old counts half), runs in the
+  current directory or below, and success rate. Usage multiplies relevance, so habits lift
+  matches without surfacing non-matches; failed commands are demoted, not hidden. Text
+  results show why a command ranked (`exact words`, `used here`, `recent`, …).
+- potion-code-16M-v2 runs natively (WordPiece tokens, mean of float16 rows, normalize;
+  no network pass). Download it with `hf download minishlab/potion-code-16M-v2`, then
+  `smcli init --potion`. Being a static model, it embeds only the command and its intent,
+  not the labels below; word order is lost (`cp a b` equals `cp b a`), so keywords matter.
   For commands with captured metadata, run counts come only from captured records;
   otherwise they count occurrences across native files.
 - Each command is embedded with labels — `command:`, `subcommand:`, `flags:`, `directory:`,

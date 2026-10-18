@@ -20,6 +20,12 @@ struct SearchEntry: Codable, Equatable {
     var intent: String? = nil
     /// Option names (`--amend`, `-m`), from the database for captured commands.
     var flags: [String] = []
+    /// Runs decayed by age (half weight every two weeks), successful runs, and runs in the searcher's directory or below (captured only).
+    var frecency: Double = 0
+    var successes: Int = 0
+    var runsHere: Int = 0
+    /// Why search ranked this command where it did; set only on search results.
+    var why: [String]? = nil
 }
 
 /// True when a command line runs smcli itself (`smcli …`, `/path/to/smcli …`, `swift run smcli …`),
@@ -47,7 +53,8 @@ func searchCorpus(captured: [String: CommandStats], native: [String]) -> [String
             command: command, runs: stats.runs,
             lastRun: formatter.string(from: Date(timeIntervalSince1970: stats.lastRun)),
             lastDirectory: stats.lastDirectory, lastExitCode: stats.lastExitCode, source: "captured",
-            author: stats.author, intent: stats.intent, flags: stats.flags)
+            author: stats.author, intent: stats.intent, flags: stats.flags,
+            frecency: stats.frecency, successes: stats.successes, runsHere: stats.runsHere)
     }
     var nativeCounts: [String: Int] = [:]
     for line in native {
@@ -75,13 +82,18 @@ extension SearchEntry {
 /// The text embedded for an entry: the command plus labeled fields, so queries naming a tool, option,
 /// or project land near the right commands. Time and frequency are left to `SearchFilter`: as labels
 /// they did not improve ranking and would force re-embedding as they change.
-func searchDocument(_ entry: SearchEntry) -> String {
+/// With `labeled` false (static models such as Potion, which mean-pool tokens and would dilute the command
+/// with repeated names and label words), only the command and its recorded intent are embedded.
+func searchDocument(_ entry: SearchEntry, labeled: Bool = true) -> String {
     // Long commands (heredocs, pasted scripts) are cut so they fit embedding contexts with their labels intact.
     var lines = [entry.command.count > 1_500 ? String(entry.command.prefix(1_500)) : entry.command]
+    guard labeled else {
+        if let intent = entry.intent, !intent.isEmpty { lines.append(intent.replacingOccurrences(of: "\n", with: " ")) }
+        return lines.joined(separator: "\n")
+    }
     if let program = entry.program { lines.append("command: \(program)") }
     if let subcommand = entry.subcommand { lines.append("subcommand: \(subcommand)") }
     if !entry.flags.isEmpty { lines.append("flags: \(entry.flags.joined(separator: " "))") }
-    if let directory = entry.lastDirectory { lines.append("directory: \(directory)") }
     if let author = entry.author, !author.isEmpty { lines.append("author: \(author)") }
     // Intent stays out of the label list in ShellTokenizer: its words are worth matching as keywords.
     if let intent = entry.intent, !intent.isEmpty { lines.append("intent: \(intent.replacingOccurrences(of: "\n", with: " "))") }
@@ -138,6 +150,55 @@ struct SearchFilter: Equatable {
     }
 }
 
+/// How literal a query is. Flags, paths, revisions, assignments, and commands that start with a known
+/// program carry exact constraints the keyword leg honors; plain words describe intent for embeddings.
+func isLiteralQuery(_ query: String, programs: Set<String>) -> Bool {
+    let words = query.split(whereSeparator: \.isWhitespace)
+    guard let first = words.first else { return false }
+    if words.contains(where: { word in
+        word.hasPrefix("-") || word.contains("/") || word.contains("=") || word.hasPrefix("~")
+            || word.contains(where: { "~^@:|$*{}".contains($0) }) || word.uppercased() == "HEAD"
+            || word.hasPrefix("HEAD") || (word.contains(".") && !word.hasSuffix("."))
+    }) { return true }
+    // A short query led by a program in the history (`git stash`) names a command; a longer one is a request.
+    return words.count <= 4 && programs.contains(first.lowercased())
+}
+
+/// Reorders hybrid hits with usage evidence. `relevance` is each hit's fused score scaled so the best is 1;
+/// usage multiplies it rather than adding, so a habit lifts a match but never surfaces a non-match.
+/// Failures lower the score without excluding: the failed command may be exactly what is wanted.
+func rerank(_ hits: [(entry: SearchEntry, relevance: Double)], literal: Bool, query: String,
+            now: Double = Date().timeIntervalSince1970) -> [SearchEntry] {
+    let terms = Set(query.lowercased().split(whereSeparator: \.isWhitespace).map(String.init))
+    return hits.map { hit -> (SearchEntry, Double) in
+        var entry = hit.entry
+        var why: [String] = []
+        let words = Set(entry.command.lowercased().split(whereSeparator: \.isWhitespace).map(String.init))
+        let exact = !terms.isEmpty && terms.isSubset(of: words)
+        why.append(exact ? "exact words" : literal ? "keyword match" : "semantic match")
+        // Native lines have no times; count their occurrences at a fifth of a dated run.
+        let usage = entry.source == "captured" ? entry.frecency : Double(entry.runs) * 0.2
+        var boost = 1 + 0.15 * log1p(usage)
+        if entry.runsHere > 0 {
+            boost += 0.35 * min(1, Double(entry.runsHere) / Double(max(1, entry.runs)) + 0.25)
+            why.append("used here")
+        }
+        if let last = entry.lastRunEpoch, now - last < 7 * 86_400 { boost += 0.1; why.append("recent") }
+        if entry.runs >= 5 { why.append("used \(entry.runs) times") }
+        if exact { boost += literal ? 0.5 : 0.2 }
+        if entry.source == "captured" && entry.runs > 0 {
+            let successRate = Double(entry.successes) / Double(entry.runs)
+            boost *= 0.75 + 0.25 * successRate
+            if entry.successes == 0 { why.append("always failed") }
+        }
+        entry.why = why
+        return (entry, hit.relevance * boost)
+    }
+    .enumerated()
+    .sorted { $0.element.1 != $1.element.1 ? $0.element.1 > $1.element.1 : $0.offset < $1.offset }
+    .map(\.element.0)
+}
+
 #if canImport(ProximaKit)
 import ProximaKit
 import ProximaEmbeddings
@@ -147,7 +208,7 @@ import ProximaEmbeddings
 /// are skipped: they are for the embedding, and words like "last" or "run" in every document would
 /// add keyword noise to queries that use them.
 struct ShellTokenizer: BM25Tokenizer {
-    static let labels = ["command: ", "subcommand: ", "flags: ", "directory: ", "author: "]
+    static let labels = ["command: ", "subcommand: ", "flags: ", "author: "]
 
     func tokenize(_ text: String) -> [String] {
         var tokens: [String] = []
@@ -200,6 +261,11 @@ struct HistorySearch {
     let directory: URL
     /// Ollama embedding model from `smcli init`; nil uses Apple's built-in model.
     var ollama: OllamaEmbedder? = nil
+    /// Local potion-code-16M-v2 from `smcli init --potion`; takes precedence over Ollama.
+    var potion: PotionEmbedder? = nil
+
+    /// Static embeddings get the bare command; contextual models get the labeled document.
+    private var labeledDocuments: Bool { potion == nil }
 
     /// Brings the index up to date with `corpus`, then returns the best `limit` matches that pass `filter`.
     /// An empty query is allowed with a filter and lists matches by most recent run.
@@ -219,15 +285,24 @@ struct HistorySearch {
         let lock = try lockIndex(wait: true)!
         defer { close(lock) }
         let (store, _) = try await openIndex()
-        let count = try await sync(store, corpus: corpus) { done, total in
+        let documents = try await sync(store, corpus: corpus) { done, total in
             if done == 0 && total > 200 { progress("Indexing \(total) commands for search…") }
         }
-        // Filters run after ranking, so a filtered search ranks the whole index before keeping matches.
-        let k = filter.isEmpty ? limit : max(limit, count)
-        let hits = try await store.query(query, k: k).compactMap {
-            $0.decodeMetadata(as: ChunkMetadata.self).flatMap { corpus[$0.text] }
+        // Literal queries lean on keywords; intent queries fuse both legs by rank.
+        let programs = Set(corpus.values.compactMap { $0.program?.lowercased() })
+        let literal = isLiteralQuery(query, programs: programs)
+        await store.index.setFusion(literal ? .weightedSum(alpha: 0.3) : .rrf)
+        // A bounded pool is reranked with usage; filters run after ranking, so a filtered search ranks
+        // the whole index before keeping matches.
+        let k = filter.isEmpty ? max(limit * 4, 40) : max(limit, documents.count)
+        let results = try await store.query(query, k: k)
+        let best = Double(results.map { -$0.distance }.max() ?? 1)
+        let hits = results.compactMap { result -> (entry: SearchEntry, relevance: Double)? in
+            guard let entry = result.decodeMetadata(as: ChunkMetadata.self).flatMap({ documents[$0.text] }).flatMap({ corpus[$0] }),
+                  filter.allows(entry) else { return nil }
+            return (entry, best > 0 ? Double(-result.distance) / best : 1)
         }
-        return Array(hits.filter(filter.allows).prefix(limit))
+        return Array(rerank(hits, literal: literal, query: query).prefix(limit))
     }
 
     /// Discards the current model's index and embeds every command again. Returns the number embedded.
@@ -236,7 +311,7 @@ struct HistorySearch {
         defer { close(lock) }
         try? FileManager.default.removeItem(at: directory.appendingPathComponent(try indexName()))
         let (store, _) = try await openIndex()
-        return try await sync(store, corpus: corpus, progress: progress)
+        return try await sync(store, corpus: corpus, progress: progress).count
     }
 
     /// Inspects the index without changing it, and checks that the embedding model answers with the right size.
@@ -245,7 +320,8 @@ struct HistorySearch {
         do {
             let name = try indexName()
             let url = directory.appendingPathComponent(name)
-            health.embedder = ollama.map { "Ollama \($0.model) (\($0.dimension) dimensions)" } ?? "Apple built-in"
+            health.embedder = potion.map { "\(PotionModel.name) (\($0.dimension) dimensions) at \($0.model.directory.path)" }
+                ?? ollama.map { "Ollama \($0.model) (\($0.dimension) dimensions)" } ?? "Apple built-in"
             health.path = url.path
             let embedder = try makeEmbedder()
             do {
@@ -285,7 +361,7 @@ struct HistorySearch {
                 return health
             }
             let indexed = await store.documentIds
-            let expected = Set(corpus.values.map(searchDocument))
+            let expected = Set(corpus.values.map { searchDocument($0, labeled: labeledDocuments) })
             health.indexed = indexed.count
             health.missing = expected.subtracting(indexed).count
             health.stale = indexed.subtracting(expected).count
@@ -295,14 +371,14 @@ struct HistorySearch {
         return health
     }
 
-    static let version = "commands-v5"
+    static let version = "commands-v7"
 
-    /// Brings `store` in line with `corpus` and saves it. Returns the number of indexed commands.
+    /// Brings `store` in line with `corpus` and saves it. Returns each indexed document's command.
     private func sync(_ store: HybridVectorStore, corpus: [String: SearchEntry],
-                      progress: (Int, Int) -> Void) async throws -> Int {
-        // Documents are keyed by their labeled text, so an entry whose labels change is re-embedded.
+                      progress: (Int, Int) -> Void) async throws -> [String: String] {
+        // Documents are keyed by their text, so an entry whose labels change is re-embedded.
         var documents: [String: String] = [:]
-        for (command, entry) in corpus { documents[searchDocument(entry)] = command }
+        for (command, entry) in corpus { documents[searchDocument(entry, labeled: labeledDocuments)] = command }
         let indexed = await store.documentIds
         for stale in indexed.subtracting(documents.keys) {
             try await store.removeDocument(id: stale)
@@ -311,17 +387,18 @@ struct HistorySearch {
         if !missing.isEmpty { progress(0, missing.count) }
         for start in stride(from: 0, to: missing.count, by: 256) {
             let batch = Array(missing[start..<min(start + 256, missing.count)])
-            try await store.addChunks(batch, metadata: batch.map {
-                ChunkMetadata(documentId: $0, chunkIndex: 0, text: documents[$0]!)
-            })
+            // ProximaKit rebuilds BM25 from the metadata text on open, so it must be the indexed document
+            // itself; searches map it back to the command.
+            try await store.addChunks(batch, metadata: batch.map { ChunkMetadata(documentId: $0, chunkIndex: 0, text: $0) })
             progress(start + batch.count, missing.count)
         }
         try await store.save()
-        return documents.count
+        return documents
     }
 
     /// Embedding model, tokenizer, or document format changes need a fresh index; the name pins all three.
     private func indexName() throws -> String {
+        if let potion { return "\(Self.version)-potion-code-16m-v2-d\(potion.dimension)" }
         if let ollama {
             let slug = String(ollama.model.map { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" ? $0 : "_" })
             return "\(Self.version)-ollama-\(slug)-d\(ollama.dimension)"
@@ -330,6 +407,7 @@ struct HistorySearch {
     }
 
     private func makeEmbedder() throws -> any TextEmbedder {
+        if let potion { return potion }
         if let ollama { return ollama }
         return CommandEmbedder(base: try NLEmbeddingProvider(language: .english))
     }

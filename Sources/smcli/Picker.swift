@@ -5,6 +5,8 @@ import Foundation
 struct Picker {
     /// Suggestions first (ranked for this directory), then every other command, most recent first.
     let candidates: [String]
+    /// How many leading `candidates` are directory suggestions; the rest is full history.
+    let suggestionCount: Int
     var query: String
     var selected = 0
     /// Semantic results for `semanticQuery`; replaces keyword filtering until the query changes.
@@ -20,6 +22,7 @@ struct Picker {
             if !command.isEmpty && !isSmcliCommand(command) && seen.insert(command).inserted { ordered.append(command) }
         }
         suggestions.forEach(add)
+        suggestionCount = ordered.count
         captured.sorted { $0.value.lastRun != $1.value.lastRun ? $0.value.lastRun > $1.value.lastRun : $0.key < $1.key }
             .forEach { add($0.key) }
         native.reversed().forEach(add)
@@ -36,6 +39,26 @@ struct Picker {
             let lowered = command.lowercased()
             return terms.allSatisfy { lowered.contains($0) }
         }
+    }
+
+    /// Whether `command` came from this directory's suggestions rather than full history.
+    func isSuggestion(_ command: String) -> Bool {
+        candidates.prefix(suggestionCount).contains(command)
+    }
+
+    enum Row: Equatable { case header(String), command(Int) }
+
+    /// Display rows for `current`: section headers split suggestions from history (not for semantic results,
+    /// whose order is by relevance). `.command` holds an index into `current`.
+    func rows(_ current: [String]) -> [Row] {
+        guard !(semantic != nil && semanticQuery == query) else { return current.indices.map(Row.command) }
+        let split = current.firstIndex { !isSuggestion($0) } ?? current.count
+        var rows: [Row] = []
+        if split > 0 { rows.append(.header("Suggested here")) }
+        rows += (0..<split).map(Row.command)
+        if split < current.count { rows.append(.header("History")) }
+        rows += (split..<current.count).map(Row.command)
+        return rows
     }
 
     // MARK: - Terminal
@@ -95,19 +118,29 @@ struct Picker {
     func render(_ current: [String], size: (rows: Int, columns: Int)) -> String {
         let width = max(20, size.columns)
         let visible = max(1, size.rows - 4)
-        // Keep the selection on screen.
-        let top = max(0, selected - visible + 1)
+        let rows = rows(current)
+        let selectedRow = rows.firstIndex(of: .command(selected)) ?? 0
+        // Keep the selection on screen, along with its section header when that fits.
+        let top = max(0, selectedRow - visible + 1)
         let mode = query.isEmpty ? "suggestions for \(FileManager.default.currentDirectoryPath)"
             : semantic != nil && semanticQuery == query ? "semantic search" : "\(current.count) matches"
         var out = "\u{1B}[H\u{1B}[2J"
         out += " \u{1B}[38;5;141m❯\u{1B}[0m \(query)\u{1B}[s\n"
         out += " \u{1B}[2m\(Self.truncate(status.isEmpty ? mode : status, width - 2))\u{1B}[0m\n"
-        for (offset, command) in current.dropFirst(top).prefix(visible).enumerated() {
-            let line = Self.truncate(command.replacingOccurrences(of: "\n", with: "↵ "), width - 3)
-            if top + offset == selected {
-                out += "\u{1B}[38;5;141m▌\u{1B}[0m\u{1B}[48;5;236m\u{1B}[38;5;231m \(line)\u{1B}[K\u{1B}[0m\n"
-            } else {
-                out += "  \(line)\n"
+        for row in rows.dropFirst(top).prefix(visible) {
+            switch row {
+            case .header(let title):
+                let label = " \(title) "
+                out += " \u{1B}[1;38;5;141m\(label)\u{1B}[0;2m\(String(repeating: "─", count: max(0, width - label.count - 2)))\u{1B}[0m\n"
+            case .command(let index):
+                let command = current[index]
+                let mark = isSuggestion(command) ? "\u{1B}[38;5;141m★\u{1B}[0m" : " "
+                let line = Self.truncate(command.replacingOccurrences(of: "\n", with: "↵ "), width - 4)
+                if index == selected {
+                    out += "\u{1B}[38;5;141m▌\u{1B}[0m\(mark)\u{1B}[48;5;236m\u{1B}[38;5;231m \(line)\u{1B}[K\u{1B}[0m\n"
+                } else {
+                    out += " \(mark) \(line)\n"
+                }
             }
         }
         if current.isEmpty { out += "  \u{1B}[2mNo matching commands.\u{1B}[0m\n" }
@@ -180,7 +213,7 @@ struct Picker {
 func pick(_ arguments: [String], captured: CapturedHistory, home: URL, environment: [String: String]) async throws {
     let directory = environment["PWD"].flatMap { $0.hasPrefix("/") ? $0 : nil } ?? FileManager.default.currentDirectoryPath
     let suggestions = try captured.suggestions(user: NSUserName(), directory: directory, limit: 50).map(\.command)
-    let stats = try captured.commandStats()
+    let stats = try captured.commandStats(directory: directory)
     // Native files are best-effort, as in search.
     let native = try historyFiles(home: home, environment: environment)
         .flatMap { (try? $0.read())?.components(separatedBy: "\n") ?? [] }
@@ -188,10 +221,10 @@ func pick(_ arguments: [String], captured: CapturedHistory, home: URL, environme
                         query: arguments.joined(separator: " "))
     var search: ((String) async throws -> [String])? = nil
     #if canImport(ProximaKit)
-    search = { query in
-        let engine = try searchEngine(captured: captured, home: home, environment: environment)
-        return try await engine.search(query, corpus: searchCorpus(captured: stats, native: native), limit: 50).map(\.command)
-    }
+    // Built once: loading an embedding model per keystroke would dominate search latency.
+    let engine = try searchEngine(captured: captured, home: home, environment: environment)
+    let corpus = searchCorpus(captured: stats, native: native)
+    search = { query in try await engine.search(query, corpus: corpus, limit: 50).map(\.command) }
     #endif
     guard let chosen = try await picker.run(search: search) else { exit(1) }
     print(chosen)

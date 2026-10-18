@@ -16,8 +16,8 @@ struct Menu {
         [
             Item(icon: "⌕", title: "Search history", detail: "Keyword + semantic search across every command",
                  prompt: "Search for", inputRequired: true) { ["search"] + words($0) },
-            Item(icon: "✦", title: "Suggest", detail: "Top commands for this directory",
-                 prompt: "Starts with (optional)", inputRequired: false) { ["suggest"] + words($0) },
+            Item(icon: "✦", title: "Suggest", detail: "Top commands for this directory, live as you type",
+                 prompt: nil, inputRequired: false) { _ in ["pick"] },
             Item(icon: "☰", title: "Show history", detail: "Native shell files plus captured metadata",
                  prompt: nil, inputRequired: false) { _ in ["history"] },
             Item(icon: "◆", title: "Choose embedding model", detail: "Pick an Ollama model for search",
