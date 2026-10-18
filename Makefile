@@ -1,8 +1,10 @@
 SWIFT ?= /usr/bin/swift
+SWIFTC ?= $(SWIFT)c
+PYTHON ?= python3
 DIST := dist
 STAMP := $(shell date +%Y%m%d-%H%M%S)-$(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)
 
-.PHONY: build release fresh test clean run
+.PHONY: build release fresh test clean run baseline fff-build fff-smoke
 
 # Debug build.
 build:
@@ -24,7 +26,21 @@ release:
 fresh: clean release
 
 test:
-	scripts/test.sh
+	bash scripts/test.sh
+
+# Black-box baseline of the current CLI and generated hooks; never reads real history.
+baseline: release
+	SWIFT="$(SWIFT)" $(PYTHON) scripts/bench-baseline.py --binary "$(CURDIR)/$(DIST)/smcli" $(BENCH_ARGS)
+
+# Optional, isolated C API experiment. Neither smcli nor its tests link fff.
+fff-build:
+	bash scripts/build-fff.sh
+	$(SWIFTC) -swift-version 6 -O -I .build/fff/include -L .build/fff/target/release \
+		-lfff_c -Xlinker -rpath -Xlinker "$(CURDIR)/.build/fff/target/release" \
+		tools/fff/smoke.swift -o .build/fff/smoke
+
+fff-smoke: fff-build
+	.build/fff/smoke
 
 run: build
 	$(SWIFT) run smcli $(ARGS)

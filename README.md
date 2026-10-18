@@ -184,3 +184,17 @@ $ smcli --help
 ```sh
 $ bash scripts/test.sh
 ```
+
+## Backend baseline and fff experiment
+
+Before changing shell transports or search ownership:
+
+```sh
+make baseline       # release CLI; synthetic 1k/10k/100k histories, raw JSON in dist/baseline.json
+make fff-smoke      # optional pinned Rust C library + standalone Swift ownership test
+```
+
+Normal builds and `smcli` do not link fff. The experiment requires Cargo and a C
+toolchain; it does not install a service or change your shell. See
+[the baseline report](docs/baseline.md) for the capture-to-picker trace,
+measurements, dependency/API verification, limitations, and the next gate.
