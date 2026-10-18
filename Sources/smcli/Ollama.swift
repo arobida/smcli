@@ -9,6 +9,8 @@ struct SmcliConfig: Codable, Equatable {
     var ollamaModel: String?
     /// The model's vector size, recorded at init so the index can be opened without a network call.
     var ollamaDimension: Int?
+    /// Use the bundled Core AI model (F2LLM-v2-80M, macOS 27+) for search; overrides `ollamaModel`.
+    var coreai: Bool?
     /// Regexes; commands matching any, or run in a directory matching any of `cwdFilter`, are not recorded.
     var historyFilter: [String]?
     var cwdFilter: [String]?
@@ -140,12 +142,21 @@ func initialize(_ arguments: [String], configURL: URL, environment: [String: Str
                 }
             }
         }
+    case ["--coreai"]:
+        config.coreai = true
+        config.ollamaModel = nil
+        config.ollamaDimension = nil
+        try config.save(to: configURL)
+        print("Search will use the bundled Core AI model F2LLM-v2-80M (320 dimensions). Saved \(configURL.path).")
+        print("The next search re-embeds your history with it.")
+        return
     case ["--builtin"]: choice = ""
     case let arguments where arguments.count == 2 && arguments[0] == "--model": choice = arguments[1]
-    default: throw HistoryError(message: "Usage: smcli init [--model NAME | --builtin]")
+    default: throw HistoryError(message: "Usage: smcli init [--model NAME | --coreai | --builtin]")
     }
 
     guard let choice else { return }  // Nothing offered: keep any existing choice.
+    config.coreai = nil
     if !choice.isEmpty {
         let model = choice
         // Embedding once both verifies the model works and records its vector size.

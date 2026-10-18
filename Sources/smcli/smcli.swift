@@ -3,7 +3,7 @@ import Foundation
 @main
 struct Smcli {
     static let usage = """
-    Usage: smcli init [--model NAME | --builtin]
+    Usage: smcli init [--model NAME | --coreai | --builtin]
            smcli history [--json]
            smcli shell-init bash|zsh
            smcli search [query...] [--command NAME] [--subcommand NAME] [--since TIME] [--before TIME]
@@ -198,6 +198,15 @@ func searchCorpus(captured: CapturedHistory, home: URL, environment: [String: St
 func searchEngine(captured: CapturedHistory, home: URL, environment: [String: String]) throws -> HistorySearch {
     var engine = HistorySearch(directory: captured.url.appendingPathExtension("search"))
     let config = try SmcliConfig.load(from: SmcliConfig.location(home: home, environment: environment))
+    if config.coreai == true {
+        #if canImport(CoreAI)
+        guard #available(macOS 27, *) else { throw HistoryError(message: "The Core AI model needs macOS 27; rerun `smcli init`.") }
+        engine.coreai = CoreAIEmbedder()
+        return engine
+        #else
+        throw HistoryError(message: "This build has no Core AI support; rerun `smcli init`.")
+        #endif
+    }
     if let model = config.ollamaModel, let dimension = config.ollamaDimension {
         engine.ollama = OllamaEmbedder(client: Ollama(environment: environment), model: model, dimension: dimension)
     }

@@ -12,6 +12,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/vivekptnk/ProximaKit", from: "1.8.0"),
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.3"),
     ],
     targets: [
         // Apple platforms ship an SQLite3 module; Linux links the system library instead.
@@ -21,7 +22,9 @@ let package = Package(
             // Apple-only; on Linux `smcli search` reports that it is unavailable.
             .product(name: "ProximaKit", package: "ProximaKit", condition: .when(platforms: [.macOS])),
             .product(name: "ProximaEmbeddings", package: "ProximaKit", condition: .when(platforms: [.macOS])),
-        ]),
+            // Tokenizer for the bundled Core AI embedding model (used on macOS 27+).
+            .product(name: "Tokenizers", package: "swift-transformers", condition: .when(platforms: [.macOS])),
+        ], resources: [.copy("Resources/F2LLM-v2-80M")]),
         .testTarget(name: "smcliTests", dependencies: ["smcli"]),
     ]
 )

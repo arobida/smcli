@@ -200,6 +200,8 @@ struct HistorySearch {
     let directory: URL
     /// Ollama embedding model from `smcli init`; nil uses Apple's built-in model.
     var ollama: OllamaEmbedder? = nil
+    /// The bundled Core AI model from `smcli init --coreai`; takes precedence over Ollama.
+    var coreai: (any TextEmbedder)? = nil
 
     /// Brings the index up to date with `corpus`, then returns the best `limit` matches that pass `filter`.
     /// An empty query is allowed with a filter and lists matches by most recent run.
@@ -245,7 +247,7 @@ struct HistorySearch {
         do {
             let name = try indexName()
             let url = directory.appendingPathComponent(name)
-            health.embedder = ollama.map { "Ollama \($0.model) (\($0.dimension) dimensions)" } ?? "Apple built-in"
+            health.embedder = coreai.map { "Core AI F2LLM-v2-80M (\($0.dimension) dimensions)" } ?? ollama.map { "Ollama \($0.model) (\($0.dimension) dimensions)" } ?? "Apple built-in"
             health.path = url.path
             let embedder = try makeEmbedder()
             do {
@@ -322,6 +324,7 @@ struct HistorySearch {
 
     /// Embedding model, tokenizer, or document format changes need a fresh index; the name pins all three.
     private func indexName() throws -> String {
+        if let coreai { return "\(Self.version)-coreai-f2llm-v2-80m-d\(coreai.dimension)" }
         if let ollama {
             let slug = String(ollama.model.map { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" ? $0 : "_" })
             return "\(Self.version)-ollama-\(slug)-d\(ollama.dimension)"
@@ -330,6 +333,7 @@ struct HistorySearch {
     }
 
     private func makeEmbedder() throws -> any TextEmbedder {
+        if let coreai { return coreai }
         if let ollama { return ollama }
         return CommandEmbedder(base: try NLEmbeddingProvider(language: .english))
     }
