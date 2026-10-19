@@ -4,14 +4,18 @@ import Testing
 
 struct PotionTests {
     /// A two-dimensional model over a tiny WordPiece vocabulary, written in the Hugging Face layout.
-    private func tinyModel() throws -> URL {
-        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    /// `edit` adjusts the tokenizer JSON before it is written.
+    private func tinyModel(at given: URL? = nil, vocab extra: [String: Int] = [:],
+                           edit: (inout [String: Any]) -> Void = { _ in }) throws -> URL {
+        let directory = given ?? FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let vocab = ["[PAD]": 0, "[UNK]": 1, "git": 2, "push": 3, "-": 4, "f": 5, "##s": 6, "cafe": 7]
-        let tokenizer: [String: Any] = [
+        let vocab = ["[PAD]": 0, "[UNK]": 1, "git": 2, "push": 3, "-": 4, "f": 5, "##s": 6, "cafe": 7].merging(extra) { $1 }
+        var tokenizer: [String: Any] = [
             "normalizer": ["type": "BertNormalizer", "lowercase": true],
+            "pre_tokenizer": ["type": "BertPreTokenizer"],
             "model": ["type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "##", "vocab": vocab],
         ]
+        edit(&tokenizer)
         try JSONSerialization.data(withJSONObject: tokenizer).write(to: directory.appendingPathComponent("tokenizer.json"))
         // float16 rows: 1.0 = 0x3C00, 2.0 = 0x4000, -1.0 = 0xBC00, 0.5 = 0x3800.
         let rows: [[UInt16]] = [[0, 0], [0x3C00, 0x3C00], [0x3C00, 0], [0, 0x3C00], [0x4000, 0x4000],
@@ -34,6 +38,67 @@ struct PotionTests {
         // Accents are stripped with lowercasing; unknown words vanish rather than becoming [UNK].
         #expect(model.tokenize("Café zzz") == [7])
         #expect(model.embed("zzz") == nil)
+    }
+
+    @Test func `Honor the tokenizer's normalizer and WordPiece options`() throws {
+        // Accents kept: "café" no longer reduces to "cafe".
+        let accents = try tinyModel(vocab: ["café": 7, "cafe": 0]) { $0["normalizer"] = ["type": "BertNormalizer", "lowercase": true, "strip_accents": false] }
+        defer { try? FileManager.default.removeItem(at: accents) }
+        #expect(try PotionModel(directory: accents).tokenize("Café") == [7])
+        // No normalizer: case is kept.
+        let cased = try tinyModel { $0["normalizer"] = NSNull() }
+        defer { try? FileManager.default.removeItem(at: cased) }
+        #expect(try PotionModel(directory: cased).tokenize("GIT git") == [2])
+        // Another subword prefix.
+        let prefix = try tinyModel(vocab: ["##s": 0, "@@s": 6]) {
+            $0["model"] = ["type": "WordPiece", "unk_token": "[UNK]", "continuing_subword_prefix": "@@",
+                           "vocab": ["[PAD]": 0, "[UNK]": 1, "git": 2, "@@s": 6]]
+        }
+        defer { try? FileManager.default.removeItem(at: prefix) }
+        #expect(try PotionModel(directory: prefix).tokenize("gits") == [2, 6])
+        // Pieces this port does not implement are refused rather than approximated.
+        let other = try tinyModel { $0["pre_tokenizer"] = ["type": "Metaspace"] }
+        defer { try? FileManager.default.removeItem(at: other) }
+        #expect(throws: HistoryError.self) { try PotionModel(directory: other) }
+    }
+
+    @Test func `Find the snapshot refs/main names under XDG_CACHE_HOME`() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let repository = root.appendingPathComponent("xdg/huggingface/hub/models--minishlab--\(PotionModel.name)")
+        let main = try tinyModel(at: repository.appendingPathComponent("snapshots/aaa"))
+        _ = try tinyModel(at: repository.appendingPathComponent("snapshots/bbb"))
+        try FileManager.default.createDirectory(at: repository.appendingPathComponent("refs"), withIntermediateDirectories: true)
+        try "aaa".write(to: repository.appendingPathComponent("refs/main"), atomically: true, encoding: .utf8)
+        let environment = ["XDG_CACHE_HOME": root.appendingPathComponent("xdg").path]
+        #expect(PotionModel.cachedSnapshot(home: root, environment: environment)?.lastPathComponent == main.lastPathComponent)
+        #expect(PotionModel.cachedSnapshot(home: root, environment: [:]) == nil)
+    }
+
+    #if canImport(ProximaKit)
+    @Test func `Default to the cached Potion model unless Apple's is chosen`() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let captured = CapturedHistory(url: home.appendingPathComponent("history.db"))
+        let environment = ["SMCLI_CONFIG": home.appendingPathComponent("config.json").path]
+        #expect(try searchEngine(captured: captured, home: home, environment: environment).potion == nil)
+        _ = try tinyModel(at: home.appendingPathComponent(".cache/huggingface/hub/models--minishlab--\(PotionModel.name)/snapshots/aaa"))
+        #expect(try searchEngine(captured: captured, home: home, environment: environment).potion != nil)
+        try SmcliConfig(builtin: true).save(to: home.appendingPathComponent("config.json"))
+        #expect(try searchEngine(captured: captured, home: home, environment: environment).potion == nil)
+    }
+    #endif
+
+    @Test func `Ship a loadable model in Models`() throws {
+        let directory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("../../Models/\(PotionModel.name)").standardizedFileURL
+        let model = try PotionModel(directory: directory)
+        #expect(model.dimension == 256)
+        #expect(model.embed("git reset --soft HEAD~1") != nil)
+        // The test runner is not the smcli binary, so the linked copy is checked only when present.
+        if let bundled = try PotionModel.bundled() {
+            #expect(bundled.embed("git status") == model.embed("git status"))
+        }
     }
 
     @Test func `Embed as the normalized mean of token rows`() throws {
@@ -72,11 +137,16 @@ struct RankingTests {
     }
 
     @Test func `Classify literal and intent queries`() {
-        let programs: Set<String> = ["git", "docker"]
-        for query in ["--soft", "git reset --soft HEAD~1", "HEAD~1", "src/main.swift", "git stash", "FOO=1", "a | b"] {
+        let programs = programArguments(Dictionary(uniqueKeysWithValues: [
+            "git stash", "git reset --hard", "docker ps", "find . -name x", "make test", "/usr/bin/head -n 5 log",
+        ].map { ($0, SearchEntry(command: $0, runs: 1, lastRun: nil, lastDirectory: nil, lastExitCode: nil, source: "native")) }))
+        #expect(programs["git"] == ["stash", "reset"] && programs["head"] == ["-n"])
+        for query in ["--soft", "git reset --soft HEAD~1", "HEAD~1", "src/main.swift", "git stash", "FOO=1", "a | b",
+                      "make test", "git", "echo $HOME", "scp host:file"] {
             #expect(isLiteralQuery(query, programs: programs), "\(query)")
         }
-        for query in ["undo the last commit but keep the changes", "list running containers", "git rid of my changes please now"] {
+        for query in ["undo the last commit but keep the changes", "list running containers", "git rid of my changes please now",
+                      "find large files", "show head of log", "make it faster", "error: not found", "cost in $"] {
             #expect(!isLiteralQuery(query, programs: programs), "\(query)")
         }
     }
@@ -95,6 +165,10 @@ struct RankingTests {
                              literal: true, query: "make", now: now)
         #expect(failing.map(\.command) == ["make test", "make deploy"])
         #expect(failing[1].why?.contains("always failed") == true)
+        // A heavy habit that is only a distant neighbour stays below a real match.
+        let habit = rerank([(entry("rm -rf build"), 0.49), (entry("ls -la", runs: 80, frecency: 60, runsHere: 80), 0.34)],
+                           literal: false, query: "undo last commit", now: now)
+        #expect(habit.map(\.command) == ["rm -rf build", "ls -la"])
     }
 
     @Test func `Embed only the command and intent for static models`() {

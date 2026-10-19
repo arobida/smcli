@@ -7,10 +7,25 @@ struct HistorySearchTests {
         let captured = ["git status": CommandStats(runs: 3, lastRun: 1_700_000_000, lastDirectory: "/repo", lastExitCode: 1)]
         let corpus = searchCorpus(captured: captured, native: ["git status", "  ls -la ", "ls -la", "", "   "])
         #expect(corpus.count == 2)
-        #expect(corpus["git status"] == SearchEntry(command: "git status", runs: 3, lastRun: "2023-11-14T22:13:20Z",
-                                                    lastDirectory: "/repo", lastExitCode: 1, source: "captured"))
+        var status = corpus["git status"]
+        status?.frecency = 0
+        #expect(status == SearchEntry(command: "git status", runs: 3, lastRun: "2023-11-14T22:13:20Z",
+                                      lastDirectory: "/repo", lastExitCode: 1, source: "captured"))
         #expect(corpus["ls -la"]?.runs == 2)
         #expect(corpus["ls -la"]?.source == "native")
+    }
+
+    @Test func `Weigh native lines by position and keep native habits once captured`() {
+        let old = Array(repeating: "make test", count: 1_000)
+        let recent = Array(repeating: "make lint", count: 3)
+        // A captured command with a faded score keeps the native evidence; a newer native line outweighs an older one.
+        let captured = ["make test": CommandStats(runs: 1, lastRun: 0, lastDirectory: "/", lastExitCode: 0, frecency: 0.01)]
+        let corpus = searchCorpus(captured: captured, native: old + recent)
+        let test = corpus["make test"]!.frecency, lint = corpus["make lint"]!.frecency
+        #expect(test > 600 && test < 1_000)
+        #expect(abs(lint - 3) < 0.01)
+        let older = searchCorpus(captured: [:], native: ["ls"] + Array(repeating: "pwd", count: 1_000))["ls"]!.frecency
+        #expect(abs(older - 0.5) < 0.01)
     }
 
     @Test func `Leave smcli's own commands out of search and suggestions`() {

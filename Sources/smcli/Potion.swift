@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(MachO)
+import MachO
+#endif
 
 /// minishlab/potion-code-16M-v2 (a Model2Vec static embedding) run natively: BERT WordPiece tokens,
 /// a mean of their rows in one float16 table, then L2 normalization. There is no network pass, so a
@@ -8,41 +11,94 @@ final class PotionModel: @unchecked Sendable {
     static let name = "potion-code-16M-v2"
     static let maxTokens = 512
 
+    /// The Hugging Face revision of the copy in Models/, linked into the binary.
+    static let bundledRevision = "e9d2a44ca6a05ac6685f3b23709ea57eb7352d5b"
+
     let dimension: Int
-    let directory: URL
+    /// Where the model came from, for messages: a directory path, or "built in".
+    let source: String
+    /// Names the index built from this model, so another model or revision never reuses its vectors.
+    let identity: String
     private let vocabulary: [String: Int32]
     private let unknown: Int32?
+    /// BertNormalizer options; all off when the tokenizer has no normalizer.
     private let lowercase: Bool
+    private let stripAccents: Bool
+    private let cleanText: Bool
+    private let spaceChinese: Bool
+    /// WordPiece options.
+    private let subwordPrefix: String
+    private let maxWordLength: Int
     private let normalize: Bool
     private let table: Data
     private let rows: Int
 
     /// `directory` holds `model.safetensors` and `tokenizer.json`, as in a Hugging Face snapshot.
-    init(directory: URL) throws {
-        self.directory = directory
+    convenience init(directory: URL) throws {
         let modelURL = directory.appendingPathComponent("model.safetensors")
         let tokenizerURL = directory.appendingPathComponent("tokenizer.json")
         guard FileManager.default.fileExists(atPath: modelURL.path),
               FileManager.default.fileExists(atPath: tokenizerURL.path) else {
             throw HistoryError(message: "No Potion model in \(directory.path) (needs model.safetensors and tokenizer.json); rerun `smcli init --potion`.")
         }
+        // A stable hash (FNV-1a) of the resolved directory, which for a Hugging Face snapshot names its revision.
+        let path = directory.resolvingSymlinksInPath().standardizedFileURL.path
+        let hash = path.utf8.reduce(UInt64(0xcbf29ce484222325)) { ($0 ^ UInt64($1)) &* 0x100000001b3 }
+        try self.init(model: try Data(contentsOf: modelURL, options: .alwaysMapped), tokenizer: try Data(contentsOf: tokenizerURL),
+                      config: try? Data(contentsOf: directory.appendingPathComponent("config.json")),
+                      source: directory.path, identity: String(hash, radix: 16))
+    }
 
-        let tokenizer = try JSONSerialization.jsonObject(with: Data(contentsOf: tokenizerURL)) as? [String: Any]
+    /// The copy linked into the executable as the __POTION segment (see Package.swift); nil in builds without it.
+    /// The segment is part of the mapped image, so this reads it in place like a mapped file.
+    static func bundled() throws -> PotionModel? {
+        #if canImport(MachO)
+        func section(_ name: String) -> Data? {
+            var size: UInt = 0
+            guard let header = _dyld_get_image_header(0).map({ UnsafeRawPointer($0).assumingMemoryBound(to: mach_header_64.self) }),
+                  let bytes = getsectiondata(header, "__POTION", name, &size), size > 0 else { return nil }
+            return Data(bytesNoCopy: bytes, count: Int(size), deallocator: .none)
+        }
+        guard let model = section("__model"), let tokenizer = section("__tokenizer") else { return nil }
+        return try PotionModel(model: model, tokenizer: tokenizer, config: section("__config"), source: "built in",
+                               identity: "bundled-" + bundledRevision.prefix(12))
+        #else
+        return nil
+        #endif
+    }
+
+    init(model file: Data, tokenizer tokenizerData: Data, config configData: Data?, source: String, identity: String) throws {
+        self.source = source
+        self.identity = identity
+        let tokenizer = try JSONSerialization.jsonObject(with: tokenizerData) as? [String: Any]
+        // Only the pieces this port implements are accepted: anything else would tokenize differently
+        // from model2vec and quietly degrade every embedding.
+        let normalizer = tokenizer?["normalizer"]
         guard let model = tokenizer?["model"] as? [String: Any], model["type"] as? String == "WordPiece",
-              let vocab = model["vocab"] as? [String: Int] else {
-            throw HistoryError(message: "Unsupported Potion tokenizer in \(tokenizerURL.path): expected WordPiece.")
+              let vocab = model["vocab"] as? [String: Int],
+              (tokenizer?["pre_tokenizer"] as? [String: Any])?["type"] as? String == "BertPreTokenizer",
+              normalizer == nil || normalizer is NSNull || (normalizer as? [String: Any])?["type"] as? String == "BertNormalizer" else {
+            throw HistoryError(message: "Unsupported Potion tokenizer in \(source): expected BertNormalizer, BertPreTokenizer, and WordPiece.")
         }
         vocabulary = vocab.mapValues(Int32.init)
         unknown = (model["unk_token"] as? String).flatMap { vocab[$0] }.map(Int32.init)
-        lowercase = ((tokenizer?["normalizer"] as? [String: Any])?["lowercase"] as? Bool) ?? true
+        subwordPrefix = model["continuing_subword_prefix"] as? String ?? "##"
+        maxWordLength = model["max_input_chars_per_word"] as? Int ?? 100
+        if let options = normalizer as? [String: Any] {
+            lowercase = options["lowercase"] as? Bool ?? true
+            // A null strip_accents follows lowercase, as in the Hugging Face tokenizers library.
+            stripAccents = options["strip_accents"] as? Bool ?? lowercase
+            cleanText = options["clean_text"] as? Bool ?? true
+            spaceChinese = options["handle_chinese_chars"] as? Bool ?? true
+        } else {
+            (lowercase, stripAccents, cleanText, spaceChinese) = (false, false, false, false)
+        }
 
-        let configURL = directory.appendingPathComponent("config.json")
-        let config = (try? Data(contentsOf: configURL)).flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let config = configData.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
         normalize = config?["normalize"] as? Bool ?? true
 
         // safetensors: an 8-byte little-endian header length, a JSON header, then raw tensor bytes.
-        let file = try Data(contentsOf: modelURL, options: .alwaysMapped)
-        guard file.count > 8 else { throw HistoryError(message: "Potion model file is truncated: \(modelURL.path)") }
+        guard file.count > 8 else { throw HistoryError(message: "Potion model file is truncated: \(source)") }
         let headerLength = file.prefix(8).enumerated().reduce(0) { $0 | Int($1.element) << (8 * $1.offset) }
         guard headerLength > 0, 8 + headerLength <= file.count,
               let header = try JSONSerialization.jsonObject(with: file.subdata(in: 8..<8 + headerLength)) as? [String: Any],
@@ -50,14 +106,16 @@ final class PotionModel: @unchecked Sendable {
               let shape = tensor["shape"] as? [Int], shape.count == 2,
               let offsets = tensor["data_offsets"] as? [Int], offsets.count == 2,
               offsets[1] - offsets[0] == shape[0] * shape[1] * 2, 8 + headerLength + offsets[1] <= file.count else {
-            throw HistoryError(message: "Unsupported Potion model in \(modelURL.path): expected one float16 embeddings table.")
+            throw HistoryError(message: "Unsupported Potion model in \(source): expected one float16 embeddings table.")
         }
         rows = shape[0]
         dimension = shape[1]
-        let start = 8 + headerLength + offsets[0]
-        table = file.subdata(in: start..<start + rows * dimension * 2)
+        let start = file.startIndex + 8 + headerLength + offsets[0]
+        // A slice shares the mapped file, so only the rows a query touches are paged in. Its start can be odd,
+        // so `embed` reads unaligned.
+        table = file[start..<start + rows * dimension * 2]
         guard vocabulary.values.allSatisfy({ $0 >= 0 && Int($0) < rows }) else {
-            throw HistoryError(message: "Potion tokenizer and model in \(directory.path) do not match.")
+            throw HistoryError(message: "Potion tokenizer and model in \(source) do not match.")
         }
     }
 
@@ -77,11 +135,13 @@ final class PotionModel: @unchecked Sendable {
         guard !ids.isEmpty else { return nil }
         var sum = [Float](repeating: 0, count: dimension)
         table.withUnsafeBytes { raw in
-            let halves = raw.bindMemory(to: UInt16.self)
             sum.withUnsafeMutableBufferPointer { out in
                 for id in ids {
-                    let row = Int(id) * dimension
-                    for d in 0..<dimension { out[d] += halfToFloat[Int(UInt16(littleEndian: halves[row + d]))] }
+                    let row = Int(id) * dimension * 2
+                    for d in 0..<dimension {
+                        let half = raw.loadUnaligned(fromByteOffset: row + d * 2, as: UInt16.self)
+                        out[d] += halfToFloat[Int(UInt16(littleEndian: half))]
+                    }
                 }
             }
         }
@@ -99,24 +159,26 @@ final class PotionModel: @unchecked Sendable {
         return sum
     }
 
-    /// BertNormalizer: drop control characters, whitespace to spaces, space out CJK ideographs,
-    /// and (with lowercasing, as strip_accents defaults to it) remove accents.
+    /// BertNormalizer, each step as configured: clean_text drops control characters and turns whitespace
+    /// into spaces, handle_chinese_chars spaces out CJK ideographs, strip_accents removes accents.
     private func normalized(_ text: String) -> String {
         var scalars = String.UnicodeScalarView()
-        let source = lowercase ? text.decomposedStringWithCanonicalMapping : text
+        let source = stripAccents ? text.decomposedStringWithCanonicalMapping : text
         for scalar in source.unicodeScalars {
             let value = scalar.value
-            if value == 0 || value == 0xFFFD { continue }
-            if scalar == "\t" || scalar == "\n" || scalar == "\r" || scalar.properties.generalCategory == .spaceSeparator {
-                scalars.append(" ")
-                continue
+            if cleanText {
+                if value == 0 || value == 0xFFFD { continue }
+                if scalar == "\t" || scalar == "\n" || scalar == "\r" || scalar.properties.generalCategory == .spaceSeparator {
+                    scalars.append(" ")
+                    continue
+                }
+                switch scalar.properties.generalCategory {
+                case .control, .format: continue
+                default: break
+                }
             }
-            switch scalar.properties.generalCategory {
-            case .control, .format: continue
-            case .nonspacingMark where lowercase: continue
-            default: break
-            }
-            if Self.isCJK(value) {
+            if stripAccents && scalar.properties.generalCategory == .nonspacingMark { continue }
+            if spaceChinese && Self.isCJK(value) {
                 scalars.append(" ")
                 scalars.append(scalar)
                 scalars.append(" ")
@@ -153,7 +215,7 @@ final class PotionModel: @unchecked Sendable {
     /// Greedy longest-match WordPiece; a word with any unmatched piece becomes [UNK], which is dropped.
     private func wordPiece(_ word: Substring.UnicodeScalarView, into ids: inout [Int32]) {
         let scalars = Array(word)
-        guard scalars.count <= 100 else { return }
+        guard scalars.count <= maxWordLength else { return }
         var pieces: [Int32] = []
         var start = 0
         while start < scalars.count {
@@ -161,7 +223,7 @@ final class PotionModel: @unchecked Sendable {
             var found: Int32?
             while start < end {
                 var piece = String(String.UnicodeScalarView(scalars[start..<end]))
-                if start > 0 { piece = "##" + piece }
+                if start > 0 { piece = subwordPrefix + piece }
                 if let id = vocabulary[piece] { found = id; break }
                 end -= 1
             }
@@ -190,12 +252,22 @@ final class PotionModel: @unchecked Sendable {
             || (0xF900...0xFAFF).contains(value) || (0x2F800...0x2FA1F).contains(value)
     }
 
-    /// The newest Potion snapshot in the Hugging Face cache, where `model2vec`/`huggingface_hub` put it.
+    /// The Potion snapshot in the Hugging Face cache, where `model2vec`/`huggingface_hub` put it: the revision
+    /// `refs/main` names, else the newest. The cache is found as huggingface_hub does: HF_HUB_CACHE, then
+    /// HF_HOME/hub, then XDG_CACHE_HOME/huggingface/hub, then ~/.cache/huggingface/hub.
     static func cachedSnapshot(home: URL, environment: [String: String]) -> URL? {
-        let hub = environment["HF_HUB_CACHE"].map { URL(fileURLWithPath: $0) }
-            ?? environment["HF_HOME"].map { URL(fileURLWithPath: $0).appendingPathComponent("hub") }
+        let set = { (key: String) in environment[key].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) } }
+        let hub = set("HF_HUB_CACHE")
+            ?? set("HF_HOME").map { $0.appendingPathComponent("hub") }
+            ?? set("XDG_CACHE_HOME").map { $0.appendingPathComponent("huggingface/hub") }
             ?? home.appendingPathComponent(".cache/huggingface/hub")
-        let snapshots = hub.appendingPathComponent("models--minishlab--\(name)/snapshots")
+        let repository = hub.appendingPathComponent("models--minishlab--\(name)")
+        let snapshots = repository.appendingPathComponent("snapshots")
+        if let main = try? String(contentsOf: repository.appendingPathComponent("refs/main"), encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines), !main.isEmpty, !main.contains("/") {
+            let snapshot = snapshots.appendingPathComponent(main)
+            if FileManager.default.fileExists(atPath: snapshot.appendingPathComponent("model.safetensors").path) { return snapshot }
+        }
         let names = (try? FileManager.default.contentsOfDirectory(at: snapshots, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
         return names
             .filter { FileManager.default.fileExists(atPath: $0.appendingPathComponent("model.safetensors").path) }

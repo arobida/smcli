@@ -221,10 +221,17 @@ func pick(_ arguments: [String], captured: CapturedHistory, home: URL, environme
                         query: arguments.joined(separator: " "))
     var search: ((String) async throws -> [String])? = nil
     #if canImport(ProximaKit)
-    // Built once: loading an embedding model per keystroke would dominate search latency.
-    let engine = try searchEngine(captured: captured, home: home, environment: environment)
-    let corpus = searchCorpus(captured: stats, native: native)
-    search = { query in try await engine.search(query, corpus: corpus, limit: 50).map(\.command) }
+    // Built on the first search, not per keystroke: loading an embedding model would dominate latency.
+    // Deferring it also keeps a broken model or config to a status-line error rather than a dead history key.
+    var prepared: (engine: HistorySearch, corpus: [String: SearchEntry], programs: [String: Set<String>])?
+    search = { query in
+        if prepared == nil {
+            let corpus = searchCorpus(captured: stats, native: native)
+            prepared = (try searchEngine(captured: captured, home: home, environment: environment), corpus, programArguments(corpus))
+        }
+        let (engine, corpus, programs) = prepared!
+        return try await engine.search(query, corpus: corpus, limit: 50, programs: programs).map(\.command)
+    }
     #endif
     guard let chosen = try await picker.run(search: search) else { exit(1) }
     print(chosen)

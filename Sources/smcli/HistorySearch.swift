@@ -56,31 +56,47 @@ func searchCorpus(captured: [String: CommandStats], native: [String]) -> [String
             author: stats.author, intent: stats.intent, flags: stats.flags,
             frecency: stats.frecency, successes: stats.successes, runsHere: stats.runsHere)
     }
+    // Native lines have no times, but files are oldest first, so position stands in for age: a run's weight
+    // halves every `nativeHalfLife` lines from the end. Captured commands keep whichever evidence is
+    // stronger, so turning capture on does not throw away years of native habit.
+    let lines = native.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty && !isSmcliCommand($0) }
     var nativeCounts: [String: Int] = [:]
-    for line in native {
-        let command = line.trimmingCharacters(in: .whitespaces)
-        if !command.isEmpty && corpus[command] == nil && !isSmcliCommand(command) { nativeCounts[command, default: 0] += 1 }
+    var nativeUsage: [String: Double] = [:]
+    for (index, command) in lines.enumerated() {
+        nativeCounts[command, default: 0] += 1
+        nativeUsage[command, default: 0] += pow(0.5, Double(lines.count - 1 - index) / nativeHalfLife)
     }
     for (command, count) in nativeCounts {
-        corpus[command] = SearchEntry(command: command, runs: count, lastRun: nil, lastDirectory: nil,
-                                      lastExitCode: nil, source: "native", flags: commandFlags(command))
+        let usage = nativeUsage[command] ?? 0
+        if let entry = corpus[command] {
+            corpus[command]?.frecency = max(entry.frecency, usage)
+        } else {
+            corpus[command] = SearchEntry(command: command, runs: count, lastRun: nil, lastDirectory: nil,
+                                          lastExitCode: nil, source: "native", flags: commandFlags(command), frecency: usage)
+        }
     }
     return corpus
 }
 
+/// Native history lines after which a run counts half; about two weeks for a busy shell, like captured usage.
+let nativeHalfLife = 1_000.0
+
 extension SearchEntry {
     /// The executable's name without its path (`git` for `/usr/bin/git git status`); for compound
     /// shell lines the parser refuses, the first word.
-    var program: String? {
-        if let main = CommandBreakdown.parse(command)?.mainCommand { return main.split(separator: "/").last.map(String.init) ?? main }
+    var program: String? { Self.program(of: command, parsed: CommandBreakdown.parse(command)) }
+
+    /// `program` from an existing parse, for callers that also need other parts of it.
+    static func program(of command: String, parsed: CommandBreakdown?) -> String? {
+        if let main = parsed?.mainCommand { return main.split(separator: "/").last.map(String.init) ?? main }
         return command.split(whereSeparator: \.isWhitespace).first.map { String($0.split(separator: "/").last ?? $0) }
     }
     var subcommand: String? { CommandBreakdown.parse(command)?.subcommand }
     var lastRunEpoch: Double? { lastRun.flatMap { ISO8601DateFormatter().date(from: $0)?.timeIntervalSince1970 } }
 }
 
-/// The text embedded for an entry: the command plus labeled fields, so queries naming a tool, option,
-/// or project land near the right commands. Time and frequency are left to `SearchFilter`: as labels
+/// The text embedded for an entry: the command plus labeled fields, so queries naming a tool or option
+/// land near the right commands. Directories are left out; `--dir` and the "used here" boost cover them. Time and frequency are left to `SearchFilter`: as labels
 /// they did not improve ranking and would force re-embedding as they change.
 /// With `labeled` false (static models such as Potion, which mean-pool tokens and would dilute the command
 /// with repeated names and label words), only the command and its recorded intent are embedded.
@@ -91,8 +107,9 @@ func searchDocument(_ entry: SearchEntry, labeled: Bool = true) -> String {
         if let intent = entry.intent, !intent.isEmpty { lines.append(intent.replacingOccurrences(of: "\n", with: " ")) }
         return lines.joined(separator: "\n")
     }
-    if let program = entry.program { lines.append("command: \(program)") }
-    if let subcommand = entry.subcommand { lines.append("subcommand: \(subcommand)") }
+    let parsed = CommandBreakdown.parse(entry.command)
+    if let program = SearchEntry.program(of: entry.command, parsed: parsed) { lines.append("command: \(program)") }
+    if let subcommand = parsed?.subcommand { lines.append("subcommand: \(subcommand)") }
     if !entry.flags.isEmpty { lines.append("flags: \(entry.flags.joined(separator: " "))") }
     if let author = entry.author, !author.isEmpty { lines.append("author: \(author)") }
     // Intent stays out of the label list in ShellTokenizer: its words are worth matching as keywords.
@@ -150,22 +167,42 @@ struct SearchFilter: Equatable {
     }
 }
 
-/// How literal a query is. Flags, paths, revisions, assignments, and commands that start with a known
-/// program carry exact constraints the keyword leg honors; plain words describe intent for embeddings.
-func isLiteralQuery(_ query: String, programs: Set<String>) -> Bool {
+/// How literal a query is. Flags, paths, revisions, assignments, variables, and commands from the history
+/// carry exact constraints the keyword leg honors; plain words describe intent for embeddings.
+/// `programs` maps each program in the history to the words seen right after it (`git` → `stash`, `log`).
+func isLiteralQuery(_ query: String, programs: [String: Set<String>]) -> Bool {
     let words = query.split(whereSeparator: \.isWhitespace)
     guard let first = words.first else { return false }
     if words.contains(where: { word in
         word.hasPrefix("-") || word.contains("/") || word.contains("=") || word.hasPrefix("~")
-            || word.contains(where: { "~^@:|$*{}".contains($0) }) || word.uppercased() == "HEAD"
-            || word.hasPrefix("HEAD") || (word.contains(".") && !word.hasSuffix("."))
+            || word.contains(where: { "~^@|*{}".contains($0) }) || word == "HEAD"
+            || (word.hasPrefix("$") && word.count > 1) || word.dropFirst().dropLast().contains(":")
+            || (word.contains(".") && !word.hasSuffix("."))
     }) { return true }
-    // A short query led by a program in the history (`git stash`) names a command; a longer one is a request.
-    return words.count <= 4 && programs.contains(first.lowercased())
+    // A short query that reads as a command from the history (`git stash`, `make test`) is literal. Many
+    // programs are also verbs (find, make, open), so the next word must be one seen after that program:
+    // "find large files" is a request.
+    guard words.count <= 4, let next = programs[first.lowercased()] else { return false }
+    return words.count == 1 || next.contains(words[1].lowercased())
 }
 
-/// Reorders hybrid hits with usage evidence. `relevance` is each hit's fused score scaled so the best is 1;
-/// usage multiplies it rather than adding, so a habit lifts a match but never surfaces a non-match.
+/// Each program in `corpus` with the words that follow it, for `isLiteralQuery`.
+func programArguments(_ corpus: [String: SearchEntry]) -> [String: Set<String>] {
+    var programs: [String: Set<String>] = [:]
+    for entry in corpus.values {
+        guard let program = entry.program?.lowercased() else { continue }
+        let words = entry.command.split(whereSeparator: \.isWhitespace)
+        let index = words.firstIndex { $0.split(separator: "/").last.map { $0.lowercased() == program } ?? false }
+        let next = index.flatMap { words.indices.contains($0 + 1) ? words[$0 + 1].lowercased() : nil }
+        programs[program, default: []].formUnion(next.map { [$0] } ?? [])
+    }
+    return programs
+}
+
+/// Reorders hybrid hits with usage evidence. `relevance` is each hit's fused score scaled so the best is 1.
+/// Usage multiplies it as `boost ^ relevance`, so a habit lifts a strong match nearly fully but barely moves a
+/// weak one: rank fusion leaves even distant dense neighbours a third of the best score, and a plain product
+/// would let frequent unrelated commands outrank real matches.
 /// Failures lower the score without excluding: the failed command may be exactly what is wanted.
 func rerank(_ hits: [(entry: SearchEntry, relevance: Double)], literal: Bool, query: String,
             now: Double = Date().timeIntervalSince1970) -> [SearchEntry] {
@@ -176,9 +213,7 @@ func rerank(_ hits: [(entry: SearchEntry, relevance: Double)], literal: Bool, qu
         let words = Set(entry.command.lowercased().split(whereSeparator: \.isWhitespace).map(String.init))
         let exact = !terms.isEmpty && terms.isSubset(of: words)
         why.append(exact ? "exact words" : literal ? "keyword match" : "semantic match")
-        // Native lines have no times; count their occurrences at a fifth of a dated run.
-        let usage = entry.source == "captured" ? entry.frecency : Double(entry.runs) * 0.2
-        var boost = 1 + 0.15 * log1p(usage)
+        var boost = 1 + 0.15 * log1p(entry.frecency)
         if entry.runsHere > 0 {
             boost += 0.35 * min(1, Double(entry.runsHere) / Double(max(1, entry.runs)) + 0.25)
             why.append("used here")
@@ -192,7 +227,7 @@ func rerank(_ hits: [(entry: SearchEntry, relevance: Double)], literal: Bool, qu
             if entry.successes == 0 { why.append("always failed") }
         }
         entry.why = why
-        return (entry, hit.relevance * boost)
+        return (entry, hit.relevance * pow(boost, hit.relevance))
     }
     .enumerated()
     .sorted { $0.element.1 != $1.element.1 ? $0.element.1 > $1.element.1 : $0.offset < $1.offset }
@@ -269,8 +304,9 @@ struct HistorySearch {
 
     /// Brings the index up to date with `corpus`, then returns the best `limit` matches that pass `filter`.
     /// An empty query is allowed with a filter and lists matches by most recent run.
+    /// `programs` is `programArguments(corpus)`; callers searching one corpus repeatedly pass it to skip re-parsing.
     func search(_ query: String, corpus: [String: SearchEntry], limit: Int, filter: SearchFilter = SearchFilter(),
-                progress: (String) -> Void = { _ in }) async throws -> [SearchEntry] {
+                programs: [String: Set<String>]? = nil, progress: (String) -> Void = { _ in }) async throws -> [SearchEntry] {
         if query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !filter.isEmpty {
             return corpus.values.filter(filter.allows).sorted {
                 if $0.lastRunEpoch != $1.lastRunEpoch { return ($0.lastRunEpoch ?? 0) > ($1.lastRunEpoch ?? 0) }
@@ -289,8 +325,7 @@ struct HistorySearch {
             if done == 0 && total > 200 { progress("Indexing \(total) commands for search…") }
         }
         // Literal queries lean on keywords; intent queries fuse both legs by rank.
-        let programs = Set(corpus.values.compactMap { $0.program?.lowercased() })
-        let literal = isLiteralQuery(query, programs: programs)
+        let literal = isLiteralQuery(query, programs: programs ?? programArguments(corpus))
         await store.index.setFusion(literal ? .weightedSum(alpha: 0.3) : .rrf)
         // A bounded pool is reranked with usage; filters run after ranking, so a filtered search ranks
         // the whole index before keeping matches.
@@ -320,7 +355,7 @@ struct HistorySearch {
         do {
             let name = try indexName()
             let url = directory.appendingPathComponent(name)
-            health.embedder = potion.map { "\(PotionModel.name) (\($0.dimension) dimensions) at \($0.model.directory.path)" }
+            health.embedder = potion.map { "\(PotionModel.name) (\($0.dimension) dimensions), \($0.model.source == "built in" ? "built in" : "at " + $0.model.source)" }
                 ?? ollama.map { "Ollama \($0.model) (\($0.dimension) dimensions)" } ?? "Apple built-in"
             health.path = url.path
             let embedder = try makeEmbedder()
@@ -398,7 +433,9 @@ struct HistorySearch {
 
     /// Embedding model, tokenizer, or document format changes need a fresh index; the name pins all three.
     private func indexName() throws -> String {
-        if let potion { return "\(Self.version)-potion-code-16m-v2-d\(potion.dimension)" }
+        // Keyed by the model's directory, which for a Hugging Face snapshot names its revision: another
+        // model or revision with the same dimension must not reuse these vectors.
+        if let potion { return "\(Self.version)-potion-\(potion.model.identity)-d\(potion.dimension)" }
         if let ollama {
             let slug = String(ollama.model.map { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" ? $0 : "_" })
             return "\(Self.version)-ollama-\(slug)-d\(ollama.dimension)"

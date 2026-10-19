@@ -3,6 +3,12 @@
 
 import PackageDescription
 
+// potion-code-16M-v2 ships inside the binary: the linker copies each file into a section of a read-only
+// __POTION segment, which PotionModel.bundled() reads in place. One self-contained executable, no download.
+let potion = Context.packageDirectory + "/Models/potion-code-16M-v2/"
+let potionSections = [("__model", "model.safetensors"), ("__tokenizer", "tokenizer.json"), ("__config", "config.json")]
+    .flatMap { section, file in ["-Xlinker", "-sectcreate", "-Xlinker", "__POTION", "-Xlinker", section, "-Xlinker", potion + file] }
+
 let package = Package(
     name: "smcli",
     // ProximaKit's hybrid search requires macOS 14 (Accelerate/NaturalLanguage).
@@ -21,7 +27,7 @@ let package = Package(
             // Apple-only; on Linux `smcli search` reports that it is unavailable.
             .product(name: "ProximaKit", package: "ProximaKit", condition: .when(platforms: [.macOS])),
             .product(name: "ProximaEmbeddings", package: "ProximaKit", condition: .when(platforms: [.macOS])),
-        ]),
+        ], linkerSettings: [.unsafeFlags(potionSections, .when(platforms: [.macOS]))]),
         .testTarget(name: "smcliTests", dependencies: ["smcli"]),
     ]
 )

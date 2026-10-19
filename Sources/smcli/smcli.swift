@@ -3,7 +3,7 @@ import Foundation
 @main
 struct Smcli {
     static let usage = """
-    Usage: smcli init [--model NAME | --potion [DIR] | --builtin]
+    Usage: smcli init [--model NAME | --potion [DIR] | --builtin | --default]
            smcli history [--json]
            smcli shell-init bash|zsh
            smcli search [query...] [--command NAME] [--subcommand NAME] [--since TIME] [--before TIME]
@@ -19,7 +19,8 @@ struct Smcli {
     search filters are exact; TIME is 30m, 12h, 7d, 2w, YYYY-MM-DD, or ISO 8601, matched against the last run.
     reindex re-embeds every command for search; health checks the index and the embedding model.
     pick opens the history picker that shell-init binds to Up and Ctrl-R (SMCLI_NO_KEYS=1 to skip).
-    init picks the search embedding model: Ollama, local potion-code-16M-v2 (--potion, default: Hugging Face cache), or Apple's (saved to ~/.config/smcli/config.json, or SMCLI_CONFIG).
+    init picks the search embedding model: Ollama, local potion-code-16M-v2 (--potion [DIR]), or Apple's (--builtin); saved to ~/.config/smcli/config.json, or SMCLI_CONFIG.
+    By default (--default) search uses the potion-code-16M-v2 model built into smcli.
     Commands with a leading space, likely secrets, or matching historyFilter/cwdFilter in the config are not recorded;
     prune removes already-stored ones. import --atuin --replace discards existing smcli history first.
     SMCLI_DB selects the metadata database (default: ~/.local/share/smcli/history.db).
@@ -203,7 +204,9 @@ func workingDirectory(_ environment: [String: String]) -> String {
     environment["PWD"].flatMap { $0.hasPrefix("/") ? $0 : nil } ?? FileManager.default.currentDirectoryPath
 }
 
-/// The search index next to the history database, using the model chosen by `smcli init`.
+/// The search index next to the history database, using the model chosen by `smcli init`. With no choice
+/// made, the potion-code-16M-v2 built into the binary (or, in a build without it, from the Hugging Face
+/// cache); Apple's model when neither loads, so search keeps working.
 func searchEngine(captured: CapturedHistory, home: URL, environment: [String: String]) throws -> HistorySearch {
     var engine = HistorySearch(directory: captured.url.appendingPathExtension("search"))
     let config = try SmcliConfig.load(from: SmcliConfig.location(home: home, environment: environment))
@@ -211,6 +214,10 @@ func searchEngine(captured: CapturedHistory, home: URL, environment: [String: St
         engine.potion = PotionEmbedder(model: try PotionModel(directory: URL(fileURLWithPath: path)))
     } else if let model = config.ollamaModel, let dimension = config.ollamaDimension {
         engine.ollama = OllamaEmbedder(client: Ollama(environment: environment), model: model, dimension: dimension)
+    } else if config.builtin != true {
+        let model = (try? PotionModel.bundled()) ?? PotionModel.cachedSnapshot(home: home, environment: environment)
+            .flatMap { try? PotionModel(directory: $0) }
+        engine.potion = model.map(PotionEmbedder.init)
     }
     return engine
 }
@@ -244,7 +251,15 @@ func reindex(captured: CapturedHistory, home: URL, environment: [String: String]
 func health(json: Bool, captured: CapturedHistory, home: URL, environment: [String: String]) async throws {
     #if canImport(ProximaKit)
     let corpus = try searchCorpus(captured: captured, home: home, environment: environment)
-    let report = try await searchEngine(captured: captured, home: home, environment: environment).health(corpus: corpus)
+    let report: IndexHealth
+    do {
+        report = try await searchEngine(captured: captured, home: home, environment: environment).health(corpus: corpus)
+    } catch {
+        // A missing model or bad config is itself a health finding, reported like any other.
+        var failed = IndexHealth(path: captured.url.appendingPathExtension("search").path, commands: corpus.count)
+        failed.problems.append(error.localizedDescription)
+        report = failed
+    }
     if json {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]

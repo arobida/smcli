@@ -202,6 +202,11 @@ final class SQLiteDatabase {
         db = handle
         // Concurrent terminals wait briefly for the writer instead of failing.
         sqlite3_busy_timeout(db, 5000)
+        // SQLite has no portable pow(), so usage decay is a function of ours: smcli_decay(age in seconds).
+        sqlite3_create_function_v2(db, "smcli_decay", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nil, { context, _, arguments in
+            let age = max(0, sqlite3_value_double(arguments![0]))
+            sqlite3_result_double(context, pow(0.5, age / CapturedHistory.usageHalfLife))
+        }, nil, nil, nil)
     }
 
     deinit { sqlite3_close(db) }
@@ -263,7 +268,7 @@ struct CapturedHistory {
         );
         CREATE INDEX commands_by_command ON commands(command, started_at);
         CREATE INDEX commands_by_directory ON commands(directory, started_at);
-        """ + migrationToV2 + migrationToV3 + migrationToV4
+        """ + migrationToV2 + migrationToV3
 
     /// Fields borrowed from Atuin's history table: a UUID for deduplication, soft deletion, and authorship.
     static let migrationToV2 = """
@@ -280,19 +285,24 @@ struct CapturedHistory {
         ALTER TABLE commands ADD COLUMN flags TEXT;
         PRAGMA user_version = 3;
         """
-    /// Per-command usage decayed exponentially (half-life `usageHalfLife`): `score` is as of `at`, the newest run.
-    /// Maintained on every insert so ranking never rescans runs; rebuilt by `rebuildUsage` after deletions.
-    static let migrationToV4 = """
-        CREATE TABLE usage (command TEXT PRIMARY KEY, score REAL NOT NULL, at REAL NOT NULL) WITHOUT ROWID;
-        PRAGMA user_version = 4;
-        """
-    static let version = 4
+    static let version = 3
+    /// A short-lived build stored usage scores in a `usage` table at version 4. Usage is now computed when read,
+    /// so such databases are taken back to version 3, which every binary since flags can open.
+    /// The next real schema change must therefore use version 5.
+    static let discardedUsageVersion = 4
+    /// Usage halves every two weeks, so habits outweigh one-offs without old habits winning forever.
     static let usageHalfLife = 14.0 * 86_400
 
-    /// Adds a run at `time` to a decayed score held as of `at`; runs may arrive out of order (imports).
-    static func addRun(score: Double, at: Double, time: Double) -> (score: Double, at: Double) {
-        time >= at ? (score * pow(0.5, (time - at) / usageHalfLife) + 1, time)
-                   : (score + pow(0.5, (at - time) / usageHalfLife), at)
+    /// Exit codes that do not mean the command failed: stopped with Ctrl-C (130) or by a closed pipe (141).
+    static let interruptedExitCodes = [130, 141]
+    /// Programs whose exit code 1 is an answer ("no match", "files differ", "false"), not an error.
+    static let answeringPrograms: Set<String> = ["grep", "egrep", "fgrep", "rg", "ag", "ack", "pgrep", "diff", "cmp",
+                                                 "colordiff", "test", "[", "which", "type", "command", "false"]
+
+    static func answersWithExitCode(_ command: String) -> Bool {
+        let program = CommandBreakdown.parse(command)?.mainCommand
+            ?? command.split(whereSeparator: \.isWhitespace).first.map(String.init)
+        return program.map { answeringPrograms.contains(String($0.split(separator: "/").last ?? Substring($0))) } ?? false
     }
 
     static func atuinLocation(home: URL, environment: [String: String]) -> URL {
@@ -356,7 +366,7 @@ struct CapturedHistory {
         var imported = 0
         try db.execute("BEGIN IMMEDIATE")
         do {
-            if replace { try db.execute("DELETE FROM commands; DELETE FROM sessions; DELETE FROM usage;") }
+            if replace { try db.execute("DELETE FROM commands; DELETE FROM sessions;") }
             try source.run("""
                 SELECT id, timestamp, duration, exit, command, cwd, session, hostname, \(optional.joined(separator: ", "))
                 FROM history ORDER BY timestamp
@@ -432,7 +442,6 @@ struct CapturedHistory {
         try db.execute("BEGIN IMMEDIATE")
         do {
             for id in ids { try db.run("DELETE FROM commands WHERE id = ?", [.integer(id)]) }
-            try rebuildUsage(db)
             try db.execute("COMMIT")
         } catch {
             try? db.execute("ROLLBACK")
@@ -471,30 +480,32 @@ struct CapturedHistory {
         return records
     }
 
-    /// One row per distinct command: run count, its flags, and the most recent run's time, directory, exit code, author, and intent.
-    /// One row per distinct command. Usage aggregates are computed in the same grouped query, so ranking
-    /// never rescans individual runs; `directory` scopes `runsHere`.
+    /// One row per distinct command: run count, its flags, and the most recent run's time, directory, exit code,
+    /// author, and intent, plus usage aggregates from the same grouped query; `directory` scopes `runsHere`.
     func commandStats(directory: String? = nil, now: Double = Date().timeIntervalSince1970) throws -> [String: CommandStats] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
         let db = try connect(write: false)
         var stats: [String: CommandStats] = [:]
         let here = directory.map { $0.count > 1 && $0.hasSuffix("/") ? String($0.dropLast()) : $0 } ?? ""
-        // SQLite returns the bare columns from the row holding MAX(started_at). The stored usage score is
-        // decayed from its last run to `now` here, since SQLite has no portable pow().
+        // SQLite returns the bare columns from the row holding MAX(started_at).
         try db.run("""
             SELECT c.command, COUNT(*), MAX(c.started_at), c.directory, c.exit_code, c.author, c.intent, c.flags,
-                   u.score, u.at, SUM(c.exit_code = 0),
+                   SUM(smcli_decay(? - c.started_at)), SUM(c.exit_code IN (0, \(Self.interruptedExitCodes.map(String.init).joined(separator: ", ")))),
+                   SUM(c.exit_code = 1),
                    SUM(? <> '' AND (c.directory = ? OR (? <> '/' AND substr(c.directory, 1, length(?) + 1) = ? || '/')))
-            FROM commands c LEFT JOIN usage u ON u.command = c.command
+            FROM commands c
             WHERE c.deleted_at IS NULL GROUP BY c.command
-            """, [.text(here), .text(here), .text(here), .text(here), .text(here)]) { row in
-            stats[text(row, 0)] = CommandStats(
+            """, [.real(now), .text(here), .text(here), .text(here), .text(here), .text(here)]) { row in
+            let command = text(row, 0)
+            let answers = sqlite3_column_int64(row, 10) > 0 && Self.answersWithExitCode(command)
+            stats[command] = CommandStats(
                 runs: Int(sqlite3_column_int64(row, 1)), lastRun: sqlite3_column_double(row, 2),
                 lastDirectory: text(row, 3), lastExitCode: Int(sqlite3_column_int64(row, 4)),
                 author: optionalText(row, 5), intent: optionalText(row, 6),
                 flags: text(row, 7).split(separator: " ").map(String.init),
-                frecency: sqlite3_column_double(row, 8) * pow(0.5, max(0, now - sqlite3_column_double(row, 9)) / Self.usageHalfLife),
-                successes: Int(sqlite3_column_int64(row, 10)), runsHere: Int(sqlite3_column_int64(row, 11)))
+                frecency: sqlite3_column_double(row, 8),
+                successes: Int(sqlite3_column_int64(row, 9) + (answers ? sqlite3_column_int64(row, 10) : 0)),
+                runsHere: Int(sqlite3_column_int64(row, 11)))
         }
         return stats
     }
@@ -508,6 +519,7 @@ struct CapturedHistory {
         let here = directory.count > 1 && directory.hasSuffix("/") ? String(directory.dropLast()) : directory
         struct Tally { var score = 0.0, runs = 0, runsHere = 0, lastRun = 0.0, lastExitCode = 0 }
         var tallies: [String: Tally] = [:]
+        var answering: [String: Bool] = [:]
         try db.run("""
             SELECT c.command, c.directory, c.started_at, c.exit_code
             FROM commands c JOIN sessions s ON s.id = c.session
@@ -519,14 +531,19 @@ struct CapturedHistory {
             let started = sqlite3_column_double(row, 2)
             let exitCode = Int(sqlite3_column_int64(row, 3))
             // Halves every two weeks, so habits outweigh one-offs without old habits winning forever.
-            var weight = pow(0.5, max(0, now - started) / (14 * 86_400))
+            var weight = pow(0.5, max(0, now - started) / Self.usageHalfLife)
             if runDirectory == here {
                 weight *= 4
             } else if here != "/" && runDirectory != "/" &&
                         (runDirectory.hasPrefix(here + "/") || here.hasPrefix(runDirectory + "/")) {
                 weight *= 2
             }
-            if exitCode != 0 { weight *= 0.25 }
+            if exitCode != 0 && !Self.interruptedExitCodes.contains(exitCode) {
+                let command = text(row, 0)
+                let answers = answering[command] ?? Self.answersWithExitCode(command)
+                answering[command] = answers
+                if !(exitCode == 1 && answers) { weight *= 0.25 }
+            }
             var tally = tallies[text(row, 0), default: Tally()]
             tally.score += weight
             tally.runs += 1
@@ -565,32 +582,10 @@ struct CapturedHistory {
                       .text(directory), .text(command), .integer(exitCode), uuid.map(SQLValue.text) ?? .null,
                       deletedAt.map(SQLValue.real) ?? .null, author.map(SQLValue.text) ?? .null,
                       intent.map(SQLValue.text) ?? .null, .text(commandFlags(command).joined(separator: " "))])
-            if db.changes > 0 && deletedAt == nil {
-                var current: (score: Double, at: Double)?
-                try db.run("SELECT score, at FROM usage WHERE command = ?", [.text(command)]) {
-                    current = (sqlite3_column_double($0, 0), sqlite3_column_double($0, 1))
-                }
-                let updated = current.map { Self.addRun(score: $0.score, at: $0.at, time: startedAt) } ?? (score: 1, at: startedAt)
-                try db.run("INSERT OR REPLACE INTO usage (command, score, at) VALUES (?, ?, ?)",
-                           [.text(command), .real(updated.score), .real(updated.at)])
-            }
             if transaction { try db.execute("COMMIT") }
         } catch {
             if transaction { try? db.execute("ROLLBACK") }
             throw error
-        }
-    }
-
-    /// Recomputes every usage score from the live runs, after deletions or when the table is first added.
-    private func rebuildUsage(_ db: SQLiteDatabase) throws {
-        var usage: [String: (score: Double, at: Double)] = [:]
-        try db.run("SELECT command, started_at FROM commands WHERE deleted_at IS NULL") { row in
-            let time = sqlite3_column_double(row, 1)
-            usage[text(row, 0)] = usage[text(row, 0)].map { Self.addRun(score: $0.score, at: $0.at, time: time) } ?? (1, time)
-        }
-        try db.execute("DELETE FROM usage")
-        for (command, value) in usage {
-            try db.run("INSERT INTO usage (command, score, at) VALUES (?, ?, ?)", [.text(command), .real(value.score), .real(value.at)])
         }
     }
 
@@ -627,13 +622,13 @@ struct CapturedHistory {
         let db = try SQLiteDatabase(path: path, readOnly: !write)
         var version = 0
         try db.run("PRAGMA user_version") { version = Int(sqlite3_column_int64($0, 0)) }
-        if version > Self.version { throw HistoryError(message: "History database was written by a newer smcli: \(url.path)") }
-        if !write && version != 0 && version < Self.version {
+        if version > Self.version && version != Self.discardedUsageVersion { throw HistoryError(message: "History database was written by a newer smcli: \(url.path)") }
+        if !write && version != 0 && version != Self.version {
             // Readers need the current columns; upgrade once through a writable connection.
             return try connect(write: true)
         }
         if write {
-            if version < Self.version {
+            if version != Self.version {
                 try db.execute("BEGIN IMMEDIATE")
                 // Another terminal may have created or upgraded the schema while this one waited for the lock.
                 var tables = 0
@@ -647,9 +642,8 @@ struct CapturedHistory {
                         try db.execute(Self.migrationToV3)
                         try backfillFlags(db)
                     }
-                    if version <= 3 {
-                        try db.execute(Self.migrationToV4)
-                        try rebuildUsage(db)
+                    if version == Self.discardedUsageVersion {
+                        try db.execute("DROP TABLE IF EXISTS usage; PRAGMA user_version = 3;")
                     }
                 }
                 try db.execute("COMMIT")

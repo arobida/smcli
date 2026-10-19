@@ -4,7 +4,8 @@ Read your saved Bash and Zsh commands, and — with an opt-in shell hook — rec
 metadata native history doesn't reliably keep: the working directory, exit code,
 start time, duration, user, host, and terminal session. Search commands with keyword
 and semantic matching, or rank captured commands for your current directory.
-Search uses Apple's on-device embeddings by default; a local potion-code-16M-v2 static model or Ollama is optional.
+Search uses the potion-code-16M-v2 static model, built into the binary (about 33 MB, MIT licensed,
+see `Models/`); Apple's on-device embeddings and Ollama are optional.
 
 > [!NOTE]
 > Native shell history stores the command line and little else. smcli never rewrites
@@ -83,8 +84,9 @@ smcli shell-init bash|zsh     # print opt-in hooks; eval for your shell
 smcli pick [query...]         # interactive picker; prints the chosen command
 smcli init                    # choose from installed Ollama embedding models
 smcli init --model NAME       # verify and select an Ollama model
-smcli init --potion [DIR]     # use local potion-code-16M-v2 (default: Hugging Face cache)
-smcli init --builtin          # return to Apple's built-in embeddings
+smcli init --potion [DIR]     # use another potion-code-16M-v2 copy (no DIR: the built-in one)
+smcli init --builtin          # use Apple's built-in embeddings instead of Potion
+smcli init --default          # back to the default: the built-in Potion model
 smcli reindex                 # discard the search index and re-embed every command
 smcli health [--json]         # index coverage, size, and embedding model check (exit 1 if broken)
 smcli import legacy.jsonl     # import older smcli JSONL logs (not native history)
@@ -115,18 +117,22 @@ $ smcli --help
   your history) weight keywords more; plain-language requests fuse both legs by rank.
 - A bounded pool of matches is reranked with usage aggregates computed in the same SQL
   query as the stats: age-weighted runs (a run two weeks old counts half), runs in the
-  current directory or below, and success rate. Usage multiplies relevance, so habits lift
-  matches without surfacing non-matches; failed commands are demoted, not hidden. Text
+  current directory or below, and success rate (Ctrl-C, and exit 1 from `grep`/`diff`-style
+  programs, are not failures). Usage scales with relevance, so habits lift strong matches
+  without surfacing weak ones; failed commands are demoted, not hidden. Text
   results show why a command ranked (`exact words`, `used here`, `recent`, …).
 - potion-code-16M-v2 runs natively (WordPiece tokens, mean of float16 rows, normalize;
-  no network pass). Download it with `hf download minishlab/potion-code-16M-v2`, then
-  `smcli init --potion`. Being a static model, it embeds only the command and its intent,
+  no network pass). It is linked into the binary as a read-only segment and read in place,
+  so there is nothing to download; `init --potion DIR` points at another copy. Being a static model, it embeds only the command and its intent,
   not the labels below; word order is lost (`cp a b` equals `cp b a`), so keywords matter.
   For commands with captured metadata, run counts come only from captured records;
-  otherwise they count occurrences across native files.
-- Each command is embedded with labels — `command:`, `subcommand:`, `flags:`, `directory:`,
+  otherwise they count occurrences across native files. Native lines have no times, so
+  their usage decays by position (halving every 1,000 lines from the end); a captured
+  command keeps its native usage when that is the stronger evidence.
+- Each command is embedded with labels — `command:`, `subcommand:`, `flags:`,
   `author:` and `intent:` (from the last captured run) — so queries naming a
-  tool, option or project rank closer. Time and frequency are filters, not labels.
+  tool or option rank closer. Directories are not embedded: use `--dir PATH`, and
+  commands run in the current directory get a "used here" boost. Time and frequency are filters, not labels.
   Captured commands store their option names in a `flags` column (filled in for existing rows on upgrade).
 - Hard filters drop non-matching results: `--command git`, `--subcommand commit`,
   `--since 7d`, `--before 2026-10-01`, `--min-runs 5`, `--author NAME`, `--dir PATH`

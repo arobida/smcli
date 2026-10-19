@@ -1,5 +1,10 @@
 import Foundation
 import Testing
+#if canImport(SQLite3)
+import SQLite3
+#else
+import CSQLite
+#endif
 @testable import smcli
 
 struct CapturedHistoryTests {
@@ -189,7 +194,7 @@ struct CapturedHistoryTests {
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         let url = home.appendingPathComponent("captured.db")
         let old = try fixtureDatabase(url)
-        try old.execute(CapturedHistory.schema.replacingOccurrences(of: CapturedHistory.migrationToV3 + CapturedHistory.migrationToV4, with: "") + """
+        try old.execute(CapturedHistory.schema.replacingOccurrences(of: CapturedHistory.migrationToV3, with: "") + """
             INSERT INTO sessions VALUES ('s', 'bob', 'h', 'zsh');
             INSERT INTO commands (session, started_at, directory, command, exit_code) VALUES ('s', 1, '/', 'git commit --amend -m x', 0);
             """)
@@ -199,6 +204,40 @@ struct CapturedHistoryTests {
         let stats = try log.commandStats()
         #expect(stats["git commit --amend -m x"]?.flags == ["--amend", "-m"])
         #expect(stats["ls -la"]?.flags == ["-la"])
+    }
+
+    @Test func `Take version 4 databases back to version 3`() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let url = home.appendingPathComponent("captured.db")
+        let old = try fixtureDatabase(url)
+        try old.execute(CapturedHistory.schema + """
+            CREATE TABLE usage (command TEXT PRIMARY KEY, score REAL NOT NULL, at REAL NOT NULL) WITHOUT ROWID;
+            PRAGMA user_version = 4;
+            INSERT INTO sessions VALUES ('s', 'bob', 'h', 'zsh');
+            INSERT INTO commands (session, started_at, directory, command, exit_code, flags) VALUES ('s', 1, '/', 'old', 0, '');
+            """)
+        chmod(url.path, 0o600)
+        let log = CapturedHistory(url: url)
+        #expect(try log.records().map(\.command) == ["old"])
+        var version = 0, tables = 0
+        try old.run("PRAGMA user_version") { version = Int(sqlite3_column_int64($0, 0)) }
+        try old.run("SELECT count(*) FROM sqlite_master WHERE name = 'usage'") { tables = Int(sqlite3_column_int64($0, 0)) }
+        #expect(version == 3 && tables == 0)
+    }
+
+    @Test func `Do not count interrupts or answering exit codes as failures`() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let log = CapturedHistory(url: home.appendingPathComponent("captured.db"))
+        for (command, code) in [("npm run dev", 130), ("grep -r todo .", 1), ("diff a b", 1), ("make", 1), ("make", 2)] {
+            try log.append(command: command, shell: "zsh", directory: "/", exitCode: code, nativeFile: "")
+        }
+        let stats = try log.commandStats()
+        #expect(stats["npm run dev"]?.successes == 1)
+        #expect(stats["grep -r todo ."]?.successes == 1 && stats["diff a b"]?.successes == 1)
+        #expect(stats["make"]?.successes == 0)
     }
 
     @Test func `Aggregate usage per command for ranking`() throws {
@@ -221,7 +260,7 @@ struct CapturedHistoryTests {
             try log.append(command: "old", shell: "zsh", directory: "/", exitCode: 0, nativeFile: "", startedAt: time, endedAt: time)
         }
         #expect(try log.commandStats(now: now)["old"]!.frecency < 1e-9)
-        // Pruning rebuilds the scores from the remaining runs.
+        // Pruned runs no longer count.
         _ = try log.prune(filter: CaptureFilter(config: SmcliConfig(historyFilter: ["^make$"])), dryRun: false)
         #expect(try log.commandStats(now: now)["make"] == nil)
     }

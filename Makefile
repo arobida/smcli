@@ -22,8 +22,10 @@ release:
 	@echo "  eval \"\$$(\"$(CURDIR)/$(DIST)/smcli\" shell-init zsh)\""
 	@echo "  \"$(CURDIR)/$(DIST)/smcli\" history"
 
-# Clean rebuild from scratch, for testing.
-fresh: clean release
+# Clean rebuild from scratch, for testing. Sequential even under -j: clean must finish before the build starts.
+fresh:
+	$(MAKE) clean
+	$(MAKE) release
 
 test:
 	bash scripts/test.sh
@@ -45,6 +47,9 @@ fff-smoke: fff-build
 run: build
 	$(SWIFT) run smcli $(ARGS)
 
+# Removes build output, keeping the newest dist/ binary that dist/smcli points to (shell hooks may use it).
 clean:
 	$(SWIFT) package clean
 	rm -rf .build/release
+	@latest=$$(readlink $(DIST)/smcli 2>/dev/null); \
+	for f in $(DIST)/smcli-*; do [ -e "$$f" ] && [ "$$(basename $$f)" != "$$latest" ] && rm -f "$$f"; done; true
