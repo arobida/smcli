@@ -55,23 +55,23 @@ saved in SQLite at `~/.local/share/smcli/history.db`; recording normally happens
 the background, so the newest command may not appear immediately. Set `SMCLI_SYNC=1`
 in the shell to make recording synchronous.
 
-`shell-init` also binds **Up**, **Ctrl-R**, **Ctrl-Right**, **Alt-;**, and **Left** (on an empty prompt only) to `smcli pick`. It opens on suggestions
+`shell-init` also binds **Up** to `smcli pick`, plus **Ctrl-R** and **Left** (on an empty prompt only) if you chose them in `smcli init`. It opens on suggestions
 for the current directory; start typing to filter every captured and native command
 (all words must match), press Tab for semantic search, Enter to put the command on your
 prompt, Esc to cancel. Text already on the prompt becomes the initial query. Set
-`SMCLI_NO_KEYS=1` before the `eval` to keep your shell's own keys. Bash needs 4.0+. On macOS, Alt-; needs your terminal's Option key set to send Meta/Esc+.
+`SMCLI_NO_KEYS=1` before the `eval` to keep your shell's own keys, or `SMCLI_EXTRA_KEYS=1` to add Left, Ctrl-Right and Alt-;. Bash needs 4.0+.
 
 ## Install
 
-Requires Swift 6.0+ and macOS 14+ on macOS. Linux needs SQLite development headers
-(e.g. `libsqlite3-dev` on Debian/Ubuntu); search is unavailable on Linux, even with
-Ollama configured.
+See **[docs/install.md](docs/install.md)** to install a release or build from source, set up Zsh, Bash or Fish,
+choose the picker keys, and upgrade or uninstall. In short:
 
 ```sh
-$ swift build -c release
+scripts/install.sh       # build (needs Swift 6.0+, Rust, macOS 14+), install, hook your shell, start the service
+smcli-uninstall          # export your history, then remove everything
 ```
 
-The binary is `.build/release/smcli`. There's no installer yet.
+Linux needs SQLite development headers (e.g. `libsqlite3-dev`); search is unavailable there.
 
 ## Usage
 
@@ -80,9 +80,10 @@ smcli history                 # native history by file, then captured records
 smcli history --json          # captured records only, as JSON
 smcli search [query...]       # --limit N, --json, filters below
 smcli suggest [prefix...]     # --dir PATH, --limit N, --json
-smcli shell-init bash|zsh     # print opt-in hooks; eval for your shell
+smcli shell-init bash|zsh|fish  # print opt-in hooks; eval (or `| source` in fish)
 smcli pick [query...]         # interactive picker; prints the chosen command
-smcli init                    # choose from installed Ollama embedding models
+smcli init                    # ask for picker keys, then choose an Ollama embedding model
+smcli init --keys [LIST]      # picker keys only: ask, or ctrl-r,left | ctrl-r | left | none
 smcli init --model NAME       # verify and select an Ollama model
 smcli init --potion [DIR]     # use another potion-code-16M-v2 copy (no DIR: the built-in one)
 smcli init --builtin          # use Apple's built-in embeddings instead of Potion
@@ -188,7 +189,7 @@ $ smcli --help
 ## Test
 
 ```sh
-$ bash scripts/test.sh
+$ make test
 ```
 
 ## Backend baseline and fff experiment

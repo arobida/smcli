@@ -86,6 +86,17 @@ struct HistorySearchTests {
     }
 
     #if canImport(ProximaKit)
+    @Test func `With no history yet, search still offers the project's commands`() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try #"{"scripts":{"storybook":"x"}}"#.write(to: directory.appendingPathComponent("package.json"), atomically: true, encoding: .utf8)
+        let context = RankingContext(project: ProjectContext.discover(directory.path), session: nil, environment: [:])
+        let hits = try await HistorySearch(directory: directory.appendingPathComponent("index"))
+            .search("run storybook", corpus: [:], limit: 5, signals: SearchSignals(context: context))
+        #expect(hits.map(\.command) == ["npm run storybook"])
+    }
+
     @Test func `Filtered search keeps only matches, and lists them without a query`() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

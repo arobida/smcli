@@ -60,7 +60,7 @@ final class RankingWorld {
         db = try log.openConnection()
         try history()
         for pick in Self.selections {
-            try log.recordPick(query: pick.query, command: pick.command, kind: "suggest", directory: path("notes"),
+            try log.recordPick(query: pick.query, command: pick.command, kind: "suggest", directory: path("notes"), filter: .standard,
                                at: Self.now - pick.days * 86_400, on: db)
         }
     }

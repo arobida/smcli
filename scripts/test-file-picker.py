@@ -27,6 +27,8 @@ NAMES = {
     "t13": "t13 tab\there", "t14": "t14 東京 é.txt",
     "-t15": "-t15 dash.txt",
 }
+# Not in NAMES: used only by the quote-context and cursor checks below.
+INJECT = "t16 $(touch PWNED)"
 root = tempfile.mkdtemp(prefix="smcli-fp.", dir="/tmp")
 
 
@@ -52,6 +54,7 @@ def run(shell, path):
     for name in NAMES.values():
         Path(repo, name).write_text("x\n")
     Path(repo, "t00 decoy").write_text("x\n")
+    Path(repo, INJECT).write_text("x\n")
     for cmd in (["init", "-q"], ["add", "."], ["-c", "user.name=t", "-c", "user.email=t@e.x", "commit", "-q", "-m", "one"]):
         subprocess.run(["git", "-C", repo, *cmd], check=True, capture_output=True)
     args, extra = shell_setup(shell, home)
@@ -104,6 +107,45 @@ def run(shell, path):
             want = "./" + name if name.startswith("-") else name
             assert got == want, f"{shell}: {name!r}: shell received {got!r}, wanted {want!r}"
         print(f"{shell}: {len(NAMES)} awkward names inserted as one word each, none executed.")
+
+        def choose(token):
+            os.write(fd, b"\x1b[A")
+            until(lambda t: "type to search" in t, "picker")
+            os.write(fd, b"\x14")
+            until(lambda t: "enter insert path" in t, "files mode")
+            os.write(fd, token.encode())
+            until(lambda t: "files results" in t, "results")
+            os.write(fd, b"\r")
+
+        def settle():
+            nonlocal buffer
+            while select.select([fd], [], [], 0.5)[0]:
+                buffer += os.read(fd, 65536)
+
+        # Inside an open double quote the quoted word would be reparsed and `$(…)` would run: refused, nothing inserted.
+        buffer = b""
+        os.write(fd, b"printf 'GOT<%s>END\\n' \"x ")
+        choose("t16")
+        settle()
+        assert "not inserting a path inside an open quote" in CSI.sub(b"", buffer).decode(errors="replace"), \
+            f"{shell}: no refusal: {CSI.sub(b'', buffer).decode(errors='replace')!r}"
+        buffer = b""
+        os.write(fd, b"\"\r")
+        got = printed(until(lambda t: printed(t), "quoted output"))
+        assert got == ["x "], f"{shell}: inside quotes the line became {got!r}"
+        assert not Path(repo, "PWNED").exists(), f"{shell}: command substitution in a file name ran"
+
+        # The cursor sits after a multibyte character: the word goes exactly there, the rest of the line intact.
+        buffer = b""
+        os.write(fd, "printf 'GOT<%s>END\\n' é suffix".encode())
+        os.write(fd, b"\x1b[D" * 6)
+        choose("t01")
+        settle()
+        buffer = b""
+        os.write(fd, b"\r")
+        got = printed(until(lambda t: len(printed(t)) >= 3, "unicode output"))
+        assert got == ["é", NAMES["t01"], "suffix"], f"{shell}: insertion after a multibyte character gave {got!r}"
+        print(f"{shell}: no insertion inside quotes; insertion after multibyte text lands at the cursor.")
     finally:
         try:
             os.kill(pid, signal.SIGKILL)

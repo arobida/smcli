@@ -629,7 +629,8 @@ def run_bash_plugins(variant):
             declared = t.send("declare -p PROMPT_COMMAND precmd_functions 2>/dev/null")
             # smcli's entry is in PROMPT_COMMAND, or in precmd_functions when bash-preexec owns the prompt hook.
             assert declared.count("printf") >= 2 and "_smcli_prompt" in declared, declared
-            assert "ps0-user" in t.send("echo PS0=$PS0") or variant.prelude or True
+            ps0 = t.send("echo PS0=$PS0")
+            assert "ps0-user" in ps0 or variant.prelude, f"the user's PS0 was lost: {ps0!r}"
             t.send("false")
             t.send("true")
             records = read_records(env)
@@ -637,7 +638,9 @@ def run_bash_plugins(variant):
             pc = (home / "pc-log").read_text().splitlines()
             assert "a1" in pc and "b1" in pc, f"user PROMPT_COMMAND entries lost $?: {pc}"
             keys = t.send("bind -X | grep -c _atuin_up; bind -s | grep -c FZF-MACRO; bind -X | grep -c '_smcli_pick\"'")
-            assert keys.count("1") >= 3 or "1\r\n1\r\n1" in keys.replace("\r", "") or True
+            # The user's PS0 ([ps0-user]) prints just before the first count.
+            counts = re.findall(r"^(?:\[ps0-user\])?(\d+)\s*$", keys.replace("\r", ""), re.M)
+            assert counts[-3:] == ["1", "1", "1"], f"atuin, fzf and smcli bindings should each be bound once: {keys!r}"
             t.type("\x1b[A")  # Up, not the application-mode sequence atuin took
             t.until_text("type to search")
             t.type("\x07")
@@ -719,6 +722,33 @@ def run_extra_keys(variant):
                 stop_services(env)
                 shutil.rmtree(runtime, ignore_errors=True)
     print(f"{variant.label}: extra keys are opt-in.")
+
+
+def run_init_keys(variant):
+    """The keys chosen in `smcli init` (saved in the config) decide Ctrl-R and Left; Up stays bound."""
+    query = {"bash": "bind -X", "zsh": "bindkey -M emacs", "fish": "bind --user"}[variant.kind]
+    for ctrl_r, left in ((True, False), (False, True)):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            (home / "config.json").write_text(json.dumps({"ctrlRKey": ctrl_r, "leftKey": left}))
+            runtime = tempfile.mkdtemp(prefix="smcli-sh.", dir="/tmp")
+            env = new_environment(home, runtime, variant)
+            t = Terminal(variant.path, variant.args, env, str(home))
+            try:
+                t.drain()
+                setup_prompt(t, variant.kind)
+                t.send(init_line(variant.kind))
+                bound = t.send(query)
+                has_r = bool(re.search(r'(\\C-r|"\^R"|\\cr|ctrl-r)\S*\s+"?_smcli_pick\b', bound))
+                assert has_r == ctrl_r, (variant.label, "Ctrl-R", ctrl_r, bound)
+                assert ("_smcli_pick_left" in bound) == left, (variant.label, "Left", left, bound)
+                assert "_smcli_pick_up" in bound or "_smcli_pick" in bound, (variant.label, "Up", bound)
+                t.wait_exit(0)
+            finally:
+                t.close()
+                stop_services(env)
+                shutil.rmtree(runtime, ignore_errors=True)
+    print(f"{variant.label}: Ctrl-R and Left follow the keys chosen in smcli init.")
 
 
 def run_no_keys(variant):
@@ -826,6 +856,7 @@ for v in found:
         run_extra_keys(v)
     if v.keys and (v.kind != "bash" or "PS0" in v.label):
         run_no_keys(v)
+        run_init_keys(v)
 for name in skipped:
     print(f"SKIPPED (not installed): {name}")
 

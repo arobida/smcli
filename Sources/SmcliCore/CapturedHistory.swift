@@ -400,25 +400,37 @@ package struct CapturedHistory {
               (pipestatus ?? []).count <= 256, (pipestatus ?? []).allSatisfy({ (0...255).contains($0) }) else {
             throw HistoryError(message: "Invalid shell, directory, exit code, pipestatus, session, or empty command.")
         }
-        if !nativeFile.isEmpty && url.resolvingSymlinksInPath() == URL(fileURLWithPath: nativeFile).resolvingSymlinksInPath() {
-            throw HistoryError(message: "SMCLI_DB must be separate from the shell's native HISTFILE.")
+        try checkSeparate(from: nativeFile)
+        // Converting an unbounded Double to Int traps, and these come from shells and service clients.
+        guard [startedAt, endedAt].allSatisfy({ $0.map(Self.isTimestamp) ?? true }) else {
+            throw HistoryError(message: "Invalid start or end time.")
         }
         let start = startedAt ?? Date().timeIntervalSince1970
         let duration = endedAt.map { max(0, Int((($0 - start) * 1000).rounded())) }
         guard Self.isEventID(event) else { throw HistoryError(message: "Invalid event ID.") }
         let db = try db ?? connect(write: true)
-        if !nativeFile.isEmpty {
-            var logInfo = stat()
-            var nativeInfo = stat()
-            if stat(url.path, &logInfo) == 0 && stat(nativeFile, &nativeInfo) == 0,
-               logInfo.st_dev == nativeInfo.st_dev && logInfo.st_ino == nativeInfo.st_ino {
-                throw HistoryError(message: "SMCLI_DB must not be a hard link to native HISTFILE.")
-            }
-        }
         return try insert(into: db, session: session, user: NSUserName(), host: ProcessInfo.processInfo.hostName,
                           shell: shell, startedAt: start, durationMs: duration, directory: directory, command: command,
                           exitCode: exitCode, uuid: event, pipestatus: pipestatus)
     }
+
+    /// Refuses a native history file that is this database, by path or by hard link. Checked before anything opens
+    /// the database: opening it would create or write SQLite pages into the shell's history file.
+    package func checkSeparate(from nativeFile: String) throws {
+        guard !nativeFile.isEmpty else { return }
+        if url.resolvingSymlinksInPath() == URL(fileURLWithPath: nativeFile).resolvingSymlinksInPath() {
+            throw HistoryError(message: "SMCLI_DB must be separate from the shell's native HISTFILE.")
+        }
+        var logInfo = stat()
+        var nativeInfo = stat()
+        if stat(url.path, &logInfo) == 0 && stat(nativeFile, &nativeInfo) == 0,
+           logInfo.st_dev == nativeInfo.st_dev && logInfo.st_ino == nativeInfo.st_ino {
+            throw HistoryError(message: "SMCLI_DB must not be a hard link to native HISTFILE.")
+        }
+    }
+
+    /// Epoch seconds from 1970 up to year 5138: finite, and any difference of two in milliseconds fits an Int.
+    package static func isTimestamp(_ time: Double) -> Bool { time.isFinite && (0...1e11).contains(time) }
 
     /// Records one explicit file selection.
     package func recordSelection(root: String, path: String, mode: String, query: String,
@@ -437,10 +449,16 @@ package struct CapturedHistory {
     }
 
     /// Records that the user picked `command` after typing `query` (empty for the unfiltered list).
-    package func recordPick(query: String, command: String, kind: String, directory: String,
-                            at time: Double = Date().timeIntervalSince1970, on db: SQLiteDatabase) throws {
+    /// A pick can come from native history, which never passed the capture filter, so it is applied here, to the
+    /// command and to what was typed. Returns false when the filter kept it out.
+    @discardableResult
+    package func recordPick(query: String, command: String, kind: String, directory: String, filter: CaptureFilter,
+                            at time: Double = Date().timeIntervalSince1970, on db: SQLiteDatabase) throws -> Bool {
+        guard filter.allows(command: command, directory: directory),
+              query.isEmpty || filter.allows(command: query, directory: directory) else { return false }
         try db.run("INSERT INTO command_selections (query, command, kind, directory, selected_at) VALUES (?, ?, ?, ?, ?)",
                    [.text(query), .text(command), .text(kind), .text(directory), .real(time)])
+        return true
     }
 
     /// The most recent picks, oldest first; older ones have faded anyway.
@@ -624,10 +642,23 @@ package struct CapturedHistory {
                 commands.append(text(row, 1))
             }
         }
-        guard !dryRun, !ids.isEmpty else { return commands }
+        // Picks are checked on their own: one can hold a command that was never captured (from native history),
+        // or a secret in what was typed.
+        var picks: [Int] = []
+        var pickedOnly: [String] = []
+        try db.run("SELECT id, command, query, directory, selected_at FROM command_selections ORDER BY selected_at, id") { row in
+            let (command, query, directory) = (text(row, 1), text(row, 2), text(row, 3))
+            if !filter.allows(command: command, directory: directory)
+                || !query.isEmpty && !filter.allows(command: query, directory: directory) {
+                picks.append(Int(sqlite3_column_int64(row, 0)))
+                if !commands.contains(command) && !pickedOnly.contains(command) { pickedOnly.append(command) }
+            }
+        }
+        guard !dryRun, !ids.isEmpty || !picks.isEmpty else { return commands + pickedOnly }
         try db.execute("BEGIN IMMEDIATE")
         do {
             for id in ids { try db.run("DELETE FROM commands WHERE id = ?", [.integer(id)]) }
+            for id in picks { try db.run("DELETE FROM command_selections WHERE id = ?", [.integer(id)]) }
             // A pick keeps the command's text too.
             for command in Set(commands) { try db.run("DELETE FROM command_selections WHERE command = ?", [.text(command)]) }
             try db.execute("COMMIT")
@@ -638,7 +669,7 @@ package struct CapturedHistory {
         // Deleted text can linger in free pages and the WAL until they are rewritten.
         try db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         try db.execute("VACUUM")
-        return commands
+        return commands + pickedOnly
     }
 
     package func records() throws -> [CapturedCommand] {

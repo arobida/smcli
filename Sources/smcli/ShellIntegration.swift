@@ -11,8 +11,10 @@ func fishQuote(_ text: String) -> String {
     "'" + text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'") + "'"
 }
 
-func shellIntegration(shell: String, executable: String) throws -> String {
+/// `ctrlR` and `left` are the picker keys chosen in `smcli init`; SMCLI_EXTRA_KEYS=1 still adds Left (and more) too.
+func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, left: Bool = false) throws -> String {
     let binary = shellQuote(executable)
+    let (keyR, keyLeft) = (ctrlR ? "1" : "0", left ? "1" : "0")
     switch shell {
     case "bash":
         return #"""
@@ -177,18 +179,28 @@ func shellIntegration(shell: String, executable: String) throws -> String {
         if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} && ${_smcli_keys-} != 1 ]] && (( BASH_VERSINFO[0] >= 4 )); then
             _smcli_keys=1
             _smcli_pick_bin=\#(binary)
+            # Bash 4 counts READLINE_POINT in bytes (5.0 and later in characters) while ${var:offset} counts characters,
+            # so on Bash 4 slice and measure in the C locale. The local LC_ALL ends with the function.
+            _smcli_split() {
+                (( BASH_VERSINFO[0] >= 5 )) || local LC_ALL=C
+                _smcli_before=${READLINE_LINE:0:READLINE_POINT} _smcli_after=${READLINE_LINE:READLINE_POINT} _smcli_bytes=${#1}
+            }
             _smcli_pick() {
                 local chosen code
-                chosen=$(SMCLI_SHELL=bash "$_smcli_pick_bin" pick "$READLINE_LINE" </dev/tty)
+                _smcli_split
+                chosen=$(SMCLI_SHELL=bash SMCLI_LBUFFER=$_smcli_before "$_smcli_pick_bin" pick "$READLINE_LINE" </dev/tty)
                 code=$?
                 if (( code == 0 )); then
                     READLINE_LINE=$chosen
-                    READLINE_POINT=${#chosen}
+                    _smcli_split "$chosen"
+                    READLINE_POINT=$_smcli_bytes
                 elif (( code == 10 )); then
                     # A file or grep result: one quoted word, inserted at the cursor. Never run.
-                    READLINE_LINE=${READLINE_LINE:0:READLINE_POINT}$chosen\ ${READLINE_LINE:READLINE_POINT}
-                    READLINE_POINT=$(( READLINE_POINT + ${#chosen} + 1 ))
+                    _smcli_split "$chosen"
+                    READLINE_LINE=$_smcli_before$chosen\ $_smcli_after
+                    READLINE_POINT=$(( READLINE_POINT + _smcli_bytes + 1 ))
                 fi
+                unset _smcli_before _smcli_after _smcli_bytes
             }
             # Left opens the picker only on an empty line; otherwise it moves the cursor as usual.
             _smcli_pick_left() {
@@ -209,12 +221,15 @@ func shellIntegration(shell: String, executable: String) throws -> String {
             _smcli_maps=$(bind -X 2>/dev/null)
             _smcli_maps=$'\n'$(bind -p 2>/dev/null; bind -s 2>/dev/null)$'\n'${_smcli_maps//\" \"/\": \"}
             _smcli_kept=
-            _smcli_bind '\C-r' _smcli_pick 'reverse-search-history history-search-backward'
+            # From `smcli init`: Ctrl-R, and Left on an empty line.
+            (( \#(keyR) )) && _smcli_bind '\C-r' _smcli_pick 'reverse-search-history history-search-backward'
             _smcli_bind '\e[A' _smcli_pick 'previous-history history-search-backward'
             _smcli_bind '\eOA' _smcli_pick 'previous-history history-search-backward'
-            if [[ -n ${SMCLI_EXTRA_KEYS-} ]]; then
+            if [[ -n ${SMCLI_EXTRA_KEYS-} ]] || (( \#(keyLeft) )); then
                 _smcli_bind '\e[D' _smcli_pick_left backward-char
                 _smcli_bind '\eOD' _smcli_pick_left backward-char
+            fi
+            if [[ -n ${SMCLI_EXTRA_KEYS-} ]]; then
                 _smcli_bind '\e[1;5C' _smcli_pick forward-word
                 _smcli_bind '\e[5C' _smcli_pick forward-word
                 _smcli_bind '\e;' _smcli_pick ''
@@ -284,7 +299,7 @@ func shellIntegration(shell: String, executable: String) throws -> String {
             _smcli_pick_bin=\#(binary)
             _smcli_pick() {
                 local chosen code
-                chosen=$(SMCLI_SHELL=zsh "$_smcli_pick_bin" pick "$BUFFER" </dev/tty)
+                chosen=$(SMCLI_SHELL=zsh SMCLI_LBUFFER=$LBUFFER "$_smcli_pick_bin" pick "$BUFFER" </dev/tty)
                 code=$?
                 if (( code == 0 )); then
                     BUFFER=$chosen
@@ -317,12 +332,15 @@ func shellIntegration(shell: String, executable: String) throws -> String {
             }
             _smcli_kept=()
             for _smcli_keymap in emacs viins; do
-                _smcli_bind $_smcli_keymap '^R' _smcli_pick 'redisplay|history-incremental-(pattern-|)search-backward|history-search-backward'
+                # From `smcli init`: Ctrl-R, and Left on an empty line.
+                (( \#(keyR) )) && _smcli_bind $_smcli_keymap '^R' _smcli_pick 'redisplay|history-incremental-(pattern-|)search-backward|history-search-backward'
                 _smcli_bind $_smcli_keymap '^[[A' _smcli_pick_up 'up-line-or-(history|beginning-search)'
                 _smcli_bind $_smcli_keymap '^[OA' _smcli_pick_up 'up-line-or-(history|beginning-search)'
-                if [[ -n ${SMCLI_EXTRA_KEYS-} ]]; then
+                if [[ -n ${SMCLI_EXTRA_KEYS-} ]] || (( \#(keyLeft) )); then
                     _smcli_bind $_smcli_keymap '^[[D' _smcli_pick_left backward-char
                     _smcli_bind $_smcli_keymap '^[OD' _smcli_pick_left backward-char
+                fi
+                if [[ -n ${SMCLI_EXTRA_KEYS-} ]]; then
                     _smcli_bind $_smcli_keymap '^[[1;5C' _smcli_pick forward-word
                     _smcli_bind $_smcli_keymap '^[[5C' _smcli_pick forward-word
                     _smcli_bind $_smcli_keymap '^[;' _smcli_pick 'undefined-key'
@@ -381,6 +399,9 @@ func shellIntegration(shell: String, executable: String) throws -> String {
         if status is-interactive; and test -z "$SMCLI_NO_KEYS"; and not set -q _smcli_keys
             set -g _smcli_keys 1
             function _smcli_pick
+                # The text left of the cursor, so smcli can refuse to insert a path inside an open quote.
+                set -l before (commandline -c | string collect)
+                set -lx SMCLI_LBUFFER "$before"
                 set -l chosen (SMCLI_SHELL=fish command $_smcli_bin pick (commandline | string collect) </dev/tty)
                 set -l code $status
                 if test $code -eq 0
@@ -410,9 +431,22 @@ func shellIntegration(shell: String, executable: String) throws -> String {
                     set -a _smcli_kept (string escape -- $argv[1])
                 end
             end
-            _smcli_bind \cr _smcli_pick
+            # Left opens the picker only on an empty line; otherwise it moves the cursor as usual.
+            function _smcli_pick_left
+                if test -z (commandline | string collect)
+                    _smcli_pick
+                else
+                    commandline -f backward-char
+                end
+            end
+            # From `smcli init`: Ctrl-R, and Left on an empty line.
+            test \#(keyR) = 1; and _smcli_bind \cr _smcli_pick
             _smcli_bind \e\[A _smcli_pick_up
             _smcli_bind \eOA _smcli_pick_up
+            if test \#(keyLeft) = 1
+                _smcli_bind \e\[D _smcli_pick_left
+                _smcli_bind \eOD _smcli_pick_left
+            end
             test (count $_smcli_kept) -eq 0; or echo "smcli: kept existing key bindings: $_smcli_kept (bind them to _smcli_pick to switch)." >&2
             functions -e _smcli_bind
             set -e _smcli_kept

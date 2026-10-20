@@ -75,6 +75,10 @@ package struct ServiceRequest: Codable, Equatable {
     package var path: String?
     package var mode: String?
 
+    // search, select: the caller's config file (SMCLI_CONFIG or the default), since a running service may have been
+    // started by a shell with another. Filled in by ServiceClient.
+    package var config: String?
+
     package init(op: Operation) { self.op = op }
 }
 
@@ -139,6 +143,8 @@ package struct ServiceResponse: Codable, Equatable {
     package var files: [FileHit]?
     package var root: String?
     package var instance: Int?
+    /// grep: true when the time budget or limit stopped the search early, so more matches may exist.
+    package var partial: Bool?
 
     // ping, shutdown
     package var pid: Int32?

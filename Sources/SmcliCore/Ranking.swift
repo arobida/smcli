@@ -78,6 +78,8 @@ extension ProjectContext {
             for name in names where valid(name) {
                 switch (lower, project.kind) {
                 case ("package.json", _):
+                    // Checked again here: a cached or hand-built context may carry any text.
+                    let manager = ProjectContext.Project.nodeManagers.contains(manager) ? manager : ""
                     let command = manager == "yarn" ? "yarn \(name)" : "\(manager.isEmpty ? "npm" : manager) run \(name)"
                     found.append(.init(command: command, kind: .script, reason: "package.json script"))
                     if manager.isEmpty || manager == "npm", name == "test" || name == "start" {

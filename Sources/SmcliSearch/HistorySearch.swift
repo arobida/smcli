@@ -384,7 +384,12 @@ package struct HistorySearch {
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw HistoryError(message: "Search query is empty.")
         }
-        guard !corpus.isEmpty else { return [] }
+        // No history yet: nothing to embed, but project commands can still answer.
+        guard !corpus.isEmpty else {
+            let hits = signals.additions(query: query, corpus: corpus, existing: [], filter: filter, now: now)
+            return Array(rerank(hits, literal: isLiteralQuery(query, programs: programs ?? [:]), query: query, now: now,
+                                signals: signals).prefix(limit))
+        }
         let lock = try lockIndex(wait: true)!
         defer { close(lock) }
         let (store, name) = try await openIndex(reusing: open)

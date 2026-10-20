@@ -167,6 +167,55 @@ struct CapturedHistoryTests {
         #expect(bytes.range(of: Data("AKIAABCDEFGHIJKLMNOP".utf8)) == nil)
     }
 
+    @Test func `Picks pass the capture filter, and prune removes picks on their own`() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let log = CapturedHistory(url: home.appendingPathComponent("captured.db"))
+        try log.append(command: "ls", shell: "zsh", directory: "/", exitCode: 0, nativeFile: "")
+        let db = try log.openConnection()
+        let filter = try CaptureFilter(config: SmcliConfig(historyFilter: ["^vault "]))
+        // A native-history command the filter rejects, and a secret typed as the query, are never stored.
+        #expect(try !log.recordPick(query: "", command: "vault login", kind: "suggest", directory: "/", filter: filter, on: db))
+        #expect(try !log.recordPick(query: "AKIAABCDEFGHIJKLMNOP", command: "ls", kind: "search", directory: "/", filter: filter, on: db))
+        #expect(try log.recordPick(query: "l", command: "ls", kind: "suggest", directory: "/", filter: filter, on: db))
+        // Picks stored before a filter existed: prune finds them though no command row matches.
+        #expect(try log.recordPick(query: "", command: "aws configure", kind: "suggest", directory: "/", filter: .standard, on: db))
+        #expect(try log.recordPick(query: "ghp_", command: "ls", kind: "search", directory: "/", filter: .standard, on: db))
+        let stricter = try CaptureFilter(config: SmcliConfig(historyFilter: ["^aws ", "^ghp_"]))
+        #expect(try log.prune(filter: stricter, dryRun: true) == ["aws configure", "ls"])
+        _ = try log.prune(filter: stricter, dryRun: false)
+        var left: [String] = []
+        try log.openConnection().run("SELECT query FROM command_selections") { left.append(String(cString: sqlite3_column_text($0, 0))) }
+        #expect(left == ["l"])
+        #expect(try log.records().map(\.command) == ["ls"])
+    }
+
+    @Test func `Reject timestamps that can't be stored instead of trapping`() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let log = CapturedHistory(url: home.appendingPathComponent("captured.db"))
+        for (start, end) in [(1e300, 1.0), (1.0, 1e300), (-1e300, 1.0), (Double.nan, 1.0), (1.0, Double.infinity), (-5, 1.0)] {
+            #expect(throws: HistoryError.self) {
+                try log.append(command: "ls", shell: "zsh", directory: "/", exitCode: 0, nativeFile: "", startedAt: start, endedAt: end)
+            }
+        }
+        try log.append(command: "ls", shell: "zsh", directory: "/", exitCode: 0, nativeFile: "", startedAt: 1e9, endedAt: 1e9 + 2)
+        #expect(try log.records().first?.durationMs == 2000)
+    }
+
+    @Test func `Never open a database that is the native history file`() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let native = home.appendingPathComponent("zsh_history")
+        let log = CapturedHistory(url: native)
+        #expect(throws: HistoryError.self) { try log.checkSeparate(from: native.path) }
+        #expect(throws: HistoryError.self) {
+            try log.append(command: "ls", shell: "zsh", directory: "/", exitCode: 0, nativeFile: native.path)
+        }
+        #expect(!FileManager.default.fileExists(atPath: native.path))
+    }
+
     @Test func `Upgrade version 1 databases in place`() throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: home) }
@@ -286,7 +335,7 @@ struct CapturedHistoryTests {
         var version = 0
         try db.run("PRAGMA user_version") { version = Int(sqlite3_column_int64($0, 0)) }
         #expect(version == 7)
-        try log.recordPick(query: "ol", command: "old", kind: "suggest", directory: "/", at: 5, on: db)
+        try log.recordPick(query: "ol", command: "old", kind: "suggest", directory: "/", filter: .standard, at: 5, on: db)
         #expect(try log.picks(on: db).picks == [.init(query: "ol", command: "old", time: 5)])
         #expect(try log.records().map(\.command) == ["old"])
     }
@@ -434,4 +483,9 @@ private func fixtureDatabase(_ url: URL) throws -> SQLiteDatabase {
     let resolved = realpath(url.path, nil)!
     defer { free(resolved) }
     return try SQLiteDatabase(path: String(cString: resolved), readOnly: false)
+}
+
+extension CaptureFilter {
+    /// The default filter: leading space and likely secrets.
+    static let standard = try! CaptureFilter(config: SmcliConfig())
 }

@@ -14,11 +14,21 @@ package final class FFFPool: @unchecked Sendable {
         var used: Date
     }
 
+    /// One creation in progress; requests for the same root wait for it instead of scanning again.
+    private final class Pending: @unchecked Sendable {
+        let group = DispatchGroup()
+        var result: Result<FFFIndex, any Error>?
+        init() { group.enter() }
+    }
+
     package let capacity: Int
     package let idleTimeout: Double
     private let make: @Sendable (String) throws -> FFFIndex
     private let lock = NSLock()
     private var entries: [String: Entry] = [:]
+    private var pending: [String: Pending] = [:]
+    /// At most `capacity` creations (each a scan plus a watcher) run at once, across all roots.
+    private let building: DispatchSemaphore
     private var next = 1
 
     package init(capacity: Int = 4, idleTimeout: Double = 600,
@@ -26,29 +36,41 @@ package final class FFFPool: @unchecked Sendable {
         self.capacity = max(1, capacity)
         self.idleTimeout = idleTimeout
         self.make = make
+        building = DispatchSemaphore(value: self.capacity)
     }
 
     /// The instance for `root`, created (and the least recently used one evicted) when needed.
     /// Creation waits for the first scan, so it happens outside the lock: other roots stay responsive.
     package func index(for root: String, now: Date = Date()) throws -> (index: FFFIndex, id: Int) {
         lock.lock()
-        dropStale(now)
-        if var entry = entries[root] {
-            entry.used = now
-            entries[root] = entry
+        while true {
+            dropStale(now)
+            if var entry = entries[root] {
+                entry.used = now
+                entries[root] = entry
+                lock.unlock()
+                return (entry.index, entry.id)
+            }
+            guard let waiting = pending[root] else { break }
             lock.unlock()
-            return (entry.index, entry.id)
+            waiting.group.wait()
+            // The creator's failure is ours too; retrying here would only repeat the same scan.
+            if case .failure(let error) = waiting.result { throw error }
+            lock.lock()
         }
+        let build = Pending()
+        pending[root] = build
         lock.unlock()
-        let created = try make(root)
+        building.wait()
+        let result = Result { try make(root) }
+        building.signal()
         lock.lock()
         defer { lock.unlock() }
-        // A concurrent request for the same root may have won; keep its instance and drop ours.
-        if var entry = entries[root] {
-            entry.used = now
-            entries[root] = entry
-            return (entry.index, entry.id)
-        }
+        pending[root] = nil
+        build.result = result
+        // Waiters wake into the lock, which is held until the new entry is in place.
+        build.group.leave()
+        let created = try result.get()
         while entries.count >= capacity, let oldest = entries.min(by: { $0.value.used < $1.value.used }) {
             entries[oldest.key] = nil
         }

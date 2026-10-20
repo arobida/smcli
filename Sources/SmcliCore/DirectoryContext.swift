@@ -35,6 +35,9 @@ package struct ProjectContext: Codable, Equatable {
         package var packageManager: String?
         /// Script, target or task names, by the manifest that declares them.
         package var scripts: [String: [String]]
+
+        /// The only package.json managers smcli builds commands for; anything else in the field is ignored.
+        package static let nodeManagers: Set<String> = ["npm", "pnpm", "yarn", "bun"]
     }
 
     /// The directory asked about, as given.
@@ -167,7 +170,9 @@ package struct ProjectContext: Codable, Equatable {
     private static func nodeScripts(_ text: String?, into project: inout Project, exists: (String) -> Bool) -> [String] {
         let json = text.flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) } as? [String: Any]
         project.name = json?["name"] as? String
-        if let field = json?["packageManager"] as? String, let name = field.split(separator: "@").first {
+        // The field is repository-controlled text that ends up in suggested commands, so only known names count.
+        if let field = json?["packageManager"] as? String, let name = field.split(separator: "@").first,
+           Project.nodeManagers.contains(String(name)) {
             project.packageManager = String(name)
         } else if let lock = [("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"), ("bun.lock", "bun"),
                               ("bun.lockb", "bun"), ("package-lock.json", "npm")].first(where: { exists($0.0) }) {

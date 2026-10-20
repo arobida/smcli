@@ -28,7 +28,10 @@ struct SmcliService {
             let lock = open(location.lock.path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
             guard lock >= 0 else { throw HistoryError(message: "Cannot open \(location.lock.path)") }
             guard flock(lock, LOCK_EX | LOCK_NB) == 0 else { exit(0) }
-            let service = try Service(history: CapturedHistory(url: database), location: location,
+            // Never open (and so create or write) the database when it is the starting shell's native history.
+            let history = CapturedHistory(url: database)
+            try history.checkSeparate(from: environment["HISTFILE"] ?? "")
+            let service = try Service(history: history, location: location,
                                       idle: environment["SMCLI_SERVICE_IDLE"].flatMap(Double.init) ?? 1800)
             try service.run()
         } catch {
@@ -225,10 +228,14 @@ final class Service: @unchecked Sendable {
         return queue.sync {
             lastActivity = Date()
             do {
+                // An unreadable config records nothing rather than skipping the filter.
+                let filter = try CaptureFilter(config: SmcliConfig.load(from: configURL(request)))
                 try refresh()
                 let time = Date().timeIntervalSince1970
-                try history.recordPick(query: query, command: command, kind: mode, directory: directory, at: time, on: db)
-                index?.addPick(query: query, command: command, at: time)
+                if try history.recordPick(query: query, command: command, kind: mode, directory: directory, filter: filter,
+                                          at: time, on: db) {
+                    index?.addPick(query: query, command: command, at: time)
+                }
                 return ServiceResponse(ok: true)
             } catch {
                 return .failure("failed", error.localizedDescription)
@@ -333,6 +340,17 @@ final class Service: @unchecked Sendable {
         }
     }
 
+    private var home: URL {
+        ProcessInfo.processInfo.environment["HOME"].map { URL(fileURLWithPath: $0) }
+            ?? FileManager.default.homeDirectoryForCurrentUser
+    }
+
+    /// The caller's config file; requests from older clients fall back to the one this service started with.
+    private func configURL(_ request: ServiceRequest) -> URL {
+        if let path = request.config, path.hasPrefix("/") { return URL(fileURLWithPath: path) }
+        return SmcliConfig.location(home: home, environment: ProcessInfo.processInfo.environment)
+    }
+
     // MARK: - Search
 
     #if canImport(ProximaKit)
@@ -367,7 +385,7 @@ final class Service: @unchecked Sendable {
                 if context.uses(.transition), let previous = request.session.flatMap(index.previousCommand) {
                     (signals.previous, signals.followers) = (previous, index.following(previous))
                 }
-                return (try currentEngine(), try currentCorpus(request, directory: directory, project: context.uses(.project) ? context.projectRoot : nil),
+                return (try currentEngine(request), try currentCorpus(request, directory: directory, project: context.uses(.project) ? context.projectRoot : nil),
                         signals)
             }
             var response = ServiceResponse(ok: true)
@@ -388,14 +406,10 @@ final class Service: @unchecked Sendable {
         return environment
     }
 
-    private var home: URL {
-        ProcessInfo.processInfo.environment["HOME"].map { URL(fileURLWithPath: $0) }
-            ?? FileManager.default.homeDirectoryForCurrentUser
-    }
-
-    private func currentEngine() throws -> HistorySearch {
-        let environment = ProcessInfo.processInfo.environment
-        let config = try SmcliConfig.load(from: SmcliConfig.location(home: home, environment: environment))
+    private func currentEngine(_ request: ServiceRequest) throws -> HistorySearch {
+        var environment = ProcessInfo.processInfo.environment
+        environment["SMCLI_CONFIG"] = configURL(request).path
+        let config = try SmcliConfig.load(from: configURL(request))
         if let engine, engine.config == config { return engine.search }
         let search = try searchEngine(captured: history, home: home, environment: environment)
         engine = (config, search)

@@ -46,8 +46,11 @@ final class FileSearch: @unchecked Sendable {
             let (index, id) = try pool.index(for: root)
             let picked = scores(root)
             var hits: [FileHit]
+            var complete = true
             if grep {
-                hits = try index.grep(query, limit: limit).map {
+                let page = try index.grep(query, limit: limit)
+                complete = page.complete
+                hits = page.matches.map {
                     FileHit(path: $0.path, insert: Self.relative($0.path, root: root, from: directory),
                             provenance: ["grep"] + (picked[$0.path] != nil ? ["picked"] : []), git: Self.git($0.git),
                             line: $0.line, column: $0.column, text: $0.text)
@@ -71,6 +74,7 @@ final class FileSearch: @unchecked Sendable {
             }
             var response = ServiceResponse(ok: true)
             (response.files, response.root, response.instance) = (hits, root, id)
+            if !complete { response.partial = true }
             return response
         } catch {
             return .failure("failed", error.localizedDescription)

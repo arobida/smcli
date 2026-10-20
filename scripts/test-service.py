@@ -5,6 +5,7 @@ Usage: test-service.py <path to smcli>  (smcli-service must sit next to it). Use
 runtime directory; never touches the user's history or a running service of theirs.
 """
 import json
+from pathlib import Path
 import os
 import shutil
 import signal
@@ -177,6 +178,10 @@ try:
     assert raw(b"x" * (2 << 20) + b"\n")["error"]["code"] == "too_large"
     bad = dict(request, event="NOT-A-UUID")
     assert raw((json.dumps(bad) + "\n").encode())["error"]["code"] == "failed"
+    # Timestamps whose duration can't be an integer were a trapping conversion: now a plain error.
+    for times in ({"startedAt": 1, "endedAt": 1e300}, {"startedAt": 1e300, "endedAt": 1}, {"startedAt": -1e300}):
+        huge = dict(request, event=str(uuid.uuid4()), **times)
+        assert raw((json.dumps(huge) + "\n").encode())["error"]["code"] == "failed", times
     assert service_pid() == first, "bad input must not kill the service"
 
     # The picker's first draw: directory suggestions plus every command, most recent first.
@@ -387,6 +392,14 @@ try:
         assert ask("select", plain_dir, "zzq ", command="zzq commit", mode="suggest")["ok"]
     for bad in ({"command": "", "mode": "suggest"}, {"command": "x", "mode": "other"}, {"command": "smcli search x", "mode": "search"}):
         assert raw((json.dumps({"v": 1, "op": "select", "directory": plain_dir, "query": "q", **bad}) + "\n").encode())["ok"] is False
+    # Picks pass the capture filter of the caller's config (not the one the service started with): a native-history
+    # command the filter rejects, or a secret typed as the query, is acknowledged but not stored.
+    other_config = f"{root}/other-config.json"
+    Path(other_config).write_text(json.dumps({"historyFilter": ["^vault "]}))
+    for command, query in (("vault login", "va"), ("zzq add", "AKIAABCDEFGHIJKLMNOP"), (" zzq add", "")):
+        sent = json.dumps({"v": 1, "op": "select", "directory": plain_dir, "query": query, "command": command,
+                           "mode": "suggest", "config": other_config})
+        assert raw((sent + "\n").encode())["ok"], command
     with sqlite3.connect(env["SMCLI_DB"]) as db:
         assert db.execute("SELECT query, command, kind FROM command_selections").fetchall() == [("zzq ", "zzq commit", "suggest")] * 3
     top = suggested("zzq ")[0]

@@ -35,6 +35,22 @@ struct RankingSignalTests {
         #expect(ProjectContext.discover(empty.path).candidates().isEmpty)
     }
 
+    @Test func `A package manager the manifest names is a known one, never shell syntax`() throws {
+        let root = try temporary()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try write(#"{"packageManager":"npm; touch PWNED #@1","scripts":{"dev":"a"}}"#, "package.json", in: root)
+        try write("", "yarn.lock", in: root)
+        var context = ProjectContext.discover(root.path)
+        // The field is ignored, so the lockfile decides.
+        #expect(context.projects.first?.packageManager == "yarn")
+        #expect(context.candidates().map(\.command).contains("yarn dev"))
+        // A context from elsewhere (a cache, a test) carrying bad text still yields only plain commands.
+        context.projects[0].packageManager = "pnpm && id"
+        let commands = context.candidates().map(\.command)
+        #expect(commands.contains("npm run dev"))
+        #expect(!commands.contains { $0.contains("&&") || $0.contains(";") || $0.contains("#") })
+    }
+
     @Test func `Point to the way out of an operation in progress`() throws {
         let root = try temporary()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -70,8 +86,8 @@ struct RankingSignalTests {
         let log = CapturedHistory(url: root.appendingPathComponent("h.db"))
         try log.append(command: "docker compose up", shell: "zsh", directory: "/r", exitCode: 0, nativeFile: "", session: "s")
         let db = try log.openConnection()
-        try log.recordPick(query: "Docker", command: "docker compose up", kind: "suggest", directory: "/r", on: db)
-        try log.recordPick(query: "other", command: "ls", kind: "search", directory: "/r", on: db)
+        try log.recordPick(query: "Docker", command: "docker compose up", kind: "suggest", directory: "/r", filter: .standard, on: db)
+        try log.recordPick(query: "other", command: "ls", kind: "search", directory: "/r", filter: .standard, on: db)
         #expect(try log.picks(on: db).picks.map(\.query) == ["docker", "other"])
         var config = SmcliConfig()
         config.historyFilter = ["^docker "]
@@ -102,7 +118,7 @@ struct RankingSignalTests {
         #expect(boosted.command == "git commit -m x" && boosted.why == ["used here", "often follows git add -A"])
         // A pick for the same prefix wins too, and says so.
         let db = try log.openConnection()
-        for _ in 0..<3 { try log.recordPick(query: "git ", command: "git add -A", kind: "suggest", directory: "/r", at: now - 10, on: db) }
+        for _ in 0..<3 { try log.recordPick(query: "git ", command: "git add -A", kind: "suggest", directory: "/r", filter: .standard, at: now - 10, on: db) }
         let picked = try log.suggestions(user: NSUserName(), directory: "/r", prefix: "git ", limit: 1, now: now)[0]
         #expect(picked.command == "git add -A" && picked.why?.last == "picked for similar searches")
     }

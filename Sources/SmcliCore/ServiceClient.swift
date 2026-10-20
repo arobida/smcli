@@ -22,6 +22,8 @@ package struct ServiceClient {
     package let mode: Mode
     let executable: URL?
     let environment: [String: String]
+    /// Sent with every request: the service reads this caller's config, not the one it was started with.
+    let config: String
 
     /// The mode comes from `SMCLI_SERVICE`: unset (or `1`/`on`) starts the service as needed, `connect` only uses a
     /// running one, and `0`/`off` keeps every command in-process.
@@ -29,6 +31,8 @@ package struct ServiceClient {
         self.database = database
         self.environment = environment
         location = ServiceLocation(database: database, environment: environment)
+        let home = environment["HOME"].map { URL(fileURLWithPath: $0) } ?? FileManager.default.homeDirectoryForCurrentUser
+        config = SmcliConfig.location(home: home, environment: environment).path
         switch environment["SMCLI_SERVICE"]?.lowercased() {
         case "0", "off", "false", "no": mode = .off
         case "connect": mode = .connect
@@ -61,10 +65,23 @@ package struct ServiceClient {
             let deadline = Date().addingTimeInterval(2)
             while kill(pid, 0) == 0 && Date() < deadline { usleep(10_000) }
         }
+        // The old service already acted on this request. Only a request that is safe to repeat is sent again:
+        // a select would count the pick twice (a record is safe, its event ID makes a retry a no-op).
+        guard Self.repeatable(request.op) else { return response }
         return exchange(request, spawn: true, timeout: timeout)
     }
 
+    /// Requests the old service's answer can be replaced by the new one's without a second effect.
+    static func repeatable(_ op: ServiceRequest.Operation) -> Bool {
+        switch op {
+        case .select, .shutdown: false
+        case .ping, .record, .suggest, .pick, .search, .context, .files, .grep: true
+        }
+    }
+
     private func exchange(_ request: ServiceRequest, spawn: Bool, timeout: Double) -> ServiceResponse? {
+        var request = request
+        if request.config == nil { request.config = config }
         guard let connection = connect(spawn: spawn) else { return nil }
         // The private directory already keeps others out; this also refuses a socket some other user planted.
         guard connection.peerUID() == getuid() else { return nil }

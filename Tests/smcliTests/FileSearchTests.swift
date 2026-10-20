@@ -12,6 +12,37 @@ private let awkwardNames = [
 ]
 
 struct ShellQuotingTests {
+    @Test func `Insert a path only where the shell reads plain words`() {
+        for shell in ["bash", "zsh", "fish"] {
+            for safe in ["", "cat ", "cat a b ", "echo \"done\" ", "echo 'x' ", "echo $(ls ", "echo \"$(ls ", "(cd ", "a\\ b "] {
+                #expect(ShellQuoting.insertable(after: safe, shell: shell), "\(shell): \(safe)")
+            }
+            for unsafe in ["echo \"", "echo 'abc", "echo \"$(ls \"", "echo \\", "echo \"a\\\" "] {
+                #expect(!ShellQuoting.insertable(after: unsafe, shell: shell), "\(shell): \(unsafe)")
+            }
+        }
+        for shell in ["bash", "zsh"] {
+            for unsafe in ["echo `", "echo $'a", "echo ${x:-", "echo \"`"] {
+                #expect(!ShellQuoting.insertable(after: unsafe, shell: shell), "\(shell): \(unsafe)")
+            }
+            // POSIX single quotes have no escapes: this one is closed.
+            #expect(ShellQuoting.insertable(after: "echo 'a\\' ", shell: shell))
+        }
+        // Fish: `\'` stays inside single quotes; backticks and `$'` are plain characters.
+        #expect(!ShellQuoting.insertable(after: "echo 'a\\' ", shell: "fish"))
+        #expect(ShellQuoting.insertable(after: "echo ` ", shell: "fish"))
+    }
+
+    @Test func `Here documents refuse file insertion even across a continued operator`() {
+        for shell in ["bash", "zsh"] {
+            for before in ["cat <<EOF\n", "cat <<-EOF\n\t", "cat <<\'EOF\'\n", "cat <\\\n<EOF\n",
+                           "cat <<EOF\nbody\nEOF\necho ", "echo \'<<\' "] {
+                #expect(!ShellQuoting.insertable(after: before, shell: shell), "\(shell): \(before)")
+            }
+        }
+        #expect(ShellQuoting.insertable(after: "echo \'<<\' ", shell: "fish"))
+    }
+
     @Test func `Leading dash gets ./ and safe names stay bare`() {
         #expect(ShellQuoting.quote("-dash.txt", shell: "bash") == "./-dash.txt")
         #expect(ShellQuoting.quote("--flag", shell: "fish") == "./--flag")
@@ -77,7 +108,7 @@ struct ShellQuotingTests {
 }
 
 struct FFFTests {
-    private func fixture(_ files: [String: String]) throws -> URL {
+    static func fixture(_ files: [String: String]) throws -> URL {
         let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("fff-\(UUID().uuidString)")
         for (name, text) in files {
             let url = root.appendingPathComponent(name)
@@ -88,18 +119,22 @@ struct FFFTests {
     }
 
     @Test func `Search and grep copy their results out of fff`() throws {
-        let root = try fixture(["src/main.swift": "let needle = 1\n", "a b.txt": "x\n", "-dash.txt": "needle too\n"])
+        let root = try Self.fixture(["src/main.swift": "let needle = 1\n", "a b.txt": "x\n", "-dash.txt": "needle too\n"])
         defer { try? FileManager.default.removeItem(at: root) }
         let index = try FFFIndex(root: root.path, watch: false)
         #expect(index.scanned)
         #expect(try index.search("main").first?.path == "src/main.swift")
         #expect(Set(try index.search("").map(\.path)) == ["src/main.swift", "a b.txt", "-dash.txt"])
         #expect(try index.search("zzzqqq").isEmpty)
-        let hits = try index.grep("needle", limit: 10)
+        let grep = try index.grep("needle", limit: 10)
+        #expect(grep.complete)
+        let hits = grep.matches
         #expect(Set(hits.map(\.path)) == ["src/main.swift", "-dash.txt"])
         #expect(hits.first { $0.path == "src/main.swift" }.map { ($0.line, $0.column, $0.text.trimmingCharacters(in: .whitespacesAndNewlines)) }! == (1, 5, "let needle = 1"))
         // Plain text, not a regex.
-        #expect(try index.grep("n.edle", limit: 10).isEmpty)
+        #expect(try index.grep("n.edle", limit: 10).matches.isEmpty)
+        // A page cut short by the limit says more may exist.
+        #expect(try !index.grep("needle", limit: 1).complete)
         #expect(throws: FFFError.self) { try index.search("a\0b") }
         #expect(throws: FFFError.self) { try index.grep("a\0b", limit: 1) }
     }
@@ -112,7 +147,7 @@ struct FFFTests {
     }
 
     @Test func `The watcher shows new and removed files in the same instance`() throws {
-        let root = try fixture(["one.txt": "1"])
+        let root = try Self.fixture(["one.txt": "1"])
         defer { try? FileManager.default.removeItem(at: root) }
         let index = try FFFIndex(root: root.path)
         func wait(for name: String, present: Bool) -> Bool {
@@ -130,7 +165,7 @@ struct FFFTests {
     }
 
     @Test func `The pool reuses an instance per root and evicts the least recently used`() throws {
-        let roots = try (0..<3).map { _ in try fixture(["f.txt": "x"]) }
+        let roots = try (0..<3).map { _ in try Self.fixture(["f.txt": "x"]) }
         defer { roots.forEach { try? FileManager.default.removeItem(at: $0) } }
         let pool = FFFPool(capacity: 2, idleTimeout: 60) { try FFFIndex(root: $0, watch: false) }
         let start = Date()
@@ -148,6 +183,73 @@ struct FFFTests {
         #expect(pool.evictIdle(start.addingTimeInterval(12 + 61)) == 2)
         #expect(pool.instances.isEmpty)
         #expect(try pool.index(for: roots[0].path, now: start.addingTimeInterval(100)).id != a.id)
+    }
+}
+
+struct FFFPoolConcurrencyTests {
+    final class Counter: @unchecked Sendable {
+        private let lock = NSLock()
+        private(set) var made: [String: Int] = [:]
+        private(set) var running = 0, peak = 0
+        func start(_ root: String) { lock.lock(); made[root, default: 0] += 1; running += 1; peak = max(peak, running); lock.unlock() }
+        func end() { lock.lock(); running -= 1; lock.unlock() }
+    }
+
+    @Test func `Cold concurrent requests share one creation per root, and creations are bounded`() throws {
+        let roots = try (0..<4).map { _ in try FFFTests.fixture(["f.txt": "x"]) }
+        defer { roots.forEach { try? FileManager.default.removeItem(at: $0) } }
+        let counter = Counter()
+        let pool = FFFPool(capacity: 2, idleTimeout: 60) { root in
+            counter.start(root)
+            defer { counter.end() }
+            usleep(200_000)  // a slow first scan, so the requests overlap
+            return try FFFIndex(root: root, watch: false)
+        }
+        let seen = Counter()
+        let group = DispatchGroup()
+        for i in 0..<16 {
+            group.enter()
+            Thread.detachNewThread {
+                let root = roots[i % 2].path
+                if let id = try? pool.index(for: root).id { seen.start("\(root) \(id)"); seen.end() }
+                group.leave()
+            }
+        }
+        group.wait()
+        #expect(counter.made == [roots[0].path: 1, roots[1].path: 1])
+        // Every request for a root got the same instance.
+        #expect(seen.made.count == 2 && seen.made.values.reduce(0, +) == 16)
+        let more = DispatchGroup()
+        for root in roots {
+            more.enter()
+            Thread.detachNewThread { _ = try? pool.index(for: root.path); more.leave() }
+        }
+        more.wait()
+        #expect(counter.peak <= 2)
+    }
+
+    @Test func `Requests waiting on a failed creation get its error`() {
+        struct Boom: Error {}
+        let counter = Counter()
+        let pool = FFFPool(capacity: 2, idleTimeout: 60) { root in
+            counter.start(root)
+            defer { counter.end() }
+            usleep(200_000)
+            throw Boom()
+        }
+        let failures = Counter()
+        // Real threads, so all eight overlap the slow creation (concurrentPerform may run them in turn).
+        let group = DispatchGroup()
+        for _ in 0..<8 {
+            group.enter()
+            Thread.detachNewThread {
+                if (try? pool.index(for: "/nowhere")) == nil { failures.start("failed"); failures.end() }
+                group.leave()
+            }
+        }
+        group.wait()
+        #expect(failures.made["failed"] == 8 && counter.made["/nowhere"] == 1)
+        #expect(pool.instances.isEmpty)
     }
 }
 

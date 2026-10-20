@@ -19,6 +19,13 @@ package struct FFFFile: Equatable, Sendable {
 }
 
 /// A line found by content search.
+/// One page of grep matches. `complete` is false when the time budget or the limit stopped the search before every
+/// file was read, so more matches may exist.
+package struct FFFGrep: Equatable, Sendable {
+    package let matches: [FFFMatch]
+    package let complete: Bool
+}
+
 package struct FFFMatch: Equatable, Sendable {
     package let path: String
     package let line: Int
@@ -90,7 +97,7 @@ package final class FFFIndex: @unchecked Sendable {
     }
 
     /// Plain-text content search (smart case), up to `limit` matches within `budget` ms.
-    package func grep(_ query: String, limit: Int, budget: UInt64 = 1000) throws -> [FFFMatch] {
+    package func grep(_ query: String, limit: Int, budget: UInt64 = 1000) throws -> FFFGrep {
         guard !query.utf8.contains(0) else { throw FFFError(message: "NUL in query") }
         lock.lock()
         defer { lock.unlock() }
@@ -100,7 +107,8 @@ package final class FFFIndex: @unchecked Sendable {
                     throw FFFError(message: "Missing grep payload")
                 }
                 defer { fff_free_grep_result(payload) }
-                return try (0..<fff_grep_result_get_count(payload)).map { index in
+                let complete = fff_grep_result_get_next_file_offset(payload) == 0
+                let matches = try (0..<fff_grep_result_get_count(payload)).map { index in
                     guard let match = fff_grep_result_get_match(payload, index),
                           let path = fff_grep_match_get_relative_path(match) else {
                         throw FFFError(message: "Missing grep match")
@@ -110,6 +118,7 @@ package final class FFFIndex: @unchecked Sendable {
                                     text: fff_grep_match_get_line_content(match).map { String(cString: $0) } ?? "",
                                     git: fff_grep_match_get_git_status(match).map { String(cString: $0) })
                 }
+                return FFFGrep(matches: matches, complete: complete)
             }
         }
     }

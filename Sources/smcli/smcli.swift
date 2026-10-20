@@ -5,7 +5,7 @@ import SmcliSearch
 @main
 struct Smcli {
     static let usage = """
-    Usage: smcli init [--model NAME | --potion [DIR] | --builtin | --default]
+    Usage: smcli init [--model NAME | --potion [DIR] | --builtin | --default] [--keys [ctrl-r,left|none]]
            smcli history [--json]
            smcli shell-init bash|zsh|fish
            smcli search [query...] [--command NAME] [--subcommand NAME] [--since TIME] [--before TIME]
@@ -23,8 +23,9 @@ struct Smcli {
     search filters are exact; TIME is 30m, 12h, 7d, 2w, YYYY-MM-DD, or ISO 8601, matched against the last run.
     context prints the repository, worktree, branch, Git status and project manifests for a directory (cached by the service).
     reindex re-embeds every command for search; health checks the index and the embedding model.
-    pick opens the history picker that shell-init binds to Up and Ctrl-R (SMCLI_NO_KEYS=1 to skip; keys another tool already
-    bound are left alone). SMCLI_EXTRA_KEYS=1 also binds Left on an empty line, Ctrl-Right and Alt-; (Bash and Zsh).
+    pick opens the history picker that shell-init binds to Up, plus Ctrl-R and Left on an empty line as chosen in `smcli init`
+    (asked, or set with `--keys ctrl-r,left`, `--keys ctrl-r`, `--keys left` or `--keys none`); SMCLI_NO_KEYS=1 skips them all, and keys another tool already bound are left alone.
+    SMCLI_EXTRA_KEYS=1 also binds Left on an empty line, Ctrl-Right and Alt-; (Bash and Zsh).
     In the picker, Ctrl-T cycles history, files (fff name search) and grep (fff content search) for the repository; they need
     the service. Enter inserts the path at the cursor, quoted for your shell (SMCLI_SHELL), and never runs anything.
     suggest and search also weigh the project (nearest manifest), the shell session's previous command (SMCLI_SESSION, set by
@@ -64,7 +65,10 @@ struct Smcli {
             let service = ServiceClient(database: captured.url, environment: environment, cliExecutable: Bundle.main.executableURL)
             if arguments.count == 2 && arguments[0] == "shell-init" {
                 let executable = Bundle.main.executableURL?.path ?? URL(fileURLWithPath: CommandLine.arguments[0]).path
-                print(try shellIntegration(shell: arguments[1], executable: executable))
+                // A broken config falls back to the default keys rather than leaving the shell without hooks.
+                let config = try? SmcliConfig.load(from: configURL)
+                print(try shellIntegration(shell: arguments[1], executable: executable,
+                                           ctrlR: config?.ctrlRKey ?? true, left: config?.leftKey ?? false))
             } else if (arguments.count == 9 || arguments.count == 10) && arguments[0] == "record" {
                 // record <shell> <session> <directory> <status> [<pipestatus>] <started> <ended> <native HISTFILE> <command>
                 // The pipestatus word is optional; hooks from earlier versions send nine arguments without it.
@@ -314,6 +318,8 @@ func health(json: Bool, captured: CapturedHistory, home: URL, environment: [Stri
 func record(command: String, shell: String, directory: String, exitCode: Int, nativeFile: String, session: String,
             startedAt: Double?, endedAt: Double?, pipestatus: [Int]? = nil, captured: CapturedHistory,
             service: ServiceClient) throws {
+    // Before the service is asked (or started on this database).
+    try captured.checkSeparate(from: nativeFile)
     let event = UUID().uuidString.lowercased()
     // Stamp the start now if the shell didn't, so a retry stores the same time.
     let started = startedAt ?? Date().timeIntervalSince1970

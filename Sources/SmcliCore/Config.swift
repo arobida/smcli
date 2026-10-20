@@ -15,6 +15,10 @@ package struct SmcliConfig: Codable, Equatable {
     package var cwdFilter: [String]?
     /// Skip commands containing likely API keys and tokens; on unless set to false.
     package var secretsFilter: Bool?
+    /// Picker keys bound by shell-init, chosen in `smcli init`: Ctrl-R (on unless false) and Left on an empty line
+    /// (off unless true). Up is always bound; SMCLI_NO_KEYS=1 still skips them all.
+    package var ctrlRKey: Bool?
+    package var leftKey: Bool?
 
     package static func location(home: URL, environment: [String: String]) -> URL {
         if let path = environment["SMCLI_CONFIG"], !path.isEmpty { return URL(fileURLWithPath: path) }

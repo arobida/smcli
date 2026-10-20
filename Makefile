@@ -47,8 +47,10 @@ test: fff
 	bash scripts/test.sh
 
 # Scores suggest and search ranking on the fixed query set (MRR, top-1, top-3) and lists the misses.
+# Fails when the tests fail; the filtered report is printed either way.
 ranking: fff
-	$(SWIFT) test --filter RankingQualityTests 2>&1 | grep -E "^ranking|^  (suggest|search|wanted)|^      why|error:|✘|Test run" || true
+	@log=$$(mktemp); $(SWIFT) test --filter RankingQualityTests > "$$log" 2>&1; status=$$?; \
+	grep -E "^ranking|^  (suggest|search|wanted)|^      why|error:|✘|Test run" "$$log"; rm -f "$$log"; exit $$status
 
 # Black-box baseline of the current CLI and generated hooks; never reads real history.
 baseline: release
@@ -67,9 +69,8 @@ fff-smoke: fff-build
 run: build
 	$(SWIFT) run smcli $(ARGS)
 
-# Removes build output, keeping the newest dist/ binary that dist/smcli points to (shell hooks may use it).
+# Removes build output, keeping the newest dist/ CLI and service pair and their symlinks (shell hooks may use them).
 clean:
 	$(SWIFT) package clean
 	rm -rf .build/release
-	@latest=$$(readlink $(DIST)/smcli 2>/dev/null); \
-	for f in $(DIST)/smcli-*; do [ -e "$$f" ] && [ "$$(basename $$f)" != "$$latest" ] && rm -f "$$f"; done; true
+	@bash scripts/clean-dist.sh $(DIST)

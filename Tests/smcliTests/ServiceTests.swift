@@ -54,7 +54,7 @@ struct ServiceTests {
             ("git", "git push", now - 3_600), ("g", "git status", now - 86_400), ("make", "make test", now - 5 * 86_400),
             ("", "ls 'my dir'", now - 7_200), ("echo hé", "echo héllo", now - 100),
         ]
-        for pick in picks { try log.recordPick(query: pick.query, command: pick.command, kind: "suggest", directory: "/", at: pick.time, on: db) }
+        for pick in picks { try log.recordPick(query: pick.query, command: pick.command, kind: "suggest", directory: "/", filter: .standard, at: pick.time, on: db) }
         #expect(try log.runs(user: NSUserName(), on: db) == runs)
         // Built from half the runs and then fed the rest, as the service does between records.
         var index = SuggestionIndex(runs: Array(runs.prefix(200)), picks: try log.picks(on: db))
@@ -210,5 +210,15 @@ struct ServiceTests {
         #expect(ServiceClient.serviceExecutable(beside: URL(fileURLWithPath: "/x/smcli")).path == "/x/smcli-service")
         #expect(ServiceClient.serviceExecutable(beside: URL(fileURLWithPath: "/x/smcli-20261019-abc")).path
                 == "/x/smcli-service-20261019-abc")
+    }
+}
+
+struct ServiceClientReplayTests {
+    @Test func `After replacing an old build's service, only repeatable requests are sent again`() {
+        #expect(!ServiceClient.repeatable(.select))
+        #expect(!ServiceClient.repeatable(.shutdown))
+        for op: ServiceRequest.Operation in [.ping, .record, .suggest, .pick, .search, .context, .files, .grep] {
+            #expect(ServiceClient.repeatable(op))
+        }
     }
 }

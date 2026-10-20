@@ -21,6 +21,8 @@ struct Picker {
     var savedQueries: [Mode: String] = [:]
     /// Results for `fetched`, so a key that doesn't change the query doesn't search again.
     var hits: [FileHit] = []
+    /// What a files or grep search returned; `complete` is false when grep stopped early.
+    struct FileResults { var hits: [FileHit]; var complete = true }
     var fetched: (mode: Mode, query: String)?
 
     init(suggestions: [String], captured: [String: CommandStats], native: [String], query: String = "") {
@@ -101,7 +103,7 @@ struct Picker {
     /// Runs the picker on the controlling terminal. `files` searches the service in the files and grep modes;
     /// nil when there is none. Returns the choice, or nil if cancelled.
     mutating func run(search: ((String) async throws -> [String])?,
-                      files: ((Mode, String) throws -> [FileHit])? = nil) async throws -> Choice? {
+                      files: ((Mode, String) throws -> FileResults)? = nil) async throws -> Choice? {
         let tty = open("/dev/tty", O_RDWR | O_CLOEXEC)
         guard tty >= 0 else { throw HistoryError(message: "pick needs a terminal.") }
         defer { close(tty) }
@@ -164,15 +166,16 @@ struct Picker {
     }
 
     /// Searches for the current query; an unreachable service or a failed search shows as a status line.
-    private mutating func refetch(_ files: ((Mode, String) throws -> [FileHit])?) {
+    private mutating func refetch(_ files: ((Mode, String) throws -> FileResults)?) {
         fetched = (mode, query)
         hits = []
         selected = 0
         guard let files else { status = "files and grep need smcli-service"; return }
         guard mode == .files || !query.isEmpty else { status = "type to search file contents"; return }
         do {
-            hits = try files(mode, query)
-            status = ""
+            let results = try files(mode, query)
+            hits = results.hits
+            status = results.complete ? "" : "\(hits.count) grep results so far · search stopped early, type more to narrow it"
         } catch {
             status = error.localizedDescription
         }
@@ -189,8 +192,8 @@ struct Picker {
         let mode = query.isEmpty ? "suggestions for \(FileManager.default.currentDirectoryPath)"
             : semantic != nil && semanticQuery == query ? "semantic search" : "\(current.count) matches"
         var out = "\u{1B}[H\u{1B}[2J"
-        out += " \u{1B}[38;5;141m❯\u{1B}[0m \(query)\u{1B}[s\n"
-        out += " \u{1B}[2m\(Self.truncate(status.isEmpty ? mode : status, width - 2))\u{1B}[0m\n"
+        out += " \u{1B}[38;5;141m❯\u{1B}[0m \(Self.visible(query))\u{1B}[s\n"
+        out += " \u{1B}[2m\(Self.truncate(Self.visible(status.isEmpty ? mode : status), width - 2))\u{1B}[0m\n"
         for row in rows.dropFirst(top).prefix(visible) {
             switch row {
             case .header(let title):
@@ -199,7 +202,7 @@ struct Picker {
             case .command(let index):
                 let command = current[index]
                 let mark = isSuggestion(command) ? "\u{1B}[38;5;141m★\u{1B}[0m" : " "
-                let line = Self.truncate(command.replacingOccurrences(of: "\n", with: "↵ "), width - 4)
+                let line = Self.truncate(Self.visible(command), width - 4)
                 if index == selected {
                     out += "\u{1B}[38;5;141m▌\u{1B}[0m\(mark)\u{1B}[48;5;236m\u{1B}[38;5;231m \(line)\u{1B}[K\u{1B}[0m\n"
                 } else {
@@ -220,15 +223,15 @@ struct Picker {
         let label = mode == .files ? "files" : "grep"
         let summary = hits.isEmpty ? (status.isEmpty ? "no matches" : status) : (status.isEmpty ? "\(hits.count) \(label) results" : status)
         var out = "\u{1B}[H\u{1B}[2J"
-        out += " \u{1B}[38;5;141m\(label) ❯\u{1B}[0m \(query)\u{1B}[s\n"
-        out += " \u{1B}[2m\(Self.truncate(summary, width - 2))\u{1B}[0m\n"
+        out += " \u{1B}[38;5;141m\(label) ❯\u{1B}[0m \(Self.visible(query))\u{1B}[s\n"
+        out += " \u{1B}[2m\(Self.truncate(Self.visible(summary), width - 2))\u{1B}[0m\n"
         for (index, hit) in hits.enumerated().dropFirst(top).prefix(visible) {
-            let git = (hit.git ?? "").padding(toLength: 2, withPad: " ", startingAt: 0)
+            let git = Self.visible(hit.git ?? "").padding(toLength: 2, withPad: " ", startingAt: 0)
             var name = hit.path
             if let line = hit.line { name += ":\(line)" + (hit.text.map { "  " + $0.trimmingCharacters(in: .whitespaces) } ?? "") }
-            let source = hit.provenance.joined(separator: "+")
+            let source = Self.visible(hit.provenance.joined(separator: "+"))
             let room = max(4, width - 8 - source.count)
-            let text = Self.truncate(name.replacingOccurrences(of: "\n", with: "↵ "), room)
+            let text = Self.truncate(Self.visible(name), room)
             let gap = String(repeating: " ", count: max(1, room - text.count + 1))
             if index == selected {
                 out += "\u{1B}[38;5;141m▌\u{1B}[0m\u{1B}[48;5;236m\u{1B}[38;5;231m \(git) \(text)\(gap)\u{1B}[2m\(source)\u{1B}[K\u{1B}[0m\n"
@@ -238,6 +241,24 @@ struct Picker {
         }
         out += "\u{1B}[\(size.rows);1H\u{1B}[2m type to search · ↑↓ move · enter insert path · ^T \(mode == .files ? "grep" : "history") · esc cancel\u{1B}[0m"
         return out + "\u{1B}[u"
+    }
+
+    /// Display form of text from history or a repository: control characters (ESC, C1 CSI...) are shown as `^[`-style
+    /// caret notation or `<U+009B>`, never sent to the terminal, so file names and contents can't move the cursor,
+    /// clear the screen or forge picker rows. The original text is still what gets inserted.
+    static func visible(_ text: String) -> String {
+        var out = ""
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 0x0A: out += "↵ "
+            case 0x09: out += "  "
+            case 0..<0x20: out += "^" + String(UnicodeScalar(UInt8(scalar.value + 0x40)))
+            case 0x7F: out += "^?"
+            case 0x80..<0xA0: out += String(format: "<U+%04X>", scalar.value)
+            default: out.unicodeScalars.append(scalar)
+            }
+        }
+        return out
     }
 
     private static func truncate(_ text: String, _ width: Int) -> String {
@@ -348,7 +369,7 @@ func pick(_ arguments: [String], captured: CapturedHistory, service: ServiceClie
         return try await engine.search(query, corpus: corpus, limit: 50, programs: programs, signals: signals).map(\.command)
     }
     #endif
-    let files: (Picker.Mode, String) throws -> [FileHit] = { mode, query in
+    let files: (Picker.Mode, String) throws -> Picker.FileResults = { mode, query in
         var request = ServiceRequest(op: mode == .files ? .files : .grep)
         (request.directory, request.query, request.limit) = (directory, query, 100)
         // The first search in a repository waits for fff's scan.
@@ -356,7 +377,7 @@ func pick(_ arguments: [String], captured: CapturedHistory, service: ServiceClie
             throw HistoryError(message: "files and grep need smcli-service (off, unreachable or too slow)")
         }
         guard response.ok else { throw HistoryError(message: response.error?.message ?? "search failed") }
-        return response.files ?? []
+        return .init(hits: response.files ?? [], complete: response.partial != true)
     }
     guard let chosen = try await picker.run(search: search, files: service.mode == .off ? nil : files) else { exit(1) }
     switch chosen {
@@ -364,9 +385,11 @@ func pick(_ arguments: [String], captured: CapturedHistory, service: ServiceClie
         // Remembered for ranking because the user chose it for this query; best effort, in-process when no service.
         var request = ServiceRequest(op: .select)
         (request.directory, request.command, request.query, request.mode) = (directory, command, query, semantic ? "search" : "suggest")
-        if service.send(request, timeout: 2) == nil, !isSmcliCommand(command), let db = try? captured.openConnection() {
+        if service.send(request, timeout: 2) == nil, !isSmcliCommand(command),
+           let filter = try? CaptureFilter(config: SmcliConfig.load(from: SmcliConfig.location(home: home, environment: environment))),
+           let db = try? captured.openConnection() {
             try? captured.recordPick(query: String(query.prefix(1000)), command: command, kind: request.mode ?? "suggest",
-                                     directory: directory, on: db)
+                                     directory: directory, filter: filter, on: db)
         }
         print(command)
     case .file(let hit, let mode, let query):
@@ -374,8 +397,14 @@ func pick(_ arguments: [String], captured: CapturedHistory, service: ServiceClie
         var request = ServiceRequest(op: .select)
         (request.directory, request.path, request.mode, request.query) = (directory, hit.path, mode.rawValue, query)
         _ = service.send(request, timeout: 2)
+        // The adapter passes the text left of the cursor; without it (a hook from an older build) we can't tell.
+        let shell = environment["SMCLI_SHELL"] ?? "bash"
+        guard let before = environment["SMCLI_LBUFFER"], ShellQuoting.insertable(after: before, shell: shell) else {
+            FileHandle.standardError.write(Data("smcli: not inserting a path inside an open quote or substitution, or after here-document syntax; finish the command first\(environment["SMCLI_LBUFFER"] == nil ? " (or reload smcli's shell-init)" : "").\n".utf8))
+            exit(1)
+        }
         // Not a command: the adapter inserts this word at the cursor instead of replacing the line.
-        print(ShellQuoting.quote(hit.insert, shell: environment["SMCLI_SHELL"] ?? "bash"))
+        print(ShellQuoting.quote(hit.insert, shell: shell))
         exit(10)
     }
 }

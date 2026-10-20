@@ -2,8 +2,67 @@ import Foundation
 import SmcliCore
 import SmcliSearch
 
-/// `smcli init`: choose the search embedding model, interactively or with --model/--potion/--builtin.
+/// Asks yes/no, with the current answer as the default. Nil at end of input.
+private func ask(_ question: String, default yes: Bool) -> Bool? {
+    while true {
+        print("\(question) [\(yes ? "Y/n" : "y/N")]: ", terminator: "")
+        fflush(stdout)
+        guard let line = readLine() else { return nil }
+        switch line.trimmingCharacters(in: .whitespaces).lowercased() {
+        case "": return yes
+        case "y", "yes": return true
+        case "n", "no": return false
+        default: continue
+        }
+    }
+}
+
+/// Asks which picker keys shell-init binds, and saves them. Up is always bound.
+private func chooseKeys(configURL: URL) throws {
+    var config = try SmcliConfig.load(from: configURL)
+    guard let ctrlR = ask("Open the history picker with Ctrl-R?", default: config.ctrlRKey ?? true),
+          let left = ask("Open it with Left arrow when the command line is empty?", default: config.leftKey ?? false) else {
+        throw HistoryError(message: "No choice made; key bindings unchanged.")
+    }
+    (config.ctrlRKey, config.leftKey) = (ctrlR, left)
+    try config.save(to: configURL)
+    print("Saved key bindings to \(configURL.path). Open a new shell (or re-run shell-init) to use them.")
+}
+
+/// Saves keys given as `--keys ctrl-r,left` (either, both, or `none`), for install scripts.
+private func setKeys(_ list: String, configURL: URL) throws {
+    let names = Set(list.lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
+    guard names.isSubset(of: ["ctrl-r", "left", "none"]), !names.isEmpty, !(names.contains("none") && names.count > 1) else {
+        throw HistoryError(message: "--keys takes ctrl-r, left, ctrl-r,left or none.")
+    }
+    var config = try SmcliConfig.load(from: configURL)
+    (config.ctrlRKey, config.leftKey) = (names.contains("ctrl-r"), names.contains("left"))
+    try config.save(to: configURL)
+    let chosen = ["Up"] + (names.contains("ctrl-r") ? ["Ctrl-R"] : []) + (names.contains("left") ? ["Left on an empty line"] : [])
+    print("The picker opens with \(chosen.joined(separator: ", ")). Saved \(configURL.path).")
+}
+
+/// `smcli init`: choose the picker keys and the search embedding model. With no arguments both are asked.
+/// `--keys LIST` sets the keys without asking (`--keys` alone asks); it combines with the model flags
+/// --model/--potion/--builtin/--default, which never ask about keys, so scripts don't block on a question.
 func initialize(_ arguments: [String], configURL: URL, environment: [String: String]) async throws {
+    var arguments = arguments
+    if let flag = arguments.firstIndex(of: "--keys") {
+        let value = arguments.index(after: flag) < arguments.endIndex && !arguments[flag + 1].hasPrefix("--")
+            ? arguments[flag + 1] : nil
+        arguments.removeSubrange(flag...(value == nil ? flag : flag + 1))
+        if let value {
+            try setKeys(value, configURL: configURL)
+        } else {
+            guard isatty(STDIN_FILENO) != 0 else {
+                throw HistoryError(message: "smcli init --keys needs a terminal to ask; pass e.g. --keys ctrl-r,left.")
+            }
+            try chooseKeys(configURL: configURL)
+        }
+        if arguments.isEmpty { return }
+    } else if arguments.isEmpty && isatty(STDIN_FILENO) != 0 {
+        try chooseKeys(configURL: configURL)
+    }
     var config = try SmcliConfig.load(from: configURL)
     let ollama = Ollama(environment: environment)
     var choice: String?
@@ -64,7 +123,7 @@ func initialize(_ arguments: [String], configURL: URL, environment: [String: Str
         print("The next search re-embeds your history with it.")
         return
     case let arguments where arguments.count == 2 && arguments[0] == "--model": choice = arguments[1]
-    default: throw HistoryError(message: "Usage: smcli init [--model NAME | --potion [DIR] | --builtin | --default]")
+    default: throw HistoryError(message: "Usage: smcli init [--model NAME | --potion [DIR] | --builtin | --default] [--keys [ctrl-r,left|none]]")
     }
 
     guard let choice else { return }  // Nothing offered: keep any existing choice.
