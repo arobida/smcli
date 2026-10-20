@@ -23,7 +23,8 @@ struct Smcli {
     search filters are exact; TIME is 30m, 12h, 7d, 2w, YYYY-MM-DD, or ISO 8601, matched against the last run.
     context prints the repository, worktree, branch, Git status and project manifests for a directory (cached by the service).
     reindex re-embeds every command for search; health checks the index and the embedding model.
-    pick opens the history picker that shell-init binds to Up, plus Ctrl-R and Left on an empty line as chosen in `smcli init`
+    pick opens the history picker: Up and Ctrl-R show all history, newest first; Left on an empty line (pick --suggest) shows
+    only this directory's suggestions; Tab searches all history semantically. Ctrl-R and Left are chosen in `smcli init`
     (asked, or set with `--keys ctrl-r,left`, `--keys ctrl-r`, `--keys left` or `--keys none`); SMCLI_NO_KEYS=1 skips them all, and keys another tool already bound are left alone.
     SMCLI_EXTRA_KEYS=1 also binds Left on an empty line, Ctrl-Right and Alt-; (Bash and Zsh).
     In the picker, Ctrl-T cycles history, files (fff name search) and grep (fff content search) for the repository; they need
