@@ -176,8 +176,7 @@ func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, lef
         fi
         # smcli: history picker on Up and Ctrl-R, for keys no other tool has bound. Set SMCLI_NO_KEYS=1 before this line to
         # keep readline's keys; SMCLI_EXTRA_KEYS=1 adds Left on an empty line, Ctrl-Right and Alt-;.
-        if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} && ${_smcli_keys-} != 1 ]] && (( BASH_VERSINFO[0] >= 4 )); then
-            _smcli_keys=1
+        if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]] && (( BASH_VERSINFO[0] >= 4 )); then
             _smcli_pick_bin=\#(binary)
             # Bash 4 counts READLINE_POINT in bytes (5.0 and later in characters) while ${var:offset} counts characters,
             # so on Bash 4 slice and measure in the C locale. The local LC_ALL ends with the function.
@@ -188,7 +187,7 @@ func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, lef
             _smcli_pick() {
                 local chosen code
                 _smcli_split
-                chosen=$(SMCLI_SHELL=bash SMCLI_LBUFFER=$_smcli_before "$_smcli_pick_bin" pick "$READLINE_LINE" </dev/tty)
+                chosen=$(SMCLI_SHELL=bash SMCLI_LBUFFER=$_smcli_before "$_smcli_pick_bin" pick "$@" "$READLINE_LINE" </dev/tty)
                 code=$?
                 if (( code == 0 )); then
                     READLINE_LINE=$chosen
@@ -202,9 +201,9 @@ func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, lef
                 fi
                 unset _smcli_before _smcli_after _smcli_bytes
             }
-            # Left opens the picker only on an empty line; otherwise it moves the cursor as usual.
+            # Left opens the picker on directory suggestions only on an empty line; otherwise it moves the cursor as usual.
             _smcli_pick_left() {
-                if [[ -z $READLINE_LINE ]]; then _smcli_pick
+                if [[ -z $READLINE_LINE ]]; then _smcli_pick --suggest
                 elif (( READLINE_POINT > 0 )); then READLINE_POINT=$((READLINE_POINT - 1)); fi
             }
             # Bind $1 to function $2 unless something other than readline's own $3 (or nothing) holds it.
@@ -294,12 +293,11 @@ func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, lef
         fi
         # smcli: history picker on Up and Ctrl-R, for keys no other tool has bound. Set SMCLI_NO_KEYS=1 before this line to
         # keep zle's keys; SMCLI_EXTRA_KEYS=1 adds Left on an empty line, Ctrl-Right and Alt-;.
-        if [[ -o interactive && -z ${SMCLI_NO_KEYS-} && ${_smcli_keys-} != 1 ]]; then
-            _smcli_keys=1
+        if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
             _smcli_pick_bin=\#(binary)
             _smcli_pick() {
                 local chosen code
-                chosen=$(SMCLI_SHELL=zsh SMCLI_LBUFFER=$LBUFFER "$_smcli_pick_bin" pick "$BUFFER" </dev/tty)
+                chosen=$(SMCLI_SHELL=zsh SMCLI_LBUFFER=$LBUFFER "$_smcli_pick_bin" pick "$@" "$BUFFER" </dev/tty)
                 code=$?
                 if (( code == 0 )); then
                     BUFFER=$chosen
@@ -315,9 +313,9 @@ func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, lef
                 if [[ $BUFFER == *$'\n'* ]]; then zle up-line-or-history; else _smcli_pick; fi
             }
             zle -N _smcli_pick
-            # Left opens the picker only on an empty line; otherwise it moves the cursor as usual.
+            # Left opens the picker on directory suggestions only on an empty line; otherwise it moves the cursor as usual.
             _smcli_pick_left() {
-                if [[ -z $BUFFER ]]; then _smcli_pick; else zle backward-char; fi
+                if [[ -z $BUFFER ]]; then _smcli_pick --suggest; else zle backward-char; fi
             }
             zle -N _smcli_pick_up
             zle -N _smcli_pick_left
@@ -396,13 +394,12 @@ func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, lef
         end
         # smcli: history picker on Up and Ctrl-R, for keys you haven't bound yourself. Set SMCLI_NO_KEYS=1 before this line to
         # keep fish's keys. Selections are put on the command line, never run; autosuggestions are left alone.
-        if status is-interactive; and test -z "$SMCLI_NO_KEYS"; and not set -q _smcli_keys
-            set -g _smcli_keys 1
+        if status is-interactive; and test -z "$SMCLI_NO_KEYS"
             function _smcli_pick
                 # The text left of the cursor, so smcli can refuse to insert a path inside an open quote.
                 set -l before (commandline -c | string collect)
                 set -lx SMCLI_LBUFFER "$before"
-                set -l chosen (SMCLI_SHELL=fish command $_smcli_bin pick (commandline | string collect) </dev/tty)
+                set -l chosen (SMCLI_SHELL=fish command $_smcli_bin pick $argv (commandline | string collect) </dev/tty)
                 set -l code $status
                 if test $code -eq 0
                     commandline -r -- (string join \n -- $chosen | string collect)
@@ -431,10 +428,10 @@ func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, lef
                     set -a _smcli_kept (string escape -- $argv[1])
                 end
             end
-            # Left opens the picker only on an empty line; otherwise it moves the cursor as usual.
+            # Left opens the picker on directory suggestions only on an empty line; otherwise it moves the cursor as usual.
             function _smcli_pick_left
                 if test -z (commandline | string collect)
-                    _smcli_pick
+                    _smcli_pick --suggest
                 else
                     commandline -f backward-char
                 end

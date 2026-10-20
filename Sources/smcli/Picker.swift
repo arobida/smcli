@@ -2,8 +2,8 @@ import Foundation
 import SmcliCore
 import SmcliSearch
 
-/// Interactive history picker bound to Up/Ctrl-R by `shell-init`. Opens on ranked suggestions for this directory;
-/// typing filters every known command. Draws on /dev/tty and prints the chosen command to stdout.
+/// Interactive history picker bound by `shell-init`: Left opens ranked suggestions for this directory, Up/Ctrl-R all history;
+/// typing filters that list and Tab searches all history semantically. Draws on /dev/tty and prints the chosen command to stdout.
 struct Picker {
     /// Suggestions first (ranked for this directory), then every other command, most recent first.
     let candidates: [String]
@@ -348,8 +348,11 @@ func pick(_ arguments: [String], captured: CapturedHistory, service: ServiceClie
     // Native files are best-effort, as in search.
     let native = try historyFiles(home: home, environment: environment)
         .flatMap { (try? $0.read())?.components(separatedBy: "\n") ?? [] }
-    var picker = Picker(suggestions: suggestions, recent: recent, native: native,
-                        query: arguments.joined(separator: " "))
+    // Left (--suggest) shows only this directory's suggestions; Up and Ctrl-R show all history, newest first.
+    let suggestOnly = arguments.first == "--suggest"
+    var picker = suggestOnly
+        ? Picker(suggestions: suggestions, recent: [], native: [], query: arguments.dropFirst().joined(separator: " "))
+        : Picker(suggestions: [], recent: recent, native: native, query: arguments.joined(separator: " "))
     var search: ((String) async throws -> [String])? = nil
     #if canImport(ProximaKit)
     // Built on the first search, not per keystroke: loading an embedding model would dominate latency.
@@ -388,7 +391,7 @@ func pick(_ arguments: [String], captured: CapturedHistory, service: ServiceClie
         if service.send(request, timeout: 2) == nil, !isSmcliCommand(command),
            let filter = try? CaptureFilter(config: SmcliConfig.load(from: SmcliConfig.location(home: home, environment: environment))),
            let db = try? captured.openConnection() {
-            try? captured.recordPick(query: String(query.prefix(1000)), command: command, kind: request.mode ?? "suggest",
+            _ = try? captured.recordPick(query: String(query.prefix(1000)), command: command, kind: request.mode ?? "suggest",
                                      directory: directory, filter: filter, on: db)
         }
         print(command)
