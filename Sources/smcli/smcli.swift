@@ -5,13 +5,13 @@ import SmcliSearch
 @main
 struct Smcli {
     static let usage = """
-    Usage: smcli init [--model NAME | --potion [DIR] | --builtin | --default] [--keys [ctrl-r,left|none]]
+    Usage: smcli init [--model NAME | --potion [DIR] | --builtin | --default] [--keys [ctrl-r,left,ctrl-t,ctrl-g|none]]
            smcli history [--json]
            smcli shell-init bash|zsh|fish
            smcli search [query...] [--command NAME] [--subcommand NAME] [--since TIME] [--before TIME]
                         [--min-runs N] [--author NAME] [--dir PATH] [--flag NAME] [--limit N] [--json]
            smcli suggest [prefix...] [--dir PATH] [--limit N] [--json]
-           smcli pick [query...]
+           smcli pick [--suggest|--files|--grep] [query...]
            smcli context [--json] [--dir PATH]
            smcli reindex
            smcli health [--json]
@@ -24,11 +24,12 @@ struct Smcli {
     context prints the repository, worktree, branch, Git status and project manifests for a directory (cached by the service).
     reindex re-embeds every command for search; health checks the index and the embedding model.
     pick opens the history picker: Up and Ctrl-R show all history, newest first; Left on an empty line (pick --suggest) shows
-    only this directory's suggestions; Tab searches all history semantically. Ctrl-R and Left are chosen in `smcli init`
-    (asked, or set with `--keys ctrl-r,left`, `--keys ctrl-r`, `--keys left` or `--keys none`); SMCLI_NO_KEYS=1 skips them all, and keys another tool already bound are left alone.
+    only this directory's suggestions; Tab searches all history semantically. Ctrl-R, Left, Ctrl-T and Ctrl-G are chosen in `smcli init`
+    (asked, or set with a list such as `--keys ctrl-r,left,ctrl-t,ctrl-g`, `--keys ctrl-r` or `--keys none`); SMCLI_NO_KEYS=1 skips them all, and keys another tool already bound are left alone.
     SMCLI_EXTRA_KEYS=1 also binds Left on an empty line, Ctrl-Right and Alt-; (Bash and Zsh).
-    In the picker, Ctrl-T cycles history, files (fff name search) and grep (fff content search) for the repository; they need
-    the service. Enter inserts the path at the cursor, quoted for your shell (SMCLI_SHELL), and never runs anything.
+    Ctrl-T at the prompt (pick --files) opens files mode on this directory's entries; type to filter, Ctrl-F shows only
+    directories, then only files, Tab searches the whole project with fff. Ctrl-G (pick --grep) searches file contents with fff.
+    In the picker, Ctrl-T and Ctrl-G switch to files and grep and back to history; project search and grep need the service. Enter inserts the path at the cursor, quoted for your shell (SMCLI_SHELL), and never runs anything.
     suggest and search also weigh the project (nearest manifest), the shell session's previous command (SMCLI_SESSION, set by
     shell-init), commands you picked in the picker for a similar query, scripts and targets named in the project's manifest, and
     an operation in progress (a rebase suggests `git rebase --continue`); --json and search show why. SMCLI_RANKING_OFF=project,
@@ -69,7 +70,8 @@ struct Smcli {
                 // A broken config falls back to the default keys rather than leaving the shell without hooks.
                 let config = try? SmcliConfig.load(from: configURL)
                 print(try shellIntegration(shell: arguments[1], executable: executable,
-                                           ctrlR: config?.ctrlRKey ?? true, left: config?.leftKey ?? false))
+                                           ctrlR: config?.ctrlRKey ?? true, left: config?.leftKey ?? false,
+                                           ctrlT: config?.ctrlTKey ?? true, ctrlG: config?.ctrlGKey ?? true))
             } else if (arguments.count == 9 || arguments.count == 10) && arguments[0] == "record" {
                 // record <shell> <session> <directory> <status> [<pipestatus>] <started> <ended> <native HISTFILE> <command>
                 // The pipestatus word is optional; hooks from earlier versions send nine arguments without it.

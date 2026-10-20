@@ -7,8 +7,8 @@
 #   --prefix DIR    where the executables go (default ~/.local/bin)
 #   --from DIR      a directory holding smcli and smcli-service (default: beside this script, else build)
 #   --shells LIST   zsh,bash,fish to hook (default: your login shell; `all`: every one installed; `none`)
-#   --keys LIST     picker keys: ctrl-r,left | ctrl-r | left | none (default: ask in a terminal, else ctrl-r)
-#   --yes           don't ask anything; with no --keys, keeps the default keys (Up and Ctrl-R)
+#   --keys LIST     picker keys: any of ctrl-r,left,ctrl-t,ctrl-g, or none (default: ask in a terminal, else ctrl-r,ctrl-t,ctrl-g)
+#   --yes           don't ask anything; with no --keys, keeps the default keys (Up, Ctrl-R, Ctrl-T and Ctrl-G)
 set -euo pipefail
 
 prefix="$HOME/.local/bin"

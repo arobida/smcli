@@ -51,7 +51,7 @@ final class FileSearch: @unchecked Sendable {
                 let page = try index.grep(query, limit: limit)
                 complete = page.complete
                 hits = page.matches.map {
-                    FileHit(path: $0.path, insert: Self.relative($0.path, root: root, from: directory),
+                    FileHit(path: $0.path, insert: FileHit.relative($0.path, root: root, from: directory),
                             provenance: ["grep"] + (picked[$0.path] != nil ? ["picked"] : []), git: Self.git($0.git),
                             line: $0.line, column: $0.column, text: $0.text)
                 }
@@ -67,7 +67,7 @@ final class FileSearch: @unchecked Sendable {
                 }
                 let ranked = found.enumerated().sorted { key($0) != key($1) ? key($0) < key($1) : $0.offset < $1.offset }
                 hits = ranked.prefix(limit).map {
-                    FileHit(path: $0.element.path, insert: Self.relative($0.element.path, root: root, from: directory),
+                    FileHit(path: $0.element.path, insert: FileHit.relative($0.element.path, root: root, from: directory),
                             provenance: ["files"] + (picked[$0.element.path] != nil ? ["picked"] : []),
                             git: Self.git($0.element.git))
                 }
@@ -118,19 +118,5 @@ final class FileSearch: @unchecked Sendable {
         case nil, "clean": return nil
         default: return "~~"  // conflicted or type-changed: fff has no name for it
         }
-    }
-
-    /// `path` (under `root`) as seen from `directory`: `a.swift` from its own folder, `../x/b.swift` from a sibling.
-    static func relative(_ path: String, root: String, from directory: String) -> String {
-        let real = realpath(directory, nil).map { defer { free($0) }; return String(cString: $0) } ?? directory
-        let rootParts = root.split(separator: "/").map(String.init)
-        let here = real.split(separator: "/").map(String.init)
-        // A directory outside the root can't be expressed relative to it; the root-relative path is the best we have.
-        guard here.starts(with: rootParts) else { return path }
-        let down = Array(here.dropFirst(rootParts.count))
-        let target = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
-        var common = 0
-        while common < down.count, common < target.count - 1, down[common] == target[common] { common += 1 }
-        return (Array(repeating: "..", count: down.count - common) + target.dropFirst(common)).joined(separator: "/")
     }
 }

@@ -11,10 +11,10 @@ func fishQuote(_ text: String) -> String {
     "'" + text.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "'", with: "\\'") + "'"
 }
 
-/// `ctrlR` and `left` are the picker keys chosen in `smcli init`; SMCLI_EXTRA_KEYS=1 still adds Left (and more) too.
-func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, left: Bool = false) throws -> String {
+/// `ctrlR`, `left`, `ctrlT` and `ctrlG` are the picker keys chosen in `smcli init`; SMCLI_EXTRA_KEYS=1 still adds Left (and more) too.
+func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, left: Bool = false, ctrlT: Bool = true, ctrlG: Bool = true) throws -> String {
     let binary = shellQuote(executable)
-    let (keyR, keyLeft) = (ctrlR ? "1" : "0", left ? "1" : "0")
+    let (keyR, keyLeft, keyT, keyG) = (ctrlR ? "1" : "0", left ? "1" : "0", ctrlT ? "1" : "0", ctrlG ? "1" : "0")
     switch shell {
     case "bash":
         return #"""
@@ -78,7 +78,7 @@ func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, lef
                 }
                 _smcli_preexec() {
                     local prior_status=$2 entry
-                    if [[ $_smcli_armed == 1 && $1 != _smcli_prompt && $1 != _smcli_ready && $1 != _smcli_pick && $1 != _smcli_pick_left ]]; then
+                    if [[ $_smcli_armed == 1 && $1 != _smcli_prompt && $1 != _smcli_ready && $1 != _smcli_pick && $1 != _smcli_pick_left && $1 != _smcli_pick_files && $1 != _smcli_pick_grep ]]; then
                         _smcli_started=${EPOCHREALTIME:-$((_smcli_epoch + SECONDS))}
                         _smcli_armed=0
                         _smcli_pending=1
@@ -206,6 +206,10 @@ func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, lef
                 if [[ -z $READLINE_LINE ]]; then _smcli_pick --suggest
                 elif (( READLINE_POINT > 0 )); then READLINE_POINT=$((READLINE_POINT - 1)); fi
             }
+            # Ctrl-T opens the picker on this directory's files; Tab there searches the whole project.
+            _smcli_pick_files() { _smcli_pick --files; }
+            # Ctrl-G searches file contents.
+            _smcli_pick_grep() { _smcli_pick --grep; }
             # Bind $1 to function $2 unless something other than readline's own $3 (or nothing) holds it.
             _smcli_bind() {
                 local marker=$'\n'"\"$1\": " current= word free=
@@ -224,6 +228,12 @@ func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, lef
             (( \#(keyR) )) && _smcli_bind '\C-r' _smcli_pick 'reverse-search-history history-search-backward'
             _smcli_bind '\e[A' _smcli_pick 'previous-history history-search-backward'
             _smcli_bind '\eOA' _smcli_pick 'previous-history history-search-backward'
+            if (( \#(keyT) )); then
+                _smcli_bind '\C-t' _smcli_pick_files transpose-chars
+                # BSD and macOS ttys send Ctrl-T to the kernel as STATUS (load report) before readline sees it.
+                [[ $_smcli_kept == *'\C-t'* ]] || stty status undef 2>/dev/null
+            fi
+            (( \#(keyG) )) && _smcli_bind '\C-g' _smcli_pick_grep abort
             if [[ -n ${SMCLI_EXTRA_KEYS-} ]] || (( \#(keyLeft) )); then
                 _smcli_bind '\e[D' _smcli_pick_left backward-char
                 _smcli_bind '\eOD' _smcli_pick_left backward-char
@@ -319,6 +329,12 @@ func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, lef
             }
             zle -N _smcli_pick_up
             zle -N _smcli_pick_left
+            # Ctrl-T opens the picker on this directory's files; Tab there searches the whole project.
+            _smcli_pick_files() { _smcli_pick --files; }
+            zle -N _smcli_pick_files
+            # Ctrl-G searches file contents.
+            _smcli_pick_grep() { _smcli_pick --grep; }
+            zle -N _smcli_pick_grep
             # Bind $2 in keymap $1 to widget $3 unless something other than zle's own $4 (or nothing) holds it.
             _smcli_bind() {
                 local current=${${(z)"$(bindkey -M $1 "$2" 2>/dev/null)"}[-1]}
@@ -334,6 +350,8 @@ func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, lef
                 (( \#(keyR) )) && _smcli_bind $_smcli_keymap '^R' _smcli_pick 'redisplay|history-incremental-(pattern-|)search-backward|history-search-backward'
                 _smcli_bind $_smcli_keymap '^[[A' _smcli_pick_up 'up-line-or-(history|beginning-search)'
                 _smcli_bind $_smcli_keymap '^[OA' _smcli_pick_up 'up-line-or-(history|beginning-search)'
+                (( \#(keyT) )) && _smcli_bind $_smcli_keymap '^T' _smcli_pick_files 'transpose-chars|self-insert'
+                (( \#(keyG) )) && _smcli_bind $_smcli_keymap '^G' _smcli_pick_grep 'send-break|list-expand|self-insert'
                 if [[ -n ${SMCLI_EXTRA_KEYS-} ]] || (( \#(keyLeft) )); then
                     _smcli_bind $_smcli_keymap '^[[D' _smcli_pick_left backward-char
                     _smcli_bind $_smcli_keymap '^[OD' _smcli_pick_left backward-char
@@ -344,6 +362,8 @@ func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, lef
                     _smcli_bind $_smcli_keymap '^[;' _smcli_pick 'undefined-key'
                 fi
             done
+            # BSD and macOS ttys send Ctrl-T to the kernel as STATUS (load report) before zle sees it.
+            (( \#(keyT) )) && [[ ${(j: :)_smcli_kept} != *'^T ('* ]] && stty status undef 2>/dev/null
             (( $#_smcli_kept )) && print -u2 "smcli: kept existing key bindings: ${(j:, :)${(u)_smcli_kept}} (bindkey them to _smcli_pick to switch)."
             unset _smcli_keymap _smcli_kept
         fi
@@ -436,8 +456,18 @@ func shellIntegration(shell: String, executable: String, ctrlR: Bool = true, lef
                     commandline -f backward-char
                 end
             end
+            # Ctrl-T opens the picker on this directory's files; Tab there searches the whole project.
+            function _smcli_pick_files
+                _smcli_pick --files
+            end
+            # Ctrl-G searches file contents.
+            function _smcli_pick_grep
+                _smcli_pick --grep
+            end
             # From `smcli init`: Ctrl-R, and Left on an empty line.
             test \#(keyR) = 1; and _smcli_bind \cr _smcli_pick
+            test \#(keyT) = 1; and _smcli_bind \ct _smcli_pick_files
+            test \#(keyG) = 1; and _smcli_bind \cg _smcli_pick_grep
             _smcli_bind \e\[A _smcli_pick_up
             _smcli_bind \eOA _smcli_pick_up
             if test \#(keyLeft) = 1

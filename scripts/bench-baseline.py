@@ -150,8 +150,8 @@ def picker(binary, env, directory):
     try:
         terminal.until(b"type to search")
         elapsed = (time.perf_counter_ns() - terminal.start) / 1e6
-        # Ctrl-G cancels immediately; Escape deliberately waits for an arrow sequence.
-        os.write(terminal.fd, b"\x07")
+        # Ctrl-C cancels immediately; Escape deliberately waits for an arrow sequence.
+        os.write(terminal.fd, b"\x03")
         return elapsed, terminal.wait(expected=1)
     finally:
         terminal.close()

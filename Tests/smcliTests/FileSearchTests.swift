@@ -254,18 +254,20 @@ struct FFFPoolConcurrencyTests {
 }
 
 struct PickerModeTests {
-    @Test func `Ctrl-T cycles history, files, grep and each keeps its own query`() {
+    @Test func `Ctrl-T toggles files and Ctrl-G grep, and each mode keeps its own query`() {
         var picker = Picker(suggestions: ["ls"], captured: [:], native: [], query: "ls")
-        picker.cycleMode()
+        picker.toggle(.files)
         #expect(picker.mode == .files && picker.query == "")
         picker.query = "main"
-        picker.cycleMode()
+        picker.toggle(.grep)
         #expect(picker.mode == .grep && picker.query == "")
         picker.query = "needle"
-        picker.cycleMode()
+        picker.toggle(.grep)
         #expect(picker.mode == .history && picker.query == "ls")
-        picker.cycleMode()
+        picker.toggle(.files)
         #expect(picker.mode == .files && picker.query == "main")
+        picker.toggle(.files)
+        #expect(picker.mode == .history)
     }
 
     @Test func `File rows show Git status, path and provenance; grep rows add line and text`() {
@@ -280,8 +282,44 @@ struct PickerModeTests {
         #expect(screen.contains("src/a b.swift:12  let needle = 1"))
         #expect(screen.contains("grep+picked"))
         #expect(screen.contains("README.md"))
-        #expect(screen.contains("^T history"))
+        #expect(screen.contains("^G history"))
         picker.mode = .history
         #expect(picker.render([], size: (24, 100)).contains("^T files"))
+    }
+}
+
+struct LocalFilesTests {
+    @Test func `Files mode starts on directory entries, dirs first, filtered as typed; Tab goes project-wide`() throws {
+        let root = try FFFTests.fixture(["b.txt": "", "sub/x": "", ".hidden": "", ".plans/p.md": ""])
+        defer { try? FileManager.default.removeItem(at: root) }
+        let entries = Picker.directoryEntries(root.path)
+        #expect(Set(entries.map(\.insert)) == ["sub/", ".plans/", "b.txt", ".hidden"])
+        var picker = Picker(suggestions: [], captured: [:], native: [])
+        (picker.mode, picker.localFiles, picker.query) = (.files, entries, "B.T")
+        #expect(picker.localMatches.map(\.insert) == ["b.txt"])
+        picker.query = ""
+        picker.kind = .folders
+        #expect(picker.render([], size: (24, 120)).contains("folders ❯"))
+        #expect(Set(picker.localMatches.map(\.insert)) == ["sub/", ".plans/"])
+        picker.kind = .files
+        #expect(Set(picker.localMatches.map(\.insert)) == ["b.txt", ".hidden"])
+        picker.query = "B.T"
+        picker.hits = picker.localMatches
+        #expect(picker.render([], size: (24, 120)).contains("tab search all"))
+        picker.globalFiles = true
+        #expect(!picker.render([], size: (24, 120)).contains("tab search all"))
+    }
+}
+
+struct PickedFilesTests {
+    @Test func `Picked files that still exist lead, relative to the directory, without repeating an entry`() throws {
+        let root = try FFFTests.fixture(["a.txt": "", "sub/b.txt": "", "sub/c.txt": ""])
+        defer { try? FileManager.default.removeItem(at: root) }
+        let real = realpath(root.path, nil).map { defer { free($0) }; return String(cString: $0) }!
+        let sub = real + "/sub"
+        let merged = Picker.withPicked(["a.txt": 1, "sub/b.txt": 2, "gone.txt": 9], root: real, directory: sub,
+                                       entries: Picker.directoryEntries(sub))
+        #expect(merged.map(\.insert) == ["b.txt", "../a.txt", "c.txt"])
+        #expect(merged.map(\.provenance) == [["picked"], ["picked"], ["here"]])
     }
 }

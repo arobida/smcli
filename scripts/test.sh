@@ -35,9 +35,10 @@ fi
 # init --keys sets the picker keys without asking, and shell-init follows them.
 cfg="$home/keys.json"
 SMCLI_CONFIG="$cfg" "$bin_dir/smcli" init --keys left > /dev/null
-grep -q '"ctrlRKey" : false' "$cfg" && grep -q '"leftKey" : true' "$cfg"
+grep -q '"ctrlRKey" : false' "$cfg" && grep -q '"leftKey" : true' "$cfg" && grep -q '"ctrlTKey" : false' "$cfg"
 init="$(SMCLI_CONFIG="$cfg" "$bin_dir/smcli" shell-init zsh)"
 [[ $init == *"(( 0 )) && _smcli_bind \$_smcli_keymap '^R'"* && $init == *"|| (( 1 )); then"* ]]
+[[ $init == *"(( 0 )) && _smcli_bind \$_smcli_keymap '^T'"* && $init == *"(( 0 )) && _smcli_bind \$_smcli_keymap '^G'"* ]]
 SMCLI_CONFIG="$cfg" "$bin_dir/smcli" init --keys ctrl-r,left > /dev/null
 grep -q '"ctrlRKey" : true' "$cfg"
 if SMCLI_CONFIG="$cfg" "$bin_dir/smcli" init --keys up > /dev/null 2>&1; then

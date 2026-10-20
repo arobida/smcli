@@ -102,6 +102,20 @@ package struct FileHit: Codable, Equatable {
         (self.path, self.insert, self.provenance, self.git) = (path, insert, provenance, git)
         (self.line, self.column, self.text) = (line, column, text)
     }
+
+    /// `path` (under `root`) as seen from `directory`: `a.swift` from its own folder, `../x/b.swift` from a sibling.
+    package static func relative(_ path: String, root: String, from directory: String) -> String {
+        let real = realpath(directory, nil).map { defer { free($0) }; return String(cString: $0) } ?? directory
+        let rootParts = root.split(separator: "/").map(String.init)
+        let here = real.split(separator: "/").map(String.init)
+        // A directory outside the root can't be expressed relative to it; the root-relative path is the best we have.
+        guard here.starts(with: rootParts) else { return path }
+        let down = Array(here.dropFirst(rootParts.count))
+        let target = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        var common = 0
+        while common < down.count, common < target.count - 1, down[common] == target[common] { common += 1 }
+        return (Array(repeating: "..", count: down.count - common) + target.dropFirst(common)).joined(separator: "/")
+    }
 }
 
 /// One live fff instance in the service, for `ping`.

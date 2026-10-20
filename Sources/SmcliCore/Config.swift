@@ -15,9 +15,12 @@ package struct SmcliConfig: Codable, Equatable {
     package var cwdFilter: [String]?
     /// Skip commands containing likely API keys and tokens; on unless set to false.
     package var secretsFilter: Bool?
-    /// Picker keys bound by shell-init, chosen in `smcli init`: Ctrl-R (on unless false) and Left on an empty line
-    /// (off unless true). Up is always bound; SMCLI_NO_KEYS=1 still skips them all.
+    /// Picker keys bound by shell-init, chosen in `smcli init`: Ctrl-R and Ctrl-T file search (on unless false) and Left
+    /// on an empty line (off unless true). Up is always bound; SMCLI_NO_KEYS=1 still skips them all.
     package var ctrlRKey: Bool?
+    package var ctrlTKey: Bool?
+    /// Ctrl-G grep at the prompt; on unless false.
+    package var ctrlGKey: Bool?
     package var leftKey: Bool?
 
     package static func location(home: URL, environment: [String: String]) -> URL {

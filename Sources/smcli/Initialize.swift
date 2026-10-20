@@ -21,24 +21,28 @@ private func ask(_ question: String, default yes: Bool) -> Bool? {
 private func chooseKeys(configURL: URL) throws {
     var config = try SmcliConfig.load(from: configURL)
     guard let ctrlR = ask("Open the history picker with Ctrl-R?", default: config.ctrlRKey ?? true),
-          let left = ask("Open it with Left arrow when the command line is empty?", default: config.leftKey ?? false) else {
+          let left = ask("Open it with Left arrow when the command line is empty?", default: config.leftKey ?? false),
+          let ctrlT = ask("Open file search with Ctrl-T?", default: config.ctrlTKey ?? true),
+          let ctrlG = ask("Open grep (file contents) with Ctrl-G?", default: config.ctrlGKey ?? true) else {
         throw HistoryError(message: "No choice made; key bindings unchanged.")
     }
-    (config.ctrlRKey, config.leftKey) = (ctrlR, left)
+    (config.ctrlRKey, config.leftKey, config.ctrlTKey, config.ctrlGKey) = (ctrlR, left, ctrlT, ctrlG)
     try config.save(to: configURL)
     print("Saved key bindings to \(configURL.path). Open a new shell (or re-run shell-init) to use them.")
 }
 
-/// Saves keys given as `--keys ctrl-r,left` (either, both, or `none`), for install scripts.
+/// Saves keys given as `--keys ctrl-r,left,ctrl-t,ctrl-g` (any of them, or `none`), for install scripts.
 private func setKeys(_ list: String, configURL: URL) throws {
     let names = Set(list.lowercased().split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
-    guard names.isSubset(of: ["ctrl-r", "left", "none"]), !names.isEmpty, !(names.contains("none") && names.count > 1) else {
-        throw HistoryError(message: "--keys takes ctrl-r, left, ctrl-r,left or none.")
+    guard names.isSubset(of: ["ctrl-r", "left", "ctrl-t", "ctrl-g", "none"]), !names.isEmpty, !(names.contains("none") && names.count > 1) else {
+        throw HistoryError(message: "--keys takes a comma-separated list of ctrl-r, left, ctrl-t and ctrl-g, or none.")
     }
     var config = try SmcliConfig.load(from: configURL)
     (config.ctrlRKey, config.leftKey) = (names.contains("ctrl-r"), names.contains("left"))
+    (config.ctrlTKey, config.ctrlGKey) = (names.contains("ctrl-t"), names.contains("ctrl-g"))
     try config.save(to: configURL)
     let chosen = ["Up"] + (names.contains("ctrl-r") ? ["Ctrl-R"] : []) + (names.contains("left") ? ["Left on an empty line"] : [])
+        + (names.contains("ctrl-t") ? ["Ctrl-T for files"] : []) + (names.contains("ctrl-g") ? ["Ctrl-G for grep"] : [])
     print("The picker opens with \(chosen.joined(separator: ", ")). Saved \(configURL.path).")
 }
 
@@ -55,7 +59,7 @@ func initialize(_ arguments: [String], configURL: URL, environment: [String: Str
             try setKeys(value, configURL: configURL)
         } else {
             guard isatty(STDIN_FILENO) != 0 else {
-                throw HistoryError(message: "smcli init --keys needs a terminal to ask; pass e.g. --keys ctrl-r,left.")
+                throw HistoryError(message: "smcli init --keys needs a terminal to ask; pass e.g. --keys ctrl-r,left,ctrl-t,ctrl-g.")
             }
             try chooseKeys(configURL: configURL)
         }
@@ -123,7 +127,7 @@ func initialize(_ arguments: [String], configURL: URL, environment: [String: Str
         print("The next search re-embeds your history with it.")
         return
     case let arguments where arguments.count == 2 && arguments[0] == "--model": choice = arguments[1]
-    default: throw HistoryError(message: "Usage: smcli init [--model NAME | --potion [DIR] | --builtin | --default] [--keys [ctrl-r,left|none]]")
+    default: throw HistoryError(message: "Usage: smcli init [--model NAME | --potion [DIR] | --builtin | --default] [--keys [ctrl-r,left,ctrl-t,ctrl-g|none]]")
     }
 
     guard let choice else { return }  // Nothing offered: keep any existing choice.

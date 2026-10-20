@@ -15,7 +15,7 @@ struct Picker {
     var semantic: [String]? = nil
     var semanticQuery = ""
     var status = ""
-    /// History is the default; Ctrl-T cycles to file-name search, then content search. Each keeps its own query.
+    /// History is the default; Ctrl-T switches to file-name search and Ctrl-G to content search. Each keeps its own query.
     enum Mode: String, CaseIterable { case history, files, grep }
     var mode = Mode.history
     var savedQueries: [Mode: String] = [:]
@@ -24,6 +24,12 @@ struct Picker {
     /// What a files or grep search returned; `complete` is false when grep stopped early.
     struct FileResults { var hits: [FileHit]; var complete = true }
     var fetched: (mode: Mode, query: String)?
+    /// Files mode starts on this directory's entries, filtered as you type; Tab switches to fff over the whole project.
+    var localFiles: [FileHit] = []
+    var globalFiles = false
+    /// Ctrl-F narrows the directory list to directories, then files, then back to both.
+    enum Kind: String, CaseIterable { case all, folders, files }
+    var kind = Kind.all
 
     init(suggestions: [String], captured: [String: CommandStats], native: [String], query: String = "") {
         self.init(suggestions: suggestions, recent: Self.recent(captured), native: native, query: query)
@@ -83,7 +89,7 @@ struct Picker {
 
     // MARK: - Terminal
 
-    enum Key: Equatable { case up, down, enter, cancel, backspace, clear, tab, mode, text(String), other }
+    enum Key: Equatable { case up, down, enter, cancel, backspace, clear, tab, files, grep, kind, text(String), other }
 
     enum Choice: Equatable {
         /// `query` is what was typed; `semantic` says the choice came from the Tab results rather than the filtered list.
@@ -91,10 +97,10 @@ struct Picker {
         case file(FileHit, Mode, query: String)
     }
 
-    /// Moves to the next mode, keeping each mode's own query.
-    mutating func cycleMode() {
+    /// Ctrl-T toggles files and Ctrl-G grep, each back to history when pressed again; each mode keeps its own query.
+    mutating func toggle(_ target: Mode) {
         savedQueries[mode] = query
-        mode = Mode.allCases[(Mode.allCases.firstIndex(of: mode)! + 1) % Mode.allCases.count]
+        mode = mode == target ? .history : target
         query = savedQueries[mode] ?? ""
         selected = 0
         status = ""
@@ -119,7 +125,10 @@ struct Picker {
             tcsetattr(tty, TCSAFLUSH, &original)
         }
         while true {
-            if mode != .history && fetched.map({ $0 != (mode, query) }) != false {
+            if mode == .files && !globalFiles {
+                hits = localMatches
+                fetched = nil
+            } else if mode != .history && fetched.map({ $0 != (mode, query) }) != false {
                 refetch(files)
             }
             let current = mode == .history ? matches : hits.map(\.path)
@@ -133,16 +142,18 @@ struct Picker {
                 return mode == .history ? .command(current[selected], query: query, semantic: semantic != nil && semanticQuery == query)
                     : .file(hits[selected], mode, query: query)
             case .cancel: return nil
-            case .mode:
-                // Files and grep need the service; say so rather than showing an empty list.
-                if files == nil && mode == .history {
-                    status = "files and grep need smcli-service"
-                } else {
-                    cycleMode()
-                }
+            case .files: toggle(.files)
+            case .grep: toggle(.grep)
+            case .kind where mode == .files && !globalFiles:
+                kind = Kind.allCases[(Kind.allCases.firstIndex(of: kind)! + 1) % Kind.allCases.count]
+                selected = 0
+            case .kind: break
             case .backspace: if !query.isEmpty { query.removeLast(); edited() }
-            case .clear: query = ""; edited()
+            case .clear: query = ""; globalFiles = false; edited()
             case .text(let text): query += text; edited()
+            case .tab where mode == .files:
+                globalFiles = true
+                selected = 0
             case .tab:
                 guard mode == .history, let search, !query.trimmingCharacters(in: .whitespaces).isEmpty else { break }
                 status = "searching…"
@@ -163,6 +174,41 @@ struct Picker {
     private mutating func edited() {
         selected = 0
         status = ""
+    }
+
+    /// This directory's entries of the chosen kind containing every query word (case-insensitive).
+    var localMatches: [FileHit] {
+        let terms = query.lowercased().split(whereSeparator: \.isWhitespace)
+        return localFiles.filter { hit in
+            let directory = hit.insert.hasSuffix("/")
+            return (kind == .all || directory == (kind == .folders)) && terms.allSatisfy { hit.insert.lowercased().contains($0) }
+        }
+    }
+
+    /// Entries of `directory` for files-mode suggestions: directories first (with a trailing `/`), then files,
+    /// each most recently modified first. Hidden entries are listed; `.git` and `.DS_Store` are not.
+    static func directoryEntries(_ directory: String, limit: Int = 200) -> [FileHit] {
+        let url = URL(fileURLWithPath: directory)
+        let keys: [URLResourceKey] = [.isDirectoryKey, .contentModificationDateKey]
+        let urls = (try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: keys))?
+            .filter { ![".git", ".DS_Store"].contains($0.lastPathComponent) } ?? []
+        let entries = urls.map { url -> (name: String, directory: Bool, modified: Date) in
+            let values = try? url.resourceValues(forKeys: Set(keys))
+            return (url.lastPathComponent, values?.isDirectory == true, values?.contentModificationDate ?? .distantPast)
+        }
+        return entries.sorted { $0.directory != $1.directory ? $0.directory : $0.modified != $1.modified ? $0.modified > $1.modified : $0.name < $1.name }
+            .prefix(limit)
+            .map { FileHit(path: $0.name, insert: $0.name + ($0.directory ? "/" : ""), provenance: ["here"]) }
+    }
+
+    /// The `limit` best-scored picked files that still exist, inserted relative to `directory`, then `entries` not already listed.
+    static func withPicked(_ scores: [String: Double], root: String, directory: String, entries: [FileHit], limit: Int = 10) -> [FileHit] {
+        let picked = scores.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+            .filter { FileManager.default.fileExists(atPath: root + "/" + $0.key) }
+            .prefix(limit)
+            .map { FileHit(path: $0.key, insert: FileHit.relative($0.key, root: root, from: directory), provenance: ["picked"]) }
+        let shown = Set(picked.map(\.insert))
+        return picked + entries.filter { !shown.contains($0.insert) }
     }
 
     /// Searches for the current query; an unreachable service or a failed search shows as a status line.
@@ -212,7 +258,7 @@ struct Picker {
             }
         }
         if current.isEmpty { out += "  \u{1B}[2mNo matching commands.\u{1B}[0m\n" }
-        out += "\u{1B}[\(size.rows);1H\u{1B}[2m type to search · ↑↓ move · enter select · tab semantic · ^T files · esc cancel\u{1B}[0m"
+        out += "\u{1B}[\(size.rows);1H\u{1B}[2m type to search · ↑↓ move · enter select · tab semantic · ^T files · ^G grep · esc cancel\u{1B}[0m"
         return out + "\u{1B}[u"
     }
 
@@ -221,14 +267,16 @@ struct Picker {
         let width = max(20, size.columns)
         let visible = max(1, size.rows - 4)
         let top = max(0, selected - visible + 1)
-        let label = mode == .files ? "files" : "grep"
-        let summary = hits.isEmpty ? (status.isEmpty ? "no matches" : status) : (status.isEmpty ? "\(hits.count) \(label) results" : status)
+        let local = mode == .files && !globalFiles
+        let label = local ? kind.rawValue : mode == .files ? "files" : "grep"
+        let found = local ? "\(hits.count) in \(FileManager.default.currentDirectoryPath) · tab searches the project" : "\(hits.count) \(label) results"
+        let summary = hits.isEmpty && !local ? (status.isEmpty ? "no matches" : status) : (status.isEmpty ? found : status)
         var out = "\u{1B}[H\u{1B}[2J"
         out += " \u{1B}[38;5;141m\(label) ❯\u{1B}[0m \(Self.visible(query))\u{1B}[s\n"
         out += " \u{1B}[2m\(Self.truncate(Self.visible(summary), width - 2))\u{1B}[0m\n"
         for (index, hit) in hits.enumerated().dropFirst(top).prefix(visible) {
             let git = Self.visible(hit.git ?? "").padding(toLength: 2, withPad: " ", startingAt: 0)
-            var name = hit.path
+            var name = local ? hit.insert : hit.path
             if let line = hit.line { name += ":\(line)" + (hit.text.map { "  " + $0.trimmingCharacters(in: .whitespaces) } ?? "") }
             let source = Self.visible(hit.provenance.joined(separator: "+"))
             let room = max(4, width - 8 - source.count)
@@ -240,7 +288,7 @@ struct Picker {
                 out += " \u{1B}[33m\(git)\u{1B}[0m \(text)\(gap)\u{1B}[2m\(source)\u{1B}[0m\n"
             }
         }
-        out += "\u{1B}[\(size.rows);1H\u{1B}[2m type to search · ↑↓ move · enter insert path · ^T \(mode == .files ? "grep" : "history") · esc cancel\u{1B}[0m"
+        out += "\u{1B}[\(size.rows);1H\u{1B}[2m type to search · ↑↓ move · enter insert path · \(local ? "tab search all · ^F dirs/files · " : "")\(mode == .files ? "^T history · ^G grep" : "^G history · ^T files") · esc cancel\u{1B}[0m"
         return out + "\u{1B}[u"
     }
 
@@ -276,10 +324,12 @@ struct Picker {
         guard let byte = readByte(tty) else { return .cancel }
         switch byte {
         case 0x0A, 0x0D: return .enter
-        case 0x03, 0x04, 0x07: return .cancel
+        case 0x03, 0x04: return .cancel
+        case 0x07: return .grep          // Ctrl-G
         case 0x09: return .tab
         case 0x7F, 0x08: return .backspace
-        case 0x14: return .mode          // Ctrl-T
+        case 0x06: return .kind          // Ctrl-F
+        case 0x14: return .files         // Ctrl-T
         case 0x15: return .clear
         case 0x10, 0x12: return .up      // Ctrl-P, Ctrl-R
         case 0x0E, 0x13: return .down    // Ctrl-N, Ctrl-S
@@ -335,7 +385,8 @@ func pick(_ arguments: [String], captured: CapturedHistory, service: ServiceClie
     (request.directory, request.limit) = (directory, 50)
     request.session = environment["SMCLI_SESSION"]
     let response = service.send(request)
-    let context = RankingContext(project: ProjectContext.discover(directory), session: request.session, environment: environment)
+    let project = ProjectContext.discover(directory)
+    let context = RankingContext(project: project, session: request.session, environment: environment)
     var stats: [String: CommandStats]? = nil
     let suggestions: [String]
     let recent: [String]
@@ -350,10 +401,19 @@ func pick(_ arguments: [String], captured: CapturedHistory, service: ServiceClie
     let native = try historyFiles(home: home, environment: environment)
         .flatMap { (try? $0.read())?.components(separatedBy: "\n") ?? [] }
     // Left (--suggest) shows only this directory's suggestions; Up and Ctrl-R show all history, newest first.
-    let suggestOnly = arguments.first == "--suggest"
-    var picker = suggestOnly
-        ? Picker(suggestions: suggestions, recent: [], native: [], query: arguments.dropFirst().joined(separator: " "))
-        : Picker(suggestions: [], recent: recent, native: native, query: arguments.joined(separator: " "))
+    // Ctrl-T (--files) opens on this directory's files and Ctrl-G (--grep) on content search; inside the picker they switch modes.
+    let flag = arguments.first.flatMap { ["--suggest", "--files", "--grep"].contains($0) ? $0 : nil }
+    let query = arguments.dropFirst(flag == nil ? 0 : 1).joined(separator: " ")
+    var picker = flag == "--suggest"
+        ? Picker(suggestions: suggestions, recent: [], native: [], query: query)
+        : Picker(suggestions: [], recent: recent, native: native, query: flag == nil ? query : "")
+    // Files picked before in this project lead the directory's entries; read straight from the database so it works without the service.
+    let root = project.repository?.root ?? realpath(directory, nil).map { defer { free($0) }; return String(cString: $0) } ?? directory
+    let scores = (try? captured.openConnection()).flatMap { try? captured.selectionScores(root: root, on: $0) } ?? [:]
+    picker.localFiles = Picker.withPicked(scores, root: root, directory: directory, entries: Picker.directoryEntries(directory))
+    // The command line is not a file query, so files mode starts empty.
+    if flag == "--files" { picker.mode = .files }
+    if flag == "--grep" { picker.mode = .grep }
     var search: ((String) async throws -> [String])? = nil
     #if canImport(ProximaKit)
     // Built on the first search, not per keystroke: loading an embedding model would dominate latency.
@@ -398,9 +458,12 @@ func pick(_ arguments: [String], captured: CapturedHistory, service: ServiceClie
         print(command)
     case .file(let hit, let mode, let query):
         // Remembered for ranking only because the user chose it; best effort.
-        var request = ServiceRequest(op: .select)
-        (request.directory, request.path, request.mode, request.query) = (directory, hit.path, mode.rawValue, query)
-        _ = service.send(request, timeout: 2)
+        // Directory entries aren't root-relative, so only project search results are recorded.
+        if hit.provenance != ["here"] {
+            var request = ServiceRequest(op: .select)
+            (request.directory, request.path, request.mode, request.query) = (directory, hit.path, mode.rawValue, query)
+            _ = service.send(request, timeout: 2)
+        }
         // The adapter passes the text left of the cursor; without it (a hook from an older build) we can't tell.
         let shell = environment["SMCLI_SHELL"] ?? "bash"
         guard let before = environment["SMCLI_LBUFFER"], ShellQuoting.insertable(after: before, shell: shell) else {

@@ -92,6 +92,7 @@ def run(shell, path):
             os.write(fd, b"\x14")  # Ctrl-T: files
             until(lambda t: "files" in t and "enter insert path" in t, "files mode")
             os.write(fd, token.lstrip("-").encode())
+            os.write(fd, b"\t")  # Tab: search the whole project instead of this directory's entries
             until(lambda t: "files results" in t, "results")
             os.write(fd, b"\r")
             # Let the shell finish repainting: read until the terminal has been quiet for a moment.
@@ -109,11 +110,9 @@ def run(shell, path):
         print(f"{shell}: {len(NAMES)} awkward names inserted as one word each, none executed.")
 
         def choose(token):
-            os.write(fd, b"\x1b[A")
-            until(lambda t: "type to search" in t, "picker")
-            os.write(fd, b"\x14")
+            os.write(fd, b"\x14")  # Ctrl-T at the prompt opens files mode directly
             until(lambda t: "enter insert path" in t, "files mode")
-            os.write(fd, token.encode())
+            os.write(fd, token.encode() + b"\t")
             until(lambda t: "files results" in t, "results")
             os.write(fd, b"\r")
 

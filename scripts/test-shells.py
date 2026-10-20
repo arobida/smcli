@@ -387,7 +387,7 @@ def picker(t, env):
     t.type("echo abc")
     t.type("\x1b[A")
     t.until_text("type to search")
-    t.type("\x07")
+    t.type("\x03")
     t.until_text("echo abc")
     t.send("def")
     assert commands(env)[-1] == "echo abcdef", commands(env)[-3:]
@@ -572,7 +572,7 @@ def run_zsh_plugins(variant):
             count = len(read_records(env))
             t.type("\x1b[A")
             t.until_text("type to search")
-            t.type("\x07")
+            t.type("\x03")
             time.sleep(0.3)
             assert "wrapped:_smcli_pick_up" in plugin_log.read_text(), "the wrapper never saw smcli's widget"
             t.type("\x15")  # kill the line
@@ -643,7 +643,7 @@ def run_bash_plugins(variant):
             assert counts[-3:] == ["1", "1", "1"], f"atuin, fzf and smcli bindings should each be bound once: {keys!r}"
             t.type("\x1b[A")  # Up, not the application-mode sequence atuin took
             t.until_text("type to search")
-            t.type("\x07")
+            t.type("\x03")
             time.sleep(0.3)
             t.type("\x03")
             t.until_prompt(redrawn=True)
