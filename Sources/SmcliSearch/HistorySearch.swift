@@ -390,7 +390,7 @@ package struct HistorySearch {
             return Array(rerank(hits, literal: isLiteralQuery(query, programs: programs ?? [:]), query: query, now: now,
                                 signals: signals).prefix(limit))
         }
-        let lock = try lockIndex(wait: true)!
+        let lock = try await acquireIndexLock()
         defer { close(lock) }
         let (store, name) = try await openIndex(reusing: open)
         let documents = try await sync(store, corpus: corpus) { done, total in
@@ -416,7 +416,7 @@ package struct HistorySearch {
 
     /// Discards the current model's index and embeds every command again. Returns the number embedded.
     package func reindex(corpus: [String: SearchEntry], progress: (Int, Int) -> Void = { _, _ in }) async throws -> Int {
-        let lock = try lockIndex(wait: true)!
+        let lock = try await acquireIndexLock()
         defer { close(lock) }
         try? FileManager.default.removeItem(at: directory.appendingPathComponent(try indexName()))
         let (store, _) = try await openIndex()
@@ -457,7 +457,7 @@ package struct HistorySearch {
                 if let date = values?.contentModificationDate, date > latest ?? .distantPast { latest = date }
             }
             health.lastUpdated = latest.map { ISO8601DateFormatter().string(from: $0) }
-            guard let lock = try lockIndex(wait: false) else {
+            guard let lock = try lockIndex() else {
                 health.problems.append("Another smcli is updating the index; check again when it finishes.")
                 return health
             }
@@ -535,6 +535,8 @@ package struct HistorySearch {
         removeOldIndexes()
         do {
             return (try await openStore(name: name, embedder: embedder), name)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             // The index is a cache of the history; rebuild it rather than fail.
             try? FileManager.default.removeItem(at: directory.appendingPathComponent(name))
@@ -562,18 +564,27 @@ package struct HistorySearch {
         return stamp.sorted()
     }
 
-    /// Serializes index writers. Without `wait`, returns nil when another process holds the lock.
-    private func lockIndex(wait: Bool) throws -> Int32? {
+    /// Serializes index writers. Returns nil when another process holds the lock.
+    private func lockIndex() throws -> Int32? {
         try prepareDirectory()
         let lock = open(directory.appendingPathComponent("lock").path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, mode_t(0o600))
         guard lock >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
-        if flock(lock, wait ? LOCK_EX : LOCK_EX | LOCK_NB) != 0 {
+        if flock(lock, LOCK_EX | LOCK_NB) != 0 {
             let error = errno
             close(lock)
-            if !wait && error == EWOULDBLOCK { return nil }
+            if error == EWOULDBLOCK { return nil }
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(error))
         }
         return lock
+    }
+
+    /// Waits for the index lock without blocking a thread, so a cancelled task stops waiting.
+    private func acquireIndexLock() async throws -> Int32 {
+        while true {
+            try Task.checkCancellation()
+            if let lock = try lockIndex() { return lock }
+            try await Task.sleep(for: .milliseconds(50))
+        }
     }
 
     /// Indexes from earlier document formats are never read again.

@@ -91,11 +91,13 @@ package final class ContextCache: @unchecked Sendable {
         let delay = max(0, minInterval - Date().timeIntervalSince(entry.started))
         entry.started = Date().addingTimeInterval(delay)
         entries[root] = entry
+        let started = entry.started
         queue.asyncAfter(deadline: .now() + delay) { [self] in
             let status = read(root)
             lock.lock()
             defer { lock.unlock() }
-            guard var entry = entries[root] else { return }
+            // An entry evicted and recreated while this read ran belongs to a newer refresh.
+            guard var entry = entries[root], entry.started == started else { return }
             // A failed or timed-out read keeps the previous status rather than erasing it.
             entry.status = status ?? entry.status
             entry.refreshing = false

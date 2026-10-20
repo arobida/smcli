@@ -27,7 +27,8 @@ package struct ProjectContext: Codable, Equatable {
     package struct Project: Codable, Equatable {
         /// The directory holding the manifests.
         package var root: String
-        /// `swift`, `node`, `rust`, `python`, `go` or `make`: the first manifest found in that order.
+        /// `swift`, `node`, `deno`, `rust`, `python`, `go`, `ruby`, `php`, `maven`, `gradle`, `elixir`, `dart`,
+        /// `cmake`, `make`, `just`, `task`, `rake`, `compose` or `docker`: the first manifest found in that order.
         package var kind: String
         package var manifests: [String]
         package var name: String?
@@ -57,11 +58,16 @@ package struct ProjectContext: Codable, Equatable {
         projects = []
     }
 
-    private static let manifests: [(file: String, kind: String)] = [
-        ("Package.swift", "swift"), ("package.json", "node"), ("Cargo.toml", "rust"),
-        ("pyproject.toml", "python"), ("go.mod", "go"), ("Makefile", "make"),
+    /// Languages first, then task runners and containers, so a language decides the kind when there is one.
+    private static let manifests: [(names: [String], kind: String)] = [
+        (["Package.swift"], "swift"), (["package.json"], "node"), (["deno.json", "deno.jsonc"], "deno"),
+        (["Cargo.toml"], "rust"), (["pyproject.toml"], "python"), (["go.mod"], "go"), (["Gemfile"], "ruby"),
+        (["composer.json"], "php"), (["pom.xml"], "maven"), (["build.gradle.kts", "build.gradle"], "gradle"),
+        (["mix.exs"], "elixir"), (["pubspec.yaml"], "dart"), (["CMakeLists.txt"], "cmake"),
+        (["Makefile", "makefile", "GNUmakefile"], "make"), (["justfile", "Justfile", ".justfile"], "just"),
+        (["Taskfile.yml", "Taskfile.yaml"], "task"), (["Rakefile"], "rake"),
+        (["compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"], "compose"), (["Dockerfile"], "docker"),
     ]
-    private static let makefiles = ["Makefile", "makefile", "GNUmakefile"]
     private static let maxLevels = 64
 
     package static func discover(_ directory: String) -> ProjectContext {
@@ -134,8 +140,7 @@ package struct ProjectContext: Codable, Equatable {
 
     static func project(at directory: String) -> Project? {
         var found: [(file: String, kind: String)] = []
-        for (file, kind) in manifests {
-            let names = kind == "make" ? makefiles : [file]
+        for (names, kind) in manifests {
             if let name = names.first(where: { access(directory + "/" + $0, F_OK) == 0 }) { found.append((name, kind)) }
         }
         guard let primary = found.first else { return nil }
@@ -151,12 +156,21 @@ package struct ProjectContext: Codable, Equatable {
             case "rust": names = cargoTargets(text, into: &project)
             case "python": names = pythonScripts(text, into: &project, exists: exists)
             case "go": project.name = project.name ?? goModule(text)
-            default: names = makeTargets(text)
+            case "deno": names = jsonKeys(text, "tasks")
+            case "php": names = jsonKeys(text, "scripts")
+            case "make": names = makeTargets(text)
+            case "just": names = justRecipes(text)
+            case "task": names = taskfileTasks(text)
+            case "rake": names = matches(#"(?m)^\s*task\s+:?["']?([A-Za-z0-9_:-]+)"#, in: text ?? "")
+            default: break
             }
             if !names.isEmpty { project.scripts[file] = Array(names.prefix(200)) }
         }
+        // Wrappers pin the build tool's version, so commands use them when present.
+        project.manifests += ["gradlew", "mvnw"].filter(exists)
         if project.packageManager == nil {
-            project.packageManager = ["swift": "swiftpm", "rust": "cargo", "go": "go", "make": "make"][primary.kind]
+            project.packageManager = ["swift": "swiftpm", "rust": "cargo", "go": "go", "make": "make", "ruby": "bundler",
+                                      "php": "composer", "elixir": "mix", "deno": "deno"][primary.kind]
         }
         return project
     }
@@ -212,6 +226,40 @@ package struct ProjectContext: Codable, Equatable {
         }
         let locks = [("uv.lock", "uv"), ("poetry.lock", "poetry"), ("Pipfile.lock", "pipenv"), ("pdm.lock", "pdm")]
         project.packageManager = locks.first { exists($0.0) }?.1 ?? ["uv", "poetry"].first { tools.contains($0) } ?? "pip"
+        return names
+    }
+
+    private static func jsonKeys(_ text: String?, _ field: String) -> [String] {
+        let json = text.flatMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) } as? [String: Any]
+        return ((json?[field] as? [String: Any]).map { Array($0.keys) } ?? []).sorted()
+    }
+
+    /// Recipe names: `name args:` at the start of a line (`@name:` is a quiet recipe), not `x := y` or a setting.
+    private static func justRecipes(_ text: String?) -> [String] {
+        var names: [String] = []
+        for line in (text ?? "").split(separator: "\n") {
+            guard let first = line.first, first.isLetter || first == "_" || first == "@", !line.contains(":="),
+                  let colon = line.firstIndex(of: ":") else { continue }
+            let head = line[..<colon].drop { $0 == "@" }
+            guard let name = head.split(separator: " ").first,
+                  !["set", "alias", "import", "mod", "export"].contains(String(name)) else { continue }
+            names.append(String(name))
+        }
+        return names
+    }
+
+    /// Keys one level under the top-level `tasks:` of a Taskfile, read by indentation rather than a YAML parser.
+    private static func taskfileTasks(_ text: String?) -> [String] {
+        var names: [String] = []
+        var inTasks = false
+        var indent: Int?
+        for line in (text ?? "").split(separator: "\n") where !line.trimmingCharacters(in: .whitespaces).isEmpty {
+            let depth = line.prefix { $0 == " " }.count
+            if depth == 0 { inTasks = line.hasPrefix("tasks:"); continue }
+            guard inTasks, line.hasSuffix(":"), !line.contains("#") else { continue }
+            if indent == nil { indent = depth }
+            if depth == indent { names.append(line.trimmingCharacters(in: .whitespaces).dropLast().trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))) }
+        }
         return names
     }
 

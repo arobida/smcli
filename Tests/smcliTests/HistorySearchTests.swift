@@ -108,6 +108,23 @@ struct HistorySearchTests {
         #expect(listed.map(\.command) == ["docker build ."])
     }
 
+    @Test func `A search waiting on another process's index lock stops when cancelled`() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let held = open(directory.appendingPathComponent("lock").path, O_RDWR | O_CREAT, mode_t(0o600))
+        #expect(held >= 0 && flock(held, LOCK_EX) == 0)
+        defer { close(held) }
+        let corpus = searchCorpus(captured: [:], native: ["git push"])
+        let search = Task { try await HistorySearch(directory: directory).search("push", corpus: corpus, limit: 1) }
+        try await Task.sleep(for: .milliseconds(200))
+        let started = Date()
+        search.cancel()
+        await #expect(throws: CancellationError.self) { try await search.value }
+        #expect(Date().timeIntervalSince(started) < 1)
+    }
+
     @Test func `Report index health and rebuild with reindex`() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

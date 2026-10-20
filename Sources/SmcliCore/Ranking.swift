@@ -95,11 +95,61 @@ extension ProjectContext {
                     if ["uv", "poetry", "pdm", "pipenv"].contains(manager) {
                         found.append(.init(command: "\(manager) run \(name)", kind: .script, reason: "pyproject script"))
                     }
+                case ("deno.json", _), ("deno.jsonc", _):
+                    found.append(.init(command: "deno task \(name)", kind: .script, reason: "deno task"))
+                case ("composer.json", _):
+                    found.append(.init(command: "composer run \(name)", kind: .script, reason: "composer script"))
+                case ("justfile", _), (".justfile", _):
+                    found.append(.init(command: "just \(name)", kind: .script, reason: "justfile recipe"))
+                case ("taskfile.yml", _), ("taskfile.yaml", _):
+                    found.append(.init(command: "task \(name)", kind: .script, reason: "Taskfile task"))
+                case ("rakefile", _):
+                    let rake = project.manifests.contains("Gemfile") ? "bundle exec rake" : "rake"
+                    found.append(.init(command: "\(rake) \(name)", kind: .script, reason: "Rakefile task"))
                 default: break
                 }
             }
         }
+        for file in project.manifests {
+            for command in Self.standardCommands(file.lowercased(), project: project) {
+                found.append(.init(command: command, kind: .script, reason: "\(file) project"))
+            }
+        }
         return found
+    }
+
+    /// The usual commands for a manifest, whatever it declares. Fixed text: only the tool varies, and only
+    /// between known names.
+    private static func standardCommands(_ file: String, project: Project) -> [String] {
+        let manager = project.packageManager ?? ""
+        switch file {
+        case "package.swift": return ["swift build", "swift test", "swift run"]
+        case "package.json": return ["\(Project.nodeManagers.contains(manager) ? manager : "npm") install"]
+        case "deno.json", "deno.jsonc": return ["deno test", "deno lint", "deno fmt"]
+        case "cargo.toml": return ["cargo build", "cargo test", "cargo run", "cargo check", "cargo clippy", "cargo fmt"]
+        case "pyproject.toml":
+            switch manager {
+            case "uv": return ["uv sync", "uv run pytest"]
+            case "poetry": return ["poetry install", "poetry run pytest"]
+            default: return ["pytest"]
+            }
+        case "go.mod": return ["go build ./...", "go test ./...", "go run .", "go vet ./...", "go mod tidy"]
+        case "gemfile": return ["bundle install", "bundle exec rspec"]
+        case "composer.json": return ["composer install", "composer update"]
+        case "pom.xml":
+            let mvn = project.manifests.contains("mvnw") ? "./mvnw" : "mvn"
+            return ["\(mvn) clean install", "\(mvn) test", "\(mvn) package"]
+        case "build.gradle.kts", "build.gradle":
+            let gradle = project.manifests.contains("gradlew") ? "./gradlew" : "gradle"
+            return ["\(gradle) build", "\(gradle) test", "\(gradle) run"]
+        case "mix.exs": return ["mix deps.get", "mix compile", "mix test", "iex -S mix"]
+        case "pubspec.yaml": return ["dart pub get", "dart test", "dart run"]
+        case "cmakelists.txt": return ["cmake -B build", "cmake --build build"]
+        case "compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml":
+            return ["docker compose up", "docker compose up -d", "docker compose down", "docker compose build", "docker compose logs -f"]
+        case "dockerfile": return ["docker build ."]
+        default: return []
+        }
     }
 }
 

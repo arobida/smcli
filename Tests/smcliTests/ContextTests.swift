@@ -221,6 +221,33 @@ struct ContextTests {
         #expect(wait { reads.value == 4 })
     }
 
+    @Test func `A refresh of an evicted entry leaves its replacement alone`() throws {
+        let roots = try (0..<2).map { _ in try temporaryDirectory() }
+        defer { roots.forEach { try? FileManager.default.removeItem(at: $0) } }
+        try roots.forEach(repository)
+        let (a, b) = (roots[0].path, roots[1].path)
+        let (first, second) = (DispatchSemaphore(value: 0), DispatchSemaphore(value: 0))
+        let reads = Counter()
+        let cache = ContextCache(maxAge: 3600, minInterval: 0, limit: 1, watch: false) { root in
+            guard root == a else { return GitStatus() }
+            reads.increment()
+            if reads.value == 1 { first.wait(); return GitStatus(fetchedAt: 1) }
+            second.wait()
+            return GitStatus(fetchedAt: 2)
+        }
+        _ = cache.context(for: a)
+        #expect(wait { reads.value == 1 })
+        _ = cache.context(for: b)  // evicts a while its refresh runs
+        _ = cache.context(for: a)  // recreates a with a second refresh
+        #expect(wait { reads.value == 2 })
+        first.signal()
+        usleep(100_000)
+        let context = cache.context(for: a)
+        #expect(context.status == nil && context.statusPending, "the old refresh neither published nor cleared pending")
+        second.signal()
+        #expect(wait { cache.context(for: a).status?.fetchedAt == 2 })
+    }
+
     #if canImport(CoreServices)
     @Test func `File-system events refresh the status`() throws {
         let root = try temporaryDirectory()

@@ -74,7 +74,7 @@ struct Picker {
         guard !(semantic != nil && semanticQuery == query) else { return current.indices.map(Row.command) }
         let split = current.firstIndex { !isSuggestion($0) } ?? current.count
         var rows: [Row] = []
-        if split > 0 { rows.append(.header("Suggested here")) }
+        if split > 0 { rows.append(.header("Suggested in \(FileManager.default.currentDirectoryPath)")) }
         rows += (0..<split).map(Row.command)
         if split < current.count { rows.append(.header("History")) }
         rows += (split..<current.count).map(Row.command)
@@ -184,16 +184,17 @@ struct Picker {
     func render(_ current: [String], size: (rows: Int, columns: Int)) -> String {
         if mode != .history { return renderFiles(size: size) }
         let width = max(20, size.columns)
-        let visible = max(1, size.rows - 4)
+        let mode = query.isEmpty ? "" : semantic != nil && semanticQuery == query ? "semantic search" : "\(current.count) matches"
+        let summary = status.isEmpty ? mode : status
+        // An empty query has no summary line: the suggestions header already names the directory.
+        let visible = max(1, size.rows - (summary.isEmpty ? 3 : 4))
         let rows = rows(current)
         let selectedRow = rows.firstIndex(of: .command(selected)) ?? 0
         // Keep the selection on screen, along with its section header when that fits.
         let top = max(0, selectedRow - visible + 1)
-        let mode = query.isEmpty ? "suggestions for \(FileManager.default.currentDirectoryPath)"
-            : semantic != nil && semanticQuery == query ? "semantic search" : "\(current.count) matches"
         var out = "\u{1B}[H\u{1B}[2J"
         out += " \u{1B}[38;5;141m❯\u{1B}[0m \(Self.visible(query))\u{1B}[s\n"
-        out += " \u{1B}[2m\(Self.truncate(Self.visible(status.isEmpty ? mode : status), width - 2))\u{1B}[0m\n"
+        if !summary.isEmpty { out += " \u{1B}[2m\(Self.truncate(Self.visible(summary), width - 2))\u{1B}[0m\n" }
         for row in rows.dropFirst(top).prefix(visible) {
             switch row {
             case .header(let title):

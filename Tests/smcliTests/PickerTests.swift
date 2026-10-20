@@ -12,7 +12,7 @@ struct PickerTests {
                             native: ["ls", "smcli search x", "", "vim a", "ls"])
         #expect(picker.candidates == ["git push", "make", "git status", "ls", "vim a"])
         #expect(picker.matches == picker.candidates)
-        #expect(picker.rows(picker.matches) == [.header("Suggested here"), .command(0), .command(1),
+        #expect(picker.rows(picker.matches) == [.header("Suggested in \(FileManager.default.currentDirectoryPath)"), .command(0), .command(1),
                                                  .header("History"), .command(2), .command(3), .command(4)])
     }
 

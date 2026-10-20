@@ -35,6 +35,29 @@ struct RankingSignalTests {
         #expect(ProjectContext.discover(empty.path).candidates().isEmpty)
     }
 
+    @Test func `Other ecosystems get their usual commands and declared tasks`() throws {
+        let root = try temporary()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try write("module example.com/m\n", "go/go.mod", in: root)
+        try write("[package]\nname = \"r\"\n", "rust/Cargo.toml", in: root)
+        try write("plugins {}\n", "jvm/build.gradle.kts", in: root)
+        try write("", "jvm/gradlew", in: root)
+        try write("set shell := [\"zsh\"]\nversion := \"1\"\n@deploy env:\n\techo\nbuild:\n\techo\n", "tools/justfile", in: root)
+        try write("version: '3'\ntasks:\n  lint:\n    cmds:\n      - x\n  serve:\n    cmds: [y]\n", "tools/Taskfile.yml", in: root)
+        try write("services: {}\n", "tools/compose.yaml", in: root)
+        try write("source 'x'\n", "rb/Gemfile", in: root)
+        try write("task :seed do\nend\ntask \"x;id\" do\nend\n", "rb/Rakefile", in: root)
+        func commands(_ path: String) -> [String] { ProjectContext.discover(root.path + "/" + path).candidates().map(\.command) }
+        #expect(ProjectContext.discover(root.path + "/go").projects.first?.kind == "go")
+        #expect(commands("go").contains("go test ./...") && commands("rust").contains("cargo clippy"))
+        #expect(commands("jvm").contains("./gradlew build"))
+        let tools = commands("tools")
+        #expect(tools.contains("just deploy") && tools.contains("just build") && !tools.contains("just set") && !tools.contains("just version"))
+        #expect(tools.contains("task lint") && tools.contains("task serve") && !tools.contains("task cmds"))
+        #expect(tools.contains("docker compose up"))
+        #expect(commands("rb").contains("bundle exec rake seed") && !commands("rb").contains { $0.contains(";") })
+    }
+
     @Test func `A package manager the manifest names is a known one, never shell syntax`() throws {
         let root = try temporary()
         defer { try? FileManager.default.removeItem(at: root) }
