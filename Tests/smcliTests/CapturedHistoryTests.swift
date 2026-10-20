@@ -6,6 +6,8 @@ import SQLite3
 import CSQLite
 #endif
 @testable import smcli
+@testable import SmcliSearch
+@testable import SmcliCore
 
 struct CapturedHistoryTests {
     @Test func `Break down simple commands without evaluating arguments`() {
@@ -194,7 +196,10 @@ struct CapturedHistoryTests {
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         let url = home.appendingPathComponent("captured.db")
         let old = try fixtureDatabase(url)
-        try old.execute(CapturedHistory.schema.replacingOccurrences(of: CapturedHistory.migrationToV3, with: "") + """
+        try old.execute(CapturedHistory.schema.replacingOccurrences(of: CapturedHistory.migrationToV3, with: "")
+            .replacingOccurrences(of: CapturedHistory.migrationToV5, with: "")
+            .replacingOccurrences(of: CapturedHistory.migrationToV6, with: "")
+            .replacingOccurrences(of: CapturedHistory.migrationToV7, with: "") + """
             INSERT INTO sessions VALUES ('s', 'bob', 'h', 'zsh');
             INSERT INTO commands (session, started_at, directory, command, exit_code) VALUES ('s', 1, '/', 'git commit --amend -m x', 0);
             """)
@@ -206,13 +211,109 @@ struct CapturedHistoryTests {
         #expect(stats["ls -la"]?.flags == ["-la"])
     }
 
-    @Test func `Take version 4 databases back to version 3`() throws {
+    @Test func `Add pipestatus to version 3 databases without touching their rows`() throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: home) }
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
         let url = home.appendingPathComponent("captured.db")
         let old = try fixtureDatabase(url)
-        try old.execute(CapturedHistory.schema + """
+        try old.execute(CapturedHistory.schema.replacingOccurrences(of: CapturedHistory.migrationToV5, with: "")
+            .replacingOccurrences(of: CapturedHistory.migrationToV6, with: "")
+            .replacingOccurrences(of: CapturedHistory.migrationToV7, with: "") + """
+            PRAGMA user_version = 3;
+            INSERT INTO sessions VALUES ('s', 'bob', 'h', 'zsh');
+            INSERT INTO commands (session, started_at, directory, command, exit_code, flags) VALUES ('s', 1, '/', 'old', 2, '');
+            """)
+        chmod(url.path, 0o600)
+        let log = CapturedHistory(url: url)
+        #expect(try log.records().map(\.command) == ["old"])
+        var version = 0
+        try old.run("PRAGMA user_version") { version = Int(sqlite3_column_int64($0, 0)) }
+        #expect(version == CapturedHistory.version)
+        try log.append(command: "a | b", shell: "zsh", directory: "/", exitCode: 1, nativeFile: "", pipestatus: [0, 1])
+        try log.append(command: "plain", shell: "fish", directory: "/", exitCode: 0, nativeFile: "")
+        let records = try log.records()
+        #expect(records.map(\.command) == ["old", "a | b", "plain"])
+        #expect(records.map(\.pipestatus) == [nil, [0, 1], nil])
+        #expect(records.map(\.exitCode) == [2, 1, 0])
+        // Reopening an up-to-date database changes nothing.
+        #expect(try CapturedHistory(url: url).records().count == 3)
+    }
+
+    @Test func `Add file selections to version 5 databases and keep what they record`() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let url = home.appendingPathComponent("captured.db")
+        let old = try fixtureDatabase(url)
+        try old.execute(CapturedHistory.schema.replacingOccurrences(of: CapturedHistory.migrationToV6, with: "")
+            .replacingOccurrences(of: CapturedHistory.migrationToV7, with: "") + """
+            INSERT INTO sessions VALUES ('s', 'bob', 'h', 'zsh');
+            INSERT INTO commands (session, started_at, directory, command, exit_code, flags) VALUES ('s', 1, '/', 'old', 2, '');
+            """)
+        chmod(url.path, 0o600)
+        let log = CapturedHistory(url: url)
+        #expect(try log.records().map(\.command) == ["old"])
+        let db = try log.openConnection()
+        var version = 0
+        try db.run("PRAGMA user_version") { version = Int(sqlite3_column_int64($0, 0)) }
+        #expect(version == CapturedHistory.version)
+        let now = 1_000_000.0
+        try log.recordSelection(root: "/r", path: "a b.txt", mode: "files", query: "a", at: now, on: db)
+        try log.recordSelection(root: "/r", path: "a b.txt", mode: "grep", query: "b", at: now - CapturedHistory.usageHalfLife, on: db)
+        try log.recordSelection(root: "/other", path: "x", mode: "files", query: "x", at: now, on: db)
+        let scores = try log.selectionScores(root: "/r", now: now, on: db)
+        #expect(scores.keys.sorted() == ["a b.txt"])
+        #expect(abs(scores["a b.txt"]! - 1.5) < 1e-9)
+        // Reopening changes nothing.
+        #expect(try CapturedHistory(url: url).records().count == 1)
+        #expect(try CapturedHistory(url: url).selectionScores(root: "/r", now: now, on: db)["a b.txt"] != nil)
+    }
+
+    @Test func `Add command picks to version 6 databases`() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let url = home.appendingPathComponent("captured.db")
+        let old = try fixtureDatabase(url)
+        try old.execute(CapturedHistory.schema.replacingOccurrences(of: CapturedHistory.migrationToV7, with: "") + """
+            INSERT INTO sessions VALUES ('s', 'bob', 'h', 'zsh');
+            INSERT INTO commands (session, started_at, directory, command, exit_code, flags) VALUES ('s', 1, '/', 'old', 0, '');
+            """)
+        chmod(url.path, 0o600)
+        let log = CapturedHistory(url: url)
+        let db = try log.openConnection()
+        var version = 0
+        try db.run("PRAGMA user_version") { version = Int(sqlite3_column_int64($0, 0)) }
+        #expect(version == 7)
+        try log.recordPick(query: "ol", command: "old", kind: "suggest", directory: "/", at: 5, on: db)
+        #expect(try log.picks(on: db).picks == [.init(query: "ol", command: "old", time: 5)])
+        #expect(try log.records().map(\.command) == ["old"])
+    }
+
+    @Test func `Parse and validate pipestatus words`() throws {
+        #expect(try CapturedHistory.parsePipestatus("") == nil)
+        #expect(try CapturedHistory.parsePipestatus(" 0  1\t141 ") == [0, 1, 141])
+        for bad in ["x", "0 1 -1", "256", "1.5"] {
+            #expect(throws: (any Error).self) { try CapturedHistory.parsePipestatus(bad) }
+        }
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let log = CapturedHistory(url: home.appendingPathComponent("captured.db"))
+        #expect(throws: (any Error).self) {
+            try log.append(command: "x", shell: "zsh", directory: "/", exitCode: 0, nativeFile: "", pipestatus: [300])
+        }
+    }
+
+    @Test func `Take version 4 databases back to version 3 and on to the current version`() throws {
+        let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        let url = home.appendingPathComponent("captured.db")
+        let old = try fixtureDatabase(url)
+        try old.execute(CapturedHistory.schema.replacingOccurrences(of: CapturedHistory.migrationToV5, with: "")
+            .replacingOccurrences(of: CapturedHistory.migrationToV6, with: "")
+            .replacingOccurrences(of: CapturedHistory.migrationToV7, with: "") + """
             CREATE TABLE usage (command TEXT PRIMARY KEY, score REAL NOT NULL, at REAL NOT NULL) WITHOUT ROWID;
             PRAGMA user_version = 4;
             INSERT INTO sessions VALUES ('s', 'bob', 'h', 'zsh');
@@ -224,7 +325,7 @@ struct CapturedHistoryTests {
         var version = 0, tables = 0
         try old.run("PRAGMA user_version") { version = Int(sqlite3_column_int64($0, 0)) }
         try old.run("SELECT count(*) FROM sqlite_master WHERE name = 'usage'") { tables = Int(sqlite3_column_int64($0, 0)) }
-        #expect(version == 3 && tables == 0)
+        #expect(version == CapturedHistory.version && tables == 0)
     }
 
     @Test func `Do not count interrupts or answering exit codes as failures`() throws {
@@ -293,7 +394,7 @@ struct CapturedHistoryTests {
     @Test func `Validate recording arguments before touching disk`() throws {
         let log = CapturedHistory(url: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
         #expect(throws: (any Error).self) {
-            try log.append(command: "echo hi", shell: "fish", directory: "/", exitCode: 0, nativeFile: "")
+            try log.append(command: "echo hi", shell: "tcsh", directory: "/", exitCode: 0, nativeFile: "")
         }
         #expect(throws: (any Error).self) {
             try log.append(command: "echo hi", shell: "bash", directory: "relative", exitCode: 300, nativeFile: "")

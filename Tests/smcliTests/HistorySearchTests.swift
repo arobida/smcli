@@ -1,6 +1,8 @@
 import Foundation
 import Testing
 @testable import smcli
+@testable import SmcliSearch
+@testable import SmcliCore
 
 struct HistorySearchTests {
     @Test func `Merge captured stats and native lines into distinct commands`() {

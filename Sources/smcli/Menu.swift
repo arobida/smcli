@@ -1,4 +1,6 @@
 import Foundation
+import SmcliCore
+import SmcliSearch
 
 /// Interactive command picker shown when smcli runs in a terminal with no arguments.
 struct Menu {
@@ -43,7 +45,8 @@ struct Menu {
 
     /// Returns the arguments to run, or nil if the user quit.
     static func choose(environment: [String: String]) -> [String]? {
-        let shell = (environment["SHELL"] as NSString?)?.lastPathComponent == "bash" ? "bash" : "zsh"
+        let login = (environment["SHELL"] as NSString?)?.lastPathComponent
+        let shell = ["bash", "fish"].contains(login) ? login! : "zsh"
         let items = items(shell: shell)
         var selected = 0
         while true {

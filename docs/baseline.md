@@ -1,69 +1,64 @@
-# Backend gate 1: baseline and fff verification
+# Backend baseline and fff verification
 
-Status: **baseline and standalone C API integration complete on macOS arm64**.
-No service, shell-adapter rewrite, directory-context cache, new ranking algorithm,
-or user-facing file/grep mode is implemented by this change.
+Status (2026-10-20): **steps 1 to 7 measured; macOS arm64 is the primary target and macOS x86_64 builds, links and
+passes the service and file-picker tests under Rosetta. Linux is not supported (see "Platforms").** The original
+step-1 numbers (2026-10-18, in-process) are kept below for comparison with the current ones.
+
+Two modes exist and the report names the one it measured: `SMCLI_SERVICE=0` (in-process, the bench default
+`--service off`) and the service (`--service on`). smcli itself starts `smcli-service` by default, so a normal install
+behaves like `--service on`. The service owns the history database connection, the suggestion index, the search index,
+cached directory context and the fff pool. Only `smcli-service` links fff; `smcli` has no fff symbols.
+Schema version is **7** (`pipestatus`, `file_selections`, `command_selections`).
 
 ## Reproduce
 
 From the repository root:
 
 ```sh
-make baseline
+make baseline                                 # in-process, writes dist/baseline.json
+make baseline BENCH_ARGS="--service on --output dist/baseline-service.json"   # through the service, plus repositories
+make baseline BENCH_ARGS="--service on --rows 1000 --repo-files 10000"        # a short service run
 make fff-smoke
 make test
 ```
 
 `make baseline` builds the release CLI and writes raw samples, medians, nearest-rank
 p95s, high-water RSS, binary SHA-256, toolchain and host metadata to
-`dist/baseline.json`. It never imports or reads the user's real history. To do a
-short run or retain a separate comparison:
-
-```sh
-make baseline BENCH_ARGS='--rows 1000 --samples 3 --output dist/baseline-quick.json'
-```
+`dist/baseline.json`. It never imports or reads the user's real history. `--service on`
+additionally records the service's resident size after each fixture (`service_rss_mib`) and runs the
+`repositories` section: a generated Git repository of 10,000 and 50,000 tracked files, measuring directory
+context, fff `files` and `grep` through the socket (cold = first request of a fresh service, warm = median).
 
 Python 3.9+, Bash and Zsh are used for the Unix benchmark. Shells are discovered on
 `PATH`; absent shells are omitted from the report. `make test` also runs a tiny
 10-row/one-sample benchmark as a functional harness check, without performance
-thresholds. fff is optional and is not fetched by `make build`, `make release`,
-`make fresh`, or `make test`.
+thresholds. fff is built by `make fff` (a prerequisite of `build`, `release`, `fresh` and `test`;
+Cargo must be installed) and linked statically into `smcli-service`.
 
-## Current capture → SQLite → suggestions → picker
+## Request path (current)
 
-1. [Generated shell hooks](../Sources/smcli/ShellIntegration.swift#L7) keep a
-   pending command, starting cwd, session and start time. At the next prompt (or
-   exit), they invoke a new `smcli record` process. Prompt recording is detached
-   by default; `SMCLI_SYNC=1` and shell exit wait for it. Bash uses DEBUG,
-   PROMPT_COMMAND and EXIT; Zsh uses preexec and wrapped precmd/zshexit.
-2. [`record` dispatch](../Sources/smcli/smcli.swift#L49) loads the capture filter
-   and calls [append](../Sources/smcli/CapturedHistory.swift#L313).
-   Each append validates the destination, opens a private database connection,
-   checks/migrates the schema, and generates a UUID.
-   [One transaction](../Sources/smcli/CapturedHistory.swift#L551) inserts the
-   session/run and updates the existing decayed usage tally. SQLite uses a
-   five-second busy timeout, WAL and `synchronous=NORMAL`. A successful CLI exit
-   follows COMMIT, but NORMAL is not a promise to survive power loss.
-   Direct capture currently generates a new UUID for each attempt: it is **not**
-   retry-idempotent.
-3. [`suggest`](../Sources/smcli/smcli.swift#L275) calls
-   [suggestions](../Sources/smcli/CapturedHistory.swift#L504), which scans matching
-   captured runs for the current user, computes recency/directory/success weights,
-   aggregates distinct commands in Swift, sorts and limits. It does not use fff
-   or semantic search.
-4. [`pick`](../Sources/smcli/Picker.swift#L213) obtains 50 directory suggestions,
-   aggregates captured stats, reads native histories, constructs/deduplicates its
-   candidate array, and loads the configured embedding model before opening the
-   terminal UI. Typing uses in-memory all-words substring matching. Tab invokes
-   the existing hybrid search without passing semantic results through that
-   substring filter.
-5. [`HistorySearch.search`](../Sources/smcli/HistorySearch.swift#L272) locks and
-   opens the persisted ProximaKit index, synchronizes embedded command documents,
-   queries the existing keyword/semantic fusion, and reranks a bounded candidate
-   pool with usage metadata. The index is opened and saved on each CLI search.
-   This experiment leaves those algorithms and storage semantics unchanged.
-6. The picker prints a selected command; existing ZLE/Readline widgets insert it
-   into the line buffer. They do not execute it. Fish is not implemented yet.
+1. [Generated shell hooks](../Sources/smcli/ShellIntegration.swift) (Bash, Zsh, Fish) keep a
+   pending command, starting cwd, session and start time. At the next prompt (or exit)
+   they call `smcli record`. Prompt recording is detached by default; `SMCLI_SYNC=1` and
+   shell exit wait for it. Zsh registers in `precmd_functions`/`preexec_functions`/`zshexit_functions`;
+   Bash prefers bash-preexec, then `PS0`, then the DEBUG trap; Fish uses `fish_preexec`/`fish_postexec`.
+2. `smcli record` sends a versioned, newline-delimited JSON `record` request to `smcli-service` over a
+   user-private Unix socket (peer UID checked). A client-generated event ID (`uuid`) makes retries
+   idempotent; the ack follows COMMIT. If the service is unreachable the client records directly in-process.
+   The service holds one SQLite connection (WAL, `synchronous=NORMAL`, five-second busy timeout), so
+   a successful ack follows COMMIT but is not a promise to survive power loss.
+3. `suggest` and the picker's first draw are answered from `SuggestionIndex`, an in-memory tally of
+   history that is updated per record and rebuilt only when another process writes
+   (`PRAGMA data_version`). Usage is decayed when read (`smcli_decay`, two-week half-life); there is no `usage`
+   table. Ranking adds project, previous-command, picked-query, project-script and Git-state signals
+   (see the plan, step 6). In-process mode scans the database as before.
+4. `search` runs the hybrid ProximaKit index (keyword plus the built-in potion-code-16M-v2 embedder) held open in
+   the service; a record adds to the corpus in place, a write by another process forces a rebuild.
+   The picker builds its own engine lazily on the first Tab when there is no service.
+5. Directory context (`ContextCache`) and fff `files`/`grep` are service-only: cached Git status refreshed in
+   the background, and one fff instance per repository root (4 by default, idle ones dropped).
+6. The picker prints a selected command or one shell-quoted path; the adapters insert it into the line
+   buffer. They never execute it.
 
 ## Measurement method
 
@@ -80,7 +75,8 @@ The record samples add 21 runs of one additional command before reads; hook
 samples run last. `first` is **not a machine-cold cache**: no filesystem/model
 caches are flushed. The first literal search does create the command index;
 the subsequent intent query uses that index. “Warm” means OS caches/index files
-are warm, **not** a resident service, resident model or in-process query loop.
+are warm. In-process runs (`SMCLI_SERVICE=0`) have no resident service or model; in service mode the work happens in a
+long-lived `smcli-service` and the timing is the client process (exec, one socket round trip, exit).
 
 CLI timing includes exec, dynamic linking and exit. Picker timing uses a
 controlling PTY and stops when its first footer is drawn; it excludes Ctrl-G
@@ -100,7 +96,172 @@ memory. Shell results can include waited-for descendants; detached writers are
 not a reliable part of shell RSS. Synthetic histories are a scaling baseline,
 not evidence about real-world ranking quality, plugins or large multiline inputs.
 
-## Recorded baseline — 2026-10-18
+## Recorded baseline — 2026-10-20 (step 7)
+
+Same machine, toolchain, shells and method as the earlier runs (Apple M1 Pro, macOS 27.0.1 arm64, Swift 6.4,
+Python 3.15.0, Bash 5.3.20, Zsh 5.9). Source: `3822ac5` **plus the uncommitted working-tree changes of steps 2 to 7**
+(the recorded git commit is only the base). Release binary SHA-256
+`3b1fc9c7d696008c0190187aee39ae184c125344ebe4073498e57bf6a09e6975`; raw files `dist/baseline.json`
+(`9436c450b3e8...`, in-process, started 2026-10-19T21:26Z) and `dist/baseline-service.json` (`8df54d533cd8...`, service,
+started 21:30Z). Times are milliseconds; each warm cell is median / p95. In service mode the number is what the
+**client process** takes, including exec; the work happens in the already running service.
+
+### Warm and first-request latency
+
+100,000 captured runs, the numbers that mattered in step 1:
+
+| Operation | Step 1 in-process (10-18) | Now in-process | Now through service | First request, service |
+|---|---:|---:|---:|---:|
+| Record CLI | 21.90 | 20.97 / 37.91 | 10.78 / 12.33 | 66.72 (starts the service) |
+| Suggest, empty prefix | 453.93 | 458.69 / 462.95 | **12.72 / 13.34** | 515.82 (builds the in-memory index) |
+| Suggest, `git` prefix | 149.90 | 151.91 / 154.21 | 10.96 / 12.02 | 11.89 |
+| Hybrid `git status` | 897.76 | 894.43 / 905.74 | **25.77 / 27.13** | 7,707.97 (builds the index once) |
+| Hybrid intent query | 884.09 | 893.07 / 900.18 | 24.69 / 25.82 | 27.30 |
+| Picker first draw | 699.33 | 651.04 / 655.34 | **61.19 / 62.38** | 61.80 |
+
+Service mode, all sizes:
+
+| Operation | 1k first | 1k warm | 10k first | 10k warm | 100k first | 100k warm |
+|---|---:|---:|---:|---:|---:|---:|
+| Record CLI | 61.48 | 9.84 / 11.23 | 52.39 | 9.80 / 11.81 | 66.72 | 10.78 / 12.33 |
+| Suggest, empty prefix | 17.99 | 9.82 / 11.69 | 63.19 | 10.96 / 11.59 | 515.82 | 12.72 / 13.34 |
+| Suggest, `git` prefix | 10.08 | 10.00 / 10.88 | 9.59 | 10.51 / 11.93 | 11.11 | 10.96 / 12.02 |
+| Hybrid `git status` | 251.18 | 19.23 / 21.48 | 2134.04 | 21.06 / 22.28 | 7707.97 | 25.77 / 27.13 |
+| Hybrid intent query | 20.66 | 18.47 / 19.72 | 19.75 | 20.47 / 21.53 | 27.30 | 24.69 / 25.82 |
+| Picker first draw | 12.94 | 11.88 / 13.23 | 21.81 | 22.93 / 23.96 | 61.80 | 61.19 / 62.38 |
+
+In-process mode, all sizes (the 10-18 numbers are in the section below):
+
+| Operation | 1k first | 1k warm | 10k first | 10k warm | 100k first | 100k warm |
+|---|---:|---:|---:|---:|---:|---:|
+| Record CLI | 57.41 | 23.26 / 43.05 | 43.63 | 39.05 / 49.67 | 39.98 | 20.97 / 37.91 |
+| Suggest, empty prefix | 18.49 | 17.52 / 19.05 | 64.63 | 61.38 / 65.26 | 460.96 | 458.69 / 462.95 |
+| Suggest, `git` prefix | 15.49 | 13.88 / 15.32 | 28.62 | 29.03 / 30.55 | 149.84 | 151.91 / 154.21 |
+| Hybrid `git status` | 228.68 | 62.76 / 63.85 | 2084.02 | 223.71 / 225.43 | 7730.16 | 894.43 / 905.74 |
+| Hybrid intent query | 61.68 | 62.51 / 64.49 | 223.76 | 224.05 / 228.96 | 893.10 | 893.07 / 900.18 |
+| Picker first draw | 22.27 | 20.31 / 21.98 | 85.23 | 86.64 / 87.29 | 653.09 | 651.04 / 655.34 |
+
+Cold versus warm: "first" is the first invocation for a fixture (OS caches not flushed). Through the service the
+first request pays for building the state it keeps (suggestion index 0.5 s at 100k; the search index 7.7 s at 100k,
+unchanged from in-process and done once per history, after which a record updates it in place). The first
+record also starts the service, which adds roughly 50 ms to that one command. Every later request is
+warm: about 10 ms, which is process start-up and one socket round trip.
+The step-1 finding holds in both directions: moving the scan into the service did not make it fast, but the incremental
+state did (suggest 454 -> 13 ms, search 884 -> 25 ms, picker 699 -> 61 ms at 100k). The picker's remaining 61 ms is
+the native-history read it still does in-process. In-process numbers are unchanged from step 1 within noise
+(the 1k/10k record cells are noisier than before, 23 and 39 ms medians against 18 and 21 ms).
+
+### Memory
+
+Median warm high-water RSS of one client process, MiB (step 1 at 100k in parentheses):
+
+| Operation | In-process 1k | 10k | 100k | Service client, any size |
+|---|---:|---:|---:|---:|
+| Record CLI | 11.50 | 11.53 | 11.50 (10.53) | 9.91 |
+| Suggest, empty prefix | 12.61 | 16.36 | 31.25 (30.25) | 9.59 |
+| Suggest, `git` prefix | 12.39 | 14.67 | 27.41 (27.34) | 9.61 |
+| Hybrid literal / intent query | 26.88 | 36.86 | 63.42 (91.19) | 9.84 |
+| Picker | 13.31 | 17.45 | 32.64 (31.91) | 10.48 to 12.59 |
+
+First literal search (index construction) peaked at 30.48 / 55.25 / 145.30 MiB in-process (352.53 MiB at 100k in
+step 1). The memory moves into the service, which holds it for as long as it runs. Resident size of
+`smcli-service` after a whole fixture run (records, suggest, search, picker, six hook runs):
+
+| History | 1k | 10k | 100k |
+|---|---:|---:|---:|
+| `smcli-service` RSS, MiB | 33.3 | 62.8 | 211.3 |
+
+An idle service exits after `SMCLI_SERVICE_IDLE` seconds, so this cost is paid only while shells are in use.
+
+### Hooks
+
+Hook roundtrip median / p95 in milliseconds at 100k runs; overhead is median minus capture-off:
+
+| Shell / mode | In-process | Overhead | Service | Overhead |
+|---|---:|---:|---:|---:|
+| Bash off | 0.087 / 0.102 | — | 0.088 / 0.095 | — |
+| Bash detached | 4.243 / 5.562 | 4.155 | 2.992 / 3.225 | 2.904 |
+| Bash synchronous | 21.406 / 42.012 | 21.319 | 10.322 / 11.962 | 10.234 |
+| Zsh off | 0.141 / 0.160 | — | 0.139 / 0.149 | — |
+| Zsh detached | 2.244 / 8.042 | 2.103 | 1.752 / 2.728 | 1.612 |
+| Zsh synchronous | 24.203 / 42.869 | 24.062 | 9.935 / 10.878 | 9.796 |
+
+The service halves the synchronous cost and tightens the p95 considerably (a service client no longer opens the
+database or checks the schema). Detached recording is not on the typing path in either mode.
+
+### Directory context and fff (service only)
+
+Generated Git repositories of 100 files per directory plus 5 untracked files, queried from a subdirectory.
+Cold is the first request of a fresh service; warm is the median of 20 repeats.
+
+| Tracked files | context cold | Git status ready | context warm | files cold | files warm | grep cold | grep warm | service RSS before / after |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10,000 | 1.0 ms | 28.8 ms | 0.18 ms | 243 ms | 0.47 ms | 100 ms | 102 ms | 10.1 / 25.9 MiB |
+| 50,000 | 1.0 ms | 97.8 ms | 0.19 ms | 1,401 ms | 0.96 ms | 1,020 ms | 1,488 ms | 10.1 / 59.6 MiB |
+
+Context never waits for Git: the first answer carries `statusPending` and the status lands within about 100 ms even at
+50,000 files. The fff instance is created on the first `files`/`grep` for a root and costs its scan time (1.4 s at
+50,000 files); after that file search is about a millisecond. **Grep is the weak spot:** warm grep at 50,000 files
+takes 1.5 s because each query scans the content (the call has a 1 s budget and returns what it found), so very large
+trees may get partial grep results rather than a stall. `scripts/test-service.py` also builds a 50,000-file repository
+and asserts correctness (right file, line and column; new files appear; the service stays under 1.5 GB).
+
+### Changes since 2026-10-19 (pre-service run)
+
+Record and hook costs in-process are unchanged (within noise), as are warm hybrid searches at 1k/10k (63 and 224 ms).
+The service is the answer to the 100k scans, as the step-1 finding predicted.
+
+## Recorded baseline — 2026-10-19 (pre-service run, in-process)
+
+Same machine, toolchain, shells and method as the 2026-10-18 run below.
+
+- Source HEAD: `3822ac5b097cf293511d31b6090dc1b80a8ecb5d` (built-in Potion embedder, lazy picker engine).
+- Release binary SHA-256: `1840d0b9559c566bd9dc6a313d0e6c2ad32fa06b1a7b821b509d7b92dac9c50f`.
+- Raw `dist/baseline.json` SHA-256: `bf396ec2eeed9775c48b83d9f9dc056b604ef456371573490f8a6565c27e2752`.
+- Run started: `2026-10-19T11:57:46.599791+00:00`.
+
+| Operation | 1k first | 1k warm | 10k first | 10k warm | 100k first | 100k warm |
+|---|---:|---:|---:|---:|---:|---:|
+| Record CLI | 41.69 | 19.44 / 35.45 | 29.42 | 23.98 / 29.42 | 40.86 | 23.22 / 27.72 |
+| Suggest, empty prefix | 21.10 | 18.38 / 19.19 | 61.46 | 62.75 / 65.38 | 493.69 | 492.86 / 498.94 |
+| Suggest, `git` prefix | 14.90 | 14.94 / 15.69 | 30.01 | 30.35 / 31.64 | 158.68 | 162.32 / 164.79 |
+| Hybrid `git status` | 253.24 | 65.32 / 67.15 | 2235.09 | 215.39 / 217.39 | 8897.78 | 876.64 / 882.02 |
+| Hybrid intent query | 66.57 | 65.45 / 66.29 | 217.36 | 214.07 / 218.24 | 876.84 | 881.35 / 885.94 |
+| Picker first draw | 22.69 | 21.77 / 22.73 | 91.86 | 91.29 / 93.12 | 691.19 | 696.17 / 699.15 |
+
+Median warm high-water RSS, MiB:
+
+| Operation | 1k | 10k | 100k |
+|---|---:|---:|---:|
+| Record CLI | 10.48 | 10.52 | 10.53 |
+| Suggest, empty prefix | 11.62 | 15.42 | 30.84 |
+| Suggest, `git` prefix | 11.44 | 13.69 | 26.71 |
+| Hybrid literal query | 26.46 | 36.91 | 63.10 |
+| Hybrid intent query | 26.44 | 37.18 | 62.85 |
+| Picker | 12.22 | 16.77 | 32.64 |
+
+First literal search (including index construction) peaked at 30.16 / 54.97 / 147.20 MiB.
+
+Hook roundtrip median / p95 in milliseconds; overhead is median minus capture-off:
+
+| Shell / mode | 1k | 10k | 100k | Overhead at 100k |
+|---|---:|---:|---:|---:|
+| Bash off | 0.079 / 0.088 | 0.076 / 0.094 | 0.079 / 0.094 | — |
+| Bash detached | 3.782 / 5.282 | 3.881 / 5.902 | 4.330 / 5.566 | 4.251 |
+| Bash synchronous | 23.171 / 28.005 | 21.290 / 28.340 | 20.644 / 31.208 | 20.564 |
+| Zsh off | 0.119 / 0.151 | 0.141 / 0.179 | 0.136 / 0.164 | — |
+| Zsh detached | 1.946 / 3.203 | 2.214 / 3.470 | 2.568 / 4.180 | 2.432 |
+| Zsh synchronous | 20.219 / 27.042 | 21.204 / 24.559 | 19.513 / 29.571 | 19.378 |
+
+Changes since 2026-10-18: the first hybrid search (index construction) is 3–4× faster
+(100k: 28.3 s → 8.9 s) and its peak RSS fell (352.5 → 147.2 MiB), from the Potion
+embedder. Warm hybrid searches are slightly slower at 1k/10k (53 → 65 ms, 153 → 215 ms)
+and about equal at 100k. The bottleneck is unchanged: at 100k, empty-prefix `suggest`
+(~493 ms) and picker first draw (~696 ms) still scan all history; the lazy engine did
+not change picker first draw because the benchmark never pressed Tab. Record and hook
+costs are within noise.
+
+## Recorded baseline — 2026-10-18 (step 1)
 
 Apple M1 Pro, 8 logical CPUs, 16 GiB RAM; macOS 27.0.1 arm64; Apple Swift 6.4;
 Python 3.15.0. Bash on PATH was 5.3.20; Zsh was 5.9. Builds and tests were not run
@@ -169,8 +330,8 @@ workloads before deciding on more machinery.
   binary is downloaded. The upstream generated header is used unchanged.
 - License: MIT, verified in the pinned root `LICENSE` and `fff-c/Cargo.toml`.
   The notice is retained in [tools/fff/LICENSE](../tools/fff/LICENSE) and copied to
-  `.build/fff/LICENSE`. This is not a transitive-license distribution audit;
-  do that before shipping a service binary containing fff.
+  `.build/fff/LICENSE`. The transitive-license audit is in
+  [fff-licenses.md](fff-licenses.md).
 - Build: Cargo/Rust, a native C toolchain, zlib and the platform SDK/headers used
   by vendored libgit2/LMDB. Verified with Rust/Cargo 1.99.1 and the installed Apple
   toolchain. Upstream uses Rust edition 2024 and does not declare a single
@@ -184,12 +345,12 @@ workloads before deciding on more machinery.
   toolchain instead. Rust/Cargo must already be installed.
 - [Upstream C release matrix](https://github.com/dmtrKovalenko/fff/blob/95fd777c2529fc7b4d7572dabff64cc07268f2c5/.github/workflows/release.yaml#L157)
   includes arm64 and x86_64 macOS, GNU Linux, musl Linux and Windows MSVC, plus
-  arm64 Android. Those release builds use `zlob`. **Only macOS arm64 with ripgrep
-  has been built and run here**; smcli's Intel/Linux integration remains unverified.
+  arm64 Android. Those release builds use `zlob`. smcli builds the default **ripgrep** feature set from source; that has been
+  built and run on **macOS arm64** and **macOS x86_64** (see "Platforms"). Linux has not.
 
 ### Exported API and ownership
 
-The built dylib's symbols were inspected with `nm -gU`, and the Swift program
+The built library's symbols were inspected with `nm`, and the Swift code
 compiled/linked against these real exports:
 
 | API | Ownership / use |
@@ -213,24 +374,43 @@ builds, not assertions compiled out by `-O`.
 Watchers, frecency/query LMDB paths, content indexing and mmap prewarming are all
 disabled for this ownership test. It does not measure a large-repository index,
 watcher freshness, grep, file-selection frecency or safe shell insertion. Those
-remain file-search release acceptance tests, not inferred from this smoke.
+are covered by the service tests instead (`scripts/test-service.py`: watcher freshness, grep, selections, awkward
+names, a 50,000-file repository, eviction), not inferred from this smoke.
 
 `make fff-smoke` passed. `MallocStackLogging=1 leaks --atExit --
 .build/fff/smoke` reported **0 leaks / 0 leaked bytes**, with the macOS
 restricted-process visibility warning. This is supporting evidence, not proof
-against all leaks or Rust global allocations. The experimental dynamic library
-remains inside `.build`; it is not a relocatable release artifact. `smcli` does
-not link it.
+against all leaks or Rust global allocations. The smoke test uses a dynamic library kept inside `.build`; the product
+links the static archive `.build/fff/lib/libfff_c.a` into `smcli-service` only. `smcli` has no fff symbols.
 
-## Next gate
+## Platforms
 
-Introduce the separate service executable and versioned bounded Unix-socket
-protocol, moving existing storage/retrieval ownership without replacing search.
-Before routing hooks through it, establish private socket ownership,
-concurrent-startup handling, persistence acknowledgements and stable event IDs
-shared with direct fallback so retries cannot double-record. Then test restart,
-concurrent shells and unavailable-service fallback against this baseline.
+| Target | Status |
+|---|---|
+| macOS arm64 | Built and tested (`make test`, shell tests, service tests, baseline). |
+| macOS x86_64 | `rustup target add x86_64-apple-darwin`, then `make x86_64` cross-builds fff (Cargo `--target`) and both executables with SwiftPM `--arch x86_64` into `.build/x86_64-scratch/`. Run under Rosetta: `scripts/test-service.py` (including the 50,000-file repository and fff) and `scripts/test-file-picker.py` pass. The Swift unit tests and shell tests were not repeated on x86_64. |
+| macOS universal | `make fff-universal` lipo-joins the two fff archives into `.build/fff/lib/libfff_c.a`; `swift build -c release --arch arm64 --arch x86_64` then produces fat `smcli` and `smcli-service`. Built and checked with `lipo -info`; not run. |
+| Linux | **Not supported, not tried.** `Package.swift` links fff and the potion model only on macOS (`.when(platforms: [.macOS])`), `ProximaKit` is Apple-only, FSEvents is macOS-only, and `scripts/build-fff.sh` has no Linux branch. The service product would not link without fff; `smcli search` already reports itself unavailable. A Linux port needs the fff link line, a non-ProximaKit search path and a decision on the `zlob` feature. |
 
-Native Bash/Zsh/Fish adapter work, cached Git/package context, fff file/grep picker
-modes, ranking extensions and crash/eviction tests are later gates. No shell
-initialization commands are changed by this baseline experiment.
+`scripts/build-fff.sh` always writes `.build/fff/lib/libfff_c.a` (thin for this machine by default; `FFF_ARCHS="arm64 x86_64"`
+for universal) and `Package.swift` links that path. On x86_64 the linker prints four warnings for fff's hand-written
+BLAKE3 assembly objects ("built for newer macOS (27.0) than being linked (14.0)"): that code ignores
+`MACOSX_DEPLOYMENT_TARGET` and the warning is harmless. The arm64 slice is clean. SwiftPM also warns that x86_64 is deprecated
+for the macOS 27 SDK; the project's deployment target remains macOS 14.
+
+## Found while writing the step 7 tests
+
+- fff only reports file-system changes once its watcher is running, which on a larger tree is some time after the
+  initial scan completes. Files created in that gap (seen with 5,000+ files, and with 50,000) were never indexed until
+  the instance was recreated. `FFFIndex` now also waits for the watcher (`fff_wait_for_watcher`) before it is used, and
+  the large-repository test creates a file right after the first query.
+- `scripts/test-service.py` matched the service process by an unstamped binary name; it now also matches the
+  timestamped `dist/smcli-service-*` names.
+
+## Status of later gates
+
+Native shell adapters, cached Git/package context, the fff file/grep picker modes, ranking signals and the crash,
+concurrency, malformed-input, stale-index, large-repository and eviction tests are done and listed in
+`.plans/backend-plan.md`. Still open: a license for smcli and the xdiff (LGPL) decision
+(`THIRD_PARTY_NOTICES.md`, `docs/fff-licenses.md`), Linux support, and persistent-socket or async-suggestion work
+that is only justified if measurements ask for it.

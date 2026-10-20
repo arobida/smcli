@@ -1,6 +1,8 @@
 import Foundation
 import Testing
 @testable import smcli
+@testable import SmcliSearch
+@testable import SmcliCore
 
 struct PickerTests {
     @Test func `Open on suggestions, then the rest by recency`() {

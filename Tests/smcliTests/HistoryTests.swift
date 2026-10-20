@@ -1,6 +1,8 @@
 import Foundation
 import Testing
 @testable import smcli
+@testable import SmcliSearch
+@testable import SmcliCore
 
 struct HistoryTests {
     @Test(arguments: [

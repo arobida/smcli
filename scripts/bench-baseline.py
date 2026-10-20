@@ -196,7 +196,7 @@ def hooks(binary, shell, mode, env, directory, samples):
         terminal.close()
 
 
-def seed(binary, home, rows):
+def seed(binary, home, rows, service):
     directory = home / "projects" / "p0"
     directory.mkdir(parents=True)
     config = home / "config.json"
@@ -207,7 +207,11 @@ def seed(binary, home, rows):
            and k not in ("HISTFILE", "BASH_ENV", "ENV", "ZDOTDIR")}
     env.update(HOME=str(home), HISTFILE="", SMCLI_DB=str(home / "history.db"),
                SMCLI_CONFIG=str(config), PWD=str(directory), TERM="dumb",
-               XDG_DATA_HOME=str(home / "data"), XDG_CONFIG_HOME=str(home / "config"))
+               XDG_DATA_HOME=str(home / "data"), XDG_CONFIG_HOME=str(home / "config"),
+               SMCLI_SERVICE="1" if service else "0")
+    if service:
+        # Unix socket paths are short; the fixture's own directory is not.
+        env["SMCLI_RUNTIME_DIR"] = tempfile.mkdtemp(prefix="smcli-bench.", dir="/tmp")
     distinct = min(rows, max(100, rows // 5), 5000)
     templates = ["git status --short # {n}", "git log --oneline -n {n}",
                  "npm run test -- src/test{n}.ts", "cargo test package{n}",
@@ -236,13 +240,87 @@ def seed(binary, home, rows):
     return env, directory, distinct, native_rows
 
 
+def repository_search(binary, files, samples):
+    """File count -> directory context, fff files and grep latency through the service, plus its memory.
+
+    Builds a Git repository of `files` tracked files (100 per directory) and 5 untracked ones. Cold = the first request
+    of a fresh service; warm = the median of `samples` repeats. RSS is the service's resident size right after, not a peak.
+    """
+    import json as _json
+    import socket
+    with tempfile.TemporaryDirectory(prefix="smcli-repo-") as temp:
+        home = Path(temp).resolve()
+        repo = home / "repo"
+        for d in range(files // 100):
+            folder = repo / f"pkg{d // 50}" / f"dir{d}"
+            folder.mkdir(parents=True)
+            for f in range(100):
+                (folder / f"file{f}.txt").write_text(f"line {d} {f}\n")
+        (repo / "pkg0" / "dir0" / "unique_zebra_marker.swift").write_text("let marker = 1 // quokka_token_9137\n")
+        git = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@e.x", "-c", "gc.auto=0", *a],
+                                        check=True, capture_output=True)
+        git("init", "-q", "-b", "main")
+        git("add", ".")
+        git("commit", "-q", "-m", "fixture")
+        for n in range(5):
+            (repo / f"untracked{n}.txt").write_text("u")
+        runtime = tempfile.mkdtemp(prefix="smcli-bench.", dir="/tmp")
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("SMCLI_", "XDG_"))}
+        env.update(HOME=str(home), SMCLI_DB=str(home / "history.db"), SMCLI_CONFIG=str(home / "config.json"),
+                   SMCLI_RUNTIME_DIR=runtime, SMCLI_SERVICE="1")
+        (home / "config.json").write_text("{}\n")
+        subprocess.run([binary, "service", "start"], env=env, check=True, capture_output=True, timeout=60)
+        status = subprocess.run([binary, "service", "status"], env=env, check=True, capture_output=True, text=True).stdout
+        path, pid = status.split(" at ")[1].split(" for ")[0], int(status.split("pid ")[1].split(")")[0])
+
+        def ask(op, query=""):
+            start = time.perf_counter()
+            with socket.socket(socket.AF_UNIX) as connection:
+                connection.settimeout(120)
+                connection.connect(path)
+                connection.sendall((_json.dumps({"v": 1, "op": op, "directory": str(repo / "pkg0" / "dir0"), "query": query}) + "\n").encode())
+                reply = b""
+                while not reply.endswith(b"\n"):
+                    reply += connection.recv(1 << 20)
+            return (time.perf_counter() - start) * 1000, _json.loads(reply)
+
+        def rss():
+            return int(subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True).stdout) / 1024
+        try:
+            result = {"files": files, "rss_start_mib": rss()}
+            result["context_first_ms"] = ask("context")[0]
+            begin = time.perf_counter()
+            while "status" not in ask("context")[1]["context"] and time.perf_counter() - begin < 120:
+                time.sleep(0.02)
+            result["context_status_ready_ms"] = (time.perf_counter() - begin) * 1000 + result["context_first_ms"]
+            result["context_warm_ms"] = summary([ask("context")[0] for _ in range(samples)])
+            first, reply = ask("files", "unique_zebra_marker")
+            assert reply["ok"] and reply["files"][0]["path"].endswith("unique_zebra_marker.swift"), reply
+            result["files_first_ms"] = first
+            result["files_warm_ms"] = summary([ask("files", "unique_zebra_marker")[0] for _ in range(samples)])
+            result["grep_first_ms"] = ask("grep", "quokka_token_9137")[0]
+            result["grep_warm_ms"] = summary([ask("grep", "quokka_token_9137")[0] for _ in range(samples)])
+            result["rss_after_mib"] = rss()
+            return result
+        finally:
+            subprocess.run([binary, "service", "stop"], env=env, capture_output=True, timeout=60)
+            shutil.rmtree(runtime, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--rows", type=positive, nargs="+", default=[1000, 10000, 100000])
     parser.add_argument("--samples", type=positive, default=20)
     parser.add_argument("--output", type=Path, default=Path("dist/baseline.json"))
+    parser.add_argument("--service", choices=("on", "off"), default="off",
+                        help="measure through smcli-service (on) or in-process (off, the default; smcli itself defaults to on)")
+    parser.add_argument("--repo-files", type=positive, nargs="*", default=None,
+                        help="tracked-file counts for the directory context / fff files / grep section "
+                             "(needs the service; default 10000 50000 with --service on, none otherwise)")
     args = parser.parse_args()
+    if args.repo_files is None:
+        args.repo_files = [10000, 50000] if args.service == "on" and sys.platform == "darwin" else []
     binary = str(args.binary.resolve(strict=True))
     shells = [shutil.which(name) for name in ("bash", "zsh")]
     report = {
@@ -254,8 +332,10 @@ def main():
         "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
         "swift": subprocess.check_output([os.environ.get("SWIFT", "/usr/bin/swift"), "--version"],
                                          stderr=subprocess.STDOUT, text=True).strip(),
-        "samples": args.samples, "fixtures": [],
+        "samples": args.samples, "fixtures": [], "service": args.service,
         "notes": [
+            f"Service mode: {args.service}. " + ("Every command goes through a smcli-service started for the fixture (record, suggest, search, picker)."
+                                                 if args.service == "on" else "SMCLI_SERVICE=0: every command works in-process."),
             "Synthetic captured history: 20 directories, repeated commands, Unicode, 1/7 failures; native lines = rows/10.",
             "First = first invocation for this fixture, NOT a flushed filesystem/model cache.",
             "Warm = repeated one-shot processes with OS caches warm, NOT a persistent backend or in-process search.",
@@ -272,7 +352,7 @@ def main():
         print(f"Measuring {rows} captured rows…", file=sys.stderr, flush=True)
         with tempfile.TemporaryDirectory(prefix="smcli-baseline-") as temp:
             home = Path(temp).resolve()
-            env, directory, distinct, native_rows = seed(binary, home, rows)
+            env, directory, distinct, native_rows = seed(binary, home, rows, args.service == "on")
             fixture = {"rows": rows, "distinct_captured": distinct, "native_rows": native_rows}
             record = [binary, "record", "zsh", "benchmark-record", str(directory), "0", "", "", "", ": benchmark-record"]
             fixture["record"] = repeated(record, env, args.samples)
@@ -303,10 +383,25 @@ def main():
                     "path": shell,
                     "version": subprocess.check_output([shell, "--version"], text=True).splitlines()[0],
                     "modes": modes}
+            if args.service == "on":
+                status = subprocess.run([binary, "service", "status"], env=env, capture_output=True, text=True).stdout
+                if "pid " in status:
+                    pid = status.split("pid ")[1].split(")")[0]
+                    rss = subprocess.run(["ps", "-o", "rss=", "-p", pid], capture_output=True, text=True).stdout.strip()
+                    # Resident size of the service after everything above (suggest, search, picker, hooks), not a peak.
+                    fixture["service_rss_mib"] = int(rss) / 1024 if rss else None
+                subprocess.run([binary, "service", "stop"], env=env, capture_output=True, timeout=60)
+                shutil.rmtree(env["SMCLI_RUNTIME_DIR"], ignore_errors=True)
             fixture["database_bytes"] = Path(env["SMCLI_DB"]).stat().st_size
             report["fixtures"].append(fixture)
             # Persist completed fixtures, so an interrupted large run still leaves evidence.
             args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(report, indent=2) + "\n")
+    if args.repo_files:
+        report["repositories"] = []
+        for files in args.repo_files:
+            print(f"Measuring a {files}-file repository…", file=sys.stderr, flush=True)
+            report["repositories"].append(repository_search(binary, files, args.samples))
             args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(f"Wrote {args.output}", file=sys.stderr)
 

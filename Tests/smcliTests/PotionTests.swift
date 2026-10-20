@@ -1,6 +1,8 @@
 import Foundation
 import Testing
 @testable import smcli
+@testable import SmcliSearch
+@testable import SmcliCore
 
 struct PotionTests {
     /// A two-dimensional model over a tiny WordPiece vocabulary, written in the Hugging Face layout.

@@ -10,21 +10,21 @@ import SQLite3
 import CSQLite
 #endif
 
-struct CommandFlag: Codable, Equatable {
-    let name: String
-    let value: String?
+package struct CommandFlag: Codable, Equatable {
+    package let name: String
+    package let value: String?
 }
 
-struct CommandBreakdown: Codable, Equatable {
-    let mainCommand: String
-    let subcommand: String?
-    let flags: [CommandFlag]
-    let targets: [String]
-    let arguments: [String]
+package struct CommandBreakdown: Codable, Equatable {
+    package let mainCommand: String
+    package let subcommand: String?
+    package let flags: [CommandFlag]
+    package let targets: [String]
+    package let arguments: [String]
 
     // shortcut: common tools/options only; use complete tool schemas for semantic parsing.
-    static let tools: Set<String> = ["git", "docker", "npm", "cargo", "swift", "kubectl", "brew", "smcli"]
-    static let valueOptions: [String: Set<String>] = [
+    package static let tools: Set<String> = ["git", "docker", "npm", "cargo", "swift", "kubectl", "brew", "smcli"]
+    package static let valueOptions: [String: Set<String>] = [
         "git": ["-C", "-c", "--git-dir", "--work-tree"],
         "git commit": ["-m", "--message", "-F", "--file", "--author"],
         "docker": ["--context"],
@@ -38,7 +38,7 @@ struct CommandBreakdown: Codable, Equatable {
         "grep": ["-e", "--regexp", "-f", "--file", "-A", "-B", "-C"],
     ]
 
-    static func parse(_ command: String) -> CommandBreakdown? {
+    package static func parse(_ command: String) -> CommandBreakdown? {
         guard var words = shellWords(command), !words.isEmpty else { return nil }
         // Assignment prefixes are not executables. Keep the unmodified command in the record.
         while let first = words.first, let equals = first.firstIndex(of: "="), let head = first.first,
@@ -81,14 +81,14 @@ struct CommandBreakdown: Codable, Equatable {
 
 /// Option names in a command (`--amend`, `-m`), without their values. Lines the parser refuses
 /// (pipes, substitutions) fall back to whitespace-separated words that start with `-`.
-func commandFlags(_ command: String) -> [String] {
+package func commandFlags(_ command: String) -> [String] {
     if let breakdown = CommandBreakdown.parse(command) { return breakdown.flags.map(\.name) }
     return command.split(whereSeparator: \.isWhitespace).map(String.init).filter { $0.hasPrefix("-") && $0 != "-" && $0 != "--" }
         .map { $0.split(separator: "=", maxSplits: 1).first.map(String.init) ?? $0 }
 }
 
 // Tokenize without executing or expanding anything. Compound shell syntax is deliberately not guessed.
-func shellWords(_ command: String) -> [String]? {
+package func shellWords(_ command: String) -> [String]? {
     let characters = Array(command)
     var words: [String] = []
     var word = ""
@@ -133,65 +133,96 @@ func shellWords(_ command: String) -> [String]? {
     return words
 }
 
+/// True when a command line runs smcli itself (`smcli …`, `/path/to/smcli …`, `swift run smcli …`),
+/// so searches and suggestions are not about the tool. Leading `VAR=value` assignments are skipped.
+package func isSmcliCommand(_ command: String) -> Bool {
+    var words = command.split(whereSeparator: \.isWhitespace).map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "'\"")) }
+    while let first = words.first, let equals = first.firstIndex(of: "="), equals != first.startIndex,
+          !first[..<equals].contains("/") {
+        words.removeFirst()
+    }
+    // `swift run` options may take values (`-c release`), so look for the product among the next few words.
+    if words.first == "swift" && words.dropFirst().first == "run" {
+        return words.dropFirst(2).prefix(5).contains("smcli")
+    }
+    return words.first.map { $0.split(separator: "/").last == "smcli" } ?? false
+}
+
 /// A captured command as presented to readers. `runCount` and `breakdown` are derived at read time,
 /// so they reflect the whole log and the current parser rather than whatever was true when written.
-struct CapturedCommand: Codable, Equatable {
+package struct CapturedCommand: Codable, Equatable {
     /// Stable UUID, shared with Atuin for imported rows so re-imports deduplicate.
-    let id: String?
-    let timestamp: String
-    let durationMs: Int?
-    let user: String
-    let host: String
-    let session: String
-    let directory: String
-    let shell: String
-    let command: String
-    let exitCode: Int
+    package let id: String?
+    package let timestamp: String
+    package let durationMs: Int?
+    package let user: String
+    package let host: String
+    package let session: String
+    package let directory: String
+    package let shell: String
+    package let command: String
+    package let exitCode: Int
+    /// Each stage's exit status of a pipeline (Zsh and Fish `pipestatus`); nil when the shell didn't report it.
+    package let pipestatus: [Int]?
     /// Who wrote the command (a person or an agent), and why; both optional, as in Atuin.
-    let author: String?
-    let intent: String?
-    let runCount: Int
-    let breakdown: CommandBreakdown?
+    package let author: String?
+    package let intent: String?
+    package let runCount: Int
+    package let breakdown: CommandBreakdown?
 }
 
-struct CommandStats: Equatable {
-    let runs: Int
-    let lastRun: Double
-    let lastDirectory: String
-    let lastExitCode: Int
-    var author: String? = nil
-    var intent: String? = nil
-    var flags: [String] = []
+package struct CommandStats: Equatable {
+    package var runs: Int
+    package var lastRun: Double
+    package var lastDirectory: String
+    package var lastExitCode: Int
+    package var author: String? = nil
+    package var intent: String? = nil
+    package var flags: [String] = []
     /// Runs weighted by age (a run two weeks old counts half), so current habits outrank old ones.
-    var frecency: Double = 0
-    var successes: Int = 0
+    package var frecency: Double = 0
+    package var successes: Int = 0
     /// Runs in the directory passed to `commandStats`, or below it.
-    var runsHere: Int = 0
+    package var runsHere: Int = 0
+    /// Runs in the project root passed to `commandStats`, or below it.
+    package var runsProject: Int = 0
+
+    package init(runs: Int, lastRun: Double, lastDirectory: String, lastExitCode: Int, author: String? = nil,
+                 intent: String? = nil, flags: [String] = [], frecency: Double = 0, successes: Int = 0,
+                 runsHere: Int = 0, runsProject: Int = 0) {
+        (self.runs, self.lastRun, self.lastDirectory, self.lastExitCode) = (runs, lastRun, lastDirectory, lastExitCode)
+        (self.author, self.intent, self.flags, self.frecency) = (author, intent, flags, frecency)
+        (self.successes, self.runsHere, self.runsProject) = (successes, runsHere, runsProject)
+    }
 }
 
-struct Suggestion: Codable, Equatable {
-    let command: String
-    let score: Double
-    let runs: Int
+package struct Suggestion: Codable, Equatable {
+    package let command: String
+    package let score: Double
+    package let runs: Int
     /// Runs in exactly the requested directory.
-    let runsHere: Int
-    let lastRun: String
-    let lastExitCode: Int
+    package let runsHere: Int
+    package let lastRun: String
+    package let lastExitCode: Int
+    /// What moved it beyond usage: where it ran, what it often follows, a pick, a project script or Git state.
+    package var why: [String]? = nil
 }
 
-struct HistoryError: LocalizedError {
-    let message: String
-    var errorDescription: String? { message }
+package struct HistoryError: LocalizedError {
+    package let message: String
+    package var errorDescription: String? { message }
+
+    package init(message: String) { self.message = message }
 }
 
-enum SQLValue {
+package enum SQLValue {
     case text(String), integer(Int), real(Double), null
 }
 
-final class SQLiteDatabase {
+package final class SQLiteDatabase {
     private let db: OpaquePointer
 
-    init(path: String, readOnly: Bool) throws {
+    package init(path: String, readOnly: Bool) throws {
         var handle: OpaquePointer?
         let flags = (readOnly ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE) | SQLITE_OPEN_NOFOLLOW | SQLITE_OPEN_NOMUTEX
         guard sqlite3_open_v2(path, &handle, flags, nil) == SQLITE_OK, let handle else {
@@ -207,18 +238,30 @@ final class SQLiteDatabase {
             let age = max(0, sqlite3_value_double(arguments![0]))
             sqlite3_result_double(context, pow(0.5, age / CapturedHistory.usageHalfLife))
         }, nil, nil, nil)
+        // Lets a query skip smcli's own commands the way `isSmcliCommand` does everywhere else.
+        sqlite3_create_function_v2(db, "smcli_internal", 1, SQLITE_UTF8 | SQLITE_DETERMINISTIC, nil, { context, _, arguments in
+            let command = sqlite3_value_text(arguments![0]).map { String(cString: $0) } ?? ""
+            sqlite3_result_int(context, isSmcliCommand(command) ? 1 : 0)
+        }, nil, nil, nil)
     }
 
     deinit { sqlite3_close(db) }
 
-    /// Rows changed by the most recent INSERT, UPDATE, or DELETE.
-    var changes: Int { Int(sqlite3_changes(db)) }
+    /// Changes whenever another connection commits, so a long-lived reader knows its cache is stale.
+    package func dataVersion() throws -> Int {
+        var version = 0
+        try run("PRAGMA data_version") { version = Int(sqlite3_column_int64($0, 0)) }
+        return version
+    }
 
-    func execute(_ sql: String) throws {
+    /// Rows changed by the most recent INSERT, UPDATE, or DELETE.
+    package var changes: Int { Int(sqlite3_changes(db)) }
+
+    package func execute(_ sql: String) throws {
         try check(sqlite3_exec(db, sql, nil, nil, nil))
     }
 
-    func run(_ sql: String, _ values: [SQLValue] = [], row: ((OpaquePointer) throws -> Void)? = nil) throws {
+    package func run(_ sql: String, _ values: [SQLValue] = [], row: ((OpaquePointer) throws -> Void)? = nil) throws {
         var statement: OpaquePointer?
         try check(sqlite3_prepare_v2(db, sql, -1, &statement, nil))
         defer { sqlite3_finalize(statement) }
@@ -254,10 +297,12 @@ private func optionalText(_ statement: OpaquePointer, _ column: Int32) -> String
     sqlite3_column_type(statement, column) == SQLITE_NULL ? nil : text(statement, column)
 }
 
-struct CapturedHistory {
-    let url: URL
+package struct CapturedHistory {
+    package let url: URL
 
-    static let schema = """
+    package init(url: URL) { self.url = url }
+
+    package static let schema = """
         CREATE TABLE sessions (
             id TEXT PRIMARY KEY, user TEXT NOT NULL, host TEXT NOT NULL, shell TEXT NOT NULL
         ) WITHOUT ROWID;
@@ -268,10 +313,10 @@ struct CapturedHistory {
         );
         CREATE INDEX commands_by_command ON commands(command, started_at);
         CREATE INDEX commands_by_directory ON commands(directory, started_at);
-        """ + migrationToV2 + migrationToV3
+        """ + migrationToV2 + migrationToV3 + migrationToV5 + migrationToV6 + migrationToV7
 
     /// Fields borrowed from Atuin's history table: a UUID for deduplication, soft deletion, and authorship.
-    static let migrationToV2 = """
+    package static let migrationToV2 = """
         ALTER TABLE commands ADD COLUMN uuid TEXT;
         ALTER TABLE commands ADD COLUMN deleted_at REAL;
         ALTER TABLE commands ADD COLUMN author TEXT;
@@ -281,31 +326,55 @@ struct CapturedHistory {
         """
     /// Option names, space-separated (empty when none), so flags can be read without re-parsing.
     /// Existing rows are filled in by `backfillFlags`.
-    static let migrationToV3 = """
+    package static let migrationToV3 = """
         ALTER TABLE commands ADD COLUMN flags TEXT;
         PRAGMA user_version = 3;
         """
-    static let version = 3
+    /// Space-separated exit status of each pipeline stage; NULL when the shell doesn't report it.
+    package static let migrationToV5 = """
+        ALTER TABLE commands ADD COLUMN pipestatus TEXT;
+        PRAGMA user_version = 5;
+        """
+    /// Files the user explicitly picked in the file or grep picker (never inferred from command text), for frecency.
+    /// `path` is relative to `root`; `query` is what was typed.
+    package static let migrationToV6 = """
+        CREATE TABLE file_selections (
+            id INTEGER PRIMARY KEY, root TEXT NOT NULL, path TEXT NOT NULL, mode TEXT NOT NULL,
+            query TEXT NOT NULL, selected_at REAL NOT NULL
+        );
+        CREATE INDEX file_selections_by_root ON file_selections(root, path);
+        PRAGMA user_version = 6;
+        """
+    /// Commands the user explicitly picked in the picker (from suggestions, history or search results), with what was
+    /// typed at the time, so a similar query later puts that command first. `kind` is `suggest` or `search`.
+    package static let migrationToV7 = """
+        CREATE TABLE command_selections (
+            id INTEGER PRIMARY KEY, query TEXT NOT NULL, command TEXT NOT NULL, kind TEXT NOT NULL,
+            directory TEXT NOT NULL, selected_at REAL NOT NULL
+        );
+        PRAGMA user_version = 7;
+        """
+    package static let version = 7
     /// A short-lived build stored usage scores in a `usage` table at version 4. Usage is now computed when read,
     /// so such databases are taken back to version 3, which every binary since flags can open.
-    /// The next real schema change must therefore use version 5.
-    static let discardedUsageVersion = 4
+    /// Real schema changes therefore start at version 5.
+    package static let discardedUsageVersion = 4
     /// Usage halves every two weeks, so habits outweigh one-offs without old habits winning forever.
-    static let usageHalfLife = 14.0 * 86_400
+    package static let usageHalfLife = 14.0 * 86_400
 
     /// Exit codes that do not mean the command failed: stopped with Ctrl-C (130) or by a closed pipe (141).
-    static let interruptedExitCodes = [130, 141]
+    package static let interruptedExitCodes = [130, 141]
     /// Programs whose exit code 1 is an answer ("no match", "files differ", "false"), not an error.
-    static let answeringPrograms: Set<String> = ["grep", "egrep", "fgrep", "rg", "ag", "ack", "pgrep", "diff", "cmp",
+    package static let answeringPrograms: Set<String> = ["grep", "egrep", "fgrep", "rg", "ag", "ack", "pgrep", "diff", "cmp",
                                                  "colordiff", "test", "[", "which", "type", "command", "false"]
 
-    static func answersWithExitCode(_ command: String) -> Bool {
+    package static func answersWithExitCode(_ command: String) -> Bool {
         let program = CommandBreakdown.parse(command)?.mainCommand
             ?? command.split(whereSeparator: \.isWhitespace).first.map(String.init)
         return program.map { answeringPrograms.contains(String($0.split(separator: "/").last ?? Substring($0))) } ?? false
     }
 
-    static func atuinLocation(home: URL, environment: [String: String]) -> URL {
+    package static func atuinLocation(home: URL, environment: [String: String]) -> URL {
         if let path = environment["ATUIN_DB_PATH"], !path.isEmpty { return URL(fileURLWithPath: path) }
         if let data = environment["XDG_DATA_HOME"], !data.isEmpty {
             return URL(fileURLWithPath: data).appendingPathComponent("atuin/history.db")
@@ -313,25 +382,31 @@ struct CapturedHistory {
         return home.appendingPathComponent(".local/share/atuin/history.db")
     }
 
-    static func location(home: URL, environment: [String: String]) -> URL {
+    package static func location(home: URL, environment: [String: String]) -> URL {
         if let path = environment["SMCLI_DB"], !path.isEmpty { return URL(fileURLWithPath: path) }
         return home.appendingPathComponent(".local/share/smcli/history.db")
     }
 
     /// Records one finished command. Times are Unix epoch seconds supplied by the shell hook;
     /// without them the start is the save time and the duration is unknown.
-    func append(command: String, shell: String, directory: String, exitCode: Int, nativeFile: String,
-                session: String = "unknown", startedAt: Double? = nil, endedAt: Double? = nil) throws {
-        guard ["bash", "zsh"].contains(shell), (0...255).contains(exitCode),
-              directory.hasPrefix("/"), !command.isEmpty, !session.isEmpty else {
-            throw HistoryError(message: "Invalid shell, directory, exit code, session, or empty command.")
+    /// `event` is the caller's ID for this record (stored as `uuid`): retrying with the same ID never adds a
+    /// second row. Returns false when that ID was already stored. `db` reuses an open connection.
+    @discardableResult
+    package func append(command: String, shell: String, directory: String, exitCode: Int, nativeFile: String,
+                        session: String = "unknown", startedAt: Double? = nil, endedAt: Double? = nil,
+                        pipestatus: [Int]? = nil, event: String = UUID().uuidString.lowercased(), on db: SQLiteDatabase? = nil) throws -> Bool {
+        guard ["bash", "zsh", "fish"].contains(shell), (0...255).contains(exitCode),
+              directory.hasPrefix("/"), !command.isEmpty, !session.isEmpty,
+              (pipestatus ?? []).count <= 256, (pipestatus ?? []).allSatisfy({ (0...255).contains($0) }) else {
+            throw HistoryError(message: "Invalid shell, directory, exit code, pipestatus, session, or empty command.")
         }
         if !nativeFile.isEmpty && url.resolvingSymlinksInPath() == URL(fileURLWithPath: nativeFile).resolvingSymlinksInPath() {
             throw HistoryError(message: "SMCLI_DB must be separate from the shell's native HISTFILE.")
         }
         let start = startedAt ?? Date().timeIntervalSince1970
         let duration = endedAt.map { max(0, Int((($0 - start) * 1000).rounded())) }
-        let db = try connect(write: true)
+        guard Self.isEventID(event) else { throw HistoryError(message: "Invalid event ID.") }
+        let db = try db ?? connect(write: true)
         if !nativeFile.isEmpty {
             var logInfo = stat()
             var nativeInfo = stat()
@@ -340,16 +415,127 @@ struct CapturedHistory {
                 throw HistoryError(message: "SMCLI_DB must not be a hard link to native HISTFILE.")
             }
         }
-        try insert(into: db, session: session, user: NSUserName(), host: ProcessInfo.processInfo.hostName, shell: shell,
-                   startedAt: start, durationMs: duration, directory: directory, command: command, exitCode: exitCode,
-                   uuid: UUID().uuidString.lowercased())
+        return try insert(into: db, session: session, user: NSUserName(), host: ProcessInfo.processInfo.hostName,
+                          shell: shell, startedAt: start, durationMs: duration, directory: directory, command: command,
+                          exitCode: exitCode, uuid: event, pipestatus: pipestatus)
     }
+
+    /// Records one explicit file selection.
+    package func recordSelection(root: String, path: String, mode: String, query: String,
+                                 at time: Double = Date().timeIntervalSince1970, on db: SQLiteDatabase) throws {
+        try db.run("INSERT INTO file_selections (root, path, mode, query, selected_at) VALUES (?, ?, ?, ?, ?)",
+                   [.text(root), .text(path), .text(mode), .text(query), .real(time)])
+    }
+
+    /// Selection count per path under `root`, decayed like command usage, so recent picks outrank old ones.
+    package func selectionScores(root: String, now: Double = Date().timeIntervalSince1970,
+                                 on db: SQLiteDatabase) throws -> [String: Double] {
+        var scores: [String: Double] = [:]
+        try db.run("SELECT path, sum(smcli_decay(? - selected_at)) FROM file_selections WHERE root = ? GROUP BY path",
+                   [.real(now), .text(root)]) { scores[String(cString: sqlite3_column_text($0, 0))] = sqlite3_column_double($0, 1) }
+        return scores
+    }
+
+    /// Records that the user picked `command` after typing `query` (empty for the unfiltered list).
+    package func recordPick(query: String, command: String, kind: String, directory: String,
+                            at time: Double = Date().timeIntervalSince1970, on db: SQLiteDatabase) throws {
+        try db.run("INSERT INTO command_selections (query, command, kind, directory, selected_at) VALUES (?, ?, ?, ?, ?)",
+                   [.text(query), .text(command), .text(kind), .text(directory), .real(time)])
+    }
+
+    /// The most recent picks, oldest first; older ones have faded anyway.
+    package func picks(limit: Int = 5_000, on db: SQLiteDatabase) throws -> SelectionLog {
+        var rows: [SelectionLog.Pick] = []
+        try db.run("SELECT query, command, selected_at FROM command_selections ORDER BY id DESC LIMIT ?", [.integer(limit)]) {
+            rows.append(.init(query: SelectionLog.normalize(text($0, 0)), command: text($0, 1), time: sqlite3_column_double($0, 2)))
+        }
+        var log = SelectionLog()
+        for pick in rows.reversed() { log.add(query: pick.query, command: pick.command, at: pick.time) }
+        return log
+    }
+
+    /// The last command `session` ran (not counting smcli's own), for transitions.
+    package func previousCommand(session: String, user: String, on db: SQLiteDatabase) throws -> String? {
+        var command: String?
+        try db.run("""
+            SELECT c.command FROM commands c JOIN sessions s ON s.id = c.session
+            WHERE c.session = ? AND s.user = ? AND c.deleted_at IS NULL AND NOT smcli_internal(c.command)
+            ORDER BY c.started_at DESC, c.id DESC LIMIT 1
+            """, [.text(session), .text(user)]) { command = text($0, 0) }
+        return command
+    }
+
+    /// How often each command directly followed `previous` within one session.
+    package func followers(after previous: String, user: String, on db: SQLiteDatabase) throws -> [String: Int] {
+        var counts: [String: Int] = [:]
+        try db.run("""
+            SELECT command, count(*) FROM (
+                SELECT c.command AS command,
+                       LAG(c.command) OVER (PARTITION BY c.session ORDER BY c.started_at, c.id) AS prev
+                FROM commands c JOIN sessions s ON s.id = c.session
+                WHERE s.user = ? AND c.deleted_at IS NULL AND NOT smcli_internal(c.command)
+            ) WHERE prev = ? GROUP BY command
+            """, [.text(user), .text(previous)]) { counts[text($0, 0)] = Int(sqlite3_column_int64($0, 1)) }
+        return counts
+    }
+
+    /// Parses a shell's `pipestatus` words ("0 1 0"). Empty means not reported.
+    package static func parsePipestatus(_ text: String) throws -> [Int]? {
+        let words = text.split(whereSeparator: \.isWhitespace)
+        if words.isEmpty { return nil }
+        let codes = words.compactMap { Int($0) }
+        guard codes.count == words.count, codes.count <= 256, codes.allSatisfy({ (0...255).contains($0) }) else {
+            throw HistoryError(message: "Invalid pipestatus: \(text)")
+        }
+        return codes
+    }
+
+    /// Event IDs are lowercase UUIDs, so a client can't collide with Atuin's IDs or smuggle in arbitrary text.
+    package static func isEventID(_ text: String) -> Bool {
+        text.utf8.count == 36 && UUID(uuidString: text) != nil && text == text.lowercased()
+    }
+
+    /// One captured run, as the in-memory suggestion index needs it.
+    package struct Run: Equatable, Sendable {
+        package let command: String
+        package let directory: String
+        package let startedAt: Double
+        package let exitCode: Int
+        /// The shell session, whose runs form the command transitions.
+        package let session: String
+
+        package init(command: String, directory: String, startedAt: Double, exitCode: Int, session: String = "") {
+            self.command = command
+            self.directory = directory
+            self.startedAt = startedAt
+            self.exitCode = exitCode
+            self.session = session
+        }
+    }
+
+    /// `user`'s live runs in the order `suggestions` reads them.
+    package func runs(user: String, on db: SQLiteDatabase) throws -> [Run] {
+        var runs: [Run] = []
+        try db.run("""
+            SELECT c.command, c.directory, c.started_at, c.exit_code, c.session
+            FROM commands c JOIN sessions s ON s.id = c.session
+            WHERE s.user = ? AND c.deleted_at IS NULL
+            ORDER BY c.started_at, c.id
+            """, [.text(user)]) { row in
+            runs.append(Run(command: text(row, 0), directory: text(row, 1), startedAt: sqlite3_column_double(row, 2),
+                            exitCode: Int(sqlite3_column_int64(row, 3)), session: text(row, 4)))
+        }
+        return runs
+    }
+
+    /// A long-lived writable connection, for the service.
+    package func openConnection() throws -> SQLiteDatabase { try connect(write: true) }
 
     /// Imports Atuin's history.db, keeping its UUIDs so repeated imports skip rows already present.
     /// Atuin stores times as Unix nanoseconds, uses -1 for unknown durations, and `user:host` hostnames.
     /// With `replace`, existing smcli history is deleted in the same transaction, so a failed import keeps it.
     /// Returns the number of new records.
-    func importAtuin(from file: URL, replace: Bool = false) throws -> Int {
+    package func importAtuin(from file: URL, replace: Bool = false) throws -> Int {
         guard FileManager.default.fileExists(atPath: file.path), let resolved = realpath(file.path, nil) else {
             throw HistoryError(message: "No Atuin database at \(file.path)")
         }
@@ -366,7 +552,7 @@ struct CapturedHistory {
         var imported = 0
         try db.execute("BEGIN IMMEDIATE")
         do {
-            if replace { try db.execute("DELETE FROM commands; DELETE FROM sessions;") }
+            if replace { try db.execute("DELETE FROM commands; DELETE FROM sessions; DELETE FROM command_selections;") }
             try source.run("""
                 SELECT id, timestamp, duration, exit, command, cwd, session, hostname, \(optional.joined(separator: ", "))
                 FROM history ORDER BY timestamp
@@ -401,7 +587,7 @@ struct CapturedHistory {
     }
 
     /// Imports records from the JSONL log written by earlier smcli versions. Returns the number imported.
-    func importLegacy(from file: URL) throws -> Int {
+    package func importLegacy(from file: URL) throws -> Int {
         struct Legacy: Decodable { let timestamp, user, directory, shell, command: String; let exitCode: Int }
         let lines = try Data(contentsOf: file).split(separator: 0x0A)
         let legacy = try lines.map { try JSONDecoder().decode(Legacy.self, from: Data($0)) }
@@ -427,7 +613,7 @@ struct CapturedHistory {
 
     /// Permanently deletes stored commands the filter would now reject (like `atuin history prune`).
     /// With `dryRun`, only reports them. Returns the matching commands in time order.
-    func prune(filter: CaptureFilter, dryRun: Bool) throws -> [String] {
+    package func prune(filter: CaptureFilter, dryRun: Bool) throws -> [String] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [] }
         let db = try connect(write: !dryRun)
         var ids: [Int] = []
@@ -442,6 +628,8 @@ struct CapturedHistory {
         try db.execute("BEGIN IMMEDIATE")
         do {
             for id in ids { try db.run("DELETE FROM commands WHERE id = ?", [.integer(id)]) }
+            // A pick keeps the command's text too.
+            for command in Set(commands) { try db.run("DELETE FROM command_selections WHERE command = ?", [.text(command)]) }
             try db.execute("COMMIT")
         } catch {
             try? db.execute("ROLLBACK")
@@ -453,7 +641,7 @@ struct CapturedHistory {
         return commands
     }
 
-    func records() throws -> [CapturedCommand] {
+    package func records() throws -> [CapturedCommand] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [] }
         let db = try connect(write: false)
         let formatter = ISO8601DateFormatter()
@@ -461,7 +649,8 @@ struct CapturedHistory {
         var records: [CapturedCommand] = []
         try db.run("""
             SELECT c.started_at, c.duration_ms, s.user, s.host, s.id, s.shell, c.directory, c.command, c.exit_code,
-                   COUNT(*) OVER (PARTITION BY c.command ORDER BY c.started_at, c.id), c.uuid, c.author, c.intent
+                   COUNT(*) OVER (PARTITION BY c.command ORDER BY c.started_at, c.id), c.uuid, c.author, c.intent,
+                   c.pipestatus
             FROM commands c JOIN sessions s ON s.id = c.session
             WHERE c.deleted_at IS NULL
             ORDER BY c.started_at, c.id
@@ -473,6 +662,7 @@ struct CapturedHistory {
                 durationMs: sqlite3_column_type(row, 1) == SQLITE_NULL ? nil : Int(sqlite3_column_int64(row, 1)),
                 user: text(row, 2), host: text(row, 3), session: text(row, 4), directory: text(row, 6), shell: text(row, 5),
                 command: command, exitCode: Int(sqlite3_column_int64(row, 8)),
+                pipestatus: optionalText(row, 13).map { $0.split(separator: " ").compactMap { Int($0) } },
                 author: optionalText(row, 11), intent: optionalText(row, 12), runCount: Int(sqlite3_column_int64(row, 9)),
                 breakdown: CommandBreakdown.parse(command)
             ))
@@ -482,20 +672,23 @@ struct CapturedHistory {
 
     /// One row per distinct command: run count, its flags, and the most recent run's time, directory, exit code,
     /// author, and intent, plus usage aggregates from the same grouped query; `directory` scopes `runsHere`.
-    func commandStats(directory: String? = nil, now: Double = Date().timeIntervalSince1970) throws -> [String: CommandStats] {
+    package func commandStats(directory: String? = nil, project: String? = nil,
+                              now: Double = Date().timeIntervalSince1970) throws -> [String: CommandStats] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
         let db = try connect(write: false)
         var stats: [String: CommandStats] = [:]
         let here = directory.map { $0.count > 1 && $0.hasSuffix("/") ? String($0.dropLast()) : $0 } ?? ""
+        let root = project ?? ""
         // SQLite returns the bare columns from the row holding MAX(started_at).
         try db.run("""
             SELECT c.command, COUNT(*), MAX(c.started_at), c.directory, c.exit_code, c.author, c.intent, c.flags,
                    SUM(smcli_decay(? - c.started_at)), SUM(c.exit_code IN (0, \(Self.interruptedExitCodes.map(String.init).joined(separator: ", ")))),
                    SUM(c.exit_code = 1),
+                   SUM(? <> '' AND (c.directory = ? OR (? <> '/' AND substr(c.directory, 1, length(?) + 1) = ? || '/'))),
                    SUM(? <> '' AND (c.directory = ? OR (? <> '/' AND substr(c.directory, 1, length(?) + 1) = ? || '/')))
             FROM commands c
             WHERE c.deleted_at IS NULL GROUP BY c.command
-            """, [.real(now), .text(here), .text(here), .text(here), .text(here), .text(here)]) { row in
+            """, [.real(now)] + [here, here, here, here, here, root, root, root, root, root].map(SQLValue.text)) { row in
             let command = text(row, 0)
             let answers = sqlite3_column_int64(row, 10) > 0 && Self.answersWithExitCode(command)
             stats[command] = CommandStats(
@@ -505,19 +698,21 @@ struct CapturedHistory {
                 flags: text(row, 7).split(separator: " ").map(String.init),
                 frecency: sqlite3_column_double(row, 8),
                 successes: Int(sqlite3_column_int64(row, 9) + (answers ? sqlite3_column_int64(row, 10) : 0)),
-                runsHere: Int(sqlite3_column_int64(row, 11)))
+                runsHere: Int(sqlite3_column_int64(row, 11)), runsProject: Int(sqlite3_column_int64(row, 12)))
         }
         return stats
     }
 
     /// Ranks `user`'s distinct commands for `directory`: each run counts more when it is recent, ran in this
-    /// directory (or above/below it), and succeeded. Only commands starting with `prefix` are considered.
-    func suggestions(user: String, directory: String, prefix: String = "", limit: Int = 10,
-                     now: Double = Date().timeIntervalSince1970) throws -> [Suggestion] {
+    /// directory (or in the same project, or above/below it), and succeeded. Only commands starting with `prefix`
+    /// are considered. `context` adds the signals of the moment (see `applyRankingSignals`); picks apply always.
+    /// `SuggestionIndex` computes the same ranking from memory.
+    package func suggestions(user: String, directory: String, prefix: String = "", limit: Int = 10,
+                     now: Double = Date().timeIntervalSince1970, context: RankingContext? = nil) throws -> [Suggestion] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [] }
         let db = try connect(write: false)
         let here = directory.count > 1 && directory.hasSuffix("/") ? String(directory.dropLast()) : directory
-        struct Tally { var score = 0.0, runs = 0, runsHere = 0, lastRun = 0.0, lastExitCode = 0 }
+        struct Tally { var score = 0.0, runs = 0, runsHere = 0, projectRuns = 0, lastRun = 0.0, lastExitCode = 0 }
         var tallies: [String: Tally] = [:]
         var answering: [String: Bool] = [:]
         try db.run("""
@@ -530,10 +725,13 @@ struct CapturedHistory {
             let runDirectory = text(row, 1)
             let started = sqlite3_column_double(row, 2)
             let exitCode = Int(sqlite3_column_int64(row, 3))
+            let inProject = context?.inProject(runDirectory) ?? false
             // Halves every two weeks, so habits outweigh one-offs without old habits winning forever.
             var weight = pow(0.5, max(0, now - started) / Self.usageHalfLife)
             if runDirectory == here {
                 weight *= 4
+            } else if inProject {
+                weight *= 3
             } else if here != "/" && runDirectory != "/" &&
                         (runDirectory.hasPrefix(here + "/") || here.hasPrefix(runDirectory + "/")) {
                 weight *= 2
@@ -548,27 +746,46 @@ struct CapturedHistory {
             tally.score += weight
             tally.runs += 1
             if runDirectory == here { tally.runsHere += 1 }
+            if inProject { tally.projectRuns += 1 }
             tally.lastRun = started
             tally.lastExitCode = exitCode
             tallies[text(row, 0)] = tally
         }
+        var scores = tallies.mapValues(\.score)
+        var previous: String?
+        if let session = context?.session, context?.uses(.transition) ?? true {
+            previous = try previousCommand(session: session, user: user, on: db)
+        }
+        let why = applyRankingSignals(
+            to: &scores, prefix: prefix, context: context, previous: previous,
+            followers: try previous.map { try followers(after: $0, user: user, on: db) } ?? [:],
+            picks: try picks(on: db).weights(query: prefix, now: now))
         let formatter = ISO8601DateFormatter()
-        return tallies
+        return scores
             .sorted {
-                if $0.value.score != $1.value.score { return $0.value.score > $1.value.score }
-                if $0.value.lastRun != $1.value.lastRun { return $0.value.lastRun > $1.value.lastRun }
+                if $0.value != $1.value { return $0.value > $1.value }
+                let (left, right) = (tallies[$0.key]?.lastRun ?? -.infinity, tallies[$1.key]?.lastRun ?? -.infinity)
+                if left != right { return left > right }
                 return $0.key < $1.key
             }
             .prefix(limit)
-            .map { Suggestion(command: $0.key, score: $0.value.score, runs: $0.value.runs, runsHere: $0.value.runsHere,
-                              lastRun: formatter.string(from: Date(timeIntervalSince1970: $0.value.lastRun)),
-                              lastExitCode: $0.value.lastExitCode) }
+            .map { command, score in
+                guard let tally = tallies[command] else {
+                    return Suggestion(command: command, score: score, runs: 0, runsHere: 0, lastRun: "", lastExitCode: 0,
+                                      why: suggestionWhy(runsHere: 0, projectRuns: 0, extra: why[command]))
+                }
+                return Suggestion(command: command, score: score, runs: tally.runs, runsHere: tally.runsHere,
+                                  lastRun: formatter.string(from: Date(timeIntervalSince1970: tally.lastRun)),
+                                  lastExitCode: tally.lastExitCode,
+                                  why: suggestionWhy(runsHere: tally.runsHere, projectRuns: tally.projectRuns, extra: why[command]))
+            }
     }
 
+    @discardableResult
     private func insert(into db: SQLiteDatabase, session: String, user: String, host: String, shell: String,
                         startedAt: Double, durationMs: Int?, directory: String, command: String, exitCode: Int,
                         uuid: String? = nil, deletedAt: Double? = nil, author: String? = nil, intent: String? = nil,
-                        transaction: Bool = true) throws {
+                        pipestatus: [Int]? = nil, transaction: Bool = true) throws -> Bool {
         // One transaction means one WAL commit per command.
         if transaction { try db.execute("BEGIN IMMEDIATE") }
         do {
@@ -576,13 +793,18 @@ struct CapturedHistory {
                        [.text(session), .text(user), .text(host), .text(shell)])
             try db.run("""
                 INSERT OR IGNORE INTO commands
-                    (session, started_at, duration_ms, directory, command, exit_code, uuid, deleted_at, author, intent, flags)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (session, started_at, duration_ms, directory, command, exit_code, uuid, deleted_at, author, intent, flags,
+                     pipestatus)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [.text(session), .real(startedAt), durationMs.map(SQLValue.integer) ?? .null,
                       .text(directory), .text(command), .integer(exitCode), uuid.map(SQLValue.text) ?? .null,
                       deletedAt.map(SQLValue.real) ?? .null, author.map(SQLValue.text) ?? .null,
-                      intent.map(SQLValue.text) ?? .null, .text(commandFlags(command).joined(separator: " "))])
+                      intent.map(SQLValue.text) ?? .null, .text(commandFlags(command).joined(separator: " ")),
+                      pipestatus.map { SQLValue.text($0.map(String.init).joined(separator: " ")) } ?? .null])
+            // OR IGNORE skips a row whose uuid is already stored.
+            let inserted = db.changes > 0
             if transaction { try db.execute("COMMIT") }
+            return inserted
         } catch {
             if transaction { try? db.execute("ROLLBACK") }
             throw error
@@ -645,6 +867,9 @@ struct CapturedHistory {
                     if version == Self.discardedUsageVersion {
                         try db.execute("DROP TABLE IF EXISTS usage; PRAGMA user_version = 3;")
                     }
+                    if version < 5 { try db.execute(Self.migrationToV5) }
+                    if version < 6 { try db.execute(Self.migrationToV6) }
+                    if version < 7 { try db.execute(Self.migrationToV7) }
                 }
                 try db.execute("COMMIT")
                 try db.execute("PRAGMA journal_mode = WAL")

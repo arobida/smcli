@@ -3,11 +3,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 swift="${SWIFT:-/usr/bin/swift}"
+# smcli-service links fff statically; `make test` already built it, this covers running the script directly.
+bash scripts/build-fff.sh
 "$swift" test
 bin_dir="$("$swift" build --show-bin-path)"
 home="$(mktemp -d)"
-trap 'rm -rf "$home"' EXIT
-export SMCLI_DB="$home/captured.db"
+# The service is on by default; keep the one these checks start private, short-pathed and stopped on exit.
+runtime="$(mktemp -d /tmp/smcli-test.XXXXXX)"
+export SMCLI_DB="$home/captured.db" SMCLI_RUNTIME_DIR="$runtime"
+trap '"$bin_dir/smcli" service stop >/dev/null 2>&1 || true; rm -rf "$home" "$runtime"' EXIT
 
 output="$("$bin_dir/smcli")"
 [[ "$output" == 'Usage: smcli init'* ]]
@@ -29,5 +33,7 @@ if "$bin_dir/smcli" unknown > "$home/output" 2> "$home/error"; then
 fi
 [[ "$(HOME="$home" HISTFILE='' "$bin_dir/smcli" search echo zsh -n 1)" == 'echo zsh'* ]]
 python3 scripts/test-shells.py "$bin_dir/smcli"
+python3 scripts/test-service.py "$bin_dir/smcli"
+python3 scripts/test-file-picker.py "$bin_dir/smcli"
 python3 scripts/bench-baseline.py --binary "$bin_dir/smcli" --rows 10 --samples 1 --output "$home/baseline.json"
 printf 'smcli history tests passed.\n'

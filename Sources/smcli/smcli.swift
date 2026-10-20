@@ -1,29 +1,46 @@
 import Foundation
+import SmcliCore
+import SmcliSearch
 
 @main
 struct Smcli {
     static let usage = """
     Usage: smcli init [--model NAME | --potion [DIR] | --builtin | --default]
            smcli history [--json]
-           smcli shell-init bash|zsh
+           smcli shell-init bash|zsh|fish
            smcli search [query...] [--command NAME] [--subcommand NAME] [--since TIME] [--before TIME]
                         [--min-runs N] [--author NAME] [--dir PATH] [--flag NAME] [--limit N] [--json]
            smcli suggest [prefix...] [--dir PATH] [--limit N] [--json]
            smcli pick [query...]
+           smcli context [--json] [--dir PATH]
            smcli reindex
            smcli health [--json]
            smcli import <legacy.jsonl>
            smcli import --atuin [--replace] [history.db]
            smcli prune [--dry-run]
+           smcli service start|stop|status
     Read saved shell history, or print opt-in hooks for structured metadata capture.
     search filters are exact; TIME is 30m, 12h, 7d, 2w, YYYY-MM-DD, or ISO 8601, matched against the last run.
+    context prints the repository, worktree, branch, Git status and project manifests for a directory (cached by the service).
     reindex re-embeds every command for search; health checks the index and the embedding model.
-    pick opens the history picker that shell-init binds to Up and Ctrl-R (SMCLI_NO_KEYS=1 to skip).
+    pick opens the history picker that shell-init binds to Up and Ctrl-R (SMCLI_NO_KEYS=1 to skip; keys another tool already
+    bound are left alone). SMCLI_EXTRA_KEYS=1 also binds Left on an empty line, Ctrl-Right and Alt-; (Bash and Zsh).
+    In the picker, Ctrl-T cycles history, files (fff name search) and grep (fff content search) for the repository; they need
+    the service. Enter inserts the path at the cursor, quoted for your shell (SMCLI_SHELL), and never runs anything.
+    suggest and search also weigh the project (nearest manifest), the shell session's previous command (SMCLI_SESSION, set by
+    shell-init), commands you picked in the picker for a similar query, scripts and targets named in the project's manifest, and
+    an operation in progress (a rebase suggests `git rebase --continue`); --json and search show why. SMCLI_RANKING_OFF=project,
+    transition,selection,script,hint switches signals off.
+    SMCLI_FFF_MAX (4) and SMCLI_FFF_IDLE (600 s) bound the service's file indexes.
+    SMCLI_BASH_HOOK=debug makes Bash capture with a DEBUG trap even where bash-preexec or PS0 is available.
     init picks the search embedding model: Ollama, local potion-code-16M-v2 (--potion [DIR]), or Apple's (--builtin); saved to ~/.config/smcli/config.json, or SMCLI_CONFIG.
     By default (--default) search uses the potion-code-16M-v2 model built into smcli.
     Commands with a leading space, likely secrets, or matching historyFilter/cwdFilter in the config are not recorded;
     prune removes already-stored ones. import --atuin --replace discards existing smcli history first.
     SMCLI_DB selects the metadata database (default: ~/.local/share/smcli/history.db).
+    record, suggest, search and the picker go through smcli-service, which starts when needed and is restarted after an upgrade.
+    SMCLI_SERVICE=connect only uses a running one; SMCLI_SERVICE=0 (or off) keeps everything in-process. Without a reachable
+    service they work in-process as well.
     """
 
     static func main() async {
@@ -44,16 +61,21 @@ struct Smcli {
             let configURL = SmcliConfig.location(home: home, environment: environment)
             // Loaded only by commands that record or prune, so a bad config never blocks reading history.
             func filter() throws -> CaptureFilter { try CaptureFilter(config: SmcliConfig.load(from: configURL)) }
+            let service = ServiceClient(database: captured.url, environment: environment, cliExecutable: Bundle.main.executableURL)
             if arguments.count == 2 && arguments[0] == "shell-init" {
                 let executable = Bundle.main.executableURL?.path ?? URL(fileURLWithPath: CommandLine.arguments[0]).path
                 print(try shellIntegration(shell: arguments[1], executable: executable))
-            } else if arguments.count == 9 && arguments[0] == "record" {
-                // record <shell> <session> <directory> <status> <started> <ended> <native HISTFILE> <command>
+            } else if (arguments.count == 9 || arguments.count == 10) && arguments[0] == "record" {
+                // record <shell> <session> <directory> <status> [<pipestatus>] <started> <ended> <native HISTFILE> <command>
+                // The pipestatus word is optional; hooks from earlier versions send nine arguments without it.
+                let piped = arguments.count == 10
+                let tail = Array(arguments.suffix(4))  // started, ended, native HISTFILE, command
                 guard let status = Int(arguments[4]) else { throw HistoryError(message: "Invalid exit code.") }
-                guard try filter().allows(command: arguments[8], directory: arguments[3]) else { return }
-                try captured.append(command: arguments[8], shell: arguments[1], directory: arguments[3], exitCode: status,
-                                    nativeFile: arguments[7], session: arguments[2],
-                                    startedAt: epoch(arguments[5]), endedAt: epoch(arguments[6]))
+                guard try filter().allows(command: tail[3], directory: arguments[3]) else { return }
+                try record(command: tail[3], shell: arguments[1], directory: arguments[3], exitCode: status,
+                           nativeFile: tail[2], session: arguments[2], startedAt: epoch(tail[0]),
+                           endedAt: epoch(tail[1]), pipestatus: piped ? CapturedHistory.parsePipestatus(arguments[5]) : nil,
+                           captured: captured, service: service)
             } else if arguments.count == 6 && arguments[0] == "record" {
                 // Hooks installed by earlier versions stay working until the shell is restarted.
                 guard let status = Int(arguments[3]) else { throw HistoryError(message: "Invalid exit code.") }
@@ -61,18 +83,22 @@ struct Smcli {
                 try captured.append(command: arguments[4], shell: arguments[1], directory: arguments[2],
                                     exitCode: status, nativeFile: arguments[5])
             } else if arguments.first == "search" {
-                try await search(Array(arguments.dropFirst()), captured: captured, home: home, environment: environment)
+                try await search(Array(arguments.dropFirst()), captured: captured, service: service, home: home, environment: environment)
             } else if arguments == ["reindex"] {
                 try await reindex(captured: captured, home: home, environment: environment)
             } else if arguments == ["health"] || arguments == ["health", "--json"] {
                 try await health(json: arguments.count == 2, captured: captured, home: home, environment: environment)
             } else if arguments.first == "pick" {
-                try await pick(Array(arguments.dropFirst()), captured: captured, home: home, environment: environment)
+                try await pick(Array(arguments.dropFirst()), captured: captured, service: service, home: home, environment: environment)
             } else if arguments.first == "init" {
                 try await initialize(Array(arguments.dropFirst()), configURL: configURL,
                                      environment: environment)
+            } else if arguments.first == "context" {
+                try context(Array(arguments.dropFirst()), service: service, environment: environment)
             } else if arguments.first == "suggest" {
-                try suggest(Array(arguments.dropFirst()), captured: captured, environment: environment)
+                try suggest(Array(arguments.dropFirst()), captured: captured, service: service, environment: environment)
+            } else if arguments.count == 2 && arguments[0] == "service" {
+                try manageService(arguments[1], service: service)
             } else if arguments == ["prune"] || arguments == ["prune", "--dry-run"] {
                 let dryRun = arguments.count == 2
                 let pruned = try captured.prune(filter: filter(), dryRun: dryRun)
@@ -125,7 +151,22 @@ struct Smcli {
 }
 
 /// Hybrid (keyword + semantic) search over distinct commands from captured and native history.
-func search(_ arguments: [String], captured: CapturedHistory, home: URL, environment: [String: String]) async throws {
+/// Search through the service, which keeps the index open. Nil when it is off, unreachable or fails, so the
+/// caller searches in-process (and reports any error itself).
+func serviceSearch(_ query: String, limit: Int, filter: SearchFilter = SearchFilter(), service: ServiceClient,
+                   environment: [String: String]) -> [SearchEntry]? {
+    var request = ServiceRequest(op: .search)
+    (request.query, request.limit, request.directory) = (query, limit, workingDirectory(environment))
+    request.session = environment["SMCLI_SESSION"]
+    request.filter = filter.isEmpty ? nil : filter
+    (request.histfile, request.loginShell) = (environment["HISTFILE"], environment["SHELL"])
+    // A first search embeds all of history; give it time rather than doing it twice.
+    let response = service.send(request, timeout: 600)
+    return response?.ok == true ? response?.hits : nil
+}
+
+func search(_ arguments: [String], captured: CapturedHistory, service: ServiceClient, home: URL,
+            environment: [String: String]) async throws {
     var words: [String] = []
     var limit = 10
     var json = false
@@ -159,12 +200,24 @@ func search(_ arguments: [String], captured: CapturedHistory, home: URL, environ
         index += 1
     }
     #if canImport(ProximaKit)
-    // Loading the embedding model overlaps reading history.
-    async let loading = searchEngine(captured: captured, home: home, environment: environment)
-    let corpus = try searchCorpus(captured: captured, home: home, environment: environment)
-    let engine = try await loading
-    let hits = try await engine.search(words.joined(separator: " "), corpus: corpus, limit: limit, filter: filter) {
-        FileHandle.standardError.write(Data("\($0)\n".utf8))
+    let hits: [SearchEntry]
+    if let served = serviceSearch(words.joined(separator: " "), limit: limit, filter: filter, service: service,
+                                  environment: environment) {
+        hits = served
+    } else {
+        // Loading the embedding model overlaps reading history.
+        async let loading = searchEngine(captured: captured, home: home, environment: environment)
+        let directory = workingDirectory(environment)
+        let context = RankingContext(project: ProjectContext.discover(directory), session: environment["SMCLI_SESSION"],
+                                     environment: environment)
+        let corpus = try searchCorpus(captured: captured, home: home, environment: environment,
+                                      project: context.uses(.project) ? context.projectRoot : nil)
+        let engine = try await loading
+        let signals = try searchSignals(captured: captured, context: context)
+        hits = try await engine.search(words.joined(separator: " "), corpus: corpus, limit: limit, filter: filter,
+                                       signals: signals) {
+            FileHandle.standardError.write(Data("\($0)\n".utf8))
+        }
     }
     if json {
         let encoder = JSONEncoder()
@@ -186,42 +239,11 @@ func search(_ arguments: [String], captured: CapturedHistory, home: URL, environ
         }
     }
     #else
-    _ = (words, limit, json, filter, captured, home, environment)
+    _ = (words, limit, json, filter, captured, service, home, environment)
     throw HistoryError(message: "search requires macOS 14 or later.")
     #endif
 }
 
-#if canImport(ProximaKit)
-/// Captured stats plus native history. Native files are best-effort: an unreadable one should not block the rest.
-func searchCorpus(captured: CapturedHistory, home: URL, environment: [String: String]) throws -> [String: SearchEntry] {
-    let native = try historyFiles(home: home, environment: environment)
-        .flatMap { (try? $0.read())?.components(separatedBy: "\n") ?? [] }
-    return searchCorpus(captured: try captured.commandStats(directory: workingDirectory(environment)), native: native)
-}
-
-/// The shell's $PWD keeps symlinked paths as typed, matching what the capture hooks recorded.
-func workingDirectory(_ environment: [String: String]) -> String {
-    environment["PWD"].flatMap { $0.hasPrefix("/") ? $0 : nil } ?? FileManager.default.currentDirectoryPath
-}
-
-/// The search index next to the history database, using the model chosen by `smcli init`. With no choice
-/// made, the potion-code-16M-v2 built into the binary (or, in a build without it, from the Hugging Face
-/// cache); Apple's model when neither loads, so search keeps working.
-func searchEngine(captured: CapturedHistory, home: URL, environment: [String: String]) throws -> HistorySearch {
-    var engine = HistorySearch(directory: captured.url.appendingPathExtension("search"))
-    let config = try SmcliConfig.load(from: SmcliConfig.location(home: home, environment: environment))
-    if let path = config.potionPath {
-        engine.potion = PotionEmbedder(model: try PotionModel(directory: URL(fileURLWithPath: path)))
-    } else if let model = config.ollamaModel, let dimension = config.ollamaDimension {
-        engine.ollama = OllamaEmbedder(client: Ollama(environment: environment), model: model, dimension: dimension)
-    } else if config.builtin != true {
-        let model = (try? PotionModel.bundled()) ?? PotionModel.cachedSnapshot(home: home, environment: environment)
-            .flatMap { try? PotionModel(directory: $0) }
-        engine.potion = model.map(PotionEmbedder.init)
-    }
-    return engine
-}
-#endif
 
 func reindex(captured: CapturedHistory, home: URL, environment: [String: String]) async throws {
     #if canImport(ProximaKit)
@@ -287,8 +309,45 @@ func health(json: Bool, captured: CapturedHistory, home: URL, environment: [Stri
     #endif
 }
 
+/// Stores one command through the service when it is enabled, else directly. Both paths share one event ID, so a
+/// record the service committed but couldn't acknowledge is not stored twice by the direct retry.
+func record(command: String, shell: String, directory: String, exitCode: Int, nativeFile: String, session: String,
+            startedAt: Double?, endedAt: Double?, pipestatus: [Int]? = nil, captured: CapturedHistory,
+            service: ServiceClient) throws {
+    let event = UUID().uuidString.lowercased()
+    // Stamp the start now if the shell didn't, so a retry stores the same time.
+    let started = startedAt ?? Date().timeIntervalSince1970
+    var request = ServiceRequest(op: .record)
+    (request.event, request.command, request.shell, request.directory) = (event, command, shell, directory)
+    (request.exitCode, request.nativeFile, request.session) = (exitCode, nativeFile, session)
+    (request.startedAt, request.endedAt, request.pipestatus) = (started, endedAt, pipestatus)
+    if service.send(request)?.ok == true { return }
+    // Unreachable, or it refused: the direct path reports any real problem with the record itself.
+    try captured.append(command: command, shell: shell, directory: directory, exitCode: exitCode, nativeFile: nativeFile,
+                        session: session, startedAt: started, endedAt: endedAt, pipestatus: pipestatus, event: event)
+}
+
+/// `smcli service start|stop|status`, for checking on or restarting the service by hand.
+func manageService(_ action: String, service: ServiceClient) throws {
+    switch action {
+    case "status", "start":
+        if let pid = service.send(ServiceRequest(op: .ping), spawn: action == "start")?.pid {
+            print("smcli-service running (pid \(pid)) at \(service.location.socket.path) for \(service.database.path)")
+        } else {
+            print("smcli-service not running for \(service.database.path)")
+            exit(1)
+        }
+    case "stop":
+        let stopped = service.send(ServiceRequest(op: .shutdown), spawn: false)?.ok == true
+        print(stopped ? "smcli-service stopped." : "smcli-service was not running.")
+    default:
+        throw HistoryError(message: "Usage: smcli service start|stop|status")
+    }
+}
+
 /// Top captured commands for the current user and directory, for shell autocompletion.
-func suggest(_ arguments: [String], captured: CapturedHistory, environment: [String: String]) throws {
+func suggest(_ arguments: [String], captured: CapturedHistory, service: ServiceClient,
+             environment: [String: String]) throws {
     var words: [String] = []
     var limit = 10
     var json = false
@@ -316,8 +375,13 @@ func suggest(_ arguments: [String], captured: CapturedHistory, environment: [Str
         }
         index += 1
     }
-    let suggestions = try captured.suggestions(user: NSUserName(), directory: directory,
-                                               prefix: words.joined(separator: " "), limit: limit)
+    var request = ServiceRequest(op: .suggest)
+    (request.directory, request.prefix, request.limit) = (directory, words.joined(separator: " "), limit)
+    request.session = environment["SMCLI_SESSION"]
+    let response = service.send(request)
+    let suggestions = try response?.suggestions ?? captured.suggestions(
+        user: NSUserName(), directory: directory, prefix: words.joined(separator: " "), limit: limit,
+        context: RankingContext(project: ProjectContext.discover(directory), session: request.session, environment: environment))
     if json {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]

@@ -1,4 +1,5 @@
 import Foundation
+import SmcliCore
 #if canImport(MachO)
 import MachO
 #endif
@@ -7,18 +8,18 @@ import MachO
 /// a mean of their rows in one float16 table, then L2 normalization. There is no network pass, so a
 /// query embeds in microseconds and loading is a memory map plus the tokenizer's vocabulary.
 /// Tokenization mirrors model2vec: no special tokens, unknown ids dropped, at most 512 tokens.
-final class PotionModel: @unchecked Sendable {
-    static let name = "potion-code-16M-v2"
-    static let maxTokens = 512
+package final class PotionModel: @unchecked Sendable {
+    package static let name = "potion-code-16M-v2"
+    package static let maxTokens = 512
 
     /// The Hugging Face revision of the copy in Models/, linked into the binary.
-    static let bundledRevision = "e9d2a44ca6a05ac6685f3b23709ea57eb7352d5b"
+    package static let bundledRevision = "e9d2a44ca6a05ac6685f3b23709ea57eb7352d5b"
 
-    let dimension: Int
+    package let dimension: Int
     /// Where the model came from, for messages: a directory path, or "built in".
-    let source: String
+    package let source: String
     /// Names the index built from this model, so another model or revision never reuses its vectors.
-    let identity: String
+    package let identity: String
     private let vocabulary: [String: Int32]
     private let unknown: Int32?
     /// BertNormalizer options; all off when the tokenizer has no normalizer.
@@ -34,7 +35,7 @@ final class PotionModel: @unchecked Sendable {
     private let rows: Int
 
     /// `directory` holds `model.safetensors` and `tokenizer.json`, as in a Hugging Face snapshot.
-    convenience init(directory: URL) throws {
+    package convenience init(directory: URL) throws {
         let modelURL = directory.appendingPathComponent("model.safetensors")
         let tokenizerURL = directory.appendingPathComponent("tokenizer.json")
         guard FileManager.default.fileExists(atPath: modelURL.path),
@@ -51,7 +52,7 @@ final class PotionModel: @unchecked Sendable {
 
     /// The copy linked into the executable as the __POTION segment (see Package.swift); nil in builds without it.
     /// The segment is part of the mapped image, so this reads it in place like a mapped file.
-    static func bundled() throws -> PotionModel? {
+    package static func bundled() throws -> PotionModel? {
         #if canImport(MachO)
         func section(_ name: String) -> Data? {
             var size: UInt = 0
@@ -67,7 +68,7 @@ final class PotionModel: @unchecked Sendable {
         #endif
     }
 
-    init(model file: Data, tokenizer tokenizerData: Data, config configData: Data?, source: String, identity: String) throws {
+    package init(model file: Data, tokenizer tokenizerData: Data, config configData: Data?, source: String, identity: String) throws {
         self.source = source
         self.identity = identity
         let tokenizer = try JSONSerialization.jsonObject(with: tokenizerData) as? [String: Any]
@@ -120,7 +121,7 @@ final class PotionModel: @unchecked Sendable {
     }
 
     /// Token ids model2vec would embed for `text`.
-    func tokenize(_ text: String) -> [Int32] {
+    package func tokenize(_ text: String) -> [Int32] {
         var ids: [Int32] = []
         for word in Self.preTokenize(normalized(text)) {
             wordPiece(word, into: &ids)
@@ -130,7 +131,7 @@ final class PotionModel: @unchecked Sendable {
     }
 
     /// The pooled, normalized embedding; nil when no token is known (the caller picks a fallback).
-    func embed(_ text: String) -> [Float]? {
+    package func embed(_ text: String) -> [Float]? {
         let ids = tokenize(text)
         guard !ids.isEmpty else { return nil }
         var sum = [Float](repeating: 0, count: dimension)
@@ -255,7 +256,7 @@ final class PotionModel: @unchecked Sendable {
     /// The Potion snapshot in the Hugging Face cache, where `model2vec`/`huggingface_hub` put it: the revision
     /// `refs/main` names, else the newest. The cache is found as huggingface_hub does: HF_HUB_CACHE, then
     /// HF_HOME/hub, then XDG_CACHE_HOME/huggingface/hub, then ~/.cache/huggingface/hub.
-    static func cachedSnapshot(home: URL, environment: [String: String]) -> URL? {
+    package static func cachedSnapshot(home: URL, environment: [String: String]) -> URL? {
         let set = { (key: String) in environment[key].flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0) } }
         let hub = set("HF_HUB_CACHE")
             ?? set("HF_HOME").map { $0.appendingPathComponent("hub") }
@@ -305,18 +306,18 @@ private let halfToFloat: [Float] = (0...UInt16.max).map { bits in
 #if canImport(ProximaKit)
 import ProximaKit
 
-struct PotionEmbedder: TextEmbedder {
-    let model: PotionModel
-    var dimension: Int { model.dimension }
+package struct PotionEmbedder: TextEmbedder {
+    package let model: PotionModel
+    package var dimension: Int { model.dimension }
 
     /// Text with no known tokens gets a fixed vector, leaving its ranking to the BM25 leg.
-    func embed(_ text: String) async throws -> Vector {
+    package func embed(_ text: String) async throws -> Vector {
         if let vector = model.embed(text) { return Vector(vector) }
         return Vector(dimension: dimension, repeating: 1 / Float(dimension).squareRoot())
     }
 
     /// Embedding is cheap arithmetic, so a plain loop beats spawning a task per text.
-    func embedBatch(_ texts: [String]) async throws -> [Vector] {
+    package func embedBatch(_ texts: [String]) async throws -> [Vector] {
         var vectors: [Vector] = []
         vectors.reserveCapacity(texts.count)
         for text in texts { vectors.append(try await embed(text)) }

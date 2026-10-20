@@ -1,0 +1,5 @@
+// The pinned fff C API. `make fff` generates the header (scripts/build-fff.sh); SmcliFFF links the static library.
+module CFFF [system] {
+    header "../../.build/fff/include/fff.h"
+    export *
+}

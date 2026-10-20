@@ -1,14 +1,15 @@
 import Foundation
+import SmcliCore
 
-struct HistoryFile {
-    enum Shell {
+package struct HistoryFile {
+    package enum Shell {
         case bash, zsh
     }
 
-    let url: URL
-    let shell: Shell
+    package let url: URL
+    package let shell: Shell
 
-    func read() throws -> String {
+    package func read() throws -> String {
         let data = try Data(contentsOf: url)
         var bytes = [UInt8](data)
         if shell == .zsh {
@@ -48,7 +49,7 @@ struct HistoryFile {
     }
 }
 
-func historyFiles(home: URL, environment: [String: String]) throws -> [HistoryFile] {
+package func historyFiles(home: URL, environment: [String: String]) throws -> [HistoryFile] {
     let manager = FileManager.default
     var files: [HistoryFile] = []
     for (name, shell) in [("bash", HistoryFile.Shell.bash), ("zsh", .zsh)] {
