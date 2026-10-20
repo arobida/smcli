@@ -101,7 +101,8 @@ final class Service: @unchecked Sendable {
         Thread.detachNewThread { [self] in
             while true {
                 let fd = accept(listener, nil, nil)
-                if fd < 0 { continue }
+                // Out of descriptors: back off instead of spinning until one frees up.
+                if fd < 0 { if errno == EMFILE || errno == ENFILE { usleep(10_000) }; continue }
                 _ = fcntl(fd, F_SETFD, FD_CLOEXEC)
                 DispatchQueue.global().async { [self] in serve(fd) }
             }
@@ -261,11 +262,7 @@ final class Service: @unchecked Sendable {
                 return try suggest(request, context: context)
             case .pick:
                 return try pick(request, context: context)
-            case .search:
-                return .failure("bad_request", "search is not served on the state queue.")
-            case .context:
-                return .failure("bad_request", "context is not served on the state queue.")
-            case .files, .grep, .select:
+            case .search, .context, .files, .grep, .select:
                 return .failure("bad_request", "\(request.op.rawValue) is not served on the state queue.")
             }
         } catch {
