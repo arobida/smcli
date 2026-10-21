@@ -425,18 +425,18 @@ try:
     # Stale indexes. The search index is a cache named by version, model and dimension: one from an older version is
     # deleted on the next rebuild, one for another model is kept and reported, and a damaged current one is rebuilt.
     search_dir = env["SMCLI_DB"] + ".search"
-    os.makedirs(f"{search_dir}/commands-v6-potion-old-d256")
-    open(f"{search_dir}/commands-v6-potion-old-d256/index.pxkt", "w").write("old")
-    os.makedirs(f"{search_dir}/commands-v7-potion-othermodel-d256")
+    os.makedirs(f"{search_dir}/commands-v7-potion-old-d256")
+    open(f"{search_dir}/commands-v7-potion-old-d256/index.pxkt", "w").write("old")
+    open(f"{search_dir}/commands-v8-potion-othermodel-d256.taladb", "w").write("other")
     run("reindex", SMCLI_SERVICE="0")
     left = sorted(n for n in os.listdir(search_dir) if n.startswith("commands-v"))
-    assert "commands-v6-potion-old-d256" not in left and "commands-v7-potion-othermodel-d256" in left, left
-    assert "commands-v7-potion-othermodel-d256" in run("health", SMCLI_SERVICE="0").stdout
+    assert "commands-v7-potion-old-d256" not in left and "commands-v8-potion-othermodel-d256.taladb" in left, left
+    assert "commands-v8-potion-othermodel-d256" in run("health", SMCLI_SERVICE="0").stdout
     current = next(n for n in left if "othermodel" not in n)
     assert run("health", SMCLI_SERVICE="0", check=False).returncode == 0
 
     def index_files():
-        return [os.path.join(d, f) for d, _, names in os.walk(f"{search_dir}/{current}") for f in names]
+        return [f"{search_dir}/{n}" for n in os.listdir(search_dir) if n.startswith(current)]
     # Damaged under a running service: the service notices the changed files and rebuilds instead of failing.
     assert search("git commit")[0].startswith("git commit -m")
     for path in index_files():

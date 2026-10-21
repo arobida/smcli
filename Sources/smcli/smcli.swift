@@ -206,7 +206,7 @@ func search(_ arguments: [String], captured: CapturedHistory, service: ServiceCl
         }
         index += 1
     }
-    #if canImport(ProximaKit)
+    #if canImport(TalaDB)
     let hits: [SearchEntry]
     if let served = serviceSearch(words.joined(separator: " "), limit: limit, filter: filter, service: service,
                                   environment: environment) {
@@ -253,7 +253,7 @@ func search(_ arguments: [String], captured: CapturedHistory, service: ServiceCl
 
 
 func reindex(captured: CapturedHistory, home: URL, environment: [String: String]) async throws {
-    #if canImport(ProximaKit)
+    #if canImport(TalaDB)
     let corpus = try searchCorpus(captured: captured, home: home, environment: environment)
     let engine = try searchEngine(captured: captured, home: home, environment: environment)
     let tty = isatty(STDERR_FILENO) == 1
@@ -278,7 +278,7 @@ func reindex(captured: CapturedHistory, home: URL, environment: [String: String]
 
 /// Reports the index's state; exits 1 when search would not work.
 func health(json: Bool, captured: CapturedHistory, home: URL, environment: [String: String]) async throws {
-    #if canImport(ProximaKit)
+    #if canImport(TalaDB)
     let corpus = try searchCorpus(captured: captured, home: home, environment: environment)
     let report: IndexHealth
     do {

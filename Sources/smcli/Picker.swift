@@ -415,7 +415,7 @@ func pick(_ arguments: [String], captured: CapturedHistory, service: ServiceClie
     if flag == "--files" { picker.mode = .files }
     if flag == "--grep" { picker.mode = .grep }
     var search: ((String) async throws -> [String])? = nil
-    #if canImport(ProximaKit)
+    #if canImport(TalaDB)
     // Built on the first search, not per keystroke: loading an embedding model would dominate latency.
     // Deferring it also keeps a broken model or config to a status-line error rather than a dead history key.
     var prepared: (engine: HistorySearch, corpus: [String: SearchEntry], programs: [String: Set<String>], signals: SearchSignals)?

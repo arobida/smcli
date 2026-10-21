@@ -83,10 +83,9 @@ package func embeddingBatches(_ texts: [String], maxCharacters: Int, maxCount: I
     return ranges
 }
 
-#if canImport(ProximaKit)
-import ProximaKit
+#if canImport(TalaDB)
 
-/// Embeds through Ollama, splitting each ProximaKit batch into requests small enough for the model's
+/// Embeds through Ollama, splitting each index batch into requests small enough for the model's
 /// runner: one request carrying hundreds of long commands can exhaust its memory and crash it.
 package struct OllamaEmbedder: TextEmbedder {
     package let client: Ollama
@@ -95,19 +94,19 @@ package struct OllamaEmbedder: TextEmbedder {
     package var maxRequestCharacters = 16_000
     package var maxRequestInputs = 32
 
-    package func embed(_ text: String) async throws -> Vector {
+    package func embed(_ text: String) async throws -> [Float] {
         try await embedBatch([text])[0]
     }
 
-    package func embedBatch(_ texts: [String]) async throws -> [Vector] {
-        var vectors: [Vector] = []
+    package func embedBatch(_ texts: [String]) async throws -> [[Float]] {
+        var vectors: [[Float]] = []
         vectors.reserveCapacity(texts.count)
         for range in embeddingBatches(texts, maxCharacters: maxRequestCharacters, maxCount: maxRequestInputs) {
             for embedding in try await client.embed(Array(texts[range]), model: model) {
                 guard embedding.count == dimension else {
                     throw HistoryError(message: "Ollama model \(model) now returns \(embedding.count) dimensions, not \(dimension); rerun `smcli init`.")
                 }
-                vectors.append(Vector(embedding))
+                vectors.append(embedding)
             }
         }
         return vectors

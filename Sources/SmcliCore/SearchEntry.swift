@@ -45,7 +45,8 @@ extension SearchEntry {
         return command.split(whereSeparator: \.isWhitespace).first.map { String($0.split(separator: "/").last ?? $0) }
     }
     package var subcommand: String? { CommandBreakdown.parse(command)?.subcommand }
-    package var lastRunEpoch: Double? { lastRun.flatMap { ISO8601DateFormatter().date(from: $0)?.timeIntervalSince1970 } }
+    /// Swift-native parser: search reads this for every command, and `ISO8601DateFormatter` goes through ICU.
+    package var lastRunEpoch: Double? { lastRun.flatMap { try? Date($0, strategy: .iso8601).timeIntervalSince1970 } }
 }
 
 /// Hard filters applied to search results. Time bounds apply to a command's most recent run,

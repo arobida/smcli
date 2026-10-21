@@ -98,6 +98,7 @@ final class Service: @unchecked Sendable {
         }
         timer.resume()
         retained.append(timer)
+        warmSearch()
         Thread.detachNewThread { [self] in
             while true {
                 let fd = accept(listener, nil, nil)
@@ -350,7 +351,23 @@ final class Service: @unchecked Sendable {
 
     // MARK: - Search
 
-    #if canImport(ProximaKit)
+    #if canImport(TalaDB)
+
+    /// Opens the search index in the background so the first search doesn't pay for it; a search waits on `searching`.
+    private func warmSearch() {
+        Thread.detachNewThread { [self] in
+            searching.lock()
+            defer { searching.unlock() }
+            let done = DispatchSemaphore(value: 0)
+            Task {
+                if let engine = try? queue.sync(execute: { try currentEngine(ServiceRequest(op: .search)) }) {
+                    try? await engine.warm(open: open)
+                }
+                done.signal()
+            }
+            done.wait()
+        }
+    }
 
     /// Blocks this connection's thread, not `queue`, for the length of the search.
     private func search(_ request: ServiceRequest) -> ServiceResponse {
@@ -435,6 +452,8 @@ final class Service: @unchecked Sendable {
         return built
     }
     #else
+    private func warmSearch() {}
+
     private func search(_ request: ServiceRequest) -> ServiceResponse {
         .failure("unsupported", "search requires macOS 14 or later.")
     }

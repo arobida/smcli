@@ -77,7 +77,7 @@ struct PotionTests {
         #expect(PotionModel.cachedSnapshot(home: root, environment: [:]) == nil)
     }
 
-    #if canImport(ProximaKit)
+    #if canImport(TalaDB)
     @Test func `Default to the cached Potion model unless Apple's is chosen`() throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: home) }

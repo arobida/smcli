@@ -227,7 +227,7 @@ final class RankingWorld {
                             now: Self.now, context: context(item)).map(\.command)
     }
 
-    #if canImport(ProximaKit)
+    #if canImport(TalaDB)
     private lazy var engine: HistorySearch = {
         let model = try! PotionModel(directory: URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .appendingPathComponent("../../Models/\(PotionModel.name)").standardizedFileURL)
@@ -263,7 +263,7 @@ struct RankingQualityTests {
             switch item.kind {
             case .suggest: ranked = try world.suggest(item)
             case .search:
-                #if canImport(ProximaKit)
+                #if canImport(TalaDB)
                 ranked = try await world.search(item)
                 #else
                 continue

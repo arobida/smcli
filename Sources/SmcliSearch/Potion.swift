@@ -303,25 +303,30 @@ private let halfToFloat: [Float] = (0...UInt16.max).map { bits in
     return Float(bitPattern: result)
 }
 
-#if canImport(ProximaKit)
-import ProximaKit
+#if canImport(TalaDB)
+/// Turns text into a fixed-dimension vector for the index's embedding leg.
+package protocol TextEmbedder: Sendable {
+    var dimension: Int { get }
+    func embed(_ text: String) async throws -> [Float]
+    func embedBatch(_ texts: [String]) async throws -> [[Float]]
+}
+
+extension TextEmbedder {
+    package func embedBatch(_ texts: [String]) async throws -> [[Float]] {
+        var vectors: [[Float]] = []
+        vectors.reserveCapacity(texts.count)
+        for text in texts { vectors.append(try await embed(text)) }
+        return vectors
+    }
+}
 
 package struct PotionEmbedder: TextEmbedder {
     package let model: PotionModel
     package var dimension: Int { model.dimension }
 
     /// Text with no known tokens gets a fixed vector, leaving its ranking to the BM25 leg.
-    package func embed(_ text: String) async throws -> Vector {
-        if let vector = model.embed(text) { return Vector(vector) }
-        return Vector(dimension: dimension, repeating: 1 / Float(dimension).squareRoot())
-    }
-
-    /// Embedding is cheap arithmetic, so a plain loop beats spawning a task per text.
-    package func embedBatch(_ texts: [String]) async throws -> [Vector] {
-        var vectors: [Vector] = []
-        vectors.reserveCapacity(texts.count)
-        for text in texts { vectors.append(try await embed(text)) }
-        return vectors
+    package func embed(_ text: String) async throws -> [Float] {
+        model.embed(text) ?? [Float](repeating: 1 / Float(dimension).squareRoot(), count: dimension)
     }
 }
 #endif

@@ -52,8 +52,9 @@ Cargo must be installed) and linked statically into `smcli-service`.
    (`PRAGMA data_version`). Usage is decayed when read (`smcli_decay`, two-week half-life); there is no `usage`
    table. Ranking adds project, previous-command, picked-query, project-script and Git-state signals
    (see the plan, step 6). In-process mode scans the database as before.
-4. `search` runs the hybrid ProximaKit index (keyword plus the built-in potion-code-16M-v2 embedder) held open in
-   the service; a record adds to the corpus in place, a write by another process forces a rebuild.
+4. `search` runs the hybrid TalaDB index (keyword plus the built-in potion-code-16M-v2 embedder; ProximaKit when
+   these numbers were taken). Each search opens and closes the index under a file lock; the service caches the
+   indexed metadata between searches and a write by another process forces a full re-read.
    The picker builds its own engine lazily on the first Tab when there is no service.
 5. Directory context (`ContextCache`) and fff `files`/`grep` are service-only: cached Git status refreshed in
    the background, and one fff instance per repository root (4 by default, idle ones dropped).
@@ -390,7 +391,7 @@ links the static archive `.build/fff/lib/libfff_c.a` into `smcli-service` only. 
 | macOS arm64 | Built and tested (`make test`, shell tests, service tests, baseline). |
 | macOS x86_64 | `rustup target add x86_64-apple-darwin`, then `make x86_64` cross-builds fff (Cargo `--target`) and both executables with SwiftPM `--arch x86_64` into `.build/x86_64-scratch/`. Run under Rosetta: `scripts/test-service.py` (including the 50,000-file repository and fff) and `scripts/test-file-picker.py` pass. The Swift unit tests and shell tests were not repeated on x86_64. |
 | macOS universal | `make fff-universal` lipo-joins the two fff archives into `.build/fff/lib/libfff_c.a`; `swift build -c release --arch arm64 --arch x86_64` then produces fat `smcli` and `smcli-service`. Built and checked with `lipo -info`; not run. |
-| Linux | **Not supported, not tried.** `Package.swift` links fff and the potion model only on macOS (`.when(platforms: [.macOS])`), `ProximaKit` is Apple-only, FSEvents is macOS-only, and `scripts/build-fff.sh` has no Linux branch. The service product would not link without fff; `smcli search` already reports itself unavailable. A Linux port needs the fff link line, a non-ProximaKit search path and a decision on the `zlob` feature. |
+| Linux | **Not supported, not tried.** `Package.swift` links fff and the potion model only on macOS (`.when(platforms: [.macOS])`), `taladb-swift` links its engine as a macOS xcframework here (its Linux system-library path is untried), FSEvents is macOS-only, and `scripts/build-fff.sh` has no Linux branch. The service product would not link without fff; `smcli search` already reports itself unavailable. A Linux port needs the fff link line, a Linux TalaDB engine build and a decision on the `zlob` feature. |
 
 `scripts/build-fff.sh` always writes `.build/fff/lib/libfff_c.a` (thin for this machine by default; `FFF_ARCHS="arm64 x86_64"`
 for universal) and `Package.swift` links that path. On x86_64 the linker prints four warnings for fff's hand-written

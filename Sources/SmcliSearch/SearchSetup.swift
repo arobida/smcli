@@ -28,7 +28,7 @@ package func workingDirectory(_ environment: [String: String]) -> String {
     environment["PWD"].flatMap { $0.hasPrefix("/") ? $0 : nil } ?? FileManager.default.currentDirectoryPath
 }
 
-#if canImport(ProximaKit)
+#if canImport(TalaDB)
 /// The search index next to the history database, using the model chosen by `smcli init`. With no choice
 /// made, the potion-code-16M-v2 built into the binary (or, in a build without it, from the Hugging Face
 /// cache); Apple's model when neither loads, so search keeps working.

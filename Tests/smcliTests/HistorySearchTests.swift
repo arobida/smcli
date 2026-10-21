@@ -1,5 +1,8 @@
 import Foundation
 import Testing
+#if canImport(TalaDB)
+import TalaDB
+#endif
 @testable import smcli
 @testable import SmcliSearch
 @testable import SmcliCore
@@ -85,7 +88,7 @@ struct HistorySearchTests {
         #expect(throws: (any Error).self) { try SearchFilter.time("yesterday", now: now) }
     }
 
-    #if canImport(ProximaKit)
+    #if canImport(TalaDB)
     @Test func `With no history yet, search still offers the project's commands`() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -151,6 +154,22 @@ struct HistorySearchTests {
                 ["git", "reset", "--soft", "soft", "head~1", "head", "1"])
         #expect(ShellTokenizer().tokenize("git push -f\ncommand: git\nflags: -f") == ["git", "push", "-f", "f"])
         #expect(ShellTokenizer().tokenize("ls\nflags: -a\nintent: list files") == ["ls", "intent:", "intent", "list", "files"])
+    }
+
+    @Test func `Encode shell terms as hex tokens TalaDB keeps whole`() {
+        #expect(ShellTokenizer().encoded("git -m") == "t676974 t2d6d t6d")
+        #expect(ShellTokenizer().encoded("ls\nflags: -a") == "t6c73")
+    }
+
+    @Test func `Map search filters to index filters`() {
+        #expect(SearchFilter().indexFilter == nil)
+        #expect(SearchFilter(program: "git").indexFilter == ["program": "git"])
+        #expect(SearchFilter(minRuns: 2, directory: "/repo/", flag: "-m").indexFilter == ["$and": [
+            ["flags": ["$in": ["-m"]]], ["dirs": ["$in": ["/repo"]]], ["runs": ["$gte": 2]]]])
+        #expect(SearchFilter(since: 10, before: 20).indexFilter == ["lastRun": ["$gte": 10.0, "$lt": 20.0]])
+        let entry = SearchEntry(command: "git status", runs: 1, lastRun: nil, lastDirectory: "/repo/app",
+                                lastExitCode: 0, source: "captured")
+        #expect(IndexedCommand(entry, doc: "git status").dirs == ["/repo/app", "/repo", "/"])
     }
 
     @Test func `Keep intent keywords searchable after the index reopens`() async throws {
