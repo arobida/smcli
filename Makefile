@@ -21,15 +21,15 @@ x86_64:
 	$(SWIFT) build -c release --arch x86_64 --scratch-path .build/x86_64-scratch; status=$$?; bash scripts/build-fff.sh; exit $$status
 
 # Debug build.
-build: fff
-	$(SWIFT) build
+build:
+	cargo build --workspace
 
 # Optimized build, copied to dist/ as a timestamped binary plus a dist/smcli symlink to the latest.
-release: fff
-	$(SWIFT) build -c release
+release:
+	cargo build --workspace --release
 	@mkdir -p $(DIST)
-	cp "$$($(SWIFT) build -c release --show-bin-path)/smcli" $(DIST)/smcli-$(STAMP)
-	cp "$$($(SWIFT) build -c release --show-bin-path)/smcli-service" $(DIST)/smcli-service-$(STAMP)
+	cp target/release/smcli $(DIST)/smcli-$(STAMP)
+	cp target/release/smcli-service $(DIST)/smcli-service-$(STAMP)
 	ln -sf smcli-$(STAMP) $(DIST)/smcli
 	ln -sf smcli-service-$(STAMP) $(DIST)/smcli-service
 	@echo "Built $(DIST)/smcli-$(STAMP) (latest: $(DIST)/smcli)"
@@ -82,11 +82,12 @@ rs-linux:
 	docker run --rm -v "$(CURDIR)":/src -w /src -v smcli-cargo:/usr/local/cargo/registry -v smcli-target:/target \
 		-e CARGO_TARGET_DIR=/target rust:latest sh -c 'cargo build --workspace && cargo test --workspace && /target/debug/smcli-service'
 
-run: build
-	$(SWIFT) run smcli $(ARGS)
+run:
+	cargo run -p smcli -- $(ARGS)
 
 # Removes build output, keeping the newest dist/ CLI and service pair and their symlinks (shell hooks may use them).
 clean:
+	cargo clean
 	$(SWIFT) package clean
 	rm -rf .build/release
 	@bash scripts/clean-dist.sh $(DIST)

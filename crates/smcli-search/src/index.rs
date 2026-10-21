@@ -306,7 +306,8 @@ impl HistorySearch {
         for entry in entries.filter_map(|e| e.ok()) {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name.starts_with("rs-commands-v") && !name.starts_with(&format!("{VERSION}-")) {
-                let _ = std::fs::remove_file(entry.path());
+                let path = entry.path();
+                let _ = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
             }
         }
     }

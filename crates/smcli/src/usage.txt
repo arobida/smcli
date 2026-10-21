@@ -1,0 +1,39 @@
+Usage: smcli init [--model NAME | --potion [DIR] | --builtin | --default] [--keys [ctrl-r,left,ctrl-t,ctrl-g|none]]
+       smcli history [--json]
+       smcli shell-init bash|zsh|fish
+       smcli search [query...] [--command NAME] [--subcommand NAME] [--since TIME] [--before TIME]
+                    [--min-runs N] [--author NAME] [--dir PATH] [--flag NAME] [--limit N] [--json]
+       smcli suggest [prefix...] [--dir PATH] [--limit N] [--json]
+       smcli pick [--suggest|--files|--grep] [query...]
+       smcli context [--json] [--dir PATH]
+       smcli reindex
+       smcli health [--json]
+       smcli import <legacy.jsonl>
+       smcli import --atuin [--replace] [history.db]
+       smcli prune [--dry-run]
+       smcli service start|stop|status
+Read saved shell history, or print opt-in hooks for structured metadata capture.
+search filters are exact; TIME is 30m, 12h, 7d, 2w, YYYY-MM-DD, or ISO 8601, matched against the last run.
+context prints the repository, worktree, branch, Git status and project manifests for a directory (cached by the service).
+reindex re-embeds every command for search; health checks the index and the embedding model.
+pick opens the history picker: Up and Ctrl-R show all history, newest first; Left on an empty line (pick --suggest) shows
+only this directory's suggestions; Tab searches all history semantically. Ctrl-R, Left, Ctrl-T and Ctrl-G are chosen in `smcli init`
+(asked, or set with a list such as `--keys ctrl-r,left,ctrl-t,ctrl-g`, `--keys ctrl-r` or `--keys none`); SMCLI_NO_KEYS=1 skips them all, and keys another tool already bound are left alone.
+SMCLI_EXTRA_KEYS=1 also binds Left on an empty line, Ctrl-Right and Alt-; (Bash and Zsh).
+Ctrl-T at the prompt (pick --files) opens files mode on this directory's entries; type to filter, Ctrl-F shows only
+directories, then only files, Tab searches the whole project with fff. Ctrl-G (pick --grep) searches file contents with fff.
+In the picker, Ctrl-T and Ctrl-G switch to files and grep and back to history; project search and grep need the service. Enter inserts the path at the cursor, quoted for your shell (SMCLI_SHELL), and never runs anything.
+suggest and search also weigh the project (nearest manifest), the shell session's previous command (SMCLI_SESSION, set by
+shell-init), commands you picked in the picker for a similar query, scripts and targets named in the project's manifest, and
+an operation in progress (a rebase suggests `git rebase --continue`); --json and search show why. SMCLI_RANKING_OFF=project,
+transition,selection,script,hint switches signals off.
+SMCLI_FFF_MAX (4) and SMCLI_FFF_IDLE (600 s) bound the service's file indexes.
+SMCLI_BASH_HOOK=debug makes Bash capture with a DEBUG trap even where bash-preexec or PS0 is available.
+init picks the search embedding model: Ollama, local potion-code-16M-v2 (--potion [DIR]), or Apple's (--builtin); saved to ~/.config/smcli/config.json, or SMCLI_CONFIG.
+By default (--default) search uses the potion-code-16M-v2 model built into smcli.
+Commands with a leading space, likely secrets, or matching historyFilter/cwdFilter in the config are not recorded;
+prune removes already-stored ones. import --atuin --replace discards existing smcli history first.
+SMCLI_DB selects the metadata database (default: ~/.local/share/smcli/history.db).
+record, suggest, search and the picker go through smcli-service, which starts when needed and is restarted after an upgrade.
+SMCLI_SERVICE=connect only uses a running one; SMCLI_SERVICE=0 (or off) keeps everything in-process. Without a reachable
+service they work in-process as well.

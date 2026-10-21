@@ -3,15 +3,28 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 swift="${SWIFT:-/usr/bin/swift}"
-# smcli-service links fff statically; `make test` already built it, this covers running the script directly.
-bash scripts/build-fff.sh
-"$swift" test
-bin_dir="$("$swift" build --show-bin-path)"
+cargo test --workspace
+cargo build --workspace
+bin_dir="$(cd "${CARGO_TARGET_DIR:-target}/debug" && pwd)"
+# Swift build only for the shell-init parity check below; drop both when the Swift sources go.
+if [[ -x $swift ]]; then
+    "$swift" build --product smcli
+    swift_bin="$("$swift" build --show-bin-path)/smcli"
+fi
 home="$(mktemp -d)"
 # The service is on by default; keep the one these checks start private, short-pathed and stopped on exit.
 runtime="$(mktemp -d /tmp/smcli-test.XXXXXX)"
 export SMCLI_DB="$home/captured.db" SMCLI_RUNTIME_DIR="$runtime"
 trap '"$bin_dir/smcli" service stop >/dev/null 2>&1 || true; rm -rf "$home" "$runtime"' EXIT
+
+if [[ -n ${swift_bin-} ]]; then
+    # Hooks embed their executable path; run both builds at the same path for a byte-for-byte comparison.
+    mkdir -p "$home/shell-parity"
+    cp "$swift_bin" "$home/shell-parity/smcli"
+    HOME="$home" SMCLI_CONFIG="$home/parity-config.json" "$home/shell-parity/smcli" shell-init zsh > "$home/swift-shell-init"
+    cp "$bin_dir/smcli" "$home/shell-parity/smcli"
+    diff "$home/swift-shell-init" <(HOME="$home" SMCLI_CONFIG="$home/parity-config.json" "$home/shell-parity/smcli" shell-init zsh)
+fi
 
 output="$("$bin_dir/smcli")"
 [[ "$output" == 'Usage: smcli init'* ]]
@@ -35,12 +48,12 @@ fi
 # init --keys sets the picker keys without asking, and shell-init follows them.
 cfg="$home/keys.json"
 SMCLI_CONFIG="$cfg" "$bin_dir/smcli" init --keys left > /dev/null
-grep -q '"ctrlRKey" : false' "$cfg" && grep -q '"leftKey" : true' "$cfg" && grep -q '"ctrlTKey" : false' "$cfg"
+grep -Eq '"ctrlRKey" ?: false' "$cfg" && grep -Eq '"leftKey" ?: true' "$cfg" && grep -Eq '"ctrlTKey" ?: false' "$cfg"
 init="$(SMCLI_CONFIG="$cfg" "$bin_dir/smcli" shell-init zsh)"
 [[ $init == *"(( 0 )) && _smcli_bind \$_smcli_keymap '^R'"* && $init == *"|| (( 1 )); then"* ]]
 [[ $init == *"(( 0 )) && _smcli_bind \$_smcli_keymap '^T'"* && $init == *"(( 0 )) && _smcli_bind \$_smcli_keymap '^G'"* ]]
 SMCLI_CONFIG="$cfg" "$bin_dir/smcli" init --keys ctrl-r,left > /dev/null
-grep -q '"ctrlRKey" : true' "$cfg"
+grep -Eq '"ctrlRKey" ?: true' "$cfg"
 if SMCLI_CONFIG="$cfg" "$bin_dir/smcli" init --keys up > /dev/null 2>&1; then
     printf 'An unknown key should fail.\n' >&2
     exit 1

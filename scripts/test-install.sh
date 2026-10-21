@@ -23,7 +23,7 @@ for f in .zshrc .bashrc .config/fish/config.fish; do
     grep -q "$home/bin/smcli' shell-init" "$home/$f" || fail "$f does not load the installed smcli"
 done
 grep -q '^alias ll="ls -l"$' "$home/.zshrc" || fail "install lost the user's own .zshrc lines"
-grep -q '"leftKey" : true' "$home/.config/smcli/config.json" || fail "--keys was not saved"
+grep -Eq '"leftKey" ?: true' "$home/.config/smcli/config.json" || fail "--keys was not saved"
 zsh -fc "source '$home/.zshrc'; typeset -f _smcli_record > /dev/null" || fail "zsh did not load the hooks"
 fish --version > /dev/null 2>&1 && { fish -c "source '$home/.config/fish/config.fish'; functions -q _smcli_record" || fail "fish did not load the hooks"; }
 "$home/bin/smcli" service status > /dev/null || fail "service not running after install"

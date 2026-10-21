@@ -1,3 +1,14 @@
+mod cli;
+mod context;
+mod initialize;
+mod menu;
+mod picker;
+mod shell_integration;
+mod shell_quoting;
+
 fn main() {
-    println!("Hello, world!");
+    if let Err(error) = cli::run() {
+        eprintln!("smcli: {error:#}");
+        std::process::exit(1);
+    }
 }

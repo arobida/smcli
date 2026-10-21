@@ -23,6 +23,11 @@ pub struct ServiceClient {
     config: String,
 }
 impl ServiceClient {
+    pub fn socket(&self) -> &std::path::Path {
+        &self.location.socket
+    }
+
+
     /// The mode comes from `SMCLI_SERVICE`: unset (or `1`/`on`) starts the service as needed, `connect` only uses a
     /// running one, and `0`/`off` keeps every command in-process.
     pub fn new(database: &Path, environment: &HashMap<String, String>, cli: &Path) -> Self {
