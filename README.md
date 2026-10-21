@@ -5,7 +5,7 @@ metadata native history doesn't reliably keep: the working directory, exit code,
 start time, duration, user, host, and terminal session. Search commands with keyword
 and semantic matching, or rank captured commands for your current directory.
 Search uses the potion-code-16M-v2 static model, built into the binary (about 33 MB, MIT licensed,
-see `Models/`); Apple's on-device embeddings and Ollama are optional.
+see `Models/`). Search works on macOS and Linux.
 
 > [!NOTE]
 > Native shell history stores the command line and little else. smcli never rewrites
@@ -14,14 +14,14 @@ see `Models/`); Apple's on-device embeddings and Ollama are optional.
 ## Quickstart
 
 ```sh
-$ swift build -c release
-$ .build/release/smcli history
+$ make release
+$ dist/smcli history
 ==> /Users/you/.zsh_history <==
 git status
 git push origin main
 # ^^ native history, from both shells regardless of the current one
 
-$ .build/release/smcli search undo last commit
+$ dist/smcli search undo last commit
 git reset --soft HEAD~1
     runs=4  native history
 # ^^ illustrative output; native history has no captured time, exit code, or directory
@@ -31,16 +31,16 @@ git reset --soft HEAD~1
 ## Remember more than your shell does
 
 ```sh
-$ .build/release/smcli suggest
+$ dist/smcli suggest
 # ^^ no output if you haven't captured or imported any commands
 
-$ eval "$("$PWD/.build/release/smcli" shell-init zsh)"
+$ eval "$("$PWD/dist/smcli" shell-init zsh)"
 
 $ git status
 $ ./run-tests.sh
 $ git commit -am 'fix login'
 
-$ .build/release/smcli suggest
+$ dist/smcli suggest
 git commit -am 'fix login'
 ./run-tests.sh
 git status
@@ -67,11 +67,12 @@ See **[docs/install.md](docs/install.md)** to install a release or build from so
 choose the picker keys, and upgrade or uninstall. In short:
 
 ```sh
-scripts/install.sh       # build (needs Swift 6.0+, Rust, macOS 14+), install, hook your shell, start the service
+scripts/install.sh       # build (needs Rust and a C toolchain), install, hook your shell, start the service
 smcli-uninstall          # export your history, then remove everything
 ```
 
-Linux needs SQLite development headers (e.g. `libsqlite3-dev`); search is unavailable there.
+Linux builds include search. Install a C toolchain, pkg-config, and SQLite development
+headers (e.g. `build-essential pkg-config libsqlite3-dev` on Debian/Ubuntu).
 
 ## Usage
 
@@ -82,11 +83,9 @@ smcli search [query...]       # --limit N, --json, filters below
 smcli suggest [prefix...]     # --dir PATH, --limit N, --json
 smcli shell-init bash|zsh|fish  # print opt-in hooks; eval (or `| source` in fish)
 smcli pick [query...]         # interactive picker; prints the chosen command
-smcli init                    # ask for picker keys, then choose an Ollama embedding model
+smcli init                    # configure picker keys
 smcli init --keys [LIST]      # picker keys only: ask, or ctrl-r,left | ctrl-r | left | none
-smcli init --model NAME       # verify and select an Ollama model
 smcli init --potion [DIR]     # use another potion-code-16M-v2 copy (no DIR: the built-in one)
-smcli init --builtin          # use Apple's built-in embeddings instead of Potion
 smcli init --default          # back to the default: the built-in Potion model
 smcli reindex                 # discard the search index and re-embed every command
 smcli health [--json]         # index coverage, size, and embedding model check (exit 1 if broken)
@@ -112,8 +111,8 @@ $ smcli --help
   prefixes are removed, and Zsh escaped bytes are decoded. The source files aren't changed.
 - Search combines captured commands and native history, treating each native line as an
   entry (not reconstructing multiline commands). It ranks distinct commands by fusing
-  BM25 keywords (whole words like `--soft` and their pieces) with Apple's English sentence
-  embeddings, potion-code-16M-v2, or the configured Ollama model. Semantic matches aren't guaranteed.
+  BM25 keywords (whole words like `--soft` and their pieces) with potion-code-16M-v2
+  embeddings. Semantic matches aren't guaranteed.
 - Literal queries (flags, paths, revisions like `HEAD~1`, or a short query led by a program in
   your history) weight keywords more; plain-language requests fuse both legs by rank.
 - A bounded pool of matches is reranked with usage aggregates computed in the same SQL
@@ -123,7 +122,7 @@ $ smcli --help
   without surfacing weak ones; failed commands are demoted, not hidden. Text
   results show why a command ranked (`exact words`, `used here`, `recent`, …).
 - potion-code-16M-v2 runs natively (WordPiece tokens, mean of float16 rows, normalize;
-  no network pass). It is linked into the binary as a read-only segment and read in place,
+  no network pass). It is embedded in the binary,
   so there is nothing to download; `init --potion DIR` points at another copy. Being a static model, it embeds only the command and its intent,
   not the labels below; word order is lost (`cp a b` equals `cp b a`), so keywords matter.
   For commands with captured metadata, run counts come only from captured records;
@@ -152,10 +151,8 @@ $ smcli --help
 
 > [!WARNING]
 > History can contain passwords, tokens, and other secrets. smcli does not redact
-> captured commands — don't share the database or the search index. Apple's built-in
-> search embeds on-device. With Ollama configured, command text and search queries are
-> sent to the Ollama server (default `http://127.0.0.1:11434`). `OLLAMA_HOST` can point to
-> a remote server; only use an endpoint you trust.
+> captured commands — don't share the database or the search index. Search embeddings
+> are computed locally with the bundled Potion model.
 
 > [!NOTE]
 > Capture is best-effort, not an audit. It records finished interactive commands;
@@ -170,9 +167,6 @@ $ smcli --help
   `~/.config/smcli/config.json` (or `$XDG_CONFIG_HOME/smcli/config.json`);
   `SMCLI_CONFIG` overrides that file's path. `init` configures search, not capture,
   and is not required for the built-in model.
-- Ollama must be running and the model already installed (e.g. `ollama pull embeddinggemma`)
-  before `smcli init --model embeddinggemma`. It must remain available for searches
-  using that model. Initialization does not download models.
 - `import` of legacy JSONL is transactional but does not deduplicate: importing the same
   file again adds duplicate records. Run each migration only once.
 - Like Atuin, capture skips commands typed with a leading space, commands containing likely
@@ -198,10 +192,10 @@ Before changing shell transports or search ownership:
 
 ```sh
 make baseline       # release CLI; synthetic 1k/10k/100k histories, raw JSON in dist/baseline.json
-make fff-smoke      # optional pinned Rust C library + standalone Swift ownership test
+make fff-smoke      # pinned fff-search crate smoke test
 ```
 
-Normal builds and `smcli` do not link fff. The experiment requires Cargo and a C
-toolchain; it does not install a service or change your shell. See
+Normal builds link the pinned `fff-search` crate into `smcli-service` only;
+`smcli` does not link fff. Builds require Cargo and a C toolchain. See
 [the baseline report](docs/baseline.md) for the capture-to-picker trace,
 measurements, dependency/API verification, limitations, and the next gate.

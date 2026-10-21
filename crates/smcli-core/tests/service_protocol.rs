@@ -28,8 +28,7 @@ fn assert_wire_value(actual: &Value, expected: &Value) {
     }
 }
 
-fn round_trip<T: serde::Serialize + serde::de::DeserializeOwned>(fixture: &str, name: &str) {
-    let mut output = Vec::new();
+fn round_trip<T: serde::Serialize + serde::de::DeserializeOwned>(fixture: &str) {
     for line in fixture.lines() {
         let message: T = decode_line(line.as_bytes()).unwrap();
         let encoded = encode_line(&message).unwrap();
@@ -39,18 +38,13 @@ fn round_trip<T: serde::Serialize + serde::de::DeserializeOwned>(fixture: &str, 
             &serde_json::from_slice(&encoded).unwrap(),
             &serde_json::from_str(line).unwrap(),
         );
-        output.extend(encoded);
-    }
-    // Optional test artifact for independent decoding by the Swift fixture generator.
-    if let Some(directory) = std::env::var_os("SMCLI_PROTOCOL_ROUNDTRIP_DIR") {
-        std::fs::write(std::path::Path::new(&directory).join(name), output).unwrap();
     }
 }
 
 #[test]
 fn swift_service_protocol_fixtures_round_trip() {
-    round_trip::<ServiceRequest>(REQUESTS, "requests.jsonl");
-    round_trip::<ServiceResponse>(RESPONSES, "responses.jsonl");
+    round_trip::<ServiceRequest>(REQUESTS);
+    round_trip::<ServiceResponse>(RESPONSES);
     let operations: Vec<_> = REQUESTS
         .lines()
         .map(|line| decode_line::<ServiceRequest>(line.as_bytes()).unwrap().op)

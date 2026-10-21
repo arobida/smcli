@@ -330,8 +330,7 @@ def main():
         "logical_cpus": os.cpu_count(),
         "binary_sha256": hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
         "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "swift": subprocess.check_output([os.environ.get("SWIFT", "/usr/bin/swift"), "--version"],
-                                         stderr=subprocess.STDOUT, text=True).strip(),
+        "rustc": subprocess.check_output(["rustc", "--version"], stderr=subprocess.STDOUT, text=True).strip(),
         "samples": args.samples, "fixtures": [], "service": args.service,
         "notes": [
             f"Service mode: {args.service}. " + ("Every command goes through a smcli-service started for the fixture (record, suggest, search, picker)."

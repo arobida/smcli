@@ -2,29 +2,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-swift="${SWIFT:-/usr/bin/swift}"
 cargo test --workspace
 cargo build --workspace
 bin_dir="$(cd "${CARGO_TARGET_DIR:-target}/debug" && pwd)"
-# Swift build only for the shell-init parity check below; drop both when the Swift sources go.
-if [[ -x $swift ]]; then
-    "$swift" build --product smcli
-    swift_bin="$("$swift" build --show-bin-path)/smcli"
-fi
 home="$(mktemp -d)"
 # The service is on by default; keep the one these checks start private, short-pathed and stopped on exit.
 runtime="$(mktemp -d /tmp/smcli-test.XXXXXX)"
 export SMCLI_DB="$home/captured.db" SMCLI_RUNTIME_DIR="$runtime"
 trap '"$bin_dir/smcli" service stop >/dev/null 2>&1 || true; rm -rf "$home" "$runtime"' EXIT
-
-if [[ -n ${swift_bin-} ]]; then
-    # Hooks embed their executable path; run both builds at the same path for a byte-for-byte comparison.
-    mkdir -p "$home/shell-parity"
-    cp "$swift_bin" "$home/shell-parity/smcli"
-    HOME="$home" SMCLI_CONFIG="$home/parity-config.json" "$home/shell-parity/smcli" shell-init zsh > "$home/swift-shell-init"
-    cp "$bin_dir/smcli" "$home/shell-parity/smcli"
-    diff "$home/swift-shell-init" <(HOME="$home" SMCLI_CONFIG="$home/parity-config.json" "$home/shell-parity/smcli" shell-init zsh)
-fi
 
 output="$("$bin_dir/smcli")"
 [[ "$output" == 'Usage: smcli init'* ]]

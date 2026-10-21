@@ -39,7 +39,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -z $from ]]; then
     if [[ -x $here/smcli && -x $here/smcli-service ]]; then
         from=$here
-    elif [[ -f $here/../Makefile && -f $here/../Package.swift ]]; then
+    elif [[ -f $here/../Makefile && -f $here/../Cargo.toml ]]; then
         command -v cargo > /dev/null || die "building from source needs Rust (cargo); install it from https://rustup.rs"
         say "Building from source (make release)"
         make -C "$here/.." release > /dev/null

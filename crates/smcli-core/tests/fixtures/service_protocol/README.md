@@ -1,28 +1,12 @@
 # ServiceProtocol wire fixtures
 
-`generate.py` extracts the current Swift DTO declarations from `Sources/SmcliCore` and runs the Swift interpreter with `generate.swift`. It keeps Codable declarations/initializers, not runtime implementations. No Swift package build, service, user history, or Phase 2 code is needed.
+These fixtures were generated from the Swift DTOs before the Swift sources were removed, and are now the frozen wire format: a protocol change edits them by hand and bumps the protocol version.
 
 - `requests.jsonl`: all ten operations, every request field, Unicode/escaped newlines, and finite double extremes.
 - `responses.jsonl`: all response fields, nested suggestion/search/context/GitStatus/file DTOs, empty collections, omitted nils, and open-ended failure codes.
 - `decoding.jsonl`: Swift JSONDecoder's acceptance of missing/null/unknown fields, required nested keys (including initializer-defaulted properties), malformed JSON, version mismatches, and numeric boundaries.
 
-Regenerate from the worktree root (requires Swift):
-
-```sh
-python3 crates/smcli-core/tests/fixtures/service_protocol/generate.py
-```
-
-For a bidirectional check, Rust writes re-encoded fixtures to an existing temporary directory, then Swift decodes them and asserts equality with its original values:
-
-```sh
-mkdir -p /tmp/smcli-rust-protocol-roundtrip
-CARGO_TARGET_DIR=/tmp/smcli-rust-protocol-target \
-SMCLI_PROTOCOL_ROUNDTRIP_DIR=/tmp/smcli-rust-protocol-roundtrip \
-cargo test -p smcli-core --test service_protocol
-python3 crates/smcli-core/tests/fixtures/service_protocol/generate.py /tmp/smcli-rust-protocol-roundtrip
-```
-
-`make rs-test` runs these with the rest of the workspace.
+`make test` runs these with the rest of the workspace.
 
 ## Deliberate boundaries
 

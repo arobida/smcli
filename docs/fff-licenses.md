@@ -1,9 +1,10 @@
 # fff transitive license audit
 
-Audited 2026-10-19 for the pinned fff `v0.11.0` (`95fd777c`), built as `scripts/build-fff.sh`
-does: `cargo build --locked --release -p fff-c` with default features (ripgrep, vendored libgit2,
-no `zlob`, no https/ssh). This covers what a binary linking `libfff_c` would ship; it is not
-legal advice.
+Audited 2026-10-19 for the pinned fff `v0.11.0` (`95fd777c`), with default features
+(ripgrep, vendored libgit2, no `zlob`, no https/ssh). The Rust workspace now links
+`fff-search` directly into `smcli-service`, without the former C wrapper. The figures
+below record the original audit; regenerate `THIRD_PARTY_NOTICES.md` for the current
+locked dependency set. This is not legal advice.
 
 **Verdict:** shippable under permissive terms, with notice obligations. Nothing is
 GPL-incompatible with linking, but three items need action before distribution (see the end).
@@ -11,8 +12,7 @@ GPL-incompatible with linking, but three items need action before distribution (
 ## How it was checked
 
 ```sh
-bash scripts/build-fff.sh
-cargo tree --locked --manifest-path .build/fff/source/Cargo.toml -p fff-c \
+cargo tree --locked -p fff-search \
     -e normal --prefix none --target <triple> -f '{p} {l}'
 ```
 
@@ -20,8 +20,8 @@ cargo tree --locked --manifest-path .build/fff/source/Cargo.toml -p fff-c \
 appear and are counted, which overstates the shipped set slightly. The same was repeated with
 `cargo metadata --filter-platform` for `aarch64-apple-darwin` (100 crates), `x86_64-apple-darwin`
 (101) and `x86_64-unknown-linux-gnu` (102). Bundled C sources inside `-sys` crates were read
-directly, since Cargo's `license` field doesn't cover them. `strings` on the built
-`libfff_c.dylib` confirms LMDB, PCRE2 and libgit2 code are present.
+directly, since Cargo's `license` field doesn't cover them. The original audit also
+confirmed LMDB, PCRE2 and libgit2 code in the former C-wrapper binary using `strings`.
 
 ## Rust crates
 
@@ -68,5 +68,5 @@ libgit2's `COPYING` is the authoritative list of its bundled pieces and their te
 3. **xdiff:** either keep smcli's source public (simplest LGPL compliance for a static link),
    or ship relinkable object files.
 
-Re-audit whenever `scripts/build-fff.sh` changes the pin or its feature set; enabling `zlob`,
+Re-audit whenever the workspace's `fff-search` dependency changes its pin or feature set; enabling `zlob`,
 `https` or `ssh` adds Zig-built code, OpenSSL or libssh2.
