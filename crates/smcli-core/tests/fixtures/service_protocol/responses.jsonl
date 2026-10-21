@@ -1,0 +1,17 @@
+{"ok":true,"v":1}
+{"build":"/bin/smcli-service|1700000000.12|123456","indexes":[{"id":1,"root":"/repo"},{"id":2,"root":"/other"}],"ok":true,"pid":12345,"v":1}
+{"duplicate":false,"event":"00112233-4455-6677-8899-aabbccddeeff","ok":true,"v":1}
+{"ok":true,"recent":["echo héllo","printf 'a\\nb'"],"suggestions":[{"command":"git status","lastExitCode":0,"lastRun":"2026-01-01T01:02:03Z","runs":12,"runsHere":3,"score":1.25,"why":["directory","picked"]}],"v":1}
+{"hits":[{"author":"test","command":"git status","flags":["--short"],"frecency":2.5,"intent":"inspect","lastDirectory":"/repo","lastExitCode":0,"lastRun":"2026-01-01T01:02:03Z","runs":12,"runsHere":3,"runsProject":4,"source":"captured","successes":10,"why":["literal"]},{"command":"echo native","flags":[],"frecency":0,"runs":1,"runsHere":0,"runsProject":0,"source":"native","successes":0}],"ok":true,"v":1}
+{"context":{"directory":"/repo/sub","projectRelative":"sub","projects":[{"kind":"rust","manifests":["Cargo.toml"],"name":"test","packageManager":"cargo","root":"/repo","scripts":{"Cargo.toml":["build","test"]}}],"repoRelative":"sub","repository":{"branch":"main","commonDir":"/repo/.git","gitDir":"/repo/.git","linkedWorktree":false,"operation":"merge","root":"/repo"},"status":{"ahead":2,"behind":1,"branch":"main","conflicted":6,"fetchedAt":1700000000.125,"oid":"abcdef0","staged":3,"unstaged":4,"untracked":5,"upstream":"origin/main"},"statusPending":true},"ok":true,"v":1}
+{"context":{"directory":"/outside","projects":[],"statusPending":false},"ok":true,"v":1}
+{"files":[{"column":2,"git":" M","insert":"../src/main.rs","line":42,"path":"src/main.rs","provenance":["grep","picked"],"text":"let text = \"héllo\";"},{"insert":"../README.md","path":"README.md","provenance":["files"]}],"instance":1,"ok":true,"partial":true,"root":"/repo","v":1}
+{"error":{"code":"bad_request","message":"Example bad_request."},"ok":false,"v":1}
+{"error":{"code":"version","message":"Example version."},"ok":false,"v":1}
+{"error":{"code":"unsupported","message":"Example unsupported."},"ok":false,"v":1}
+{"error":{"code":"busy","message":"Example busy."},"ok":false,"v":1}
+{"error":{"code":"too_large","message":"Example too_large."},"ok":false,"v":1}
+{"error":{"code":"timeout","message":"Example timeout."},"ok":false,"v":1}
+{"error":{"code":"failed","message":"Example failed."},"ok":false,"v":1}
+{"error":{"code":"future_error","message":"Example future_error."},"ok":false,"v":1}
+{"duplicate":false,"files":[],"hits":[],"indexes":[],"ok":true,"partial":false,"recent":[],"suggestions":[],"v":1}

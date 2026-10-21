@@ -1,0 +1,16 @@
+{"op":"ping","v":1}
+{"command":"printf 'héllo 🌍\\n'\necho done","directory":"/repo","endedAt":1700000001.5,"event":"00112233-4455-6677-8899-aabbccddeeff","exitCode":141,"nativeFile":"/home/test/.zsh_history","op":"record","pipestatus":[0,141],"session":"session-1","shell":"zsh","startedAt":1700000000.125,"v":1}
+{"directory":"/repo","limit":3,"op":"suggest","prefix":"git ","session":"session-1","v":1}
+{"directory":"/repo","limit":5,"op":"pick","v":1}
+{"config":"/home/test/config.json","directory":"/repo","filter":{"author":"test","before":1800000000,"directory":"/repo","flag":"--amend","minRuns":2,"program":"git","since":1600000000.25,"subcommand":"commit"},"histfile":"/home/test/.history","limit":20,"loginShell":"/bin/zsh","op":"search","query":"commit","v":1}
+{"directory":"/repo/sub","limit":10,"op":"context","query":"test","v":1}
+{"directory":"/repo/sub","limit":10,"op":"files","query":"test","v":1}
+{"directory":"/repo/sub","limit":10,"op":"grep","query":"test","v":1}
+{"directory":"/repo","mode":"files","op":"select","path":"src/main.rs","query":"sr","v":1}
+{"command":"git status","config":"/home/test/config.json","mode":"search","op":"select","query":"git","v":1}
+{"op":"shutdown","v":1}
+{"op":"record","startedAt":0.8455124082255701,"v":1}
+{"op":"record","startedAt":1700000000.1234567,"v":1}
+{"op":"record","startedAt":979267932.8934171,"v":1}
+{"op":"record","startedAt":5e-324,"v":1}
+{"op":"record","startedAt":1.7976931348623157e+308,"v":1}

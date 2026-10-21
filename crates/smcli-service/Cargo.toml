@@ -1,0 +1,16 @@
+[package]
+name = "smcli-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+fff-search = { git = "https://github.com/dmtrKovalenko/fff", rev = "95fd777c2529fc7b4d7572dabff64cc07268f2c5", version = "0.11.0" }
+libc = "0.2.191"
+rusqlite = "0.40.2"
+smcli-core = { version = "0.1.0", path = "../smcli-core" }
+smcli-search = { version = "0.1.0", path = "../smcli-search" }
+taladb = "0.12"
+
+[dev-dependencies]
+tempfile = "3.27.0"

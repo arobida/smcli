@@ -4,7 +4,7 @@ PYTHON ?= python3
 DIST := dist
 STAMP := $(shell date +%Y%m%d-%H%M%S)-$(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)
 
-.PHONY: build release fresh test clean run baseline ranking fff fff-universal x86_64 fff-build fff-smoke
+.PHONY: build release fresh test clean run baseline ranking fff fff-universal x86_64 fff-build fff-smoke rs-build rs-test rs-ranking rs-linux
 
 # smcli-service links the pinned fff statically, so it must be built before anything that links the service.
 # Cached after the first run (cargo no-ops when nothing changed).
@@ -65,6 +65,22 @@ fff-build:
 
 fff-smoke: fff-build
 	.build/fff/smoke
+
+# Rust port (.plans/rust-port.md): Cargo workspace in crates/, output in target/.
+rs-build:
+	cargo build --workspace
+
+rs-test:
+	cargo test --workspace
+
+# The Rust port's ranking scores on the same fixed query set as `make ranking`.
+rs-ranking:
+	cargo test --release -p smcli-search --test ranking -- --nocapture
+
+# Builds and tests the Rust workspace on Linux in Docker (needs a running daemon); Linux output stays in a volume.
+rs-linux:
+	docker run --rm -v "$(CURDIR)":/src -w /src -v smcli-cargo:/usr/local/cargo/registry -v smcli-target:/target \
+		-e CARGO_TARGET_DIR=/target rust:latest sh -c 'cargo build --workspace && cargo test --workspace && /target/debug/smcli-service'
 
 run: build
 	$(SWIFT) run smcli $(ARGS)
