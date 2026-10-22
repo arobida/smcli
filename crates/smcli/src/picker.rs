@@ -17,7 +17,7 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols::border,
     text::{Line, Span},
-    widgets::{Block, HighlightSpacing, List, ListItem, ListState, Paragraph},
+    widgets::{Block, List, ListItem, ListState, Paragraph},
 };
 use crate::highlight::{highlight, plain};
 
@@ -208,6 +208,39 @@ fn stripe_line(width: u16, filled: u16, fade: Modifier) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Keep at least three result rows when possible. As height shrinks, drop
+/// decoration, filter hints, navigation hints, then global hints and the header.
+fn picker_layout(area: Rect) -> [Rect; 7] {
+    let h = area.height;
+    let heights = [
+        u16::from(h >= 5), // header
+        u16::from(h >= 9), // filters
+        if h >= 13 { 3 } else { u16::from(h >= 2) }, // search
+        u16::from(h >= 8), // navigation
+        0, // list takes the remainder
+        u16::from(h >= 10), // sunset
+        u16::from(h >= 6), // global hints
+    ];
+    let mut rows = [Rect::default(); 7];
+    let mut y = area.y;
+    for (i, height) in heights.into_iter().enumerate() {
+        let height = if i == 4 { h.saturating_sub(heights.iter().sum()) } else { height };
+        rows[i] = Rect::new(area.x, y, area.width, height);
+        y += height;
+    }
+    rows
+}
+
+fn hint_line(hints: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (i, (key, what)) in hints.iter().enumerate() {
+        if i > 0 { spans.push(Span::styled(" · ", MUTED)); }
+        spans.push(Span::raw((*key).to_owned()));
+        spans.push(Span::styled(format!(" {what}"), MUTED));
+    }
+    Line::from(spans)
+}
+
 /// Search is invoked only on Tab (history) or Ctrl-A (files); files is invoked for project filenames and grep.
 /// A file choice is unquoted: the CLI must validate the shell insertion context and quote it.
 pub fn run(
@@ -238,6 +271,7 @@ pub fn run(
     let mut next_bar = Instant::now() + Duration::from_millis(20);
     let mut cols = 0u16;
     let mut tall = false;
+    let mut page_size = 1usize;
     let mut hits = Vec::new();
     let mut status = String::new();
     let mut filtered: Option<((String, bool), Vec<String>)> = None;
@@ -336,8 +370,8 @@ pub fn run(
             cols = area.width;
             let history = picker.mode == Mode::History;
             let label = if matches!(picker.mode, Mode::Files | Mode::Directory) { match kind { 1 => "folders", 2 => "files", _ => "files+dirs" } } else if history { picker.title.as_deref().unwrap_or("history") } else { picker.mode.as_str() };
-            // Too short for boxes: keep the flat layout.
-            let boxed = area.height >= 8;
+            let [header_area, filter_area, search_area, navigation_area, list_area, stripe_area, global_area] = picker_layout(area);
+            let boxed = search_area.height == 3;
             // Files modes name their scope so directory and project search never look alike.
             let scope = match picker.mode {
                 Mode::Files | Mode::Directory if local => format!("in {}", std::env::current_dir().map(|d| visible(&d.display().to_string())).unwrap_or_default()),
@@ -345,7 +379,7 @@ pub fn run(
                 Mode::Grep => format!("in {}", std::env::current_dir().map(|d| visible(&d.display().to_string())).unwrap_or_default()),
                 _ => String::new(),
             };
-            frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!(" {label} "), ACCENT), Span::styled(scope, ACCENT.add_modifier(Modifier::BOLD)), Span::styled(" ›", ACCENT.add_modifier(Modifier::BOLD))])), Rect::new(area.x, area.y, area.width, 1));
+            frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!(" {label} "), ACCENT), Span::styled(scope, ACCENT.add_modifier(Modifier::BOLD)), Span::styled(" ›", ACCENT.add_modifier(Modifier::BOLD))])), header_area);
             let found = if local {
                 format!("{count} results")
             } else {
@@ -360,7 +394,6 @@ pub fn run(
             if busy {
                 summary.spans.insert(0, Span::styled(format!(" {}", ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][spinner]), ACCENT));
             }
-            let search_area = Rect::new(area.x, area.y + 1, area.width, if boxed { 3 } else { 1 });
             let search_block = if boxed { Block::bordered().border_set(border::ROUNDED).border_style(MUTED) } else { Block::new() };
             let input = search_block.inner(search_area);
             let query = visible(&picker.query);
@@ -371,16 +404,18 @@ pub fn run(
                 Span::raw(query.clone())
             };
             frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(prompt, ACCENT), text])).block(search_block), search_area);
-            frame.set_cursor_position((input.x + Span::raw(prompt).width() as u16 + Span::raw(query.as_str()).width() as u16, input.y));
-            let hint_rows = if area.height >= 12 { 2 } else { 1 };
-            tall = hint_rows == 2;
-            let list_area = Rect::new(area.x, search_area.bottom(), area.width, area.height.saturating_sub(search_area.height + 1 + hint_rows));
+            if input.width > 0 && input.height > 0 {
+                let offset = (Span::raw(prompt).width() + Span::raw(query.as_str()).width()).min(input.width.saturating_sub(1) as usize) as u16;
+                frame.set_cursor_position((input.x + offset, input.y));
+            }
+            tall = stripe_area.height > 0;
             let list_block = if boxed {
                 Block::bordered().border_set(border::ROUNDED).border_style(MUTED)
                     .title_bottom(summary.clone().right_aligned())
             } else {
                 Block::new()
             };
+            page_size = list_block.inner(list_area).height.max(1) as usize;
             let items: Vec<ListItem> = if history {
                 // Rows past the selection plus one screen are never visible; skip building them.
                 commands.iter().enumerate().take(selected + area.height as usize).map(|(i, c)| {
@@ -403,47 +438,26 @@ pub fn run(
                     ]))
                 }).collect()
             };
-            let list = List::new(items).block(list_block).highlight_style(SELECTED).highlight_symbol("[ ⏎ ] ").highlight_spacing(HighlightSpacing::Always);
+            let list = List::new(items).block(list_block).highlight_style(SELECTED);
             let mut state = ListState::default().with_selected((count > 0).then_some(selected));
             frame.render_stateful_widget(list, list_area, &mut state);
-            if !boxed {
-                frame.render_widget(Paragraph::new(summary).style(MUTED), Rect::new(area.x, list_area.bottom().saturating_sub(1), area.width, 1));
-            }
-            let typing = !picker.query.is_empty();
-            let hints: Vec<(&str, &str)> = if count == 0 && typing {
-                vec![("esc", "cancel")]
-            } else if history {
-                let mut h = if typing { vec![("tab", "semantic"), ("↑↓", "move")] } else { vec![("↑↓", "move"), ("tab", "semantic")] };
-                h.push(("^T", "files"));
-                if !global_files { h.push(("^G", "grep")); }
-                h.push(("esc", "cancel"));
-                h
+            let filters = if history {
+                vec![("tab", "semantic")]
+            } else if matches!(picker.mode, Mode::Files | Mode::Directory) {
+                vec![("^A", if local { "global search" } else { "cwd search" }), ("^F", "dirs/files")]
             } else {
-                let mut h = vec![("↑↓", "move")];
-                if matches!(picker.mode, Mode::Files | Mode::Directory) {
-                    h.extend([("^A", if local { "global search" } else { "cwd search" }), ("^F", "dirs/files")]);
-                }
-                if matches!(picker.mode, Mode::Files | Mode::Directory) {
-                    h.push(("^T", "history"));
-                    if !global_files { h.push(("^G", "grep")); }
-                } else {
-                    h.extend([("^G", "history"), ("^T", "files")]);
-                }
-                h.push(("esc", "cancel"));
-                h
+                vec![]
             };
-            if hint_rows == 2 {
-                // Scroll progress in the spacer row. Color follows the column's third of the full width.
-                let fade = if tick < 3 { Modifier::DIM } else { Modifier::empty() };
-                frame.render_widget(Paragraph::new(stripe_line(area.width, shown, fade)), Rect::new(area.x, area.bottom().saturating_sub(2), area.width, 1));
+            frame.render_widget(Paragraph::new(hint_line(&filters)), filter_area);
+            frame.render_widget(Paragraph::new(hint_line(&[("[ ⏎ ]", "accept"), ("↑↓", "move"), ("PgUp/PgDn", "page")])), navigation_area);
+            let mut globals = vec![("esc", "cancel"), ("^T", if matches!(picker.mode, Mode::Files | Mode::Directory) { "history" } else { "files" })];
+            if grep_available(global_files) {
+                globals.push(("^G", if picker.mode == Mode::Grep { "history" } else { "grep" }));
             }
-            let mut spans = vec![Span::raw(" ")];
-            for (i, (key, what)) in hints.into_iter().enumerate() {
-                if i > 0 { spans.push(Span::styled(" · ", MUTED)); }
-                spans.push(Span::raw(key));
-                spans.push(Span::styled(format!(" {what}"), MUTED));
-            }
-            frame.render_widget(Paragraph::new(Line::from(spans)), Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1));
+            globals.push(("^U", "clear"));
+            let fade = if tick < 3 { Modifier::DIM } else { Modifier::empty() };
+            frame.render_widget(Paragraph::new(stripe_line(area.width, shown, fade)), stripe_area);
+            frame.render_widget(Paragraph::new(hint_line(&globals)), global_area);
         })?; }
         // Soonest of bar ease (~20ms), fade-in (70ms), and spinner (80ms). A queued key
         // makes poll return at once, so held arrows still skip frames and coalesce.
@@ -489,6 +503,8 @@ pub fn run(
         match key.code {
             KeyCode::Esc => return Ok(None),
             KeyCode::Char('c' | 'd') if ctrl => return Ok(None),
+            KeyCode::PageUp => selected = selected.saturating_sub(page_size),
+            KeyCode::PageDown => selected = selected.saturating_add(page_size).min(count.saturating_sub(1)),
             KeyCode::Up => selected = selected.saturating_sub(1),
             KeyCode::Char('p' | 'r') if ctrl => selected = selected.saturating_sub(1),
             KeyCode::Down => selected = (selected + 1).min(count.saturating_sub(1)),
@@ -886,5 +902,29 @@ mod worker_tests {
         assert_eq!(identity, request);
         assert_ne!(identity, (Mode::Grep, "new query".to_owned(), 2));
         assert_eq!(result, "old query");
+    }
+}
+
+#[cfg(test)]
+mod hint_layout_tests {
+    use super::*;
+
+    #[test]
+    fn hints_stay_ordered_and_leave_results_on_short_terminals() {
+        for height in 0..=30 {
+            let area = Rect::new(2, 3, 80, height);
+            let rows = picker_layout(area);
+            let mut bottom = area.y;
+            for row in rows {
+                assert_eq!(row.y, bottom);
+                bottom = row.bottom();
+            }
+            assert_eq!(bottom, area.bottom());
+            let content_height = rows[4].height.saturating_sub(if rows[2].height == 3 { 2 } else { 0 });
+            assert!(content_height >= height.saturating_sub(1).min(3));
+            if height >= 13 {
+                assert_eq!(rows.map(|r| r.height), [1, 1, 3, 1, height - 8, 1, 1]);
+            }
+        }
     }
 }

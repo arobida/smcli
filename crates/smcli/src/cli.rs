@@ -208,15 +208,7 @@ pub fn run() -> Result<()> {
             let c = SmcliConfig::load(&config_path).unwrap_or_default();
             println!(
                 "{}",
-                crate::shell_integration::render_with_keys(
-                    &shell,
-                    &executable.to_string_lossy(),
-                    c.ctrl_r_key.unwrap_or(true),
-                    c.left_key.unwrap_or(false),
-                    c.right_key.unwrap_or(false),
-                    c.ctrl_t_key.unwrap_or(true),
-                    c.ctrl_g_key.unwrap_or(true)
-                )?
+                crate::shell_integration::render_config(&shell, &executable.to_string_lossy(), &c)?
             );
         }
         Command::Context { json, dir } => {

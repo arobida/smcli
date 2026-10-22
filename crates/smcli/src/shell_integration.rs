@@ -1,8 +1,24 @@
 use anyhow::{Result, bail};
+use smcli_core::config::SmcliConfig;
 
 /// Render hooks with the default picker keys. The caller prints the trailing newline.
 pub fn render(shell: &str, binary_path: &str) -> Result<String> {
     render_with_keys(shell, binary_path, true, false, false, true, true)
+}
+
+/// Render hooks from the saved key config. Configs written before `rightKey` existed used
+/// `leftKey` to open directory suggestions on an empty line; that feature now lives on Right,
+/// so an unset `rightKey` falls back to `leftKey` rather than silently disabling it.
+pub fn render_config(shell: &str, binary_path: &str, config: &SmcliConfig) -> Result<String> {
+    render_with_keys(
+        shell,
+        binary_path,
+        config.ctrl_r_key.unwrap_or(true),
+        config.left_key.unwrap_or(false),
+        config.right_key.or(config.left_key).unwrap_or(false),
+        config.ctrl_t_key.unwrap_or(true),
+        config.ctrl_g_key.unwrap_or(true),
+    )
 }
 
 pub fn render_with_keys(
@@ -585,5 +601,20 @@ mod tests {
         assert!(!fish.contains("_smcli_pick_right"));
         assert!(!fish.contains("--suggest"));
         assert!(fish.contains("_smcli_pick\n        else\n            commandline -f backward-char"));
+    }
+
+    #[test]
+    fn legacy_left_key_still_binds_right_suggestions() {
+        // Pre-`rightKey` configs used `leftKey` for directory suggestions on an empty line.
+        let legacy = SmcliConfig { ctrl_r_key: Some(true), left_key: Some(true), ..Default::default() };
+        let zsh = render_config("zsh", "smcli", &legacy).unwrap();
+        assert!(zsh.contains("if [[ -z $BUFFER ]]; then _smcli_pick; else zle backward-char; fi"));
+        assert!(zsh.contains("if [[ -z $BUFFER ]]; then _smcli_pick --suggest; else zle forward-char; fi"));
+        assert!(zsh.contains("|| (( 1 )); then\n            _smcli_bind $_smcli_keymap '^[[C' _smcli_pick_right"));
+
+        // An explicit `rightKey: false` still wins over the legacy fallback.
+        let off = SmcliConfig { left_key: Some(true), right_key: Some(false), ..Default::default() };
+        let zsh = render_config("zsh", "smcli", &off).unwrap();
+        assert!(zsh.contains("|| (( 0 )); then\n            _smcli_bind $_smcli_keymap '^[[C' _smcli_pick_right"));
     }
 }
