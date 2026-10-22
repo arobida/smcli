@@ -2,6 +2,18 @@
 
 This file provides guidance to coding agents when working with code in this repository.
 
+<-- Start of do not change this -->
+## Agent Team
+By using the kero skill you are allowed to open new sessions with the list of agents I will provide. Whenever you are asked you should efficiently delegate task to the appropriate agent and act as the orchestrator and let them handle the tasks. The list will show two things first an alias followed by the command needed to open the agent in the new sesion.
+
+### Agents List:
+pikcode=pi --model opencode-go/kimi-k2.7-code --thinking high
+pisol=pi --model openai/gpt-6.1-sol --thinking low
+piluna=pi --model openai/gpt-6-luna --thinking low
+pigrok47=pi --model xai/grok-4.7 --thinking high
+pigrok46=pi --model xai/grok-4.6 --thinking high
+<-- End of do not edit -->
+
 ## graphify
 
 This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
