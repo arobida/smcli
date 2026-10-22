@@ -1,11 +1,6 @@
 use anyhow::{Result, bail};
 use smcli_core::config::SmcliConfig;
 
-/// Render hooks with the default picker keys. The caller prints the trailing newline.
-pub fn render(shell: &str, binary_path: &str) -> Result<String> {
-    render_with_keys(shell, binary_path, true, false, false, true, true)
-}
-
 /// Render hooks from the saved key config. Configs written before `rightKey` existed used
 /// `leftKey` to open directory suggestions on an empty line; that feature now lives on Right,
 /// so an unset `rightKey` falls back to `leftKey` rather than silently disabling it.
@@ -544,19 +539,19 @@ mod tests {
     fn quotes_paths_and_preserves_template_like_path_text() {
         let path = "a'\\b\\#(keyR)";
         assert!(
-            render("zsh", path)
+            render_config("zsh", path, &SmcliConfig::default())
                 .unwrap()
                 .contains("_smcli_bin='a'\\''\\b\\#(keyR)'")
         );
         assert!(
-            render("fish", path)
+            render_config("fish", path, &SmcliConfig::default())
                 .unwrap()
                 .contains("set -g _smcli_bin 'a\\'\\\\b\\\\#(keyR)'")
         );
         let hooks = render_with_keys("zsh", "smcli", false, true, false, false, false).unwrap();
         assert!(hooks.contains("(( 0 )) && _smcli_bind $_smcli_keymap '^R'"));
         assert!(hooks.contains("|| (( 1 )); then"));
-        assert!(render("unknown", path).is_err());
+        assert!(render_config("unknown", path, &SmcliConfig::default()).is_err());
     }
 
     #[test]

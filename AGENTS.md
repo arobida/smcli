@@ -7,11 +7,27 @@ This file provides guidance to coding agents when working with code in this repo
 By using the kero skill you are allowed to open new sessions with the list of agents I will provide. Whenever you are asked you should efficiently delegate task to the appropriate agent and act as the orchestrator and let them handle the tasks. The list will show two things first an alias followed by the command needed to open the agent in the new sesion.
 
 ### Agents List:
-pikcode=pi --model opencode-go/kimi-k2.7-code --thinking high
 pisol=pi --model openai/gpt-6.1-sol --thinking low
 piluna=pi --model openai/gpt-6-luna --thinking low
+pikcode=pi --model opencode-go/kimi-k2.7-code --thinking high
+pidpro=pi --model opencode-go/deepseek-v4-pro --thinking max
+ocflash-free=oc mini -m opencode/deepseek-v4.1-flash-free
 pigrok47=pi --model xai/grok-4.7 --thinking high
 pigrok46=pi --model xai/grok-4.6 --thinking high
+pigrok45=pi --model xai/grok-4.5 --thinking medium
+
+#### Agent Affinities
+> Some agents are better at certain tasks than others(try to use free models as much as possible)
+pikcode: great at writing code
+pisol: complicated reasoning tasks
+piluna: fast general purpose worker
+pidpro: good general purpose model, very token efficient with prompt caching, and uses max reasoning
+ocflash: a fast a free vision model for general purpose tasks
+pigrok47: complicated reasoning tasks(not as good as pisol!)
+pigrok46: general purpose model faster than pigrok47
+pigrok45: decent model should stick to using with commit messages
+
+
 <-- End of do not edit -->
 
 ## graphify
