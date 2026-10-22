@@ -1,5 +1,6 @@
 mod cli;
 mod context;
+mod highlight;
 mod initialize;
 mod menu;
 mod picker;

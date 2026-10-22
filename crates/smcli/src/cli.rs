@@ -836,7 +836,9 @@ fn pick(
         .flat_map(|s| s.lines().map(String::from).collect::<Vec<_>>())
         .collect();
     let mut picker = if suggest {
-        Picker::new(suggestions, vec![], vec![], query)
+        let mut p = Picker::new(suggestions, vec![], vec![], query);
+        p.title = Some(format!("Suggested for {d}"));
+        p
     } else {
         Picker::new(
             vec![],
@@ -872,7 +874,14 @@ fn pick(
         crate::picker::directory_entries(Path::new(&d), 5000),
         5000,
     );
-    let mut search = |q: &str| -> Result<Vec<String>> {
+    let search = {
+        let c = CapturedHistory::new(c.path.clone());
+        let home = home.to_owned();
+        let env = env.clone();
+        let d = d.clone();
+        let context = context.clone();
+        let service = ServiceClient::new(&c.path, &env, &std::env::current_exe()?);
+        move |q: &str| -> Result<Vec<String>> {
         let mut r = ServiceRequest::new(Operation::Search);
         r.query = Some(q.into());
         r.directory = Some(d.clone());
@@ -886,19 +895,23 @@ fn pick(
             .and_then(|r| r.hits)
         {
             Some(h) => h,
-            None => search_engine(c, home, env)?.search(
+            None => search_engine(&c, &home, &env)?.search(
                 q,
-                &corpus(c, home, env, context.project_root.as_deref(), now())?,
+                &corpus(&c, &home, &env, context.project_root.as_deref(), now())?,
                 100,
                 &SearchFilter::default(),
                 None,
-                &search_signals(c, Some(context.clone()))?,
+                &search_signals(&c, Some(context.clone()))?,
                 now(),
             )?,
         };
         Ok(hits.into_iter().map(|h| h.command).collect())
+        }
     };
-    let mut file_search = |mode: Mode, q: &str| -> Result<FileResults> {
+    let file_search = {
+        let d = d.clone();
+        let service = ServiceClient::new(&c.path, env, &std::env::current_exe()?);
+        move |mode: Mode, q: &str| -> Result<FileResults> {
         let mut r = ServiceRequest::new(if mode == Mode::Grep {
             Operation::Grep
         } else {
@@ -915,8 +928,9 @@ fn pick(
             hits: response.files.unwrap_or_default(),
             complete: !response.partial.unwrap_or(false),
         })
+        }
     };
-    if let Some(choice) = crate::picker::run(picker, Some(&mut search), Some(&mut file_search))? {
+    if let Some(choice) = crate::picker::run(picker, Some(Box::new(search)), Some(Box::new(file_search)))? {
         match choice {
             Choice::Command {
                 command,

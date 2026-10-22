@@ -14,14 +14,24 @@ use ratatui::{
         terminal::{disable_raw_mode, enable_raw_mode},
     },
     layout::Rect,
-    style::{Color, Style},
-    widgets::{List, ListItem, ListState, Paragraph},
+    style::{Color, Modifier, Style},
+    symbols::border,
+    text::{Line, Span},
+    widgets::{Block, HighlightSpacing, List, ListItem, ListState, Paragraph},
 };
+use crate::highlight::{highlight, plain};
+
+// ANSI-16 roles only, so the user's terminal theme does the painting.
+pub(crate) const MUTED: Style = Style::new().add_modifier(Modifier::DIM);
+pub(crate) const ACCENT: Style = Style::new().fg(Color::Magenta);
+pub(crate) const SELECTED: Style = Style::new().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD);
 use smcli_core::service_protocol::FileHit;
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     path::Path,
+    sync::mpsc,
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -75,6 +85,8 @@ pub struct Picker {
     pub query: String,
     pub mode: Mode,
     pub local_files: Vec<FileHit>,
+    /// Replaces the "history" prompt label, e.g. for directory suggestions.
+    pub title: Option<String>,
 }
 impl Picker {
     /// Native history is oldest first; captured history is newest first.
@@ -114,128 +126,351 @@ impl Picker {
             query,
             mode: Mode::History,
             local_files: Vec::new(),
+            title: None,
         }
     }
 }
 
-/// Search is invoked only on Tab; files is invoked for project filenames and grep.
+/// Each callback has one worker; dropping the picker never waits for a slow search.
+fn worker<Q: Send + 'static, R: Send + 'static>(
+    mut callback: impl FnMut(&Q) -> R + Send + 'static,
+) -> (mpsc::Sender<Q>, mpsc::Receiver<(Q, R)>) {
+    let (requests, incoming) = mpsc::channel::<Q>();
+    let (outgoing, results) = mpsc::channel();
+    std::thread::spawn(move || {
+        while let Ok(query) = incoming.recv() {
+            let result = callback(&query);
+            if outgoing.send((query, result)).is_err() { break; }
+        }
+    });
+    (requests, results)
+}
+
+/// Cells of the sunset row that show progress. Nothing is filled when there is no row;
+/// one row fills the width; otherwise `width * (selected + 1) / count`.
+fn stripe_fill(width: u16, selected: usize, count: usize) -> u16 {
+    if width == 0 || count == 0 {
+        return 0;
+    }
+    if count <= 1 {
+        return width;
+    }
+    let cells = u128::from(width) * (selected as u128).saturating_add(1) / count as u128;
+    u16::try_from(cells).unwrap_or(width).min(width)
+}
+
+/// One third of the gap toward `target`, and at least one cell.
+fn ease_stripe(shown: u16, target: u16) -> u16 {
+    let gap = shown.abs_diff(target);
+    if gap == 0 {
+        return shown;
+    }
+    let step = (gap / 3).max(1);
+    if shown < target {
+        shown.saturating_add(step).min(target)
+    } else {
+        shown.saturating_sub(step)
+    }
+}
+
+/// Yellow, red, then magenta across thirds of the full row. A narrow row is magenta, matching the old stripe.
+fn stripe_color(col: usize, width: usize) -> Color {
+    let third = width / 3;
+    if col < third {
+        Color::Yellow
+    } else if col < third * 2 {
+        Color::Red
+    } else {
+        Color::Magenta
+    }
+}
+
+fn stripe_line(width: u16, filled: u16, fade: Modifier) -> Line<'static> {
+    let width = width as usize;
+    let filled = (filled as usize).min(width);
+    let mut spans = Vec::new();
+    let mut col = 0;
+    while col < filled {
+        let color = stripe_color(col, width);
+        let start = col;
+        col += 1;
+        while col < filled && stripe_color(col, width) == color {
+            col += 1;
+        }
+        spans.push(Span::styled(
+            "▀".repeat(col - start),
+            Style::new().fg(color).add_modifier(fade),
+        ));
+    }
+    if filled < width {
+        spans.push(Span::styled("▀".repeat(width - filled), MUTED));
+    }
+    Line::from(spans)
+}
+
+/// Search is invoked only on Tab (history) or Ctrl-A (files); files is invoked for project filenames and grep.
 /// A file choice is unquoted: the CLI must validate the shell insertion context and quote it.
 pub fn run(
     mut picker: Picker,
-    mut search: Option<&mut dyn FnMut(&str) -> Result<Vec<String>>>,
-    mut files: Option<&mut dyn FnMut(Mode, &str) -> Result<FileResults>>,
+    search: Option<Box<dyn FnMut(&str) -> Result<Vec<String>> + Send>>,
+    files: Option<Box<dyn FnMut(Mode, &str) -> Result<FileResults> + Send>>,
 ) -> Result<Option<Choice>> {
-    let mut terminal = TerminalSession::new(14)?;
+    let search = search.map(|mut callback| worker(move |q: &String| callback(q)));
+    let files = files.map(|mut callback| worker(move |(mode, q, _): &(Mode, String, u8)| {
+        callback(if *mode == Mode::Directory { Mode::Files } else { *mode }, q)
+    }));
+    let mut file_busy = false;
+    let mut semantic_busy = false;
+    let mut semantic_pending = None;
+    let mut spinner = 0;
+    let mut spun = Instant::now();
+    let mut terminal = TerminalSession::new(18)?;
     let mut saved = HashMap::new();
     let mut selected = 0usize;
     let mut semantic: Option<(String, Vec<String>)> = None;
     let mut global_files = false;
     let mut kind = if picker.mode == Mode::Directory { 1 } else { 0 };
     let mut fetched = None;
+    let mut tick = 0u8;
+    let mut fade_at = Instant::now();
+    // Displayed sunset width. It eases toward the selection instead of jumping.
+    let mut shown = 0u16;
+    let mut next_bar = Instant::now() + Duration::from_millis(20);
+    let mut cols = 0u16;
+    let mut tall = false;
     let mut hits = Vec::new();
     let mut status = String::new();
+    let mut filtered: Option<((String, bool), Vec<String>)> = None;
+    let starred: HashSet<String> = picker.candidates[..picker.suggestion_count].iter().cloned().collect();
     loop {
         let local = matches!(picker.mode, Mode::Files | Mode::Directory) && !global_files;
+        let current = (picker.mode, picker.query.clone(), kind);
+        if let Some((_, replies)) = &files {
+            if let Ok((request, result)) = replies.try_recv() {
+                file_busy = false;
+                if !local && request == current {
+                    match result {
+                        Ok(result) => {
+                            hits = if matches!(picker.mode, Mode::Files | Mode::Directory) {
+                                filter_kind(result.hits, kind)
+                            } else { result.hits };
+                            status = if result.complete { String::new() } else {
+                                "partial grep results · type more to narrow".into()
+                            };
+                        }
+                        Err(error) => status = error.to_string(),
+                    }
+                }
+            }
+        }
+        if let Some((requests, replies)) = &search {
+            if let Ok((query, result)) = replies.try_recv() {
+                semantic_busy = false;
+                if picker.mode == Mode::History && query == picker.query && semantic_pending.is_none() {
+                    match result {
+                        Ok(results) => {
+                            semantic = Some((query, results));
+                            selected = 0;
+                            status = "semantic results · type to filter again".into();
+                        }
+                        Err(error) => status = error.to_string(),
+                    }
+                }
+            }
+            if !semantic_busy {
+                if let Some(query) = semantic_pending.take() {
+                    if picker.mode == Mode::History && query == picker.query {
+                        semantic_busy = requests.send(query).is_ok();
+                    }
+                }
+            }
+        }
         if local {
-            hits = picker
-                .local_files
-                .iter()
-                .filter(|h| {
-                    (kind == 0 || h.insert.ends_with('/') == (kind == 1))
-                        && contains_terms(&h.insert, &picker.query)
-                })
-                .cloned()
-                .collect();
+            hits = picker.local_files.iter().filter(|h| {
+                (kind == 0 || h.insert.ends_with('/') == (kind == 1))
+                    && contains_terms(&h.insert, &picker.query)
+            }).cloned().collect();
             fetched = None;
-        } else if picker.mode != Mode::History
-            && fetched.as_ref() != Some(&(picker.mode, picker.query.clone()))
-        {
-            fetched = Some((picker.mode, picker.query.clone()));
+        } else if picker.mode != Mode::History && fetched.as_ref() != Some(&current) {
             hits.clear();
             selected = 0;
+            status.clear();
             if picker.mode == Mode::Grep && picker.query.is_empty() {
+                fetched = Some(current);
                 status = "type to search file contents".into();
-            } else if let Some(callback) = files.as_mut() {
-                match callback(
-                    if picker.mode == Mode::Directory {
-                        Mode::Files
-                    } else {
-                        picker.mode
-                    },
-                    &picker.query,
-                ) {
-                    Ok(result) => {
-                        hits = result.hits;
-                        status = if result.complete {
-                            String::new()
-                        } else {
-                            "partial grep results · type more to narrow".into()
-                        };
-                    }
-                    Err(error) => status = error.to_string(),
+            } else if let Some((requests, _)) = &files {
+                if !file_busy {
+                    file_busy = requests.send(current.clone()).is_ok();
+                    fetched = Some(current);
                 }
             } else {
+                fetched = Some(current);
                 status = "files and grep need smcli-service".into();
             }
         }
+        let busy = file_busy || semantic_busy;
+        if busy && spun.elapsed() >= Duration::from_millis(80) {
+            spinner = (spinner + 1) % 10;
+            spun = Instant::now();
+        }
         let semantic_active = semantic.as_ref().is_some_and(|(q, _)| q == &picker.query);
-        let commands = if semantic_active {
-            semantic.as_ref().unwrap().1.clone()
-        } else {
-            filter_history(&picker.candidates, &picker.query)
-        };
+        let key_now = (picker.query.clone(), semantic_active);
+        if filtered.as_ref().map(|(k, _)| k) != Some(&key_now) {
+            let commands = if semantic_active {
+                semantic.as_ref().unwrap().1.clone()
+            } else {
+                filter_history(&picker.candidates, &picker.query)
+            };
+            filtered = Some((key_now, commands));
+        }
+        let commands = &filtered.as_ref().unwrap().1;
         let count = if picker.mode == Mode::History {
             commands.len()
         } else {
             hits.len()
         };
         selected = selected.min(count.saturating_sub(1));
-        // Repaint everything each frame like Swift (ESC[2J): diffed updates leave stale text between new words.
-        // Terminal::clear would query the cursor position, which some ptys never answer; two swaps blank both buffers.
-        execute!(terminal.terminal.backend_mut(), ratatui::crossterm::terminal::Clear(ratatui::crossterm::terminal::ClearType::All))?;
-        terminal.terminal.swap_buffers();
-        terminal.terminal.swap_buffers();
-        terminal.terminal.draw(|frame| {
+        // Coalesce key repeat: draw only once queued input is handled, else held arrows pile up behind frames.
+        if !event::poll(std::time::Duration::ZERO)? { terminal.terminal.draw(|frame| {
             let area = frame.area();
-            let label = if local { match kind { 1 => "folders", 2 => "files", _ => "all" } } else { picker.mode.as_str() };
-            frame.render_widget(Paragraph::new(format!("{label} ❯ {}", visible(&picker.query))).style(Style::default().fg(Color::Magenta)), Rect::new(area.x, area.y, area.width, 1));
+            cols = area.width;
             let history = picker.mode == Mode::History;
-            // Dim like Swift; styled spaces also differ from blank cells, so ratatui writes lines whole.
-            let dim = Style::default().add_modifier(ratatui::style::Modifier::DIM);
+            let label = if matches!(picker.mode, Mode::Files | Mode::Directory) { match kind { 1 => "folders", 2 => "files", _ => "all" } } else if history { picker.title.as_deref().unwrap_or("history") } else { picker.mode.as_str() };
+            // Too short for boxes: keep the flat layout.
+            let boxed = area.height >= 8;
+            // Files modes name their scope so directory and project search never look alike.
+            let scope = match picker.mode {
+                Mode::Files | Mode::Directory if local => format!("in {}", std::env::current_dir().map(|d| visible(&d.display().to_string())).unwrap_or_default()),
+                Mode::Files | Mode::Directory => "across the project".into(),
+                _ => String::new(),
+            };
+            frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!(" {label} "), ACCENT), Span::styled(scope, ACCENT.add_modifier(Modifier::BOLD)), Span::styled(" ›", ACCENT.add_modifier(Modifier::BOLD))])), Rect::new(area.x, area.y, area.width, 1));
             let found = if local {
-                format!("{count} in {} · tab searches the project", std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default())
+                format!("{count} results")
             } else {
-                format!("{count} {label} results")
+                format!("{count} {} results", if picker.mode == Mode::Grep { "grep" } else { "files" })
             };
             let summary = if history {
                 visible(&status)
             } else if hits.is_empty() && !local {
                 if status.is_empty() { "no matches".into() } else { visible(&status) }
             } else if status.is_empty() { found } else { visible(&status) };
-            frame.render_widget(Paragraph::new(format!(" {summary}")).style(dim), Rect::new(area.x, area.y + 1, area.width, 1));
-            let items: Vec<ListItem> = if picker.mode == Mode::History {
-                commands.iter().map(|c| {
-                    let mark = if picker.candidates[..picker.suggestion_count].contains(c) { "★" } else { " " };
-                    ListItem::new(format!("{mark} {}", visible(c)))
+            let mut summary = Line::styled(format!(" {summary} "), MUTED);
+            if busy {
+                summary.spans.insert(0, Span::styled(format!(" {}", ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][spinner]), ACCENT));
+            }
+            let search_area = Rect::new(area.x, area.y + 1, area.width, if boxed { 3 } else { 1 });
+            let search_block = if boxed { Block::bordered().border_set(border::ROUNDED).border_style(MUTED) } else { Block::new() };
+            let input = search_block.inner(search_area);
+            let query = visible(&picker.query);
+            let prompt = " ⌕ ";
+            let text = if query.is_empty() {
+                Span::styled(format!("type to search {}…", if history { "history" } else { picker.mode.as_str() }), MUTED)
+            } else {
+                Span::raw(query.clone())
+            };
+            frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(prompt, ACCENT), text])).block(search_block), search_area);
+            frame.set_cursor_position((input.x + Span::raw(prompt).width() as u16 + Span::raw(query.as_str()).width() as u16, input.y));
+            let hint_rows = if area.height >= 12 { 2 } else { 1 };
+            tall = hint_rows == 2;
+            let list_area = Rect::new(area.x, search_area.bottom(), area.width, area.height.saturating_sub(search_area.height + 1 + hint_rows));
+            let list_block = if boxed {
+                Block::bordered().border_set(border::ROUNDED).border_style(MUTED)
+                    .title_bottom(summary.clone().right_aligned())
+            } else {
+                Block::new()
+            };
+            let items: Vec<ListItem> = if history {
+                // Rows past the selection plus one screen are never visible; skip building them.
+                commands.iter().enumerate().take(selected + area.height as usize).map(|(i, c)| {
+                    let sel = i == selected;
+                    let mark = if starred.contains(c) { "★ " } else { "  " };
+                    let spans = highlight(&visible(c));
+                    let mut line = vec![Span::styled(mark, if sel { Style::new() } else { MUTED })];
+                    line.extend(if sel { plain(spans) } else { spans });
+                    ListItem::new(Line::from(line))
                 }).collect()
             } else {
                 hits.iter().map(|h| {
                     let name = if local { &h.insert } else { &h.path };
                     let location = h.line.map(|n| format!(":{n}  {}", h.text.as_deref().unwrap_or(""))).unwrap_or_default();
-                    ListItem::new(visible(&format!("{} {name}{location}  {}", h.git.as_deref().unwrap_or(""), h.provenance.join("+"))))
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!("{} ", h.git.as_deref().unwrap_or("")), ACCENT),
+                        Span::raw(visible(name)),
+                        Span::styled(visible(&location), MUTED),
+                        Span::styled(format!("  {}", h.provenance.join("+")), MUTED),
+                    ]))
                 }).collect()
             };
-            let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray).fg(Color::White)).highlight_symbol("▌ ");
+            let list = List::new(items).block(list_block).highlight_style(SELECTED).highlight_symbol("↵ ").highlight_spacing(HighlightSpacing::Always);
             let mut state = ListState::default().with_selected((count > 0).then_some(selected));
-            frame.render_stateful_widget(list, Rect::new(area.x, area.y + 2, area.width, area.height.saturating_sub(3)), &mut state);
-            frame.render_widget(Paragraph::new(if history {
-                " type to search · ↑↓ move · enter select · tab semantic · ^T files · ^G grep · esc cancel".to_string()
+            frame.render_stateful_widget(list, list_area, &mut state);
+            if !boxed {
+                frame.render_widget(Paragraph::new(summary).style(MUTED), Rect::new(area.x, list_area.bottom().saturating_sub(1), area.width, 1));
+            }
+            let typing = !picker.query.is_empty();
+            let hints: Vec<(&str, &str)> = if count == 0 && typing {
+                vec![("esc", "cancel")]
+            } else if history {
+                let mut h = if typing { vec![("tab", "semantic"), ("↑↓", "move")] } else { vec![("↑↓", "move"), ("tab", "semantic")] };
+                h.extend([("^T", "files"), ("^G", "grep"), ("esc", "cancel")]);
+                h
             } else {
-                format!(" type to search · ↑↓ move · enter insert path · {}{} · esc cancel",
-                    if local { "tab search all · ^F dirs/files · " } else { "" },
-                    if picker.mode == Mode::Files { "^T history · ^G grep" } else { "^G history · ^T files" })
-            }).style(dim), Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1));
-        })?;
+                let mut h = vec![("↑↓", "move")];
+                if matches!(picker.mode, Mode::Files | Mode::Directory) {
+                    h.extend([("^A", if local { "global search" } else { "cwd search" }), ("^F", "dirs/files")]);
+                }
+                h.extend(if picker.mode == Mode::Files { [("^T", "history"), ("^G", "grep")] } else { [("^G", "history"), ("^T", "files")] });
+                h.push(("esc", "cancel"));
+                h
+            };
+            if hint_rows == 2 {
+                // Scroll progress in the spacer row. Color follows the column's third of the full width.
+                let fade = if tick < 3 { Modifier::DIM } else { Modifier::empty() };
+                frame.render_widget(Paragraph::new(stripe_line(area.width, shown, fade)), Rect::new(area.x, area.bottom().saturating_sub(2), area.width, 1));
+            }
+            let mut spans = vec![Span::raw(" ")];
+            for (i, (key, what)) in hints.into_iter().enumerate() {
+                if i > 0 { spans.push(Span::styled(" · ", MUTED)); }
+                spans.push(Span::raw(key));
+                spans.push(Span::styled(format!(" {what}"), MUTED));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1));
+        })?; }
+        // Soonest of bar ease (~20ms), fade-in (70ms), and spinner (80ms). A queued key
+        // makes poll return at once, so held arrows still skip frames and coalesce.
+        let fill = stripe_fill(cols, selected, count);
+        let growing = tall && shown != fill;
+        let wait = if growing {
+            let mut wait = next_bar.saturating_duration_since(Instant::now());
+            if tick < 3 {
+                wait = wait.min(Duration::from_millis(70).saturating_sub(fade_at.elapsed()));
+            }
+            if busy {
+                wait = wait.min(Duration::from_millis(80));
+            }
+            Some(wait)
+        } else if tick < 3 {
+            Some(Duration::from_millis(70))
+        } else if busy {
+            Some(Duration::from_millis(80))
+        } else {
+            None
+        };
+        if let Some(wait) = wait {
+            if !event::poll(wait)? {
+                if tick < 3 && (!growing || fade_at.elapsed() >= Duration::from_millis(70)) {
+                    tick += 1;
+                    fade_at = Instant::now();
+                }
+                if growing && Instant::now() >= next_bar {
+                    shown = ease_stripe(shown, fill);
+                    next_bar = Instant::now() + Duration::from_millis(20);
+                }
+                continue;
+            }
+        }
+        tick = 3;
         let Event::Key(key) = event::read()? else {
             continue;
         };
@@ -287,7 +522,7 @@ pub fn run(
                 selected = 0;
                 status.clear();
             }
-            KeyCode::Char('f') if ctrl && local => {
+            KeyCode::Char('f') if ctrl && matches!(picker.mode, Mode::Files | Mode::Directory) => {
                 kind = (kind + 1) % 3;
                 selected = 0;
             }
@@ -307,20 +542,13 @@ pub fn run(
                 selected = 0;
                 status.clear();
             }
-            KeyCode::Tab if local => {
-                global_files = true;
+            KeyCode::Char('a') if ctrl && matches!(picker.mode, Mode::Files | Mode::Directory) => {
+                global_files = !global_files;
                 selected = 0;
             }
             KeyCode::Tab if picker.mode == Mode::History && !picker.query.trim().is_empty() => {
-                if let Some(callback) = search.as_mut() {
-                    match callback(&picker.query) {
-                        Ok(results) => {
-                            semantic = Some((picker.query.clone(), results));
-                            selected = 0;
-                            status = "semantic results · type to filter again".into();
-                        }
-                        Err(error) => status = error.to_string(),
-                    }
+                if search.is_some() {
+                    semantic_pending = Some(picker.query.clone());
                 }
             }
             KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
@@ -389,6 +617,22 @@ pub fn directory_entries(directory: &Path, limit: usize) -> Vec<FileHit> {
             line: None,
             column: None,
             text: None,
+        })
+        .collect()
+}
+
+/// Narrows project hits to files (2) or folders (1); the index lists only files, so folders are their matches' parents.
+// shortcut: folders only appear if a file inside them matches; add directory entries to the service index if that's not enough.
+fn filter_kind(hits: Vec<FileHit>, kind: u8) -> Vec<FileHit> {
+    if kind != 1 {
+        return hits;
+    }
+    let parent = |p: &str| p.rsplit_once('/').map(|(d, _)| format!("{d}/"));
+    let mut seen = HashSet::new();
+    hits.into_iter()
+        .filter_map(|h| {
+            let path = parent(&h.path)?;
+            seen.insert(path.clone()).then(|| FileHit { insert: parent(&h.insert).unwrap_or_else(|| path.clone()), path, git: None, line: None, column: None, text: None, ..h })
         })
         .collect()
 }
@@ -500,6 +744,13 @@ impl Drop for TerminalSession {
 mod tests {
     use super::*;
     #[test]
+    fn project_folders_from_file_parents() {
+        let hit = |path: &str, insert: &str| FileHit { insert: insert.into(), path: path.into(), provenance: vec!["files".into()], git: None, line: None, column: None, text: None };
+        let dirs = filter_kind(vec![hit("src/a.rs", "../src/a.rs"), hit("src/b.rs", "../src/b.rs"), hit("top.rs", "../top.rs")], 1);
+        assert_eq!(dirs.iter().map(|h| (h.path.as_str(), h.insert.as_str())).collect::<Vec<_>>(), [("src/", "../src/")]);
+        assert_eq!(filter_kind(vec![hit("x/y", "y")], 2).len(), 1);
+    }
+    #[test]
     fn history_order_filter_and_safe_display() {
         let p = Picker::new(
             vec!["git status".into()],
@@ -542,5 +793,80 @@ mod tests {
         assert_eq!(picked[0].insert, "../file");
         assert!(contains_terms("Hello World/", "world HELLO"));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stripe_fill_eases_and_keeps_sunset_thirds() {
+        assert_eq!(stripe_fill(80, 0, 0), 0);
+        assert_eq!(stripe_fill(0, 0, 3), 0);
+        assert_eq!(stripe_fill(80, 0, 1), 80);
+        assert_eq!(stripe_fill(80, 0, 4), 20);
+        assert_eq!(stripe_fill(80, 3, 4), 80);
+        assert_eq!(stripe_fill(10, 0, 100), 0);
+        assert_eq!(ease_stripe(0, 10), 3);
+        assert_eq!(ease_stripe(9, 10), 10);
+        assert_eq!(ease_stripe(10, 0), 7);
+        assert_eq!(ease_stripe(4, 4), 4);
+        let mut shown = 0u16;
+        for _ in 0..64 {
+            let next = ease_stripe(shown, 80);
+            if shown != 80 {
+                assert!(next > shown && next <= 80);
+            }
+            shown = next;
+        }
+        assert_eq!(shown, 80);
+        shown = 80;
+        for _ in 0..64 {
+            shown = ease_stripe(shown, 0);
+        }
+        assert_eq!(shown, 0);
+
+        let width = 12u16;
+        let filled = 7u16;
+        let line = stripe_line(width, filled, Modifier::empty());
+        let mut colors = Vec::new();
+        for span in &line.spans {
+            for _ in 0..span.content.chars().count() {
+                colors.push(span.style);
+            }
+        }
+        assert_eq!(colors.len(), width as usize);
+        for (col, style) in colors.iter().enumerate().take(filled as usize) {
+            assert_eq!(style.fg, Some(stripe_color(col, width as usize)));
+            assert!(!style.add_modifier.contains(Modifier::DIM));
+        }
+        assert!(colors[filled as usize..].iter().all(|style| *style == MUTED));
+        let dim = stripe_line(9, 9, Modifier::DIM);
+        assert!(dim.spans.iter().all(|span| span.style.add_modifier.contains(Modifier::DIM)));
+        assert_eq!(
+            dim.spans.iter().map(|span| span.content.chars().count()).sum::<usize>(),
+            9
+        );
+        assert!(stripe_line(8, 0, Modifier::empty()).spans.iter().all(|span| span.style == MUTED));
+    }
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+
+    #[test]
+    fn callback_runs_off_thread_and_preserves_request_identity() {
+        let ui_thread = std::thread::current().id();
+        let (release, wait) = mpsc::channel();
+        let (requests, replies) = worker(move |query: &(Mode, String, u8)| {
+            assert_ne!(std::thread::current().id(), ui_thread);
+            wait.recv().unwrap();
+            query.1.clone()
+        });
+        let request = (Mode::Grep, "old query".to_owned(), 2);
+        requests.send(request.clone()).unwrap();
+        assert!(matches!(replies.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release.send(()).unwrap();
+        let (identity, result) = replies.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(identity, request);
+        assert_ne!(identity, (Mode::Grep, "new query".to_owned(), 2));
+        assert_eq!(result, "old query");
     }
 }

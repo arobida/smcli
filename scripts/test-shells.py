@@ -386,7 +386,7 @@ def picker(t, env):
     count = len(read_records(env))
     t.type("echo abc")
     t.type("\x1b[A")
-    t.until_text("type to search")
+    t.until_text("esc cancel")
     t.type("\x03")
     t.until_text("echo abc")
     t.send("def")
@@ -394,7 +394,7 @@ def picker(t, env):
     count = len(read_records(env))
     t.type("echo picked")
     t.type("\x12")
-    t.until_text("type to search")
+    t.until_text("esc cancel")
     t.type("\r")
     t.until_text("echo picked-marker")
     time.sleep(0.3)
@@ -571,14 +571,14 @@ def run_zsh_plugins(variant):
             t.send("echo plugin-marker")
             count = len(read_records(env))
             t.type("\x1b[A")
-            t.until_text("type to search")
+            t.until_text("esc cancel")
             t.type("\x03")
             time.sleep(0.3)
             assert "wrapped:_smcli_pick_up" in plugin_log.read_text(), "the wrapper never saw smcli's widget"
             t.type("\x15")  # kill the line
             t.type("echo plugin")
             t.type("\x1b[A")
-            t.until_text("type to search")
+            t.until_text("esc cancel")
             t.type("\r")
             t.until_text("echo plugin-marker")
             assert len(read_records(env)) == count
@@ -642,7 +642,7 @@ def run_bash_plugins(variant):
             counts = re.findall(r"^(?:\[ps0-user\])?(\d+)\s*$", keys.replace("\r", ""), re.M)
             assert counts[-3:] == ["1", "1", "1"], f"atuin, fzf and smcli bindings should each be bound once: {keys!r}"
             t.type("\x1b[A")  # Up, not the application-mode sequence atuin took
-            t.until_text("type to search")
+            t.until_text("esc cancel")
             t.type("\x03")
             time.sleep(0.3)
             t.type("\x03")
@@ -684,7 +684,7 @@ def run_fish_plugins(variant):
             count = len(read_records(env))
             t.type("echo fish")
             t.type("\x1b[A")
-            t.until_text("type to search")
+            t.until_text("esc cancel")
             t.type("\r")
             t.until_text("echo fish-marker")
             time.sleep(0.3)

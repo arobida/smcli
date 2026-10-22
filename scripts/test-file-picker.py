@@ -32,6 +32,26 @@ INJECT = "t16 $(touch PWNED)"
 root = tempfile.mkdtemp(prefix="smcli-fp.", dir="/tmp")
 
 
+def screen(data):
+    """The picker's screen as text: it redraws only changed cells, so the raw byte stream is not readable."""
+    rows, row, col = {}, 0, 0
+    for m in re.finditer(rb"\x1b\[([0-9;?]*)([ -/]*[@-~])|\x1b\][^\x07]*\x07|\x1b[=>]|([^\x1b]+)", data):
+        if m[2] == b"H":
+            row, col = (int(n or 1) - 1 for n in ((m[1] or b"1;1").split(b";") + [b"1"])[:2])
+        elif m[2] == b"J":
+            rows.clear()
+        elif m[3]:
+            for ch in m[3].decode(errors="replace"):
+                if ch == "\r":
+                    col = 0
+                elif ch == "\n":
+                    row += 1
+                else:
+                    rows.setdefault(row, {})[col] = ch
+                    col += 1
+    return "\n".join("".join(r.get(c, " ") for c in range(max(r) + 1)) for _, r in sorted(rows.items()) if r)
+
+
 def printed(text):
     """What the printf printed (not the echoed command line, which still holds `%s`)."""
     return [m for m in re.findall(r"GOT<(.*?)>END", text.replace("\r\n", "\n"), re.S) if m != "%s"]
@@ -68,7 +88,7 @@ def run(shell, path):
         os.execve(path, [path] + args, env)
     buffer = b""
 
-    def until(test, what, timeout=20):
+    def until(test, what, timeout=20, render=lambda b: CSI.sub(b"", b).decode(errors="replace")):
         nonlocal buffer
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -77,7 +97,7 @@ def run(shell, path):
                     buffer += os.read(fd, 65536)
                 except OSError:
                     break
-            text = CSI.sub(b"", buffer).decode(errors="replace")
+            text = render(buffer)
             if test(text):
                 return text
         raise AssertionError(f"{shell}: timeout waiting for {what}: {CSI.sub(b'', buffer).decode(errors='replace')!r}")
@@ -88,12 +108,12 @@ def run(shell, path):
             buffer = b""
             os.write(fd, b"printf 'GOT<%s>END\\n' ")
             os.write(fd, b"\x1b[A")  # Up opens the picker with the typed text as its history query
-            until(lambda t: "type to search" in t, "picker")
+            until(lambda t: "esc cancel" in t, "picker")
             os.write(fd, b"\x14")  # Ctrl-T: files
-            until(lambda t: "files" in t and "enter insert path" in t, "files mode")
+            until(lambda t: "files" in t and "^F dirs/files" in t, "files mode", render=screen)
             os.write(fd, token.lstrip("-").encode())
-            os.write(fd, b"\t")  # Tab: search the whole project instead of this directory's entries
-            until(lambda t: "files results" in t, "results")
+            os.write(fd, b"\x01")  # Ctrl-A: search the whole project instead of this directory's entries
+            until(lambda t: "files results" in t, "results", render=screen)
             os.write(fd, b"\r")
             # Let the shell finish repainting: read until the terminal has been quiet for a moment.
             while select.select([fd], [], [], 0.5)[0]:
@@ -111,9 +131,9 @@ def run(shell, path):
 
         def choose(token):
             os.write(fd, b"\x14")  # Ctrl-T at the prompt opens files mode directly
-            until(lambda t: "enter insert path" in t, "files mode")
-            os.write(fd, token.encode() + b"\t")
-            until(lambda t: "files results" in t, "results")
+            until(lambda t: "^F dirs/files" in t, "files mode", render=screen)
+            os.write(fd, token.encode() + b"\x01")
+            until(lambda t: "files results" in t, "results", render=screen)
             os.write(fd, b"\r")
 
         def settle():

@@ -4,7 +4,6 @@ use anyhow::Result;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::Rect,
-    style::{Color, Style},
     widgets::{List, ListItem, ListState, Paragraph},
 };
 use std::io::{self, IsTerminal, Write};
@@ -139,7 +138,7 @@ fn choose(mut selected: usize) -> Result<Option<usize>> {
             let area = frame.area();
             frame.render_widget(
                 Paragraph::new("smcli — shell history, remembered")
-                    .style(Style::default().fg(Color::Magenta)),
+                    .style(crate::picker::ACCENT),
                 Rect::new(area.x, area.y, area.width, 1),
             );
             let items: Vec<_> = ITEMS
@@ -155,8 +154,8 @@ fn choose(mut selected: usize) -> Result<Option<usize>> {
                 })
                 .collect();
             let list = List::new(items)
-                .highlight_style(Style::default().bg(Color::DarkGray))
-                .highlight_symbol("▌ ");
+                .highlight_style(crate::picker::SELECTED)
+                .highlight_symbol("  ");
             let mut state = ListState::default().with_selected(Some(selected));
             frame.render_stateful_widget(
                 list,

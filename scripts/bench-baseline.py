@@ -148,7 +148,7 @@ class Terminal:
 def picker(binary, env, directory):
     terminal = Terminal([binary, "pick"], env, directory)
     try:
-        terminal.until(b"type to search")
+        terminal.until(b"cancel")
         elapsed = (time.perf_counter_ns() - terminal.start) / 1e6
         # Ctrl-C cancels immediately; Escape deliberately waits for an arrow sequence.
         os.write(terminal.fd, b"\x03")

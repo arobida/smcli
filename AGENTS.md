@@ -17,13 +17,13 @@ Rules:
 
 Use the Makefile for builds; don't hand-roll `cargo build` commands.
 - `make fresh` — clean release build for the user to test. Output: `dist/smcli-<timestamp>-<commit>`, with `dist/smcli` symlinked to the latest. It also prints the `eval` line that loads the zsh hooks from the new build; relay those commands to the user. Run this after changes the user will try out.
-- `make release` — same, without cleaning (faster).
-- `make build` — debug build; `make run ARGS="..."` builds and runs.
+- `make release` — same, without cleaning (faster). `make build` — debug build; `make run ARGS="..."` builds and runs the CLI.
 - `make test` — full test suite (`scripts/test.sh`): `cargo test --workspace`, then black-box CLI checks against a temp `HOME`, `SMCLI_DB` and `SMCLI_RUNTIME_DIR`.
 - Single test: `cargo test -p <crate> <test name>`.
 - `make ranking` — scores suggest/search ranking on the fixed query set (`crates/smcli-search/tests/ranking.rs`); run after ranking changes.
-- `make linux` — the full test suite on Linux in Docker.
-- `make clean` — remove build output.
+- `make linux` — full test suite on Linux in Docker (needs a running daemon).
+- `make baseline` — black-box CLI/hook benchmark (`scripts/bench-baseline.py`, see `docs/baseline.md`); never reads real history.
+- `make clean` — `cargo clean`, keeping the newest `dist/` CLI and service pair (live shell hooks may point at them).
 
 ## Architecture
 
