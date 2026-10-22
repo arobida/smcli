@@ -55,7 +55,7 @@ Use the Makefile for builds; don't hand-roll `cargo build` commands.
 
 ## Architecture
 
-Cargo workspace (`crates/`), macOS and Linux, search included on both. Two executables, both embedding the potion-code-16M-v2 model (`include_bytes!`, written to the runtime dir on first use), so each can search alone:
+Cargo workspace (`crates/`), macOS and Linux, search included on both. Two executables, both embedding the potion-code-16M-v2 model (`include_bytes!`, loaded from memory via model2vec-rs), so each can search alone:
 - `smcli` (`crates/smcli`) — clap CLI, ratatui picker and menu, `shell-init` hook generation (`shell_integration.rs`).
 - `smcli-service` (`crates/smcli-service`) — long-lived owner of history state and the open search index, serving clients over a Unix-domain socket. Only it depends on `fff-search` (file search); the CLI and `smcli-core` must never link fff.
 
