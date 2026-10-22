@@ -9,7 +9,7 @@ smcli is two executables that must stay side by side:
 
 Both depend only on system libraries; the search model and the fff file-search library are built in.
 
-Requirements: macOS 14 or later. Bash 4+ for the picker keys (macOS's `/bin/bash` 3.2 still records history, without
+Requirements: macOS 14 or later, or Linux. Bash 4+ for the picker keys (macOS's `/bin/bash` 3.2 still records history, without
 keys), any recent Zsh, or Fish.
 
 - [Quick install with the script](#quick-install-with-the-script) (recommended)
@@ -82,10 +82,11 @@ Open a new terminal afterwards. The rest of this page is the same steps done by 
 
 Tools:
 
-- Xcode or the Command Line Tools, with Swift 6.0+ (`swift --version`).
-- Rust via [rustup](https://rustup.rs) (`cargo`): the pinned fff library is built from source. The first build
-  downloads one checksum-verified source archive; later builds reuse it.
-- `curl` and `git` (included with macOS).
+- A C toolchain: Xcode or the Command Line Tools on macOS; `build-essential` on Debian/Ubuntu.
+- Rust via [rustup](https://rustup.rs) (`cargo`). `fff-search` and its vendored libgit2 are built from source:
+  the first build downloads and compiles the locked crate sources; later builds reuse them.
+- On Linux, `pkg-config` and the SQLite development headers (e.g. `libsqlite3-dev` on Debian/Ubuntu).
+- `curl` and `git` (included with macOS and most Linux distributions).
 
 Build:
 
@@ -113,15 +114,15 @@ For development:
 
 | Command | What it does |
 |---|---|
-| `make build` | Debug build (`.build/debug/`) |
+| `make build` | Debug build (`target/debug/`) |
 | `make run ARGS="search git"` | Debug build, then run it |
 | `make test` | Unit tests, then the interactive Bash/Zsh/Fish, service and file-picker tests on real terminals |
 | `make ranking` | Ranking quality report; fails when the ranking tests fail |
 | `make baseline` | Black-box benchmark of the release build |
 
 `make test` uses throwaway homes and databases and never reads your real history. Shells that aren't installed are
-skipped and reported. To build Intel binaries on Apple silicon, run `rustup target add x86_64-apple-darwin`, then
-`make x86_64`.
+skipped and reported. On Linux, install the packages above, then run `make release`. `make linux` runs the full
+suite in a `rust:latest` Docker container (needs a running Docker daemon).
 
 Then continue with [Set up your shell](#set-up-your-shell).
 

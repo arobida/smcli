@@ -1,6 +1,6 @@
 # After-action report — final audit fixes (2026-10-22)
 
-Branch `rust-port`, base `cfe9b2f`. Audit: `docs/caveman-review.md` ("Final audit"). Plan: `docs/fix-plan.md`. Per-batch notes: `docs/fix-notes-{A,B,C}.md`.
+Branch `rust-port`, base `cfe9b2f`. Audit: `../reviews/caveman-review.md` ("Final audit"). The fix plan and the three per-batch notes were folded into this report and deleted.
 
 ## How the work was split
 
@@ -65,6 +65,5 @@ Each batch owned its own files, so the agents ran in parallel. No agent ran a fu
 - **Linux:** `make linux` not run, because the Docker/OrbStack daemon is down. That leaves unverified: the glibc `addclosefrom_np` change (it needs glibc ≥ 2.34 at runtime), the historical Fish prompt timeout, and the Linux build. musl still passes inherited fds to the service.
 - **Picker resize:** a recorded `shortcut:` decision, unchanged.
 - **Dead code:** `shell_integration::render` removed after this report (only tests used it).
-- **Release backlog:** license texts for 10 crates, a root `LICENSE`, the xdiff decision, and a stale `.plans/shipit-checklist.md`.
+- **Release backlog:** license texts for 10 crates, a root `LICENSE`, the xdiff decision, and the release checklist in `../plans/shipit-checklist.md`.
 - **Project-search ranking:** one known miss (`swift test --filter Lib`), unchanged.
-- **Not committed by this run.** Commit and push are a separate step.

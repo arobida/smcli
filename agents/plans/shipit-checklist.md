@@ -6,7 +6,7 @@ Every box must be checked before smcli ships (any public binary, tap or download
 
 - [ ] Choose smcli's license and add `LICENSE` at the repo root.
 - [ ] Check that the chosen license is compatible with everything below. LGPL-2.1+ (xdiff) is the constraint.
-- [ ] Put the license name in `Package.swift`/README and in `smcli --version` or `smcli licenses` output.
+- [ ] Put the license name in `Cargo.toml`/README and in `smcli --version` or `smcli licenses` output.
 
 ## xdiff (LGPL-2.1+, inside libgit2, statically linked into `smcli-service`)
 
@@ -19,12 +19,11 @@ Every box must be checked before smcli ships (any public binary, tap or download
 
 ## Third-party notices
 
-- [ ] Fetch license texts for the 8 Rust crates that ship none (listed in `THIRD_PARTY_NOTICES.md`) and add them.
+- [ ] Fetch license texts for the 10 Rust crates that ship none (listed in `THIRD_PARTY_NOTICES.md`) and add them.
 - [ ] Re-run `scripts/gen-notices.py` against the release fff build and commit the regenerated `THIRD_PARTY_NOTICES.md`.
-- [ ] Confirm the notices cover everything in each shipped binary: fff and its crates, libgit2, the Swift packages
-      (ProximaKit, SQLite), and the bundled Potion model (`potion-code-16M-v2`: check its model license and attribution).
+- [ ] Confirm the notices cover everything in each shipped binary: fff and its crates, libgit2, LMDB, TalaDB, the remaining Rust crates, and the bundled Potion model (`potion-code-16M-v2`: check its model license and attribution).
 - [ ] Ship `THIRD_PARTY_NOTICES.md` with every artifact: tarball, Homebrew formula, and universal and x86_64 builds.
-- [ ] Re-check `docs/fff-licenses.md` against the pinned fff version. Update the pin if it moved.
+- [ ] Re-check `../reference/fff-licenses.md` against the pinned fff version. Update the pin if it moved.
 
 ## Release gate
 

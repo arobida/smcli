@@ -50,7 +50,7 @@ Use the Makefile for builds; don't hand-roll `cargo build` commands.
 - Single test: `cargo test -p <crate> <test name>`.
 - `make ranking` — scores suggest/search ranking on the fixed query set (`crates/smcli-search/tests/ranking.rs`); run after ranking changes.
 - `make linux` — full test suite on Linux in Docker (needs a running daemon).
-- `make baseline` — black-box CLI/hook benchmark (`scripts/bench-baseline.py`, see `docs/baseline.md`); never reads real history.
+- `make baseline` — black-box CLI/hook benchmark (`scripts/bench-baseline.py`, see `agents/reference/baseline.md`); never reads real history.
 - `make clean` — `cargo clean`, keeping the newest `dist/` CLI and service pair (live shell hooks may point at them).
 
 ## Architecture

@@ -196,5 +196,5 @@ make fff-smoke      # pinned fff-search crate smoke test
 
 Normal builds link the pinned `fff-search` crate into `smcli-service` only;
 `smcli` does not link fff. Builds require Cargo and a C toolchain. See
-[the baseline report](docs/baseline.md) for the capture-to-picker trace,
+[the baseline report](agents/reference/baseline.md) for the capture-to-picker trace,
 measurements, dependency/API verification, limitations, and the next gate.

@@ -1,8 +1,13 @@
 # Backend baseline and fff verification
 
-Status (2026-10-20): **steps 1 to 7 measured; macOS arm64 is the primary target and macOS x86_64 builds, links and
-passes the service and file-picker tests under Rosetta. Linux is not supported (see "Platforms").** The original
-step-1 numbers (2026-10-18, in-process) are kept below for comparison with the current ones.
+Historical reference (2026-10-18 to 2026-10-20). These measurements were taken on the Swift implementation
+before the Rust port. The method, fixtures and fff ownership notes still describe how the benchmark works,
+but the latency numbers predate the Rust binaries and were not re-measured. Current sources are `crates/`.
+
+Status at the time: **steps 1 to 7 measured; macOS arm64 was the primary target and macOS x86_64 built,
+linked and passed the service and file-picker tests under Rosetta. Linux was not supported then; the Rust
+port now supports it (see `../plans/roadmap.md`).** The original step-1 numbers (2026-10-18, in-process) are
+kept below for comparison with the later ones.
 
 Two modes exist and the report names the one it measured: `SMCLI_SERVICE=0` (in-process, the bench default
 `--service off`) and the service (`--service on`). smcli itself starts `smcli-service` by default, so a normal install
@@ -35,9 +40,9 @@ Python 3.9+, Bash and Zsh are used for the Unix benchmark. Shells are discovered
 thresholds. fff is built by `make fff` (a prerequisite of `build`, `release`, `fresh` and `test`;
 Cargo must be installed) and linked statically into `smcli-service`.
 
-## Request path (current)
+## Request path (Swift implementation, 2026-10-20)
 
-1. [Generated shell hooks](../Sources/smcli/ShellIntegration.swift) (Bash, Zsh, Fish) keep a
+1. Generated shell hooks (`crates/smcli/src/shell_integration.rs` in the current tree) (Bash, Zsh, Fish) keep a
    pending command, starting cwd, session and start time. At the next prompt (or exit)
    they call `smcli record`. Prompt recording is detached by default; `SMCLI_SYNC=1` and
    shell exit wait for it. Zsh registers in `precmd_functions`/`preexec_functions`/`zshexit_functions`;
@@ -321,16 +326,19 @@ workloads before deciding on more machinery.
 
 ## Pinned fff verification
 
+Historical build notes for the C wrapper. The Rust port links `fff-search` from Cargo instead of building
+`scripts/build-fff.sh`; the upstream pin and license facts below still apply.
+
 - Repository: [dmtrKovalenko/fff](https://github.com/dmtrKovalenko/fff).
 - Release: `v0.11.0`, peeled commit
   `95fd777c2529fc7b4d7572dabff64cc07268f2c5`.
 - Codeload source archive SHA-256:
   `d2d96d7cc472571b23476b502a0b96f974f0e968c0f290b22078cc300bea6c64`.
-- Pin and download check: [build-fff.sh](../scripts/build-fff.sh#L6). Cargo uses
+- Pin and download check: `scripts/build-fff.sh` (removed with the Rust port). Cargo uses
   upstream's committed lockfile with `--locked`. No moving branch or prebuilt
   binary is downloaded. The upstream generated header is used unchanged.
 - License: MIT, verified in the pinned root `LICENSE` and `fff-c/Cargo.toml`.
-  The notice is retained in [tools/fff/LICENSE](../tools/fff/LICENSE) and copied to
+  The notice was retained in `tools/fff/LICENSE` (removed with the Rust port) and copied to
   `.build/fff/LICENSE`. The transitive-license audit is in
   [fff-licenses.md](fff-licenses.md).
 - Build: Cargo/Rust, a native C toolchain, zlib and the platform SDK/headers used
@@ -364,9 +372,9 @@ compiled/linked against these real exports:
 | `fff_free_result` | Frees the envelope/error string **only**, not its handle. Needed on success and failure. |
 | `fff_destroy` | Frees the instance; also called explicitly if scan completion fails during Swift initialization. |
 
-The [serial-use Swift boundary](../tools/fff/smoke.swift#L11) owns one opaque
-handle, frees it in deinit, keeps borrowed pointers inside the call, and rejects
-embedded NULs. It is deliberately not Sendable. The smoke test uses temporary
+The serial-use Swift boundary (`tools/fff/smoke.swift`, removed with the Rust port) owned one opaque
+handle, freed it in deinit, kept borrowed pointers inside the call, and rejected
+embedded NULs. It was deliberately not Sendable. The smoke test used temporary
 files, ten instance lifecycles, 1,000 reused-instance searches, empty results,
 real C error envelopes, and exact relative-path checks for Unicode, spaces,
 quotes and shell metacharacters. It uses explicit throwing checks in optimized
@@ -385,6 +393,10 @@ against all leaks or Rust global allocations. The smoke test uses a dynamic libr
 links the static archive `.build/fff/lib/libfff_c.a` into `smcli-service` only. `smcli` has no fff symbols.
 
 ## Platforms
+
+Historical table from the Swift build. Current support is macOS and Linux with search included on both;
+`make linux` runs the full suite in Docker (see `../plans/roadmap.md` for the unverified historical Fish
+prompt timeout).
 
 | Target | Status |
 |---|---|
@@ -412,6 +424,6 @@ for the macOS 27 SDK; the project's deployment target remains macOS 14.
 
 Native shell adapters, cached Git/package context, the fff file/grep picker modes, ranking signals and the crash,
 concurrency, malformed-input, stale-index, large-repository and eviction tests are done and listed in
-`.plans/backend-plan.md`. Still open: a license for smcli and the xdiff (LGPL) decision
-(`THIRD_PARTY_NOTICES.md`, `docs/fff-licenses.md`), Linux support, and persistent-socket or async-suggestion work
-that is only justified if measurements ask for it.
+`../reports/2026-10-20-backend.md`. Still open: a license for smcli and the xdiff (LGPL) decision
+(`THIRD_PARTY_NOTICES.md`, `fff-licenses.md`), and persistent-socket or async-suggestion work that is only
+justified if measurements ask for it.
