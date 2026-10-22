@@ -1,6 +1,6 @@
 # caveman-review
 
-Whole-tree pass over `crates/` (2026-10-22). Comments only. No fixes applied.
+Consolidated review of implementation, tests, tooling and release readiness (2026-10-22). Findings only; no implementation fixes applied. This is the single review file, incorporating the still-relevant items from the former `.plans/issues.md` and `PROJECT_REVIEW.md`.
 
 ## Findings
 
@@ -42,3 +42,52 @@ Whole-tree pass over `crates/` (2026-10-22). Comments only. No fixes applied.
 - Fish `\\` / `\'` inside single quotes matches fish 4 docs. `shell_quoting.rs` and the fish binary quote are fine.
 - Suggestion-index directory bonuses (×4 / ×3 / ×2) match the SQL scan. Tests cover that.
 - `record` argv order (bash 8 fields, zsh/fish 9 with pipestatus) matches `cli.rs:500-513`. `allow_hyphen_values` is already set there.
+
+## Additional whole-codebase review — 2026-10-22
+
+Scope: current working tree at `317355426514d0b3510e3174cdab9aa974e69fe9`, including existing uncommitted edits. Reviewed runtime, search, shell integration, installation and removal against repository docs and architecture rules. This is a whole-tree review, not a branch diff. Existing findings above are preserved, not revalidated or endorsed by this addendum. No implementation fixes applied.
+
+### Standards
+
+`crates/smcli-core/src/suggestion_index.rs:182`: 🟡 **P2 — Accepted future timestamps produce nonfinite service scores.** `history.rs:163` permits timestamps through `1e11`. A run at that time moves the index base forward; querying now makes `2^((base-now)/half-life)` overflow to infinity. Older weights underflow to zero, then become NaN at `suggestion_index.rs:216`; the future run scores infinity. The SQL fallback clamps future age to zero (`history.rs:447`) and remains finite. This breaks the service/in-process behavior requirement in `AGENTS.md`. Bound the factorization or handle future runs separately; test both paths with a far-future accepted timestamp. Verification: inspected rebasing and scoring; numeric exponent/underflow check, without an end-to-end Rust repro. No additional defensible baseline smell findings.
+
+### Spec
+
+`crates/smcli-core/src/suggestion_index.rs:115`: 🟡 **P2 — Delayed captures corrupt command transitions until the index rebuilds.** README.md:54-56 says recording normally happens "in the background". The service feeds records straight into `index.add` (`service.rs:290-292`); affinity uses arrival order unconditionally. Repro: seed `first@100`, add `third@300`, then delayed `second@200`. The index reports previous=`second`, followers(first)={third}, followers(third)={second}. The SQL fallback orders by start time and ID (`history.rs:330-350`), giving first→second→third and previous=`third`. Detect out-of-order arrivals and rebuild/invalidate chronological affinity. Verification: standalone Rust repro linked against the current core library.
+
+`scripts/uninstall.sh:63`: 🔴 **P1 — Fallback export can lose committed history.** docs/install.md:205-207 promises `history.db` is "a consistent copy of the database". When `sqlite3` is absent, `cp` copies only the main database while the service is still running; committed rows may exist only in its WAL. The script later deletes that WAL at line 93. Repro using the exact copy operation with a live WAL database: source contains one committed command, exported database contains zero. A JSON export, when available, does not make the advertised restorable database consistent. Require a SQLite backup implementation or abort before removal; never silently fall back to a raw live-file copy.
+
+`scripts/uninstall.sh:58`: 🟡 **P2 — History export loses privacy and cannot be restored as documented.** The export directory and SQLite backup inherit umask; with `022`, `.backup` creates `history.db` with mode `0644`, and `history.json` is also world-readable. Captured databases are deliberately `0600`, and opening a database rejects any group/other permission (`history.rs:512-528`). Thus the documented `SMCLI_DB=…/history.db` restore (docs/install.md:206-207) fails, while a default export may expose history to other local users when parent directories are traversable. Create a private export directory and enforce `0600` on exported history/config files, including existing destinations. Verification: system `sqlite3 .backup` changed a `0600` source into a `0644` backup under umask `022`; the current CLI rejected that backup with exit 1 and its private-permissions error.
+
+### Validation
+
+- Targeted reproductions used temporary data; no real history was modified.
+- `make test` passed: 69 Rust tests, interactive Bash/Zsh/Fish and plugin-composition checks, concurrent capture, service checks (including a 50,002-file repository), file-picker quoting/insertion, install/uninstall and benchmark smoke test. These existing checks do not cover the four new findings. Build emitted one dead-code warning for `shell_integration::render`.
+- `git diff --check -- docs/caveman-review.md` passed. Only this report was edited by this review; pre-existing implementation edits were preserved.
+
+Additional findings: Standards **1** (worst: nonfinite service scores); Spec **3** (worst: inconsistent export loses committed history).
+
+## Revalidated backlog — 2026-10-22
+
+`crates/smcli/src/picker.rs:734`: 🟡 **P2 — Picker ignores terminal resizing.** `TerminalSession::new` reads the terminal dimensions once and creates `Viewport::Fixed` at line 736. The event loop discards every non-key event at line 482, including `Event::Resize`. Growing the terminal leaves the old layout; shrinking can leave content outside the visible area. Update the terminal viewport on resize and recompute layout. Confirmed from the current construction and event loop; no live resize repro performed.
+
+`scripts/test-shells.py:878`: 🔵 **P3 — Concurrent-writer failures still lack diagnostics and skip remaining waits.** Thirteen subprocesses inherit stderr, then line 882 asserts `all(process.wait() == 0 for process in writers)`. A nonzero result produces a bare assertion, without identifying the writer or its exit code; `all` also short-circuits, leaving later children without explicit waits before service cleanup. Collect every result and report command, exit status and captured stderr for each failure. The earlier reported concurrency failure was not reproduced: the full suite passed during the preceding review. The harness defect itself remains present.
+
+`crates/smcli-core/src/context_cache.rs:442`: 🔵 **P3 — Nonblocking-refresh test remains timing-sensitive.** The assertion requires the initial `cache.context` call to finish in less than 300 ms while the injected reader sleeps for 600 ms. That initial call includes project discovery and watcher creation (`context_cache.rs:222-240`), so scheduling or filesystem delays can fail a correct asynchronous implementation. Replace the sleep/latency distinction with synchronization that proves the call returns while the reader is held pending. The focused test passed in this investigation and the preceding full suite passed; the historical flake was not reproduced, so this remains a test robustness risk rather than a confirmed current test failure.
+
+`THIRD_PARTY_NOTICES.md:1874`: 🟡 **Release-readiness backlog — License materials and distribution decisions remain incomplete.** The current notices still list ten crates with metadata-only license coverage: blake3, glidesort, heed, heed-traits, heed-types, lmdb-master-sys, number_prefix, objc2-core-foundation, objc2-core-services and taladb (versions are listed there). There is still no root `LICENSE`; the notices explicitly record the unresolved xdiff decision at line 47. Reconcile each missing-text entry with the actual selected license/materials and finish the owner decisions and distribution checks in `.plans/shipit-checklist.md`. That checklist's count of eight and references to Swift packages are stale after the Rust port. This finding records repository evidence and unfinished release work, not a new legal compliance determination. Keep `THIRD_PARTY_NOTICES.md`, `docs/fff-licenses.md` and the release checklist as supporting artifacts, not duplicate review reports.
+
+### Quality limitation
+
+`crates/smcli-search/tests/ranking.rs:289`: 🔵 **Project-search ranking still misses one top result; no aggregate regression demonstrated.** `make ranking` passes with project search MRR **0.750**, top-1 **0.50** (two cases). For `swift test` in `api/Sources/App`, the expected `swift test --filter Lib` ranks second behind `swift test`. Overall search remains MRR **0.955**, top-1 **0.91**, matching the recorded baseline in `.plans/taladb-port.md:120`; the ranking test is unchanged from phase-three commit `9b2e1c7`. Retain this as a measured quality limitation, not an established port regression or a failing acceptance gate. Any tuning needs a targeted ranking comparison before changing weights.
+
+### Verification still blocked
+
+`Makefile:42` (`linux` target): 🟡 **Historical Linux Fish prompt timeout remains unverified.** The former issue log reports `make linux` timing out in `scripts/test-shells.py` during Fish setup in a Debian `rust:latest` container. No relevant fix or current Linux pass was established by this investigation. The local Docker client cannot connect to its configured OrbStack socket because the daemon is unavailable, so the Linux run could not be performed. Keep this platform-specific report pending a real `make linux` run; the preceding macOS Fish pass does not resolve it. Record the container Fish version and prompt/setup transcript if it recurs.
+
+### Consolidation checks
+
+- Rechecked all seven source items: the six topics above remain relevant, with uncertainty distinguished from confirmed defects. Removed the obsolete `.build/` and `Sources/smcli/Resources/F2LLM-v2-80M` cleanup item because both paths are absent.
+- Removed the unsupported ranking-regression claim after the current ranking run matched the recorded overall baseline.
+- `make ranking` and the focused `cargo test -p smcli-core refresh_is_nonblocking_and_failure_keeps_status -- --nocapture` passed. The earlier full-suite result above is from the preceding review; it was not rerun for this documentation consolidation.
+- Retired `.plans/issues.md` and `PROJECT_REVIEW.md` after migration. Pre-existing implementation changes were preserved.

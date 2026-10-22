@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 
 /// Render hooks with the default picker keys. The caller prints the trailing newline.
 pub fn render(shell: &str, binary_path: &str) -> Result<String> {
-    render_with_keys(shell, binary_path, true, false, true, true)
+    render_with_keys(shell, binary_path, true, false, false, true, true)
 }
 
 pub fn render_with_keys(
@@ -10,6 +10,7 @@ pub fn render_with_keys(
     binary_path: &str,
     ctrl_r: bool,
     left: bool,
+    right: bool,
     ctrl_t: bool,
     ctrl_g: bool,
 ) -> Result<String> {
@@ -83,7 +84,7 @@ if [[ ${_smcli_installed-} != 1 ]]; then
         }
         _smcli_preexec() {
             local prior_status=$2 entry
-            if [[ $_smcli_armed == 1 && $1 != _smcli_prompt && $1 != _smcli_ready && $1 != _smcli_pick && $1 != _smcli_pick_left && $1 != _smcli_pick_files && $1 != _smcli_pick_grep ]]; then
+            if [[ $_smcli_armed == 1 && $1 != _smcli_prompt && $1 != _smcli_ready && $1 != _smcli_pick && $1 != _smcli_pick_left && $1 != _smcli_pick_right && $1 != _smcli_pick_files && $1 != _smcli_pick_grep ]]; then
                 _smcli_started=${EPOCHREALTIME:-$((_smcli_epoch + SECONDS))}
                 _smcli_armed=0
                 _smcli_pending=1
@@ -180,7 +181,7 @@ if [[ ${_smcli_installed-} != 1 ]]; then
     fi
 fi
 # smcli: history picker on Up and Ctrl-R, for keys no other tool has bound. Set SMCLI_NO_KEYS=1 before this line to
-# keep readline's keys; SMCLI_EXTRA_KEYS=1 adds Left on an empty line, Ctrl-Right and Alt-;.
+# keep readline's keys; SMCLI_EXTRA_KEYS=1 adds Left and Right on an empty line, Ctrl-Right and Alt-;.
 if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]] && (( BASH_VERSINFO[0] >= 4 )); then
     _smcli_pick_bin=\#(binary)
     # Bash 4 counts READLINE_POINT in bytes (5.0 and later in characters) while ${var:offset} counts characters,
@@ -206,10 +207,15 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]] && (( BASH_VERSINFO[0] >= 4 )); then
         fi
         unset _smcli_before _smcli_after _smcli_bytes
     }
-    # Left opens the picker on directory suggestions only on an empty line; otherwise it moves the cursor as usual.
+    # Left opens history search on an empty line (the same picker as Ctrl-R); otherwise it moves the cursor.
     _smcli_pick_left() {
-        if [[ -z $READLINE_LINE ]]; then _smcli_pick --suggest
+        if [[ -z $READLINE_LINE ]]; then _smcli_pick
         elif (( READLINE_POINT > 0 )); then READLINE_POINT=$((READLINE_POINT - 1)); fi
+    }
+    # Right opens directory suggestions on an empty line; otherwise it moves the cursor.
+    _smcli_pick_right() {
+        if [[ -z $READLINE_LINE ]]; then _smcli_pick --suggest
+        elif (( READLINE_POINT < ${#READLINE_LINE} )); then READLINE_POINT=$((READLINE_POINT + 1)); fi
     }
     # Ctrl-T opens the picker on this directory's files; Tab there searches the whole project.
     _smcli_pick_files() { _smcli_pick --files; }
@@ -229,7 +235,7 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]] && (( BASH_VERSINFO[0] >= 4 )); then
     _smcli_maps=$(bind -X 2>/dev/null)
     _smcli_maps=$'\n'$(bind -p 2>/dev/null; bind -s 2>/dev/null)$'\n'${_smcli_maps//\" \"/\": \"}
     _smcli_kept=
-    # From `smcli init`: Ctrl-R, and Left on an empty line.
+    # From `smcli init`: Ctrl-R, and Left and Right on an empty line.
     (( \#(keyR) )) && _smcli_bind '\C-r' _smcli_pick 'reverse-search-history history-search-backward'
     _smcli_bind '\e[A' _smcli_pick 'previous-history history-search-backward'
     _smcli_bind '\eOA' _smcli_pick 'previous-history history-search-backward'
@@ -242,6 +248,10 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]] && (( BASH_VERSINFO[0] >= 4 )); then
     if [[ -n ${SMCLI_EXTRA_KEYS-} ]] || (( \#(keyLeft) )); then
         _smcli_bind '\e[D' _smcli_pick_left backward-char
         _smcli_bind '\eOD' _smcli_pick_left backward-char
+    fi
+    if [[ -n ${SMCLI_EXTRA_KEYS-} ]] || (( \#(keyRight) )); then
+        _smcli_bind '\e[C' _smcli_pick_right forward-char
+        _smcli_bind '\eOC' _smcli_pick_right forward-char
     fi
     if [[ -n ${SMCLI_EXTRA_KEYS-} ]]; then
         _smcli_bind '\e[1;5C' _smcli_pick forward-word
@@ -306,7 +316,7 @@ if [[ ${_smcli_installed-} != 1 ]]; then
     zshexit_functions=(_smcli_zshexit ${zshexit_functions:#_smcli_zshexit})
 fi
 # smcli: history picker on Up and Ctrl-R, for keys no other tool has bound. Set SMCLI_NO_KEYS=1 before this line to
-# keep zle's keys; SMCLI_EXTRA_KEYS=1 adds Left on an empty line, Ctrl-Right and Alt-;.
+# keep zle's keys; SMCLI_EXTRA_KEYS=1 adds Left and Right on an empty line, Ctrl-Right and Alt-;.
 if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
     _smcli_pick_bin=\#(binary)
     _smcli_pick() {
@@ -327,12 +337,17 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
         if [[ $BUFFER == *$'\n'* ]]; then zle up-line-or-history; else _smcli_pick; fi
     }
     zle -N _smcli_pick
-    # Left opens the picker on directory suggestions only on an empty line; otherwise it moves the cursor as usual.
+    # Left opens history search on an empty line (the same picker as Ctrl-R); otherwise it moves the cursor.
     _smcli_pick_left() {
-        if [[ -z $BUFFER ]]; then _smcli_pick --suggest; else zle backward-char; fi
+        if [[ -z $BUFFER ]]; then _smcli_pick; else zle backward-char; fi
+    }
+    # Right opens directory suggestions on an empty line; otherwise it moves the cursor.
+    _smcli_pick_right() {
+        if [[ -z $BUFFER ]]; then _smcli_pick --suggest; else zle forward-char; fi
     }
     zle -N _smcli_pick_up
     zle -N _smcli_pick_left
+    zle -N _smcli_pick_right
     # Ctrl-T opens the picker on this directory's files; Tab there searches the whole project.
     _smcli_pick_files() { _smcli_pick --files; }
     zle -N _smcli_pick_files
@@ -350,15 +365,19 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
     }
     _smcli_kept=()
     for _smcli_keymap in emacs viins; do
-        # From `smcli init`: Ctrl-R, and Left on an empty line.
+        # From `smcli init`: Ctrl-R, and Left and Right on an empty line.
         (( \#(keyR) )) && _smcli_bind $_smcli_keymap '^R' _smcli_pick 'redisplay|history-incremental-(pattern-|)search-backward|history-search-backward'
         _smcli_bind $_smcli_keymap '^[[A' _smcli_pick_up 'up-line-or-(history|beginning-search)'
         _smcli_bind $_smcli_keymap '^[OA' _smcli_pick_up 'up-line-or-(history|beginning-search)'
         (( \#(keyT) )) && _smcli_bind $_smcli_keymap '^T' _smcli_pick_files 'transpose-chars|self-insert'
         (( \#(keyG) )) && _smcli_bind $_smcli_keymap '^G' _smcli_pick_grep 'send-break|list-expand|self-insert'
         if [[ -n ${SMCLI_EXTRA_KEYS-} ]] || (( \#(keyLeft) )); then
-            _smcli_bind $_smcli_keymap '^[[D' _smcli_pick_left backward-char
-            _smcli_bind $_smcli_keymap '^[OD' _smcli_pick_left backward-char
+            _smcli_bind $_smcli_keymap '^[[D' _smcli_pick_left 'backward-char|vi-backward-char'
+            _smcli_bind $_smcli_keymap '^[OD' _smcli_pick_left 'backward-char|vi-backward-char'
+        fi
+        if [[ -n ${SMCLI_EXTRA_KEYS-} ]] || (( \#(keyRight) )); then
+            _smcli_bind $_smcli_keymap '^[[C' _smcli_pick_right 'forward-char|vi-forward-char'
+            _smcli_bind $_smcli_keymap '^[OC' _smcli_pick_right 'forward-char|vi-forward-char'
         fi
         if [[ -n ${SMCLI_EXTRA_KEYS-} ]]; then
             _smcli_bind $_smcli_keymap '^[[1;5C' _smcli_pick forward-word
@@ -450,10 +469,10 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
             set -a _smcli_kept (string escape -- $argv[1])
         end
     end
-    # Left opens the picker on directory suggestions only on an empty line; otherwise it moves the cursor as usual.
+    # Left opens history search on an empty line. Right stays fish's key (it accepts an autosuggestion).
     function _smcli_pick_left
         if test -z (commandline | string collect)
-            _smcli_pick --suggest
+            _smcli_pick
         else
             commandline -f backward-char
         end
@@ -484,7 +503,9 @@ end"###
         _ => bail!("shell-init requires bash, zsh or fish."),
     };
     // Substitute the path last: its text must never be interpreted as a template token.
+    // keyRight before keyR: the shorter token is a prefix of the longer one.
     Ok(template
+        .replace(r"\#(keyRight)", if right { "1" } else { "0" })
         .replace(r"\#(keyR)", if ctrl_r { "1" } else { "0" })
         .replace(r"\#(keyLeft)", if left { "1" } else { "0" })
         .replace(r"\#(keyT)", if ctrl_t { "1" } else { "0" })
@@ -516,9 +537,53 @@ mod tests {
                 .unwrap()
                 .contains("set -g _smcli_bin 'a\\'\\\\b\\\\#(keyR)'")
         );
-        let hooks = render_with_keys("zsh", "smcli", false, true, false, false).unwrap();
+        let hooks = render_with_keys("zsh", "smcli", false, true, false, false, false).unwrap();
         assert!(hooks.contains("(( 0 )) && _smcli_bind $_smcli_keymap '^R'"));
         assert!(hooks.contains("|| (( 1 )); then"));
         assert!(render("unknown", path).is_err());
+    }
+
+    #[test]
+    fn empty_prompt_arrows_open_history_and_suggestions() {
+        let bash = render_with_keys("bash", "smcli", true, true, true, true, true).unwrap();
+        assert!(bash.contains("(( 1 )) && _smcli_bind '\\C-r' _smcli_pick "));
+        assert!(bash.contains("if (( 1 )); then\n        _smcli_bind '\\C-t' _smcli_pick_files"));
+        assert!(bash.contains("if [[ -z $READLINE_LINE ]]; then _smcli_pick\n"));
+        assert!(bash.contains("READLINE_POINT=$((READLINE_POINT - 1))"));
+        assert!(bash.contains("if [[ -z $READLINE_LINE ]]; then _smcli_pick --suggest\n"));
+        assert!(bash.contains("READLINE_POINT=$((READLINE_POINT + 1))"));
+        assert!(bash.contains("|| (( 1 )); then\n        _smcli_bind '\\e[D' _smcli_pick_left"));
+        assert!(bash.contains("|| (( 1 )); then\n        _smcli_bind '\\e[C' _smcli_pick_right"));
+        assert!(!bash.contains("#(key"));
+        assert!(!bash.contains("ight)"));
+
+        let zsh = render_with_keys("zsh", "smcli", true, true, true, true, true).unwrap();
+        assert!(zsh.contains("(( 1 )) && _smcli_bind $_smcli_keymap '^R' _smcli_pick "));
+        assert!(zsh.contains("(( 1 )) && _smcli_bind $_smcli_keymap '^T' _smcli_pick_files"));
+        assert!(zsh.contains("if [[ -z $BUFFER ]]; then _smcli_pick; else zle backward-char; fi"));
+        assert!(zsh.contains("if [[ -z $BUFFER ]]; then _smcli_pick --suggest; else zle forward-char; fi"));
+        assert!(zsh.contains("|| (( 1 )); then\n            _smcli_bind $_smcli_keymap '^[[D' _smcli_pick_left"));
+        assert!(zsh.contains("|| (( 1 )); then\n            _smcli_bind $_smcli_keymap '^[[C' _smcli_pick_right"));
+        assert!(zsh.contains("'backward-char|vi-backward-char'"));
+        assert!(zsh.contains("'forward-char|vi-forward-char'"));
+
+        let off = render_with_keys("zsh", "smcli", true, false, false, true, true).unwrap();
+        assert!(off.contains("(( 1 )) && _smcli_bind $_smcli_keymap '^R'"));
+        assert!(off.contains("(( 1 )) && _smcli_bind $_smcli_keymap '^T'"));
+        assert!(off.contains("|| (( 0 )); then\n            _smcli_bind $_smcli_keymap '^[[D'"));
+        assert!(off.contains("|| (( 0 )); then\n            _smcli_bind $_smcli_keymap '^[[C'"));
+
+        let right_only = render_with_keys("bash", "smcli", false, false, true, false, false).unwrap();
+        assert!(right_only.contains("(( 0 )) && _smcli_bind '\\C-r'"));
+        assert!(right_only.contains("if (( 0 )); then\n        _smcli_bind '\\C-t' _smcli_pick_files"));
+        assert!(right_only.contains("|| (( 0 )); then\n        _smcli_bind '\\e[D'"));
+        assert!(right_only.contains("|| (( 1 )); then\n        _smcli_bind '\\e[C'"));
+
+        let fish = render_with_keys("fish", "smcli", true, true, true, true, true).unwrap();
+        assert!(fish.contains("test 1 = 1; and _smcli_bind \\cr _smcli_pick"));
+        assert!(fish.contains("test 1 = 1; and _smcli_bind \\ct _smcli_pick_files"));
+        assert!(!fish.contains("_smcli_pick_right"));
+        assert!(!fish.contains("--suggest"));
+        assert!(fish.contains("_smcli_pick\n        else\n            commandline -f backward-char"));
     }
 }

@@ -55,11 +55,10 @@ saved in SQLite at `~/.local/share/smcli/history.db`; recording normally happens
 the background, so the newest command may not appear immediately. Set `SMCLI_SYNC=1`
 in the shell to make recording synchronous.
 
-`shell-init` also binds **Up** to `smcli pick`, plus **Ctrl-R** and **Left** (on an empty prompt only) if you chose them in `smcli init`. It opens on suggestions
-for the current directory; start typing to filter every captured and native command
+`shell-init` binds **Up** and **Ctrl-R** to history search. On an empty prompt in Bash and Zsh, **Left** opens that same search and **Right** opens directory suggestions, when you chose those keys in `smcli init`; a line that already has text keeps normal arrow movement. Start typing to filter every captured and native command
 (all words must match), press Tab for semantic search, Enter to put the command on your
 prompt, Esc to cancel. Text already on the prompt becomes the initial query. Set
-`SMCLI_NO_KEYS=1` before the `eval` to keep your shell's own keys, or `SMCLI_EXTRA_KEYS=1` to add Left, Ctrl-Right and Alt-;. Bash needs 4.0+.
+`SMCLI_NO_KEYS=1` before the `eval` to keep your shell's own keys, or `SMCLI_EXTRA_KEYS=1` to add Left and Right on an empty line, Ctrl-Right and Alt-;. Bash needs 4.0+. Fish keeps Right for autosuggestions.
 
 ## Install
 
@@ -84,7 +83,7 @@ smcli suggest [prefix...]     # --dir PATH, --limit N, --json
 smcli shell-init bash|zsh|fish  # print opt-in hooks; eval (or `| source` in fish)
 smcli pick [query...]         # interactive picker; prints the chosen command
 smcli init                    # configure picker keys
-smcli init --keys [LIST]      # picker keys only: ask, or ctrl-r,left | ctrl-r | left | none
+smcli init --keys [LIST]      # picker keys only: ask, or ctrl-r,left,right | ctrl-r | left | right | none
 smcli init --potion [DIR]     # use another potion-code-16M-v2 copy (no DIR: the built-in one)
 smcli init --default          # back to the default: the built-in Potion model
 smcli reindex                 # discard the search index and re-embed every command

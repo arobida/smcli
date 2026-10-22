@@ -1,4 +1,4 @@
-Usage: smcli init [--model NAME | --potion [DIR] | --builtin | --default] [--keys [ctrl-r,left,ctrl-t,ctrl-g|none]]
+Usage: smcli init [--model NAME | --potion [DIR] | --builtin | --default] [--keys [ctrl-r,left,right,ctrl-t,ctrl-g|none]]
        smcli history [--json]
        smcli shell-init bash|zsh|fish
        smcli search [query...] [--command NAME] [--subcommand NAME] [--since TIME] [--before TIME]
@@ -16,10 +16,9 @@ Read saved shell history, or print opt-in hooks for structured metadata capture.
 search filters are exact; TIME is 30m, 12h, 7d, 2w, YYYY-MM-DD, or ISO 8601, matched against the last run.
 context prints the repository, worktree, branch, Git status and project manifests for a directory (cached by the service).
 reindex re-embeds every command for search; health checks the index and the embedding model.
-pick opens the history picker: Up and Ctrl-R show all history, newest first; Left on an empty line (pick --suggest) shows
-only this directory's suggestions; Tab searches all history semantically. Ctrl-R, Left, Ctrl-T and Ctrl-G are chosen in `smcli init`
-(asked, or set with a list such as `--keys ctrl-r,left,ctrl-t,ctrl-g`, `--keys ctrl-r` or `--keys none`); SMCLI_NO_KEYS=1 skips them all, and keys another tool already bound are left alone.
-SMCLI_EXTRA_KEYS=1 also binds Left on an empty line, Ctrl-Right and Alt-; (Bash and Zsh).
+pick opens the history picker: Up and Ctrl-R show all history, newest first. On an empty line in Bash and Zsh, Left does the same and Right (pick --suggest) shows only this directory's suggestions; with text on the line the arrows move the cursor. Tab searches all history semantically. Ctrl-R, Left, Right, Ctrl-T and Ctrl-G are chosen in `smcli init`
+(asked, or set with a list such as `--keys ctrl-r,left,right,ctrl-t,ctrl-g`, `--keys ctrl-r` or `--keys none`); SMCLI_NO_KEYS=1 skips them all, and keys another tool already bound are left alone.
+SMCLI_EXTRA_KEYS=1 also binds Left and Right on an empty line, Ctrl-Right and Alt-; (Bash and Zsh). Fish keeps Right for autosuggestions.
 Ctrl-T at the prompt (pick --files) opens files mode on this directory's entries; type to filter, Ctrl-F shows only
 directories, then only files, Tab searches the whole project with fff. Ctrl-G (pick --grep) searches file contents with fff.
 In the picker, Ctrl-T and Ctrl-G switch to files and grep and back to history; project search and grep need the service. Enter inserts the path at the cursor, quoted for your shell (SMCLI_SHELL), and never runs anything.

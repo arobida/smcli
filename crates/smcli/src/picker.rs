@@ -335,13 +335,14 @@ pub fn run(
             let area = frame.area();
             cols = area.width;
             let history = picker.mode == Mode::History;
-            let label = if matches!(picker.mode, Mode::Files | Mode::Directory) { match kind { 1 => "folders", 2 => "files", _ => "all" } } else if history { picker.title.as_deref().unwrap_or("history") } else { picker.mode.as_str() };
+            let label = if matches!(picker.mode, Mode::Files | Mode::Directory) { match kind { 1 => "folders", 2 => "files", _ => "files+dirs" } } else if history { picker.title.as_deref().unwrap_or("history") } else { picker.mode.as_str() };
             // Too short for boxes: keep the flat layout.
             let boxed = area.height >= 8;
             // Files modes name their scope so directory and project search never look alike.
             let scope = match picker.mode {
                 Mode::Files | Mode::Directory if local => format!("in {}", std::env::current_dir().map(|d| visible(&d.display().to_string())).unwrap_or_default()),
-                Mode::Files | Mode::Directory => "across the project".into(),
+                Mode::Files | Mode::Directory => "across your system".into(),
+                Mode::Grep => format!("in {}", std::env::current_dir().map(|d| visible(&d.display().to_string())).unwrap_or_default()),
                 _ => String::new(),
             };
             frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!(" {label} "), ACCENT), Span::styled(scope, ACCENT.add_modifier(Modifier::BOLD)), Span::styled(" ›", ACCENT.add_modifier(Modifier::BOLD))])), Rect::new(area.x, area.y, area.width, 1));
@@ -384,7 +385,7 @@ pub fn run(
                 // Rows past the selection plus one screen are never visible; skip building them.
                 commands.iter().enumerate().take(selected + area.height as usize).map(|(i, c)| {
                     let sel = i == selected;
-                    let mark = if starred.contains(c) { "★ " } else { "  " };
+                    let mark = if starred.contains(c) { "* " } else { "  " };
                     let spans = highlight(&visible(c));
                     let mut line = vec![Span::styled(mark, if sel { Style::new() } else { MUTED })];
                     line.extend(if sel { plain(spans) } else { spans });
@@ -402,7 +403,7 @@ pub fn run(
                     ]))
                 }).collect()
             };
-            let list = List::new(items).block(list_block).highlight_style(SELECTED).highlight_symbol("↵ ").highlight_spacing(HighlightSpacing::Always);
+            let list = List::new(items).block(list_block).highlight_style(SELECTED).highlight_symbol("[ ⏎ ] ").highlight_spacing(HighlightSpacing::Always);
             let mut state = ListState::default().with_selected((count > 0).then_some(selected));
             frame.render_stateful_widget(list, list_area, &mut state);
             if !boxed {
@@ -413,14 +414,21 @@ pub fn run(
                 vec![("esc", "cancel")]
             } else if history {
                 let mut h = if typing { vec![("tab", "semantic"), ("↑↓", "move")] } else { vec![("↑↓", "move"), ("tab", "semantic")] };
-                h.extend([("^T", "files"), ("^G", "grep"), ("esc", "cancel")]);
+                h.push(("^T", "files"));
+                if !global_files { h.push(("^G", "grep")); }
+                h.push(("esc", "cancel"));
                 h
             } else {
                 let mut h = vec![("↑↓", "move")];
                 if matches!(picker.mode, Mode::Files | Mode::Directory) {
                     h.extend([("^A", if local { "global search" } else { "cwd search" }), ("^F", "dirs/files")]);
                 }
-                h.extend(if picker.mode == Mode::Files { [("^T", "history"), ("^G", "grep")] } else { [("^G", "history"), ("^T", "files")] });
+                if matches!(picker.mode, Mode::Files | Mode::Directory) {
+                    h.push(("^T", "history"));
+                    if !global_files { h.push(("^G", "grep")); }
+                } else {
+                    h.extend([("^G", "history"), ("^T", "files")]);
+                }
                 h.push(("esc", "cancel"));
                 h
             };
@@ -504,7 +512,7 @@ pub fn run(
                     })
                 });
             }
-            KeyCode::Char('t' | 'g') if ctrl => {
+            KeyCode::Char('t' | 'g') if ctrl && (key.code != KeyCode::Char('g') || grep_available(global_files)) => {
                 saved.insert(picker.mode, picker.query);
                 let target = if key.code == KeyCode::Char('t') {
                     Mode::Files
@@ -561,6 +569,10 @@ pub fn run(
     }
 }
 
+fn grep_available(global_files: bool) -> bool {
+    !global_files
+}
+
 fn contains_terms(text: &str, query: &str) -> bool {
     let text = text.to_lowercase();
     query
@@ -612,7 +624,7 @@ pub fn directory_entries(directory: &Path, limit: usize) -> Vec<FileHit> {
         .map(|(name, directory, _)| FileHit {
             insert: format!("{name}{}", if directory { "/" } else { "" }),
             path: name,
-            provenance: vec!["here".into()],
+            provenance: vec!["*".into()],
             git: None,
             line: None,
             column: None,
@@ -670,7 +682,7 @@ pub fn with_picked(
             FileHit {
                 path: path.clone(),
                 insert,
-                provenance: vec!["picked".into()],
+                provenance: vec!["*".into()],
                 git: None,
                 line: None,
                 column: None,
@@ -744,6 +756,11 @@ impl Drop for TerminalSession {
 mod tests {
     use super::*;
     #[test]
+    fn grep_is_only_available_outside_global_search() {
+        assert!(grep_available(false));
+        assert!(!grep_available(true));
+    }
+    #[test]
     fn project_folders_from_file_parents() {
         let hit = |path: &str, insert: &str| FileHit { insert: insert.into(), path: path.into(), provenance: vec!["files".into()], git: None, line: None, column: None, text: None };
         let dirs = filter_kind(vec![hit("src/a.rs", "../src/a.rs"), hit("src/b.rs", "../src/b.rs"), hit("top.rs", "../top.rs")], 1);
@@ -782,12 +799,13 @@ mod tests {
         }
         let entries = directory_entries(&root, 200);
         assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|hit| hit.provenance == ["*"]));
         assert_eq!(entries[0].insert, "folder/");
         assert!(entries.iter().any(|h| h.path == ".hidden"));
         let scores = HashMap::from([("file".into(), 2.0), ("missing".into(), 100.0)]);
         let picked = with_picked(&scores, &root, &root, entries, 10);
         assert_eq!(picked[0].insert, "file");
-        assert_eq!(picked[0].provenance, ["picked"]);
+        assert!(picked.iter().all(|hit| hit.provenance == ["*"]));
         assert_eq!(picked.len(), 3);
         let picked = with_picked(&scores, &root, &root.join("folder"), Vec::new(), 10);
         assert_eq!(picked[0].insert, "../file");

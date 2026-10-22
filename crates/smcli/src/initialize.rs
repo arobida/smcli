@@ -33,18 +33,19 @@ pub fn run(args: Init, path: &Path) -> Result<()> {
                 .collect();
             if names
                 .iter()
-                .any(|s| !["ctrl-r", "left", "ctrl-t", "ctrl-g", "none"].contains(&s.as_str()))
+                .any(|s| !["ctrl-r", "left", "right", "ctrl-t", "ctrl-g", "none"].contains(&s.as_str()))
                 || (names.iter().any(|s| s == "none") && names.len() > 1)
             {
-                bail!("--keys takes ctrl-r,left,ctrl-t,ctrl-g or none.");
+                bail!("--keys takes ctrl-r,left,right,ctrl-t,ctrl-g or none.");
             }
             config.ctrl_r_key = Some(names.iter().any(|s| s == "ctrl-r"));
             config.left_key = Some(names.iter().any(|s| s == "left"));
+            config.right_key = Some(names.iter().any(|s| s == "right"));
             config.ctrl_t_key = Some(names.iter().any(|s| s == "ctrl-t"));
             config.ctrl_g_key = Some(names.iter().any(|s| s == "ctrl-g"));
         } else {
             if !io::stdin().is_terminal() {
-                bail!("smcli init --keys needs a terminal; pass --keys ctrl-r,left,ctrl-t,ctrl-g.");
+                bail!("smcli init --keys needs a terminal; pass --keys ctrl-r,left,right,ctrl-t,ctrl-g.");
             }
             choose(&mut config)?;
         }
@@ -86,10 +87,15 @@ fn choose(c: &mut SmcliConfig) -> Result<()> {
         "Open history with Left on an empty line?",
         c.left_key.unwrap_or(false),
     )?;
+    let right = ask(
+        "Open suggestions with Right on an empty line?",
+        c.right_key.unwrap_or(false),
+    )?;
     let t = ask("Open files with Ctrl-T?", c.ctrl_t_key.unwrap_or(true))?;
     let g = ask("Open grep with Ctrl-G?", c.ctrl_g_key.unwrap_or(true))?;
     c.ctrl_r_key = Some(r);
     c.left_key = Some(l);
+    c.right_key = Some(right);
     c.ctrl_t_key = Some(t);
     c.ctrl_g_key = Some(g);
     Ok(())

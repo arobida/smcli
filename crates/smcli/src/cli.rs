@@ -213,6 +213,7 @@ pub fn run() -> Result<()> {
                     &executable.to_string_lossy(),
                     c.ctrl_r_key.unwrap_or(true),
                     c.left_key.unwrap_or(false),
+                    c.right_key.unwrap_or(false),
                     c.ctrl_t_key.unwrap_or(true),
                     c.ctrl_g_key.unwrap_or(true)
                 )?
@@ -967,7 +968,7 @@ fn pick(
                 println!("{command}");
             }
             Choice::File { hit, mode, query } => {
-                if hit.provenance != ["here"] {
+                if hit.provenance != ["*"] {
                     let mut r = ServiceRequest::new(Operation::Select);
                     r.directory = Some(d.clone());
                     r.path = Some(hit.path.clone());

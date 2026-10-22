@@ -36,7 +36,7 @@ scripts/install.sh           # from a source checkout: builds with `make release
 | `--prefix DIR` | Where the executables go (default `~/.local/bin`) |
 | `--from DIR` | Install the `smcli` and `smcli-service` found in `DIR` (e.g. `dist`) |
 | `--shells LIST` | `zsh,bash,fish` to hook; `all` (every one installed) or `none`. Default: your login shell |
-| `--keys LIST` | Picker keys: `ctrl-r,left`, `ctrl-r`, `left` or `none`. Default: ask in a terminal |
+| `--keys LIST` | Picker keys: `ctrl-r,left,right`, `ctrl-r`, `left`, `right` or `none`. Default: ask in a terminal |
 | `--yes` | Ask nothing; without `--keys`, keeps the default keys (Up and Ctrl-R) |
 
 The hooks go in a marked block at the end of each file, so they load after other tools that bind keys:
@@ -133,20 +133,23 @@ Then continue with [Set up your shell](#set-up-your-shell).
    smcli init
    ```
 
-   It asks two questions (press Enter to keep the default):
+   It asks which picker keys to bind (press Enter to keep the default):
 
    ```
-   Open the history picker with Ctrl-R? [Y/n]
-   Open it with Left arrow when the command line is empty? [y/N]
+   Open history with Ctrl-R? [Y/n]
+   Open history with Left on an empty line? [y/N]
+   Open suggestions with Right on an empty line? [y/N]
+   Open files with Ctrl-T? [Y/n]
+   Open grep with Ctrl-G? [Y/n]
    ```
 
-   Up always opens the picker. Then it offers any Ollama embedding models you have installed; the default is the
+   Up always opens the picker. On an empty line in Bash and Zsh, Left opens the same history search as Ctrl-R and Right opens directory suggestions. A line that already has text keeps normal arrow movement. Then it offers any Ollama embedding models you have installed; the default is the
    built-in potion-code-16M-v2 model, which needs nothing extra.
 
    For scripts and dotfiles, use flags instead; they never ask:
 
    ```sh
-   smcli init --keys ctrl-r,left     # or ctrl-r, left, none
+   smcli init --keys ctrl-r,left,right     # or ctrl-r, left, right, none
    smcli init --default --keys ctrl-r   # model and keys together
    ```
 
@@ -166,7 +169,7 @@ Then continue with [Set up your shell](#set-up-your-shell).
 
    Optional, set before the line:
    - `SMCLI_NO_KEYS=1`: bind no keys (history is still recorded).
-   - `SMCLI_EXTRA_KEYS=1`: also Left on an empty line, Ctrl-Right and Alt-; (Bash and Zsh).
+   - `SMCLI_EXTRA_KEYS=1`: also Left and Right on an empty line, Ctrl-Right and Alt-; (Bash and Zsh). Fish keeps Right for autosuggestions.
    - `SMCLI_DB=/path/history.db`: another database (it must not be your shell's `HISTFILE`).
 
 3. **Open a new terminal and check:**

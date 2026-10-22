@@ -14,8 +14,9 @@ pub struct SmcliConfig {
     pub builtin: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ctrl_g_key: Option<bool>,
-    /// Picker keys bound by shell-init, chosen in `smcli init`: Ctrl-R and Ctrl-T file search (on unless false) and Left
-    /// on an empty line (off unless true). Up is always bound; SMCLI_NO_KEYS=1 still skips them all.
+    /// Picker keys bound by shell-init, chosen in `smcli init`: Ctrl-R and Ctrl-T file search (on unless false).
+    /// On an empty line, Left opens that same history search and Right opens directory suggestions (Bash and Zsh;
+    /// each off unless true). Up is always bound; SMCLI_NO_KEYS=1 still skips them all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ctrl_r_key: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -27,6 +28,9 @@ pub struct SmcliConfig {
     pub history_filter: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub left_key: Option<bool>,
+    /// Right arrow on an empty line opens directory suggestions (Bash and Zsh; off unless true).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right_key: Option<bool>,
     /// The model's vector size, recorded at init so the index can be opened without a network call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ollama_dimension: Option<i64>,
@@ -165,6 +169,13 @@ mod tests {
         assert_eq!(config.ctrl_r_key, Some(false));
         let saved = serde_json::to_string(&config).unwrap();
         assert_eq!(saved, r#"{"ctrlRKey":false,"historyFilter":["x"],"potionPath":"/m"}"#);
+        let arrows: SmcliConfig = serde_json::from_str(r#"{"leftKey":false,"rightKey":true}"#).unwrap();
+        assert_eq!(arrows.left_key, Some(false));
+        assert_eq!(arrows.right_key, Some(true));
+        assert_eq!(
+            serde_json::to_string(&arrows).unwrap(),
+            r#"{"leftKey":false,"rightKey":true}"#
+        );
         let environment = HashMap::from([("XDG_CONFIG_HOME".to_string(), "/x".to_string())]);
         assert_eq!(SmcliConfig::location(Path::new("/h"), &environment), PathBuf::from("/x/smcli/config.json"));
         assert_eq!(SmcliConfig::location(Path::new("/h"), &HashMap::new()), PathBuf::from("/h/.config/smcli/config.json"));
