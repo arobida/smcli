@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::{Arc, Condvar, Mutex}, time::{Duration, Instant}};
+use std::{collections::HashMap, panic::{catch_unwind, AssertUnwindSafe}, sync::{Arc, Condvar, Mutex}, time::{Duration, Instant}};
 use anyhow::{Result, anyhow};
 use fff_search::{FilePicker, FilePickerOptions, SharedFilePicker, SharedFrecency, QueryParser, FuzzySearchOptions, PaginationArgs, GrepSearchOptions};
 use smcli_core::{context::ProjectContext, service_location::relative_insert, service_protocol::{FileHit, FileIndexInfo, ServiceRequest, ServiceResponse}};
@@ -65,14 +65,16 @@ impl FileSearch {
             pool.building += 1;
             drop(pool);
             // No LMDB stores: frecency lives in smcli's own database. The watcher keeps the index current.
-            let result = (|| -> Result<Index> {
+            let result = catch_unwind(AssertUnwindSafe(|| -> Result<Index> {
                 if root.contains('\0') { return Err(anyhow!("NUL in root")); }
                 let picker = SharedFilePicker::default();
                 FilePicker::new_with_shared_state(picker.clone(), SharedFrecency::default(), FilePickerOptions { base_path: root.into(), ..Default::default() })?;
                 // A slow scan is not an error: search what is indexed so far.
                 if picker.wait_for_scan(Duration::from_secs(10)) { picker.wait_for_watcher(Duration::from_secs(10)); }
                 Ok(Arc::new(OwnedIndex(picker)))
-            })().map_err(|e| e.to_string());
+            }))
+            .unwrap_or_else(|_| Err(anyhow!("file index build panicked")))
+            .map_err(|e| e.to_string());
             let mut pool = self.pool.lock().unwrap();
             pool.building -= 1;
             pool.pending.remove(root);

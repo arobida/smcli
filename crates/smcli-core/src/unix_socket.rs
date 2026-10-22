@@ -22,10 +22,7 @@ fn system(operation: &str, error: io::Error) -> SocketError {
     if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) {
         SocketError::Timeout
     } else {
-        let message = error.raw_os_error().map(|code| unsafe {
-            std::ffi::CStr::from_ptr(libc::strerror(code)).to_string_lossy().into_owned()
-        }).unwrap_or_else(|| error.to_string());
-        SocketError::System(format!("{operation}: {message}"))
+        SocketError::System(format!("{operation}: {error}"))
     }
 }
 

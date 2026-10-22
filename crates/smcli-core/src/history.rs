@@ -173,16 +173,15 @@ pub fn is_event_id(text: &str) -> bool {
         })
 }
 
-fn new_event_id() -> String {
+fn new_event_id() -> Result<String> {
     let mut bytes = [0u8; 16];
-    if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
-        use std::io::Read;
-        let _ = file.read_exact(&mut bytes);
-    }
+    let mut file = std::fs::File::open("/dev/urandom")?;
+    use std::io::Read;
+    file.read_exact(&mut bytes)?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32])
+    Ok(format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]))
 }
 
 /// Parses a shell's `pipestatus` words ("0 1 0"). Empty means not reported.
@@ -246,7 +245,7 @@ impl CapturedHistory {
         }
         let start = run.started_at.unwrap_or_else(now);
         let duration = run.ended_at.map(|end| (((end - start) * 1000.0).round() as i64).max(0));
-        let event = run.event.clone().unwrap_or_else(new_event_id);
+        let event = run.event.clone().map(Ok).unwrap_or_else(new_event_id)?;
         if !is_event_id(&event) {
             bail!("Invalid event ID.");
         }

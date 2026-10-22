@@ -1,7 +1,7 @@
 //! The long-lived owner of one history database: it keeps the database open and suggestions in memory, and
 //! answers smcli clients over a private Unix-domain socket. Started on demand by clients; exits when idle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -13,6 +13,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use smcli_core::config::{CaptureFilter, SmcliConfig};
 use smcli_core::context_cache::ContextCache;
+use smcli_core::entry::SearchEntry;
 use smcli_core::history::{CapturedHistory, NewRun, Run, user_name};
 use smcli_core::parse::is_smcli_command;
 use smcli_core::ranking::{RankingContext, Signal};
@@ -81,7 +82,7 @@ impl Service {
         let db = history.open_connection()?;
         let version = data_version(&db)?;
         let capacity = environment.get("SMCLI_FFF_MAX").and_then(|v| v.parse().ok()).unwrap_or(4);
-        let fff_idle = Duration::from_secs_f64(environment.get("SMCLI_FFF_IDLE").and_then(|v| v.parse().ok()).unwrap_or(600.0));
+        let fff_idle = Duration::from_secs_f64(environment.get("SMCLI_FFF_IDLE").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(600.0));
         // The file search reaches back into `state` through a weak handle, set once the service exists.
         let service = Arc::new_cyclic(|weak: &std::sync::Weak<Service>| {
             let (scores_handle, record_handle) = (weak.clone(), weak.clone());
@@ -155,12 +156,13 @@ impl Service {
         Ok(())
     }
 
-    /// Removes the socket only while it is still ours, then exits (which releases the lock).
+    /// Removes the socket only while it is still ours, then exits without running libc exit handlers.
     fn stop(&self, socket_inode: Option<u64>) -> ! {
         if inode(&self.location.socket).is_some() && inode(&self.location.socket) == socket_inode {
             let _ = std::fs::remove_file(&self.location.socket);
         }
-        std::process::exit(0)
+        // SAFETY: _exit is async-signal-safe and avoids running libc exit handlers while other threads work.
+        unsafe { libc::_exit(0) }
     }
 
     fn serve(&self, stream: UnixStream, socket_inode: Option<u64>) {
@@ -289,7 +291,9 @@ impl Service {
         if inserted {
             let run = Run { command: command.clone(), directory: directory.clone(), started_at: started, exit_code, session: session.clone() };
             if let Some(index) = state.index.as_mut() {
-                index.add(&run);
+                if !index.add(&run) {
+                    state.index = None;
+                }
             }
             // The corpus is updated in place (a rebuild is slow at 100k runs); an unused one just stays valid.
             if let Some(corpus) = state.corpus.as_mut() {
@@ -389,8 +393,16 @@ impl Service {
         let service = Arc::clone(self);
         std::thread::spawn(move || {
             let _searching = service.searching.lock();
-            let mut state = service.lock();
-            let _ = service.current_engine(&mut state, &ServiceRequest::new(Operation::Search));
+            let request = ServiceRequest::new(Operation::Search);
+            let path = service.config_path(&request);
+            if let Ok(config) = SmcliConfig::load(&path) {
+                let mut environment = service.environment.clone();
+                environment.insert("SMCLI_CONFIG".into(), path.to_string_lossy().into_owned());
+                if let Ok(engine) = search_engine(&service.history, &service.home(), &environment) {
+                    let mut state = service.lock();
+                    state.engine = Some((config, Arc::new(engine)));
+                }
+            }
         });
     }
 
@@ -408,7 +420,7 @@ impl Service {
         let result = (|| -> Result<ServiceResponse> {
             let context = self.ranking_context(request, directory);
             let project = context.project_root.clone().filter(|_| context.uses(Signal::Project));
-            let (engine, entries, programs, signals) = {
+            let (engine, signals) = {
                 let mut state = self.lock();
                 Self::refresh(&mut state)?;
                 let index = self.current_index(&mut state)?;
@@ -419,12 +431,12 @@ impl Service {
                     signals.followers = index.following(&previous);
                     signals.previous = Some(previous);
                 }
-                signals.context = Some(context);
+                signals.context = Some(context.clone());
                 let engine = self.current_engine(&mut state, request)?;
-                let corpus = self.current_corpus(&mut state, request, directory, project.as_deref())?;
-                // shortcut: copies the corpus per search to search outside the lock; share it (Arc + copy-on-record) if it shows up in profiles.
-                (engine, corpus.state.entries.clone(), corpus.state.programs.clone(), signals)
+                (engine, signals)
             };
+            // Read native history files and stats outside `state` so records don't wait on I/O.
+            let (entries, programs) = self.current_corpus(request, directory, project.as_deref())?;
             let filter = request.filter.clone().unwrap_or_default();
             let hits = engine.search(query, &entries, limit as usize, &filter, Some(&programs), &signals, now())?;
             let mut response = ServiceResponse::new(true);
@@ -435,8 +447,10 @@ impl Service {
     }
 
     /// The caller's view of the environment: its HISTFILE and SHELL pick the native history files.
-    fn current_corpus<'a>(&self, state: &'a mut State, request: &ServiceRequest, directory: &str, project: Option<&str>)
-        -> Result<&'a SearchCorpus> {
+    /// Copies of the corpus entries and programs, so the search runs outside `state`.
+    // shortcut: copies the corpus per search; share it (Arc + copy-on-record) if it shows up in profiles.
+    fn current_corpus(&self, request: &ServiceRequest, directory: &str, project: Option<&str>)
+        -> Result<(HashMap<String, SearchEntry>, HashMap<String, HashSet<String>>)> {
         let mut environment = self.environment.clone();
         environment.remove("HISTFILE");
         environment.remove("SHELL");
@@ -450,22 +464,28 @@ impl Service {
                 format!("{} {} {}", f.path.display(), meta.as_ref().map_or(-1, |m| m.len() as i64), meta.map_or(0, |m| m.mtime()))
             })
             .collect();
-        let fresh = state.corpus.as_ref().is_some_and(|c| {
-            c.state.directory == directory && c.state.project.as_deref() == project && c.native == stamp
-                && c.built.elapsed() < Duration::from_secs(300)
-        });
-        if !fresh {
-            let native: Vec<String> =
-                files.iter().filter_map(|f| f.read().ok()).flat_map(|t| t.split('\n').map(String::from).collect::<Vec<_>>()).collect();
-            let as_of = now();
-            let captured = self.history.command_stats(Some(directory), project, as_of)?;
-            state.corpus = Some(SearchCorpus {
-                native: stamp,
-                built: Instant::now(),
-                state: CorpusState::new(captured, &native, directory, project, as_of),
-            });
+        let version = {
+            let state = self.lock();
+            if let Some(c) = state.corpus.as_ref().filter(|c| {
+                c.state.directory == directory && c.state.project.as_deref() == project && c.native == stamp
+                    && c.built.elapsed() < Duration::from_secs(300)
+            }) {
+                return Ok((c.state.entries.clone(), c.state.programs.clone()));
+            }
+            state.data_version
+        };
+        let native: Vec<String> =
+            files.iter().filter_map(|f| f.read().ok()).flat_map(|t| t.split('\n').map(String::from).collect::<Vec<_>>()).collect();
+        let as_of = now();
+        let captured = self.history.command_stats(Some(directory), project, as_of)?;
+        let corpus = CorpusState::new(captured, &native, directory, project, as_of);
+        let copies = (corpus.entries.clone(), corpus.programs.clone());
+        let mut state = self.lock();
+        // A record that landed while this was built is missing from it: use it once, rebuild next search.
+        if state.data_version == version {
+            state.corpus = Some(SearchCorpus { native: stamp, built: Instant::now(), state: corpus });
         }
-        Ok(state.corpus.as_ref().unwrap())
+        Ok(copies)
     }
 }
 

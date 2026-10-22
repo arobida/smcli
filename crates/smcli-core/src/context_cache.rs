@@ -426,20 +426,25 @@ mod tests {
         let directory = temp.path().to_str().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = std::sync::Mutex::new(Some(release_rx));
         let cache = ContextCache::with_reader(
             100.0,
             Duration::from_millis(10),
             16,
             Arc::new(move |_| {
-                // Far longer than the call may take, which includes starting the file watcher.
-                std::thread::sleep(Duration::from_millis(600));
-                (count.fetch_add(1, Ordering::SeqCst) == 0)
-                    .then(|| GitStatus::parse("# branch.head main", now()))
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // Block until the test has observed that the refresh is pending.
+                    let _ = release_rx.lock().unwrap().take().unwrap().recv();
+                }
+                (n == 0).then(|| GitStatus::parse("# branch.head main", now()))
             }),
         );
         let start = Instant::now();
         assert!(cache.context(directory).status_pending);
         assert!(start.elapsed() < Duration::from_millis(300));
+        release_tx.send(()).unwrap();
         let context = wait(&cache, directory);
         assert_eq!(context.status.unwrap().branch.as_deref(), Some("main"));
         cache.invalidate(&context.repository.unwrap().root);

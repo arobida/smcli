@@ -257,7 +257,7 @@ pub fn run(
     let mut semantic_pending = None;
     let mut spinner = 0;
     let mut spun = Instant::now();
-    let mut terminal = TerminalSession::new(18)?;
+    let mut terminal = TerminalSession::new()?;
     let mut saved = HashMap::new();
     let mut selected = 0usize;
     let mut semantic: Option<(String, Vec<String>)> = None;
@@ -660,7 +660,7 @@ fn filter_kind(hits: Vec<FileHit>, kind: u8) -> Vec<FileHit> {
     hits.into_iter()
         .filter_map(|h| {
             let path = parent(&h.path)?;
-            seen.insert(path.clone()).then(|| FileHit { insert: parent(&h.insert).unwrap_or_else(|| path.clone()), path, git: None, line: None, column: None, text: None, ..h })
+            seen.insert(path.clone()).then(|| FileHit { insert: parent(&h.insert).unwrap_or_else(|| "./".to_string()), path, git: None, line: None, column: None, text: None, ..h })
         })
         .collect()
 }
@@ -733,28 +733,28 @@ pub(crate) struct TerminalSession {
     pub terminal: Terminal<CrosstermBackend<File>>,
 }
 impl TerminalSession {
-    pub fn new(height: u16) -> Result<Self> {
-        let tty = OpenOptions::new()
+    pub fn new() -> Result<Self> {
+        let mut tty = OpenOptions::new()
             .read(true)
             .write(true)
             .open("/dev/tty")
             .context("pick needs a terminal")?;
         enable_raw_mode()?;
         // Alternate screen like the Swift picker; an inline viewport queries the cursor position, which some ptys never answer.
-        let mut tty = tty;
-        let _ = height;
-        let terminal = execute!(tty, ratatui::crossterm::terminal::EnterAlternateScreen)
+        let mut display = tty.try_clone().context("pick needs a terminal")?;
+        let terminal = execute!(display, ratatui::crossterm::terminal::EnterAlternateScreen)
             .map_err(anyhow::Error::from)
             .and_then(|_| {
                 // Like Swift: a terminal reporting no size (some ptys) is drawn as 24x80.
                 // shortcut: the size is read once, so a resize mid-pick is not followed; re-read per frame if that matters.
                 let (columns, rows) = ratatui::crossterm::terminal::size().ok().filter(|&(_, rows)| rows > 0).unwrap_or((80, 24));
                 let viewport = Viewport::Fixed(ratatui::layout::Rect::new(0, 0, columns, rows));
-                Ok(Terminal::with_options(CrosstermBackend::new(tty), TerminalOptions { viewport })?)
+                Ok(Terminal::with_options(CrosstermBackend::new(display), TerminalOptions { viewport })?)
             });
         match terminal {
             Ok(terminal) => Ok(Self { terminal }),
             Err(error) => {
+                let _ = execute!(tty, ratatui::crossterm::terminal::LeaveAlternateScreen);
                 let _ = disable_raw_mode();
                 Err(error)
             }
@@ -781,6 +781,8 @@ mod tests {
         let hit = |path: &str, insert: &str| FileHit { insert: insert.into(), path: path.into(), provenance: vec!["files".into()], git: None, line: None, column: None, text: None };
         let dirs = filter_kind(vec![hit("src/a.rs", "../src/a.rs"), hit("src/b.rs", "../src/b.rs"), hit("top.rs", "../top.rs")], 1);
         assert_eq!(dirs.iter().map(|h| (h.path.as_str(), h.insert.as_str())).collect::<Vec<_>>(), [("src/", "../src/")]);
+        let cwd = filter_kind(vec![hit("src/a.rs", "a.rs")], 1);
+        assert_eq!(cwd.iter().map(|h| (h.path.as_str(), h.insert.as_str())).collect::<Vec<_>>(), [("src/", "./")]);
         assert_eq!(filter_kind(vec![hit("x/y", "y")], 2).len(), 1);
     }
     #[test]

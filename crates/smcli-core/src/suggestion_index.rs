@@ -15,6 +15,7 @@ use crate::time::{format_iso8601, now};
 pub struct CommandAffinity {
     pub followers: HashMap<String, HashMap<String, i64>>,
     pub last: HashMap<String, String>,
+    pub last_start: HashMap<String, f64>,
 }
 
 impl CommandAffinity {
@@ -22,7 +23,12 @@ impl CommandAffinity {
         Self::default()
     }
 
-    pub fn add(&mut self, session: &str, command: &str) {
+    /// Returns false when `started_at` is older than the last run in this session, which means the
+    /// caller's arrival order no longer matches chronological order and the index should be rebuilt.
+    pub fn add(&mut self, session: &str, command: &str, started_at: f64) -> bool {
+        if self.last_start.get(session).is_some_and(|&t| started_at < t) {
+            return false;
+        }
         if let Some(previous) = self.last.get(session) {
             *self
                 .followers
@@ -32,6 +38,8 @@ impl CommandAffinity {
                 .or_default() += 1;
         }
         self.last.insert(session.into(), command.into());
+        self.last_start.insert(session.into(), started_at);
+        true
     }
 
     pub fn following(&self, previous: &str) -> HashMap<String, i64> {
@@ -107,23 +115,30 @@ impl SuggestionIndex {
     }
 
     /// Adds one run. Runs are expected in (started_at, id) order; an older one still counts, but doesn't
-    /// replace the last-run fields.
-    pub fn add(&mut self, run: &Run) {
+    /// replace the last-run fields. Returns false when the run is older than its session's last run,
+    /// signalling that the index should be rebuilt from the database.
+    pub fn add(&mut self, run: &Run) -> bool {
         if is_smcli_command(&run.command) {
-            return;
+            return true;
         }
+        let started_at = run.started_at.min(now());
+        if !self.affinity.add(&run.session, &run.command, started_at) {
+            return false;
+        }
+        let mut run = run.clone();
+        run.started_at = started_at;
         self.history.push(run.clone());
-        self.affinity.add(&run.session, &run.command);
-        if (run.started_at - self.base) / USAGE_HALF_LIFE > 500.0 {
-            self.base = run.started_at;
+        if (started_at - self.base) / USAGE_HALF_LIFE > 500.0 {
+            self.base = started_at;
             self.commands.clear();
             self.directories.clear();
             for old in self.history.clone() {
                 self.tally(&old);
             }
         } else {
-            self.tally(run);
+            self.tally(&run);
         }
+        true
     }
 
     fn tally(&mut self, run: &Run) {
@@ -371,9 +386,11 @@ mod tests {
         index.add(&run);
         run.started_at = 1000.0 * USAGE_HALF_LIFE;
         index.add(&run);
+        // Older than the last run, from another session (the same session would ask for a rebuild).
         run.started_at -= 1.0;
         run.exit_code = 2;
-        index.add(&run);
+        run.session = "t".into();
+        assert!(index.add(&run));
         index.add_pick("echo", "echo hi", run.started_at);
         assert_eq!(index.picks().picks.len(), 1);
         let result = index.suggestions_at("/p", "", 1, run.started_at + 1.0, None);
@@ -381,5 +398,58 @@ mod tests {
         assert_eq!(result[0].last_exit_code, 0);
         assert!(result[0].score.is_finite());
         assert_eq!(index.recent(), vec!["echo hi"]);
+    }
+
+    #[test]
+    fn far_future_timestamp_stays_finite() {
+        let now = 1_700_000_000.0;
+        let mut index = SuggestionIndex::new(vec![], SelectionLog::default());
+        let mut run = Run {
+            command: "old".into(),
+            directory: "/p".into(),
+            started_at: now - USAGE_HALF_LIFE,
+            exit_code: 0,
+            session: "s".into(),
+        };
+        index.add(&run);
+        run.command = "future".into();
+        run.started_at = 1e11;
+        index.add(&run);
+        let suggestions = index.suggestions_at("/p", "", 10, now, None);
+        assert_eq!(suggestions.len(), 2);
+        for s in &suggestions {
+            assert!(s.score.is_finite(), "score for {} is not finite", s.command);
+        }
+        // The future run is treated as now, so it outranks the older run.
+        assert_eq!(suggestions[0].command, "future");
+        assert_eq!(suggestions[1].command, "old");
+    }
+
+    #[test]
+    fn out_of_order_run_invalidates_index() {
+        let mut index = SuggestionIndex::new(vec![], SelectionLog::default());
+        let mut run = Run {
+            command: "first".into(),
+            directory: "/p".into(),
+            started_at: 100.0,
+            exit_code: 0,
+            session: "s".into(),
+        };
+        assert!(index.add(&run));
+        run.command = "third".into();
+        run.started_at = 300.0;
+        assert!(index.add(&run));
+        run.command = "second".into();
+        run.started_at = 200.0;
+        assert!(!index.add(&run));
+
+        // A fresh index built from chronologically sorted runs keeps the latest previous command.
+        let sorted = vec![
+            Run { command: "first".into(), directory: "/p".into(), started_at: 100.0, exit_code: 0, session: "s".into() },
+            Run { command: "second".into(), directory: "/p".into(), started_at: 200.0, exit_code: 0, session: "s".into() },
+            Run { command: "third".into(), directory: "/p".into(), started_at: 300.0, exit_code: 0, session: "s".into() },
+        ];
+        let fresh = SuggestionIndex::new(sorted, SelectionLog::default());
+        assert_eq!(fresh.previous_command("s").as_deref(), Some("third"));
     }
 }

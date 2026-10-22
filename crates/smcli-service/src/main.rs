@@ -39,13 +39,17 @@ fn start(database: &str, environment: HashMap<String, String>) -> anyhow::Result
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&location.lock)
         .map_err(|e| anyhow::anyhow!("Cannot open {}: {e}", location.lock.display()))?;
-    if lock.try_lock().is_err() {
-        std::process::exit(0);
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => std::process::exit(0),
+        Err(std::fs::TryLockError::Error(e)) => {
+            return Err(anyhow::anyhow!("Cannot lock {}: {e}", location.lock.display()));
+        }
     }
     // Never open (and so create or write) the database when it is the starting shell's native history.
     let history = CapturedHistory::new(database);
     history.check_separate(environment.get("HISTFILE").map_or("", String::as_str))?;
-    let idle = environment.get("SMCLI_SERVICE_IDLE").and_then(|v| v.parse::<f64>().ok()).unwrap_or(1800.0);
+    let idle = environment.get("SMCLI_SERVICE_IDLE").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(1800.0);
     let service = Service::new(history, location, Duration::from_secs_f64(idle), environment)?;
     let result = service.run();
     drop(lock);

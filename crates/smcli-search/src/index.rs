@@ -102,7 +102,7 @@ impl HistorySearch {
     }
 
     /// Embedding model, tokenizer, or document format changes need a fresh index; the name pins all three.
-    fn index_name(&self) -> String {
+    pub fn index_name(&self) -> String {
         format!("{VERSION}-{}-{}-d{}", Potion::NAME, self.potion.identity, self.potion.dimension())
     }
 

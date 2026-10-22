@@ -208,7 +208,9 @@ It asks once, then:
    - `history.json` holds every recorded command with its directory, exit code, times and session.
    - `config.json` is your settings.
 
-   If the export fails, nothing is removed.
+   Export requires `sqlite3`; install it or pass `--no-export` to skip the export. The export directory is private
+   (`0700`), and exported history and config files are owner-readable/writable only (`0600`), including existing
+   destinations. If the export fails, nothing is removed.
 2. Stops the service.
 3. Removes the smcli block from each startup file and leaves the rest of the file as it was. It warns about
    `shell-init` lines you added by hand, which it doesn't touch.

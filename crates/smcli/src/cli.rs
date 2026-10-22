@@ -1,7 +1,7 @@
 use anyhow::{Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use smcli_core::{
-    config::{CaptureFilter, SmcliConfig},
+    config::{CaptureFilter, SmcliConfig, home_dir},
     context::ProjectContext,
     history::{CapturedHistory, NewRun, parse_pipestatus, user_name},
     ranking::RankingContext,
@@ -181,7 +181,7 @@ fn time(value: &str) -> Result<f64> {
 }
 pub fn run() -> Result<()> {
     let env: HashMap<String, String> = std::env::vars().collect();
-    let home = PathBuf::from(env.get("HOME").map(String::as_str).unwrap_or("/"));
+    let home = home_dir(&env);
     let captured = CapturedHistory::new(CapturedHistory::location(&home, &env));
     let executable = std::env::current_exe()?;
     let service = ServiceClient::new(&captured.path, &env, &executable);
@@ -205,7 +205,13 @@ pub fn run() -> Result<()> {
     match cli.command {
         Command::Init(args) => crate::initialize::run(args, &config_path)?,
         Command::ShellInit { shell } => {
-            let c = SmcliConfig::load(&config_path).unwrap_or_default();
+            let c = match SmcliConfig::load(&config_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("smcli: {e:#}; using default keys");
+                    SmcliConfig::default()
+                }
+            };
             println!(
                 "{}",
                 crate::shell_integration::render_config(&shell, &executable.to_string_lossy(), &c)?
@@ -410,7 +416,7 @@ pub fn run() -> Result<()> {
             }
         }
         Command::History { json } => history(&captured, &home, &env, json)?,
-        Command::Prune { dry_run } => prune(&captured, &filter()?, dry_run)?,
+        Command::Prune { dry_run } => prune(&captured, &home, &env, &filter()?, dry_run)?,
         Command::Import {
             atuin,
             replace,
@@ -584,7 +590,13 @@ fn history(
     }
     Ok(())
 }
-fn prune(c: &CapturedHistory, filter: &CaptureFilter, dry: bool) -> Result<()> {
+fn prune(
+    c: &CapturedHistory,
+    home: &Path,
+    env: &HashMap<String, String>,
+    filter: &CaptureFilter,
+    dry: bool,
+) -> Result<()> {
     if !c.path.exists() {
         println!(
             "{}",
@@ -655,9 +667,16 @@ fn prune(c: &CapturedHistory, filter: &CaptureFilter, dry: bool) -> Result<()> {
         for command in &commands {
             tx.execute("DELETE FROM command_selections WHERE command=?", [command])?;
         }
+        let removed = commands.len();
         tx.commit()?;
         db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
-        println!("Removed {} records.", commands.len());
+        println!("Removed {} records.", removed);
+        if removed > 0 {
+            // The index still holds the pruned text until rebuilt.
+            if let Err(e) = search_engine(c, home, env).and_then(|e| e.reindex(&corpus(c, home, env, None, now())?)) {
+                eprintln!("smcli: search index not rebuilt ({e:#}); run `smcli reindex`.");
+            }
+        }
     }
     Ok(())
 }
@@ -1032,14 +1051,7 @@ fn index_health(
                 && vector[0].iter().all(|x| x.is_finite()),
             "Embedding model returned an invalid vector; rerun `smcli init`."
         );
-        // This name must match HistorySearch::index_name; no shared accessor exists yet.
-        let name = format!(
-            "rs-commands-v1-{}-{}-d{}",
-            smcli_search::Potion::NAME,
-            engine.potion.identity,
-            engine.potion.dimension()
-        );
-        let path = engine.directory.join(format!("{name}.taladb"));
+        let path = engine.directory.join(format!("{}.taladb", engine.index_name()));
         report.path = path.to_string_lossy().into_owned();
         let directory = match std::fs::symlink_metadata(&engine.directory) {
             Ok(metadata) => metadata,
@@ -1057,6 +1069,7 @@ fn index_health(
             engine.directory.display()
         );
         let mut latest = None;
+        let name = engine.index_name();
         for entry in std::fs::read_dir(&engine.directory)? {
             let entry = entry?;
             let filename = entry.file_name().to_string_lossy().into_owned();
@@ -1243,9 +1256,9 @@ mod tests {
             history_filter: Some(vec!["^secret".into()]),
             ..Default::default()
         })?;
-        prune(&c, &filter, true)?;
+        prune(&c, &dir, &HashMap::new(), &filter, true)?;
         assert_eq!(records(&c)?.len(), 1);
-        prune(&c, &filter, false)?;
+        prune(&c, &dir, &HashMap::new(), &filter, false)?;
         assert!(records(&c)?.is_empty());
         std::fs::remove_dir_all(dir)?;
         Ok(())

@@ -3,7 +3,7 @@ use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::config::SmcliConfig;
+use crate::config::{SmcliConfig, home_dir};
 use crate::service_location::{ServiceLocation, build};
 use crate::service_protocol::{self, Operation, ServiceRequest, ServiceResponse, encode_line, decode_line};
 use crate::unix_socket::{SocketConnection, connect_unix};
@@ -31,16 +31,7 @@ impl ServiceClient {
     /// The mode comes from `SMCLI_SERVICE`: unset (or `1`/`on`) starts the service as needed, `connect` only uses a
     /// running one, and `0`/`off` keeps every command in-process.
     pub fn new(database: &Path, environment: &HashMap<String, String>, cli: &Path) -> Self {
-        let home = environment.get("HOME").map(PathBuf::from).unwrap_or_else(|| {
-            // Match the current user's home even when the supplied environment has no HOME.
-            unsafe {
-                let user = libc::getpwuid(libc::getuid());
-                if user.is_null() { PathBuf::from("/") } else {
-                    use std::os::unix::ffi::OsStrExt;
-                    PathBuf::from(std::ffi::OsStr::from_bytes(std::ffi::CStr::from_ptr((*user).pw_dir).to_bytes()))
-                }
-            }
-        });
+        let home = home_dir(environment);
         let mode = match environment.get("SMCLI_SERVICE").map(|s| s.to_lowercase()).as_deref() {
             Some("0" | "off" | "false" | "no") => Mode::Off,
             Some("connect") => Mode::Connect,
@@ -120,7 +111,8 @@ impl ServiceClient {
         None
     }
 
-    /// Starts the service detached in its own session, with no terminal and no inherited descriptors.
+    /// Starts the service detached in its own session, with no terminal. macOS and glibc close
+    /// inherited descriptors above stdio; musl keeps them.
     fn launch(&self) -> bool {
         use std::os::unix::ffi::OsStrExt;
         let Ok(executable) = CString::new(self.executable.as_os_str().as_bytes()) else { return false; };
@@ -147,6 +139,10 @@ impl ServiceClient {
             let mut status = libc::posix_spawnattr_setflags(&mut attributes, flags as i16);
             for fd in 0..=2 {
                 status |= libc::posix_spawn_file_actions_addopen(&mut actions, fd, c"/dev/null".as_ptr(), if fd == 0 { libc::O_RDONLY } else { libc::O_WRONLY }, 0);
+            }
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            {
+                status |= libc::posix_spawn_file_actions_addclosefrom_np(&mut actions, 3);
             }
             let mut pid = 0;
             if status == 0 { status = libc::posix_spawn(&mut pid, executable.as_ptr(), &actions, &attributes, argv.as_ptr(), envp.as_ptr()); }

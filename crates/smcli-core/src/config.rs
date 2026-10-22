@@ -1,9 +1,27 @@
 use std::collections::HashMap;
+use std::ffi::{CStr, OsStr};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+
+/// Home directory: `$HOME`, then the current user's `pw_dir`, then `/`.
+pub fn home_dir(environment: &HashMap<String, String>) -> PathBuf {
+    environment
+        .get("HOME")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| unsafe {
+            let user = libc::getpwuid(libc::getuid());
+            if user.is_null() {
+                PathBuf::from("/")
+            } else {
+                PathBuf::from(OsStr::from_bytes(CStr::from_ptr((*user).pw_dir).to_bytes()))
+            }
+        })
+}
 
 /// User settings written by `smcli init`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]

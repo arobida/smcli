@@ -209,7 +209,7 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]] && (( BASH_VERSINFO[0] >= 4 )); then
     _smcli_pick() {
         local chosen code
         _smcli_split
-        chosen=$(SMCLI_SHELL=bash SMCLI_LBUFFER=$_smcli_before "$_smcli_pick_bin" pick "$@" "$READLINE_LINE" </dev/tty)
+        chosen=$(SMCLI_SHELL=bash SMCLI_LBUFFER=$_smcli_before "$_smcli_pick_bin" pick "$@" -- "$READLINE_LINE" </dev/tty)
         code=$?
         if (( code == 0 )); then
             READLINE_LINE=$chosen
@@ -337,7 +337,7 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
     _smcli_pick_bin=\#(binary)
     _smcli_pick() {
         local chosen code
-        chosen=$(SMCLI_SHELL=zsh SMCLI_LBUFFER=$LBUFFER "$_smcli_pick_bin" pick "$@" "$BUFFER" </dev/tty)
+        chosen=$(SMCLI_SHELL=zsh SMCLI_LBUFFER=$LBUFFER "$_smcli_pick_bin" pick "$@" -- "$BUFFER" </dev/tty)
         code=$?
         if (( code == 0 )); then
             BUFFER=$chosen
@@ -456,7 +456,7 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
         # The text left of the cursor, so smcli can refuse to insert a path inside an open quote.
         set -l before (commandline -c | string collect)
         set -lx SMCLI_LBUFFER "$before"
-        set -l chosen (SMCLI_SHELL=fish command $_smcli_bin pick $argv (commandline | string collect) </dev/tty)
+        set -l chosen (SMCLI_SHELL=fish command $_smcli_bin pick $argv -- (commandline | string collect) </dev/tty)
         set -l code $status
         if test $code -eq 0
             commandline -r -- (string join \n -- $chosen | string collect)

@@ -879,7 +879,9 @@ with tempfile.TemporaryDirectory() as directory:
                    for i in range(12)]
         # The six-argument form used by hooks from earlier versions must keep working.
         writers.append(subprocess.Popen([binary, "record", "zsh", directory, "0", "echo shared", ""], env=env))
-        assert all(process.wait() == 0 for process in writers)
+        results = [(process.args, process.wait()) for process in writers]
+        failures = [(args, code) for args, code in results if code != 0]
+        assert not failures, f"Concurrent writers failed (command, exit code): {failures}"
         records = read_records(env)
         assert [record["runCount"] for record in records] == list(range(1, 14)), records
         # Nine arguments (no pipestatus) and ten (with it), and a bad pipestatus is refused.

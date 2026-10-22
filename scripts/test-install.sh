@@ -34,7 +34,29 @@ SMCLI_SYNC=1 "$home/bin/smcli" record zsh s1 /tmp 0 "" "" "" "" "echo exported-m
 "$home/bin/smcli-uninstall" < /dev/null > /dev/null 2>&1 && fail "uninstall without --yes should refuse"
 [[ -x $home/bin/smcli ]] || fail "refused uninstall removed files"
 
-"$home/bin/smcli-uninstall" --yes --export "$home/export" > "$home/out" 2>&1 || { cat "$home/out"; fail "uninstall failed"; }
+# Without sqlite3, refuse before removing hooks, executables or data.
+mkdir "$home/no-sqlite"
+for tool in dirname date; do ln -s "$(command -v "$tool")" "$home/no-sqlite/$tool"; done
+PATH="$home/no-sqlite" "$home/bin/smcli-uninstall" --yes --export "$home/export" > "$home/out" 2>&1 \
+    && fail "uninstall without sqlite3 should refuse"
+grep -q 'sqlite3 is needed to export history' "$home/out" || fail "missing sqlite3 diagnostic"
+[[ -x $home/bin/smcli && -f $home/.local/share/smcli/history.db && ! -e $home/export ]] || fail "refused uninstall changed files"
+grep -q '^# >>> smcli >>>$' "$home/.zshrc" || fail "refused uninstall removed hooks"
+
+# Existing, permissive destinations must also become private.
+mkdir "$home/export"
+chmod 755 "$home/export"
+for f in history.db history.json config.json; do touch "$home/export/$f"; chmod 644 "$home/export/$f"; done
+(umask 022; "$home/bin/smcli-uninstall" --yes --export "$home/export") > "$home/out" 2>&1 || { cat "$home/out"; fail "uninstall failed"; }
+python3 - "$home/export" <<'PY'
+import stat
+import sys
+from pathlib import Path
+export = Path(sys.argv[1])
+assert stat.S_IMODE(export.stat().st_mode) == 0o700
+for name in ("history.db", "history.json", "config.json"):
+    assert stat.S_IMODE((export / name).stat().st_mode) == 0o600, name
+PY
 grep -q 'exported-marker' "$home/export/history.json" || fail "JSON export is missing the recorded command"
 [[ $(sqlite3 "$home/export/history.db" "SELECT count(*) FROM commands WHERE command = 'echo exported-marker'") == 1 ]] \
     || fail "database copy is missing the recorded command"

@@ -10,6 +10,7 @@
 #   --prefix DIR   where smcli is installed (default: this script's directory, else ~/.local/bin)
 #   --yes          don't ask for confirmation
 set -euo pipefail
+umask 077
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 prefix=""
@@ -55,19 +56,20 @@ fi
 
 # 1. Export, before anything is removed. A failed export stops the uninstall.
 if [[ -z $keep_data && -z $no_export && -f $db ]]; then
+    command -v sqlite3 > /dev/null || die "sqlite3 is needed to export history; install it or pass --no-export"
     mkdir -p "$export_dir"
+    chmod 700 "$export_dir"
     # A consistent copy of the live database (including recent writes still in its WAL): restorable with SMCLI_DB.
-    if command -v sqlite3 > /dev/null; then
-        sqlite3 "$db" ".backup '${export_dir//\'/\'\'}/history.db'" || die "could not copy $db; nothing removed"
-    else
-        cp "$db" "$export_dir/history.db" || die "could not copy $db; nothing removed"
-    fi
+    sqlite3 "$db" ".backup '${export_dir//\'/\'\'}/history.db'" || die "could not copy $db; nothing removed"
     # Readable JSON of every recorded command with its directory, exit code, times and session.
     if [[ -x $smcli ]]; then
         SMCLI_SERVICE=off SMCLI_DB="$db" "$smcli" history --json > "$export_dir/history.json" \
             || die "could not export history as JSON; nothing removed (the copy is in $export_dir)"
     fi
     [[ -f $config ]] && cp "$config" "$export_dir/config.json"
+    for file in "$export_dir/history.db" "$export_dir/history.json" "$export_dir/config.json"; do
+        if [[ -f $file ]]; then chmod 600 "$file"; fi
+    done
     say "Exported history to $export_dir"
 fi
 

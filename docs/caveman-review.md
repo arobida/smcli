@@ -91,3 +91,134 @@ Additional findings: Standards **1** (worst: nonfinite service scores); Spec **3
 - Removed the unsupported ranking-regression claim after the current ranking run matched the recorded overall baseline.
 - `make ranking` and the focused `cargo test -p smcli-core refresh_is_nonblocking_and_failure_keeps_status -- --nocapture` passed. The earlier full-suite result above is from the preceding review; it was not rerun for this documentation consolidation.
 - Retired `.plans/issues.md` and `PROJECT_REVIEW.md` after migration. Pre-existing implementation changes were preserved.
+
+## Final audit (ponytail-audit) — 2026-10-22
+
+Scope: whole tree at `cfe9b2f` (branch `rust-port`). Read in full: `smcli-service` (`service.rs`, `main.rs`, `file_search.rs`), `smcli-core` (`history.rs`, `service_client.rs`, `suggestion_index.rs`, `config.rs`, socket error path), `smcli/src/cli.rs`, the hook text in `shell_integration.rs`, picker file/terminal code, `smcli-search/src/index.rs` search/sync, `scripts/uninstall.sh`. Skimmed: `ranking.rs`, `corpus.rs`, `context_cache.rs`, `test-shells.py`. Not read: `highlight.rs`, `menu.rs`, `parse.rs`, `bench-baseline.py`, `gen-notices.py`.
+
+**What this repo does:** smcli records every shell command (with directory, exit code and timing) into its own SQLite file, then suggests and searches those commands with a ranked list and a hybrid keyword + embedding search. A per-user background service keeps the database and search model warm; every command also works without it.
+
+**Load assumed:** one user, a handful of terminals, history up to ~100k runs. Records arrive in the background after every command, often several at once.
+
+### Corrections to earlier findings
+
+- `shell_integration.rs:195/314/424` (hooks pass the line without `--`): **downgraded 🔴 → 🟡**. Checked with the built CLI: `smcli pick --help`, `pick -la` and `pick --version` all exit **2**, not 0, so the line is never replaced. The real effect: on a line starting with `-`, Up/Ctrl-R does not open the picker and prints usage over the prompt; a line of `--files`/`--grep` silently switches mode. `smcli pick -- -la` already works, so the hook change alone fixes it; `allow_hyphen_values` is not needed.
+- `service_client.rs:145` (Linux spawn keeps fds): the suggested fix is wrong. `POSIX_SPAWN_CLOEXEC_DEFAULT` is Apple-only. On glibc use `posix_spawn_file_actions_addclosefrom_np(&actions, 3)` (in `libc` 0.2.191); musl has no equivalent.
+- `picker.rs:734` (no resize handling): carries a `shortcut:` comment naming the limit, so it is a recorded decision, not a defect. Left in backlog.
+- `unix_socket.rs:25` (`strerror`): the smallest fix is deletion. `io::Error`'s `Display` already prints the OS message; drop the `unsafe` block.
+- `history.rs:178` (zero event id): the 5-field `record` path is the only caller; make `new_event_id` return `Result` and `?` the read.
+
+### Must fix
+
+1. **Uninstall can export an empty or old database, then delete the real one** (`scripts/uninstall.sh:63`)
+   - **What this is:** Before deleting history, uninstall copies the database so the user can restore it.
+   - **Problem:** Without `sqlite3`, it uses `cp`, which skips rows still in the `-wal` file (SQLite's write-ahead log, where recent writes live). Line 93 then deletes that WAL.
+   - **Fix:** Without `sqlite3`, stop with "install sqlite3 or pass --no-export". Never fall back to `cp`.
+   - **If we skip it:** Users on a Linux box without `sqlite3` lose recent history they were told was exported.
+
+2. **Folder pick in the current directory inserts the wrong path** (`crates/smcli/src/picker.rs:635`)
+   - **What this is:** In folder mode the picker shows the parent folder of each matching file.
+   - **Problem:** For a file right in the cwd, `insert` is `a.rs` (no `/`), so it falls back to the root-relative `src/`. From inside `src/` that path does not exist.
+   - **Fix:** Fall back to `"./"` instead of `path.clone()`. One line, plus a unit test.
+   - **If we skip it:** Ctrl-T folder picks in a subdirectory insert broken paths.
+
+3. **Uninstall export is world-readable and cannot be restored as documented** (`scripts/uninstall.sh:58`)
+   - **What this is:** The export holds the full command history, which can contain secrets.
+   - **Problem:** Files get the umask mode (`0644`). smcli refuses to open a database that others can read, so `SMCLI_DB=…/history.db` fails.
+   - **Fix:** `umask 077` at the top of the script and `chmod 700` the export dir, `chmod 600` the files written.
+   - **If we skip it:** Other local users can read the export, and the documented restore fails.
+
+4. **A far-future timestamp turns service suggestions into NaN** (`crates/smcli-core/src/suggestion_index.rs:116,182`)
+   - **What this is:** The service keeps suggestion scores in memory, stored relative to a base time.
+   - **Problem:** `append` accepts start times up to 1e11. One such run moves `base` to the future; at query time `2^((base−now)/h)` is infinity and old scores are 0, so `0 × inf = NaN`. The SQL path clamps age to 0 and stays finite.
+   - **Fix:** In `SuggestionIndex::add`, clamp `started_at` to `now()` before it touches `base` or the tally. Test with a run at 1e11.
+   - **If we skip it:** One bad clock or crafted record breaks suggestion order until the service restarts.
+
+5. **Background records arriving out of order corrupt "what comes next"** (`crates/smcli-core/src/suggestion_index.rs:115`, `crates/smcli-service/src/service.rs:290`)
+   - **What this is:** Hooks record each command in a background process (`&!` in zsh, `&` in fish), so two quick commands can race.
+   - **Problem:** The index learns transitions in arrival order. `a@100`, `c@300`, then late `b@200` gives "previous = b" and "c is followed by b". The SQL fallback orders by time and gets it right.
+   - **Fix:** Have `SuggestionIndex::add` return `false` when a run is older than its session's last run; the service then drops the index (`state.index = None`) so it rebuilds in order. Test the false return.
+   - **If we skip it:** Transition suggestions are quietly wrong for fast typists, and differ between service and fallback (AGENTS.md says they must match).
+
+### Should fix
+
+6. **Hooks send the command line as flags** (`crates/smcli/src/shell_integration.rs:195,314,424`)
+   - **What this is:** Up/Ctrl-R run `smcli pick "$@" <line>`.
+   - **Problem:** A line like `-la` is parsed as a flag: exit 2, usage printed over the prompt, picker never opens.
+   - **Fix:** Insert `--` before the line in all three hooks.
+   - **If we skip it:** The picker fails on any line starting with `-`.
+
+7. **Records wait behind model load and corpus build** (`crates/smcli-service/src/service.rs:391,438-469`)
+   - **What this is:** Every record, suggest and pick takes the one `state` lock.
+   - **Problem:** `warm_search` holds it across embedding-model load; `current_corpus` holds it while reading every native history file and running a full `GROUP BY` over the database.
+   - **Fix:** Build the engine outside the lock and store it after. For the corpus: stamp under the lock, read files outside, re-take the lock to store.
+   - **If we skip it:** The first suggest after the service starts, and each picker draw during a search rebuild, waits hundreds of ms.
+
+8. **Pruned secrets stay in the search index** (`crates/smcli/src/cli.rs:587-662`)
+   - **What this is:** `smcli prune` removes commands the capture filter now rejects (for example a leaked token) and VACUUMs the database.
+   - **Problem:** The search index (`history.db.search/*.taladb`) still holds the command text until the next search syncs, and the file is not rewritten.
+   - **Fix:** After a non-dry prune that removed anything, call the existing `search_engine(...).reindex(&corpus(...))`, which deletes and rebuilds the index file.
+   - **If we skip it:** "Removed" secrets remain readable on disk.
+
+9. **Bad duration env vars panic the service** (`crates/smcli-service/src/main.rs:48`, `service.rs:84`)
+   - **What this is:** `SMCLI_SERVICE_IDLE` and `SMCLI_FFF_IDLE` set timeouts.
+   - **Problem:** `Duration::from_secs_f64` panics on `inf`, `NaN` or negative.
+   - **Fix:** `.filter(|v: &f64| v.is_finite() && *v >= 0.0)` before the default.
+   - **If we skip it:** A typo kills the service at start; every command silently falls back.
+
+10. **Shutdown runs `exit` while other threads may be mid-call** (`crates/smcli-service/src/service.rs:159-164`)
+    - **What this is:** Idle timeout and `service stop` end the process.
+    - **Problem:** `std::process::exit` runs libc exit handlers while connection and fff threads still run. The signal path already uses `_exit`.
+    - **Fix:** Unlink the socket, then `libc::_exit(0)`. Commits are already durable (WAL), so nothing is lost.
+    - **If we skip it:** Rare hangs at shutdown that leave a dead service owning the lock.
+
+11. **Thread-unsafe `strerror` on connection threads** (`crates/smcli-core/src/unix_socket.rs:25`)
+    - **What this is:** Socket errors are turned into text.
+    - **Problem:** `strerror` shares one static buffer; two failing connections at once race.
+    - **Fix:** Delete the `unsafe` block; use `error.to_string()`.
+    - **If we skip it:** Garbled or crashing error text under load. Lean: −3 lines.
+
+12. **The service on Linux keeps the spawning shell's open files** (`crates/smcli-core/src/service_client.rs:145`)
+    - **What this is:** The CLI starts the service with `posix_spawn`.
+    - **Problem:** macOS closes inherited fds; Linux does not, so `exec 3>log` in a shell stays open for the service's 30-minute life.
+    - **Fix:** On glibc add `posix_spawn_file_actions_addclosefrom_np(&mut actions, 3)`.
+    - **If we skip it:** Files and pipes stay held open on Linux.
+
+13. **Health check copies the index file name by hand** (`crates/smcli/src/cli.rs:1035-1041`)
+    - **What this is:** `smcli health` must find the same file `HistorySearch::index_name` builds.
+    - **Problem:** The format string is duplicated, and the comment says so. Bumping `VERSION` in `index.rs` makes health report "not built" forever.
+    - **Fix:** Make `index_name` `pub` and call it. Lean: −6 lines.
+    - **If we skip it:** A wrong health report after the next index format change.
+
+14. **One random-read failure drops records** (`crates/smcli-core/src/history.rs:176-186`)
+    - **What this is:** The 5-field `record` makes its own event id.
+    - **Problem:** If `/dev/urandom` cannot be read, the id is all zeros; the second such record hits the unique index and is silently skipped.
+    - **Fix:** Return `Result` and `?` the open and the read.
+    - **If we skip it:** Silent data loss in a broken sandbox.
+
+15. **Missing `HOME` puts the database under `/`** (`crates/smcli/src/cli.rs:184`)
+    - **What this is:** The CLI finds the db and config from `HOME`.
+    - **Problem:** It falls back to `/`; `ServiceClient` falls back to `getpwuid`. They can then pick different configs.
+    - **Fix:** Move the `getpwuid` fallback into one `home_dir` helper in `smcli-core` and use it in both places.
+    - **If we skip it:** cron or `env -i` runs read and write the wrong files.
+
+16. **File-index build leaks its slot on panic** (`crates/smcli-service/src/file_search.rs:65-88`)
+    - **What this is:** At most `capacity` fff indexes build at once; waiters sleep on a condvar.
+    - **Problem:** If `FilePicker::new_with_shared_state` panics, `building` stays high and `pending` stays `None`; waiters for that root hang forever.
+    - **Fix:** Wrap the build in `catch_unwind` (turn a panic into an `Err`), so the existing cleanup always runs.
+    - **If we skip it:** A bad repository makes later Ctrl-T requests for it hang until the service restarts.
+
+### Nice to have
+
+17. **`shell-init` hides a broken config** (`cli.rs:208`): print `smcli: <error>; using default keys` to stderr, then continue with defaults. Failing outright would leave the shell with no hooks at all.
+18. **Picker leaves the alternate screen on setup error** (`picker.rs:727-760`): send `LeaveAlternateScreen` in the `Err` arm. Also delete the unused `height` parameter of `TerminalSession::new` (`let _ = height;`) and its two call-site arguments.
+19. **Test robustness:** `test-shells.py:882` should wait on every writer and print the failing command and exit code; `context_cache.rs:442` should hold the reader on a channel instead of racing 600 ms against 300 ms.
+20. **`try_lock` error treated as "another service won"** (`smcli-service/src/main.rs:42`): match `TryLockError::WouldBlock` for the silent exit; report other errors.
+
+Left out: 2 smaller items (imports skip the capture filter by design; `ProjectContext::discover` runs twice in `pick`).
+
+Verdict: fix 1–5 first (data loss, broken export, wrong inserts, wrong service rankings); 6–16 are small and safe to batch.
+
+Lean: about −15 lines possible, −0 dependencies.
+
+Not checked: Linux run (`make linux` — Docker daemon is down), resize behavior live, `highlight.rs`/`menu.rs`/`parse.rs`, license backlog (unchanged; see above).

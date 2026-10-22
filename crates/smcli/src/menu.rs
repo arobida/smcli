@@ -132,7 +132,7 @@ fn arguments(command: &str, input: &str, shell: &str) -> Vec<String> {
 }
 
 fn choose(mut selected: usize) -> Result<Option<usize>> {
-    let mut terminal = TerminalSession::new(22)?;
+    let mut terminal = TerminalSession::new()?;
     loop {
         terminal.terminal.draw(|frame| {
             let area = frame.area();
