@@ -11,7 +11,7 @@ See `agents/reference/fff-licenses.md` for the fff audit and the open xdiff (LGP
 ### potion-code-16M-v2 (MIT)
 
 https://huggingface.co/minishlab/potion-code-16M-v2, revision `e9d2a44ca6a05ac6685f3b23709ea57eb7352d5b`, by Minish Lab, 
-embedded in both executables (`Models/potion-code-16M-v2`). The model card declares the MIT license; the repository 
+fine-tuned on NL2Bash and NL2SH-ALFA pairs (both MIT) into potion-shell-16m, which is embedded in both executables (`Models/potion-shell-16m`). The model card declares the MIT license; the repository 
 ships no separate license file for it, so the copyright line is the publisher's and the text below is the standard MIT license.
 
 ```text

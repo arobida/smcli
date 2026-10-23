@@ -21,27 +21,28 @@ keys), any recent Zsh, or Fish.
 ## Quick install with the script
 
 `install.sh` does everything below in one step:
+
 - It installs both executables and `smcli-uninstall` to `~/.local/bin`, clearing the macOS quarantine flag.
 - It adds the shell hooks to your startup files.
 - It asks for the picker keys and search model.
 - It starts the service.
 
-```sh
+``` sh
 ./install.sh                 # from an unpacked release (the binaries sit beside it)
 scripts/install.sh           # from a source checkout: builds with `make release` first (needs Rust)
 ```
 
-| Option | Meaning |
-|---|---|
-| `--prefix DIR` | Where the executables go (default `~/.local/bin`) |
-| `--from DIR` | Install the `smcli` and `smcli-service` found in `DIR` (e.g. `dist`) |
-| `--shells LIST` | `zsh,bash,fish` to hook; `all` (every one installed) or `none`. Default: your login shell |
-| `--keys LIST` | Picker keys: `ctrl-r,left,right`, `ctrl-r`, `left`, `right` or `none`. Default: ask in a terminal |
-| `--yes` | Ask nothing; without `--keys`, keeps the default keys (Up and Ctrl-R) |
+| Option          | Meaning                                                                                           |
+| --------------- | ------------------------------------------------------------------------------------------------- |
+| `--prefix DIR`  | Where the executables go (default `~/.local/bin`)                                                 |
+| `--from DIR`    | Install the `smcli` and `smcli-service` found in `DIR` (e.g. `dist`)                              |
+| `--shells LIST` | `zsh,bash,fish` to hook; `all` (every one installed) or `none`. Default: your login shell         |
+| `--keys LIST`   | Picker keys: `ctrl-r,left,right`, `ctrl-r`, `left`, `right` or `none`. Default: ask in a terminal |
+| `--yes`         | Ask nothing; without `--keys`, keeps the default keys (Up and Ctrl-R)                             |
 
 The hooks go in a marked block at the end of each file, so they load after other tools that bind keys:
 
-```sh
+``` sh
 # >>> smcli >>>
 # Added by smcli install.sh; remove with smcli-uninstall. Keep it below other tools that bind keys.
 eval "$('/Users/you/.local/bin/smcli' shell-init zsh)"
@@ -61,7 +62,7 @@ Open a new terminal afterwards. The rest of this page is the same steps done by 
 
 1. Unpack the release archive and copy both executables to one directory on your `PATH`:
 
-   ```sh
+   ``` sh
    mkdir -p ~/.local/bin
    cp smcli smcli-service ~/.local/bin/
    ```
@@ -72,7 +73,7 @@ Open a new terminal afterwards. The rest of this page is the same steps done by 
 2. If macOS blocks a downloaded binary ("cannot be opened because the developer cannot be verified"), clear the
    quarantine flag:
 
-   ```sh
+   ``` sh
    xattr -d com.apple.quarantine ~/.local/bin/smcli ~/.local/bin/smcli-service
    ```
 
@@ -90,7 +91,7 @@ Tools:
 
 Build:
 
-```sh
+``` sh
 git clone <repository> smcli && cd smcli
 make fresh
 ```
@@ -103,7 +104,7 @@ symlinks, because your shell hooks may point at them.
 Point your shell at the `dist/smcli` symlink, not at a timestamped file, so every rebuild is picked up by new
 shells:
 
-```sh
+``` sh
 # in ~/.zshrc (use the absolute path of your checkout)
 eval "$("$HOME/Dev/smcli/dist/smcli" shell-init zsh)"
 ```
@@ -112,13 +113,13 @@ To try a build in the current shell only, run the `eval` line that `make fresh` 
 
 For development:
 
-| Command | What it does |
-|---|---|
-| `make build` | Debug build (`target/debug/`) |
-| `make run ARGS="search git"` | Debug build, then run it |
-| `make test` | Unit tests, then the interactive Bash/Zsh/Fish, service and file-picker tests on real terminals |
-| `make ranking` | Ranking quality report; fails when the ranking tests fail |
-| `make baseline` | Black-box benchmark of the release build |
+| Command                      | What it does                                                                                    |
+| ---------------------------- | ----------------------------------------------------------------------------------------------- |
+| `make build`                 | Debug build (`target/debug/`)                                                                   |
+| `make run ARGS="search git"` | Debug build, then run it                                                                        |
+| `make test`                  | Unit tests, then the interactive Bash/Zsh/Fish, service and file-picker tests on real terminals |
+| `make ranking`               | Ranking quality report; fails when the ranking tests fail                                       |
+| `make baseline`              | Black-box benchmark of the release build                                                        |
 
 `make test` uses throwaway homes and databases and never reads your real history. Shells that aren't installed are
 skipped and reported. On Linux, install the packages above, then run `make release`. `make linux` runs the full
@@ -130,7 +131,7 @@ Then continue with [Set up your shell](#set-up-your-shell).
 
 1. **Choose the picker keys and the search model:**
 
-   ```sh
+   ``` sh
    smcli init
    ```
 
@@ -145,11 +146,11 @@ Then continue with [Set up your shell](#set-up-your-shell).
    ```
 
    Up always opens the picker. On an empty line in Bash and Zsh, Left opens the same history search as Ctrl-R and Right opens directory suggestions. A line that already has text keeps normal arrow movement. Then it offers any Ollama embedding models you have installed; the default is the
-   built-in potion-code-16M-v2 model, which needs nothing extra.
+   built-in potion-shell-16m model, which needs nothing extra.
 
    For scripts and dotfiles, use flags instead; they never ask:
 
-   ```sh
+   ``` sh
    smcli init --keys ctrl-r,left,right     # or ctrl-r, left, right, none
    smcli init --default --keys ctrl-r   # model and keys together
    ```
@@ -158,24 +159,25 @@ Then continue with [Set up your shell](#set-up-your-shell).
 
 2. **Load the hooks.** Add one line to your shell's startup file. Use the binary's absolute path:
 
-   | Shell | File | Line |
-   |---|---|---|
-   | Zsh | `~/.zshrc` | `eval "$(~/.local/bin/smcli shell-init zsh)"` |
-   | Bash | `~/.bashrc` | `eval "$(~/.local/bin/smcli shell-init bash)"` |
-   | Fish | `~/.config/fish/config.fish` | `~/.local/bin/smcli shell-init fish \| source` |
+   | Shell | File                         | Line                                           |
+   | ----- | ---------------------------- | ---------------------------------------------- |
+   | Zsh   | `~/.zshrc`                   | `eval "$(~/.local/bin/smcli shell-init zsh)"`  |
+   | Bash  | `~/.bashrc`                  | `eval "$(~/.local/bin/smcli shell-init bash)"` |
+   | Fish  | `~/.config/fish/config.fish` | `~/.local/bin/smcli shell-init fish \| source` |
 
    Put the line **after** other tools that bind keys (fzf, atuin, oh-my-zsh, zsh-autosuggestions): smcli leaves
    keys that another tool already bound alone and says which it kept. The hooks never modify your native history
    file.
 
    Optional, set before the line:
+
    - `SMCLI_NO_KEYS=1`: bind no keys (history is still recorded).
    - `SMCLI_EXTRA_KEYS=1`: also Left and Right on an empty line, Ctrl-Right and Alt-; (Bash and Zsh). Fish keeps Right for autosuggestions.
    - `SMCLI_DB=/path/history.db`: another database (it must not be your shell's `HISTFILE`).
 
 3. **Open a new terminal and check:**
 
-   ```sh
+   ``` sh
    smcli health            # search index and model
    smcli service status    # the background service (it starts on first use)
    ```
@@ -197,13 +199,14 @@ message asking you to reload.
 
 ## Uninstall
 
-```sh
+``` sh
 smcli-uninstall
 ```
 
 It asks once, then:
 
 1. **Exports your history** to `~/smcli-export-<date>/` (`--export DIR` to choose):
+
    - `history.db` is a consistent copy of the database. Use it again with `SMCLI_DB=…/history.db`, or open it with
      `sqlite3`.
    - `history.json` holds every recorded command with its directory, exit code, times and session.
@@ -212,36 +215,39 @@ It asks once, then:
    Export requires `sqlite3`; install it or pass `--no-export` to skip the export. The export directory is private
    (`0700`), and exported history and config files are owner-readable/writable only (`0600`), including existing
    destinations. If the export fails, nothing is removed.
+
 2. Stops the service.
+
 3. Removes the smcli block from each startup file and leaves the rest of the file as it was. It warns about
    `shell-init` lines you added by hand, which it doesn't touch.
+
 4. Deletes the history database, search index, settings and service socket.
+
 5. Deletes `smcli`, `smcli-service` and itself.
 
-| Option | Meaning |
-|---|---|
-| `--export DIR` | Where the export goes |
-| `--no-export` | Delete the history without exporting it |
-| `--keep-data` | Remove the program and hooks only; keep history, index and settings |
+| Option         | Meaning                                                             |
+| -------------- | ------------------------------------------------------------------- |
+| `--export DIR` | Where the export goes                                               |
+| `--no-export`  | Delete the history without exporting it                             |
+| `--keep-data`  | Remove the program and hooks only; keep history, index and settings |
 | `--prefix DIR` | Where smcli is installed (default: the uninstaller's own directory) |
-| `--yes` | Don't ask (required when not run from a terminal) |
+| `--yes`        | Don't ask (required when not run from a terminal)                   |
 
 Terminals that are already open keep the old hooks until they exit. Native Bash, Zsh and Fish history is never
 touched.
 
 By hand: run `smcli service stop`, remove the `shell-init` line, delete the executables, then delete these:
 
-| What | Where |
-|---|---|
-| Recorded history | `~/.local/share/smcli/history.db` (or `SMCLI_DB`) |
-| Search index | `~/.local/share/smcli/history.db.search/` |
-| Settings | `~/.config/smcli/` |
-| Service socket | `$SMCLI_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/smcli`, else `$TMPDIR/smcli-<uid>` |
+| What             | Where                                                                           |
+| ---------------- | ------------------------------------------------------------------------------- |
+| Recorded history | `~/.local/share/smcli/history.db` (or `SMCLI_DB`)                               |
+| Search index     | `~/.local/share/smcli/history.db.search/`                                       |
+| Settings         | `~/.config/smcli/`                                                              |
+| Service socket   | `$SMCLI_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/smcli`, else `$TMPDIR/smcli-<uid>` |
 
 ## Troubleshooting
 
-- **No picker on Up or Ctrl-R:** another tool may own the key; the shell prints `smcli: kept existing key
-  bindings: …` at startup. Move the smcli line after that tool, or bind the key to `_smcli_pick` yourself. Also
+- **No picker on Up or Ctrl-R:** another tool may own the key; the shell prints `smcli: kept existing key bindings: …` at startup. Move the smcli line after that tool, or bind the key to `_smcli_pick` yourself. Also
   check `SMCLI_NO_KEYS` isn't set and, for Bash, that it's 4.0 or later (`echo $BASH_VERSION`).
 - **"files and grep need smcli-service":** `smcli-service` isn't next to `smcli`, or `SMCLI_SERVICE=off` is set.
 - **"not inserting a path inside an open quote":** close the quote first. File paths are only inserted where the

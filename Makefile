@@ -2,7 +2,7 @@ PYTHON ?= python3
 DIST := dist
 STAMP := $(shell date +%Y%m%d-%H%M%S)-$(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)
 
-.PHONY: build release fresh test clean run baseline ranking linux
+.PHONY: build release fresh test clean run baseline ranking linux docs notices
 
 # Debug build.
 build:
@@ -42,6 +42,14 @@ baseline: release
 linux:
 	docker run --rm -v "$(CURDIR)":/src -w /src -v smcli-cargo:/usr/local/cargo/registry -v smcli-target:/target \
 		-e CARGO_TARGET_DIR=/target rust:latest sh -c 'apt-get update -qq && apt-get install -y -qq zsh fish python3 > /dev/null && git config --global --add safe.directory "*" && bash scripts/test.sh'
+
+# Formats every hand-written markdown doc with iwe. Generated docs are skipped: regenerate them instead.
+GENERATED_DOCS := THIRD_PARTY_NOTICES
+docs:
+	iwe normalize $$(iwe find --limit 0 -f keys | grep -vxF $(addprefix -e ,$(GENERATED_DOCS)) | sed 's/^/-k /')
+
+notices:
+	$(PYTHON) scripts/gen-notices.py
 
 run:
 	cargo run -p smcli -- $(ARGS)

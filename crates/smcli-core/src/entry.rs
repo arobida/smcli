@@ -29,6 +29,18 @@ pub fn trim_slash(directory: &str) -> &str {
 
 // shortcut: no `time()` parser for `30m`/`YYYY-MM-DD` yet; port it with the CLI flags in Phase 4.
 impl SearchFilter {
+    /// Fills unset fields from `parsed`; values already present in `self` win.
+    pub fn merge_parsed(&mut self, parsed: &SearchFilter) {
+        if self.program.is_none() { self.program = parsed.program.clone(); }
+        if self.subcommand.is_none() { self.subcommand = parsed.subcommand.clone(); }
+        if self.author.is_none() { self.author = parsed.author.clone(); }
+        if self.flag.is_none() { self.flag = parsed.flag.clone(); }
+        if self.directory.is_none() { self.directory = parsed.directory.clone(); }
+        if self.min_runs.is_none() { self.min_runs = parsed.min_runs; }
+        if self.since.is_none() { self.since = parsed.since; }
+        if self.before.is_none() { self.before = parsed.before; }
+    }
+
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }

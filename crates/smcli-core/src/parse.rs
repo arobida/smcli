@@ -16,8 +16,12 @@ pub struct CommandBreakdown {
     pub arguments: Vec<String>,
 }
 
-// shortcut: common tools/options only; use complete tool schemas for semantic parsing.
-const TOOLS: [&str; 8] = ["git", "docker", "npm", "cargo", "swift", "kubectl", "brew", "smcli"];
+/// A first argument that reads as a verb (`create`, `i`, `run-script`), not a path, package or value.
+fn is_subcommand(word: &str) -> bool {
+    word.starts_with(|c: char| c.is_ascii_alphabetic()) && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+// shortcut: value options for common tools only; use complete tool schemas for semantic parsing.
 
 fn value_options(key: &str) -> &'static [&'static str] {
     match key {
@@ -81,7 +85,7 @@ impl CommandBreakdown {
                 } else {
                     flags.push(CommandFlag { name: word.clone(), value: None });
                 }
-            } else if options && TOOLS.contains(&tool.as_str()) && subcommand.is_none() {
+            } else if options && subcommand.is_none() && targets.is_empty() && is_subcommand(word) {
                 subcommand = Some(word.clone());
             } else {
                 targets.push(word.clone());
@@ -204,6 +208,10 @@ mod tests {
             CommandFlag { name: "--amend".into(), value: None },
         ]);
         assert_eq!(parsed.targets, ["file"]);
+        assert_eq!(CommandBreakdown::parse("bun create cloudflare@latest").unwrap().subcommand.as_deref(), Some("create"));
+        assert_eq!(CommandBreakdown::parse("bun i -g x").unwrap().subcommand.as_deref(), Some("i"));
+        assert_eq!(CommandBreakdown::parse("cat ./notes.txt").unwrap().subcommand, None);
+        assert_eq!(CommandBreakdown::parse("npx @scope/pkg init").unwrap().subcommand, None);
         assert!(CommandBreakdown::parse("ls | wc -l").is_none());
         assert!(CommandBreakdown::parse("echo $(date)").is_none());
         assert_eq!(command_flags("ls -la | grep --color=auto x"), ["-la", "--color"]);

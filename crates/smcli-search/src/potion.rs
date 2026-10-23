@@ -5,11 +5,11 @@ use model2vec_rs::model::StaticModel;
 
 macro_rules! model_file {
     ($name:literal) => {
-        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Models/potion-code-16M-v2/", $name))
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Models/potion-shell-16m/", $name))
     };
 }
 
-/// potion-code-16M-v2, embedded in the binary or loaded from a directory. Load once per process; embed in batches.
+/// potion-shell-16m (fine-tuned potion-code-16M-v2), embedded in the binary or loaded from a directory. Load once per process; embed in batches.
 pub struct Potion {
     model: StaticModel,
     /// Names the model in the index file name, so another model never reuses these vectors.
@@ -18,7 +18,7 @@ pub struct Potion {
 }
 
 impl Potion {
-    pub const NAME: &str = "potion-code-16M-v2";
+    pub const NAME: &str = "potion-shell-16m";
 
     // Loads straight from the embedded bytes, so nothing is written to the runtime dir.
     pub fn bundled() -> Result<Self> {

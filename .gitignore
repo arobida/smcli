@@ -1,6 +1,5 @@
 .DS_Store
 .netrc
-graphify-out/
 dist/
 /target
 # Old Swift build output; delete it with rm -rf .build

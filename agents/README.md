@@ -10,12 +10,7 @@ Working notes, reviews and reference material for agents. Nothing here is built 
 
 ## reviews/
 
-- `caveman-review.md` — consolidated code and release-readiness review, including the 2026-10-22 final audit.
-
-## reports/
-
-- `2026-10-20-backend.md` — after-action report for the Swift backend plan: service, shell adapters, context, fff and ranking.
-- `2026-10-22-audit-fixes.md` — after-action report for the final audit fixes across the Rust crates and install scripts.
+- `2026-10-23-Code_Review.md` — consolidated code review: open findings from every earlier review and audit, plus what was resolved.
 
 ## plans/
 

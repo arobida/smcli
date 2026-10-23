@@ -12,7 +12,7 @@ use taladb::fts::HybridQuery;
 use taladb::json::filter_from_json;
 use taladb::{Database, Stage, TypedCollection, Value};
 
-use crate::corpus::{Hit, SearchSignals, coverage, is_literal_query, program_arguments, rerank, search_document};
+use crate::corpus::{Hit, SearchSignals, coverage, is_literal_query, parse_markers, program_arguments, query_filter, rerank, search_document};
 use crate::{Potion, ShellTokenizer};
 
 /// One indexed command; metadata fields mirror `SearchFilter` so filters narrow candidates before ranking.
@@ -131,77 +131,111 @@ impl HistorySearch {
                 &computed
             }
         };
-        // Literal queries lean on keywords; intent queries weigh both legs equally.
-        let literal = is_literal_query(query, programs);
+        // Derive filters from the query itself before touching the index. Explicit `$word` markers
+        // take priority and are strict; otherwise plain words are auto-parsed into filters.
+        let directories: HashSet<String> = corpus.values().filter_map(|e| e.last_directory.clone()).collect();
+        let (stripped, marked_filter, has_markers) = parse_markers(query, programs, &directories);
+        let parsed_filter = if has_markers { marked_filter } else { query_filter(query, programs, &directories) };
+        // Literal queries lean on keywords; intent queries weigh both legs equally. Both see the
+        // stripped query so `$word` markers do not accidentally make a query literal.
+        let literal = is_literal_query(&stripped, programs);
         // No history yet: nothing to embed, but project commands can still answer.
         if corpus.is_empty() {
-            let hits = signals.additions(query, corpus, &HashSet::new(), filter, now);
-            return Ok(rerank(hits, literal, query, now, signals).into_iter().take(limit).collect());
+            let hits = signals.additions(&stripped, corpus, &HashSet::new(), filter, now);
+            return Ok(rerank(hits, literal, &stripped, now, signals).into_iter().take(limit).collect());
         }
         let Some(_lock) = self.lock_index(20)? else {
             // The service (or a reindex) holds the index; TalaDB refuses a second process, so no semantic leg.
-            return Ok(text_fallback(query, corpus, limit, filter, literal, signals, now));
+            return Ok(text_fallback(&stripped, corpus, limit, filter, literal, signals, now, &parsed_filter, has_markers));
         };
         let name = self.index_name();
         let db = self.open_index(&name)?;
         let commands = db.typed::<IndexedCommand>("commands")?;
         self.sync(&commands, corpus)?;
         // Filters narrow candidates in the index, so a bounded pool is enough to rerank with usage.
-        let text = ShellTokenizer::encoded(query);
-        let vector = self.potion.embed(&[query.to_string()]).remove(0);
+        let text = ShellTokenizer::encoded(&stripped);
+        let vector = self.potion.embed(&[stripped.clone()]).remove(0);
         let k = (limit * 4).max(40);
-        let index_filter = index_filter(filter).map(|f| filter_from_json(&f)).transpose()?;
         let raw = commands.raw();
         let command_of = |document: &taladb::Document| match document.get("command") {
             Some(Value::Str(command)) => Some(command.clone()),
             _ => None,
         };
-        // Fused score per command, best first.
-        let mut results: Vec<(String, f64)> = if literal {
-            // Weighted sum of each leg's score over its best: rank fusion would leave the runner-up level
-            // with an exact keyword hit, and usage would then decide.
-            let keyword: Vec<(String, f64)> = raw
-                .search_text_with("terms", &text, k, &Default::default(), index_filter.clone())?
-                .into_iter()
-                .filter_map(|hit| Some((command_of(&hit.document)?, f64::from(hit.score))))
-                .collect();
-            let dense: Vec<(String, f64)> = raw
-                .find_nearest("embedding", &vector, k, index_filter)?
-                .into_iter()
-                .filter_map(|hit| Some((command_of(&hit.document)?, f64::from(hit.score))))
-                .collect();
-            let mut scores: HashMap<String, f64> = HashMap::new();
-            for (hits, weight) in [(keyword, 0.7), (dense, 0.3)] {
-                let best = hits.iter().map(|h| h.1).fold(0.0, f64::max);
-                if best > 0.0 {
-                    for (command, score) in hits {
-                        *scores.entry(command).or_insert(0.0) += weight * score / best;
+        let search_with = |filter: &SearchFilter| -> Result<Vec<(String, f64)>> {
+            let index_filter = index_filter(filter).map(|f| filter_from_json(&f)).transpose()?;
+            if literal {
+                // Weighted sum of each leg's score over its best: rank fusion would leave the runner-up level
+                // with an exact keyword hit, and usage would then decide.
+                let keyword: Vec<(String, f64)> = raw
+                    .search_text_with("terms", &text, k, &Default::default(), index_filter.clone())?
+                    .into_iter()
+                    .filter_map(|hit| Some((command_of(&hit.document)?, f64::from(hit.score))))
+                    .collect();
+                let dense: Vec<(String, f64)> = raw
+                    .find_nearest("embedding", &vector, k, index_filter)?
+                    .into_iter()
+                    .filter_map(|hit| Some((command_of(&hit.document)?, f64::from(hit.score))))
+                    .collect();
+                let mut scores: HashMap<String, f64> = HashMap::new();
+                for (hits, weight) in [(keyword, 0.7), (dense, 0.3)] {
+                    let best = hits.iter().map(|h| h.1).fold(0.0, f64::max);
+                    if best > 0.0 {
+                        for (command, score) in hits {
+                            *scores.entry(command).or_insert(0.0) += weight * score / best;
+                        }
+                    }
+                }
+                let mut sorted: Vec<(String, f64)> = scores.into_iter().collect();
+                sorted.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                Ok(sorted)
+            } else {
+                let mut hybrid = HybridQuery::new("terms", &text, "embedding", &vector, k);
+                hybrid.filter = index_filter;
+                Ok(raw.hybrid_search(hybrid)?
+                    .into_iter()
+                    .filter_map(|hit| Some((command_of(&hit.document)?, f64::from(hit.score))))
+                    .collect())
+            }
+        };
+        let parsed_any = parsed_filter.program.is_some() || parsed_filter.subcommand.is_some() || parsed_filter.directory.is_some();
+        let mut merged_filter = filter.clone();
+        if parsed_any {
+            merged_filter.merge_parsed(&parsed_filter);
+        }
+        let active_filter: &SearchFilter = if parsed_any { &merged_filter } else { filter };
+        let mut hits: Vec<Hit> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut results = search_with(active_filter)?;
+        let best = results.iter().map(|r| r.1).fold(f64::NEG_INFINITY, f64::max);
+        for (command, score) in results.drain(..) {
+            if let Some(entry) = corpus.get(&command).filter(|e| active_filter.allows(e)) {
+                if seen.insert(command.clone()) {
+                    hits.push((entry.clone(), if best > 0.0 { score / best } else { 1.0 }));
+                }
+            }
+        }
+        // Auto-parsed filters get a safety net: if they return too few hits, fall back to the
+        // explicit filter. When the parsed filter produced no hits at all it was likely wrong, so
+        // the fallback is unscaled; otherwise fallback hits are damped so filtered hits rank first.
+        // Markers are strict and do not fall back.
+        let parsed_useful = parsed_any && !hits.is_empty();
+        if hits.len() < limit && parsed_any && !has_markers {
+            let mut results = search_with(filter)?;
+            let best = results.iter().map(|r| r.1).fold(f64::NEG_INFINITY, f64::max);
+            let scale = if parsed_useful { 0.5 } else { 1.0 };
+            for (command, score) in results.drain(..) {
+                if let Some(entry) = corpus.get(&command).filter(|e| filter.allows(e)) {
+                    if seen.insert(command.clone()) {
+                        hits.push((entry.clone(), (if best > 0.0 { score / best } else { 1.0 }) * scale));
                     }
                 }
             }
-            let mut sorted: Vec<(String, f64)> = scores.into_iter().collect();
-            sorted.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            sorted
-        } else {
-            let mut hybrid = HybridQuery::new("terms", &text, "embedding", &vector, k);
-            hybrid.filter = index_filter;
-            raw.hybrid_search(hybrid)?
-                .into_iter()
-                .filter_map(|hit| Some((command_of(&hit.document)?, f64::from(hit.score))))
-                .collect()
-        };
+        }
         drop(db);
-        let best = results.iter().map(|r| r.1).fold(f64::NEG_INFINITY, f64::max);
-        let mut hits: Vec<Hit> = results
-            .drain(..)
-            .filter_map(|(command, score)| {
-                let entry = corpus.get(&command).filter(|e| filter.allows(e))?;
-                Some((entry.clone(), if best > 0.0 { score / best } else { 1.0 }))
-            })
-            .collect();
+        let final_filter: &SearchFilter = if parsed_useful { &merged_filter } else { filter };
         let existing: HashSet<String> = hits.iter().map(|h| h.0.command.clone()).collect();
-        hits.extend(signals.additions(query, corpus, &existing, filter, now));
-        Ok(rerank(hits, literal, query, now, signals).into_iter().take(limit).collect())
+        hits.extend(signals.additions(&stripped, corpus, &existing, final_filter, now));
+        Ok(rerank(hits, literal, &stripped, now, signals).into_iter().take(limit).collect())
     }
 
     /// Discards the index and embeds every command again. Returns the number embedded.
@@ -362,18 +396,51 @@ fn fingerprints(commands: &TypedCollection<IndexedCommand>) -> Result<HashMap<St
 }
 
 /// Search without the index: commands sharing the query's words, by how much of the query they cover.
+/// `query` is already stripped of `$word` markers; `parsed_filter` and `has_markers` come from the
+/// same parsing done on the indexed path so a held lock does not change ranking behavior.
 fn text_fallback(query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter, literal: bool,
-                 signals: &SearchSignals, now: f64) -> Vec<SearchEntry> {
+                 signals: &SearchSignals, now: f64, parsed_filter: &SearchFilter, has_markers: bool) -> Vec<SearchEntry> {
+    let parsed_any = parsed_filter.program.is_some() || parsed_filter.subcommand.is_some() || parsed_filter.directory.is_some();
+    let mut merged_filter = filter.clone();
+    if parsed_any {
+        merged_filter.merge_parsed(parsed_filter);
+    }
     let terms: Vec<String> = query.to_lowercase().split_whitespace().map(String::from).collect();
-    let mut hits: Vec<Hit> = corpus
-        .values()
-        .filter(|e| filter.allows(e))
-        .filter_map(|e| Some((e.clone(), Some(coverage(&e.command, &terms)).filter(|c| *c > 0.0)?)))
-        .collect();
-    hits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.command.cmp(&b.0.command)));
-    hits.truncate((limit * 4).max(40));
+    let mut hits: Vec<Hit> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    if parsed_any {
+        let mut filtered: Vec<Hit> = corpus
+            .values()
+            .filter(|e| merged_filter.allows(e))
+            .filter_map(|e| Some((e.clone(), Some(coverage(&e.command, &terms)).filter(|c| *c > 0.0)?)))
+            .collect();
+        filtered.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.command.cmp(&b.0.command)));
+        filtered.truncate((limit * 4).max(40));
+        for (entry, score) in filtered {
+            if seen.insert(entry.command.clone()) {
+                hits.push((entry, score));
+            }
+        }
+    }
+    let parsed_useful = parsed_any && !hits.is_empty();
+    if hits.len() < limit && !has_markers {
+        let mut fallback: Vec<Hit> = corpus
+            .values()
+            .filter(|e| filter.allows(e))
+            .filter_map(|e| Some((e.clone(), Some(coverage(&e.command, &terms)).filter(|c| *c > 0.0)?)))
+            .collect();
+        fallback.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.command.cmp(&b.0.command)));
+        fallback.truncate((limit * 4).max(40));
+        let scale = if parsed_useful { 0.5 } else { 1.0 };
+        for (entry, score) in fallback {
+            if seen.insert(entry.command.clone()) {
+                hits.push((entry, score * scale));
+            }
+        }
+    }
+    let final_filter: &SearchFilter = if parsed_useful { &merged_filter } else { filter };
     let existing: HashSet<String> = hits.iter().map(|h| h.0.command.clone()).collect();
-    hits.extend(signals.additions(query, corpus, &existing, filter, now));
+    hits.extend(signals.additions(query, corpus, &existing, final_filter, now));
     rerank(hits, literal, query, now, signals).into_iter().take(limit).collect()
 }
 
@@ -413,5 +480,111 @@ mod tests {
         let fallback = engine.search("git", &corpus, 3, &filter, None, &none, 0.0).unwrap();
         assert_eq!(fallback.iter().map(|e| e.command.as_str()).collect::<Vec<_>>(), ["git status"]);
         drop(held);
+    }
+
+    #[test]
+    fn setup_creates_expected_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HistorySearch::new(dir.path().join("index"), Potion::bundled().unwrap());
+        let _lock = engine.lock_index(1).unwrap().unwrap();
+        let name = engine.index_name();
+        let db = engine.open_index(&name).unwrap();
+        let commands = db.typed::<IndexedCommand>("commands").unwrap();
+        let info = commands.raw().list_indexes().unwrap();
+        for field in ["doc", "program", "subcommand", "author", "lastRun"] {
+            assert!(info.btree.contains(&field.to_string()), "missing btree index on {field}");
+        }
+        assert!(info.fts.contains(&"terms".to_string()), "missing fts index on terms");
+        assert!(info.vector.contains(&"embedding".to_string()), "missing vector index on embedding");
+    }
+
+    #[test]
+    fn setup_twice_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HistorySearch::new(dir.path().join("index"), Potion::bundled().unwrap());
+        let corpus: HashMap<String, SearchEntry> = ["git status", "docker ps"]
+            .iter()
+            .map(|c| (c.to_string(), SearchEntry::new(c, 1, "native")))
+            .collect();
+        let none = SearchSignals::default();
+        engine.search("docker", &corpus, 1, &SearchFilter::default(), None, &none, 0.0).unwrap();
+
+        let _lock = engine.lock_index(1).unwrap().unwrap();
+        let name = engine.index_name();
+        let first = engine.open_index(&name).unwrap();
+        let commands = first.typed::<IndexedCommand>("commands").unwrap();
+        let info = commands.raw().list_indexes().unwrap();
+        let count = commands.count(json!({})).unwrap();
+        drop(commands);
+        drop(first);
+
+        let second = engine.open_index(&name).unwrap();
+        let commands2 = second.typed::<IndexedCommand>("commands").unwrap();
+        assert_eq!(commands2.count(json!({})).unwrap(), count);
+        assert_eq!(commands2.raw().list_indexes().unwrap().btree, info.btree);
+        assert_eq!(commands2.raw().list_indexes().unwrap().fts, info.fts);
+        assert_eq!(commands2.raw().list_indexes().unwrap().vector, info.vector);
+    }
+
+    #[test]
+    fn stored_vector_dimension_matches_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HistorySearch::new(dir.path().join("index"), Potion::bundled().unwrap());
+        let corpus: HashMap<String, SearchEntry> = [("docker ps".to_string(), SearchEntry::new("docker ps", 1, "native"))].into_iter().collect();
+        engine.search("docker", &corpus, 1, &SearchFilter::default(), None, &SearchSignals::default(), 0.0).unwrap();
+
+        let name = engine.index_name();
+        let db = engine.open_index(&name).unwrap();
+        let commands = db.typed::<IndexedCommand>("commands").unwrap();
+        let indexed = commands.find_one(json!({"command": "docker ps"})).unwrap().unwrap();
+        assert_eq!(indexed.embedding.len(), engine.potion.dimension());
+    }
+
+    #[test]
+    fn hybrid_query_returns_expected_doc() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HistorySearch::new(dir.path().join("index"), Potion::bundled().unwrap());
+        let corpus: HashMap<String, SearchEntry> = ["git status", "docker ps", "ls -la"]
+            .iter()
+            .map(|c| (c.to_string(), SearchEntry::new(c, 1, "native")))
+            .collect();
+        // "ps docker" is not a literal command, so this exercises the HybridQuery path.
+        let hits = engine.search("ps docker", &corpus, 3, &SearchFilter::default(), None, &SearchSignals::default(), 0.0).unwrap();
+        assert!(hits.iter().any(|e| e.command == "docker ps"), "hybrid query missed docker ps: {:?}", hits);
+    }
+
+    #[test]
+    fn filters_narrow_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HistorySearch::new(dir.path().join("index"), Potion::bundled().unwrap());
+        let mut git = SearchEntry::new("git status", 1, "native");
+        git.last_directory = Some("/repo/app".into());
+        git.author = Some("alice".into());
+        git.flags = vec!["-v".into()];
+        let mut docker = SearchEntry::new("docker ps", 1, "native");
+        docker.last_directory = Some("/other".into());
+        docker.author = Some("bob".into());
+        let corpus: HashMap<String, SearchEntry> = [(git.command.clone(), git), (docker.command.clone(), docker)].into_iter().collect();
+        let none = SearchSignals::default();
+
+        let only_git = SearchFilter { program: Some("git".into()), ..Default::default() };
+        let hits = engine.search("status", &corpus, 3, &only_git, None, &none, 0.0).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].command, "git status");
+
+        let in_repo = SearchFilter { directory: Some("/repo".into()), ..Default::default() };
+        let hits = engine.search("status", &corpus, 3, &in_repo, None, &none, 0.0).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].command, "git status");
+
+        let with_flag = SearchFilter { flag: Some("-v".into()), ..Default::default() };
+        let hits = engine.search("status", &corpus, 3, &with_flag, None, &none, 0.0).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].command, "git status");
+
+        let by_author = SearchFilter { author: Some("bob".into()), ..Default::default() };
+        let hits = engine.search("ps", &corpus, 3, &by_author, None, &none, 0.0).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].command, "docker ps");
     }
 }

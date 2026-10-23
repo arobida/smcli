@@ -28,8 +28,8 @@ an operation in progress (a rebase suggests `git rebase --continue`); --json and
 transition,selection,script,hint switches signals off.
 SMCLI_FFF_MAX (4) and SMCLI_FFF_IDLE (600 s) bound the service's file indexes.
 SMCLI_BASH_HOOK=debug makes Bash capture with a DEBUG trap even where bash-preexec or PS0 is available.
-init picks the search embedding model: Ollama, local potion-code-16M-v2 (--potion [DIR]), or Apple's (--builtin); saved to ~/.config/smcli/config.json, or SMCLI_CONFIG.
-By default (--default) search uses the potion-code-16M-v2 model built into smcli.
+init picks the search embedding model: Ollama, local Model2Vec potion model (--potion [DIR]), or Apple's (--builtin); saved to ~/.config/smcli/config.json, or SMCLI_CONFIG.
+By default (--default) search uses the potion-shell-16m model built into smcli.
 Commands with a leading space, likely secrets, or matching historyFilter/cwdFilter in the config are not recorded;
 prune removes already-stored ones. import --atuin --replace discards existing smcli history first.
 SMCLI_DB selects the metadata database (default: ~/.local/share/smcli/history.db).

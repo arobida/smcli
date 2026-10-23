@@ -4,7 +4,7 @@ Read your saved Bash and Zsh commands, and — with an opt-in shell hook — rec
 metadata native history doesn't reliably keep: the working directory, exit code,
 start time, duration, user, host, and terminal session. Search commands with keyword
 and semantic matching, or rank captured commands for your current directory.
-Search uses the potion-code-16M-v2 static model, built into the binary (about 33 MB, MIT licensed,
+Search uses potion-shell-16m (potion-code-16M-v2 fine-tuned on shell commands), a static model built into the binary (about 33 MB, MIT licensed,
 see `Models/`). Search works on macOS and Linux.
 
 > [!NOTE]
@@ -13,7 +13,7 @@ see `Models/`). Search works on macOS and Linux.
 
 ## Quickstart
 
-```sh
+``` sh
 $ make release
 $ dist/smcli history
 ==> /Users/you/.zsh_history <==
@@ -30,7 +30,7 @@ git reset --soft HEAD~1
 
 ## Remember more than your shell does
 
-```sh
+``` sh
 $ dist/smcli suggest
 # ^^ no output if you haven't captured or imported any commands
 
@@ -65,7 +65,7 @@ prompt, Esc to cancel. Text already on the prompt becomes the initial query. Set
 See **[docs/install.md](docs/install.md)** to install a release or build from source, set up Zsh, Bash or Fish,
 choose the picker keys, and upgrade or uninstall. In short:
 
-```sh
+``` sh
 scripts/install.sh       # build (needs Rust and a C toolchain), install, hook your shell, start the service
 smcli-uninstall          # export your history, then remove everything
 ```
@@ -75,7 +75,7 @@ headers (e.g. `build-essential pkg-config libsqlite3-dev` on Debian/Ubuntu).
 
 ## Usage
 
-```sh
+``` sh
 smcli history                 # native history by file, then captured records
 smcli history --json          # captured records only, as JSON
 smcli search [query...]       # --limit N, --json, filters below
@@ -84,7 +84,7 @@ smcli shell-init bash|zsh|fish  # print opt-in hooks; eval (or `| source` in fis
 smcli pick [query...]         # interactive picker; prints the chosen command
 smcli init                    # configure picker keys
 smcli init --keys [LIST]      # picker keys only: ask, or ctrl-r,left,right | ctrl-r | left | right | none
-smcli init --potion [DIR]     # use another potion-code-16M-v2 copy (no DIR: the built-in one)
+smcli init --potion [DIR]     # use another Model2Vec model dir (no DIR: the built-in one)
 smcli init --default          # back to the default: the built-in Potion model
 smcli reindex                 # discard the search index and re-embed every command
 smcli health [--json]         # index coverage, size, and embedding model check (exit 1 if broken)
@@ -96,7 +96,7 @@ smcli prune [--dry-run]       # delete stored commands that current filters reje
 
 Run `smcli` with no arguments in a terminal for an interactive menu. For the rest:
 
-```sh
+``` sh
 $ smcli --help
 ```
 
@@ -110,7 +110,7 @@ $ smcli --help
   prefixes are removed, and Zsh escaped bytes are decoded. The source files aren't changed.
 - Search combines captured commands and native history, treating each native line as an
   entry (not reconstructing multiline commands). It ranks distinct commands by fusing
-  BM25 keywords (whole words like `--soft` and their pieces) with potion-code-16M-v2
+  BM25 keywords (whole words like `--soft` and their pieces) with potion-shell-16m
   embeddings. Semantic matches aren't guaranteed.
 - Literal queries (flags, paths, revisions like `HEAD~1`, or a short query led by a program in
   your history) weight keywords more; plain-language requests fuse both legs by rank.
@@ -120,7 +120,7 @@ $ smcli --help
   programs, are not failures). Usage scales with relevance, so habits lift strong matches
   without surfacing weak ones; failed commands are demoted, not hidden. Text
   results show why a command ranked (`exact words`, `used here`, `recent`, …).
-- potion-code-16M-v2 runs natively (WordPiece tokens, mean of float16 rows, normalize;
+- potion-shell-16m runs natively (WordPiece tokens, mean of float16 rows, normalize;
   no network pass). It is embedded in the binary,
   so there is nothing to download; `init --potion DIR` points at another copy. Being a static model, it embeds only the command and its intent,
   not the labels below; word order is lost (`cp a b` equals `cp b a`), so keywords matter.
@@ -181,7 +181,7 @@ $ smcli --help
 
 ## Test
 
-```sh
+``` sh
 $ make test
 ```
 
@@ -189,7 +189,7 @@ $ make test
 
 Before changing shell transports or search ownership:
 
-```sh
+``` sh
 make baseline       # release CLI; synthetic 1k/10k/100k histories, raw JSON in dist/baseline.json
 make fff-smoke      # pinned fff-search crate smoke test
 ```

@@ -42,7 +42,7 @@ const fn in_session(c: Case, session: &'static str) -> Case {
 
 use Kind::{Search, Suggest};
 
-const CASES: [Case; 27] = [
+const CASES: [Case; 29] = [
     // Directory: the command used where you are.
     case("directory", Suggest, "webapp", "npm run ", "npm run dev"),
     case("directory", Suggest, "api/Sources/Lib", "swift b", "swift build"),
@@ -72,6 +72,9 @@ const CASES: [Case; 27] = [
     case("guard", Suggest, "rebasing", "git s", "git status"),
     case("guard", Suggest, "webapp", "npm run b", "npm run build"),
     case("guard", Search, "rebasing", "show running containers", "docker ps"),
+    // Query-derived filters: program/subcommand and directory basenames are parsed into TalaDB filters.
+    case("filter", Search, "bun", "how do i create a new bun project", "bun create react-app"),
+    case("filter", Search, "smcli", "how do i build my smcli project", "cargo build"),
     // Git state: the way out of an operation in progress.
     case("git state", Suggest, "rebasing", "git ", "git rebase --continue"),
     case("git state", Suggest, "merging", "git m", "git merge --continue"),
@@ -146,7 +149,7 @@ impl World {
                    "tools/Makefile");
         self.repository("rebasing", Some("rebase-merge/done"));
         self.repository("merging", Some("MERGE_HEAD"));
-        for directory in ["notes", "other", "api/Sources/App", "api/Sources/Lib", "mono/packages/ui/src", "mono/packages/ui/stories"] {
+        for directory in ["notes", "other", "api/Sources/App", "api/Sources/Lib", "mono/packages/ui/src", "mono/packages/ui/stories", "bun", "smcli"] {
             std::fs::create_dir_all(self.path(directory)).unwrap();
         }
     }
@@ -198,6 +201,11 @@ impl World {
         self.habit("swift build -c release", "tools", 15);
         self.habit("make release", "other", 25);
         self.habit("ls -la", "notes", 30);
+        // Query-derived filters: bun and smcli directory basenames become filters.
+        self.habit("bun i", "bun", 10);
+        self.habit("bun i usearch", "bun", 5);
+        self.habit("bun create react-app", "bun", 3);
+        self.habit("cargo build", "smcli", 8);
         // Monorepo: root, the package being worked in, and a sibling package.
         self.habit("npm run dev", "mono", 14);
         self.habit_with("npm run docs", "mono/packages/ui/stories", 12, 0.5, 8.0);

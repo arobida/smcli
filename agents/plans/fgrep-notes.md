@@ -24,9 +24,9 @@ re-measured.
 ## Measured (`scripts/bench-baseline.py`, one rare token, warm median)
 
 | Tracked files | fgrep cold | fgrep warm |
-|---|---:|---:|
-| 10,000 | 100 ms | 102 ms |
-| 50,000 | 1,020 ms | 1,488 ms |
+| ------------- |-----------:|-----------:|
+| 10,000        |     100 ms |     102 ms |
+| 50,000        |   1,020 ms |   1,488 ms |
 
 The time grows roughly linearly with file count, because every query reads every eligible file.
 

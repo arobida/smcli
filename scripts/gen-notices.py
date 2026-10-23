@@ -84,7 +84,7 @@ w("**smcli's own license is not decided yet.** The repository has no `LICENSE` f
 w("## Bundled model\n")
 w("### potion-code-16M-v2 (MIT)\n")
 w("https://huggingface.co/minishlab/potion-code-16M-v2, revision `e9d2a44ca6a05ac6685f3b23709ea57eb7352d5b`, by Minish Lab, ")
-w("embedded in both executables (`Models/potion-code-16M-v2`). The model card declares the MIT license; the repository ")
+w("fine-tuned on NL2Bash and NL2SH-ALFA pairs (both MIT) into potion-shell-16m, which is embedded in both executables (`Models/potion-shell-16m`). The model card declares the MIT license; the repository ")
 w("ships no separate license file for it, so the copyright line is the publisher's and the text below is the standard MIT license.\n")
 w("""```text
 MIT License

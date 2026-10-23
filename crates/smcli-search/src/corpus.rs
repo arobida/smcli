@@ -198,6 +198,119 @@ pub fn program_arguments(corpus: &HashMap<String, SearchEntry>) -> HashMap<Strin
     programs
 }
 
+fn is_stopword(word: &str) -> bool {
+    matches!(word, "how" | "do" | "i" | "a" | "an" | "the" | "to" | "my" | "new" | "in" | "for" | "of" | "with" | "and" | "what" | "is" | "me")
+}
+
+/// Derives index filters from the words in a natural-language query. Stopwords and ambiguity are
+/// treated conservatively: a word only becomes a filter when it matches exactly one known program
+/// or directory basename, and a subcommand is only inferred when a single program is unambiguous.
+pub fn query_filter(query: &str, programs: &HashMap<String, HashSet<String>>, directories: &HashSet<String>) -> SearchFilter {
+    let words: Vec<String> = query.to_lowercase().split_whitespace().map(String::from).collect();
+    let mut filter = SearchFilter::default();
+
+    let program_candidates: Vec<&str> = words.iter().map(String::as_str).filter(|w| !is_stopword(w) && programs.contains_key(*w)).collect();
+    if program_candidates.len() == 1 {
+        filter.program = Some(program_candidates[0].to_string());
+    }
+
+    if let Some(program) = filter.program.as_deref() {
+        if let Some(args) = programs.get(program) {
+            let sub_candidates: Vec<&str> = words
+                .iter()
+                .map(String::as_str)
+                .filter(|w| *w != program && !is_stopword(w) && w.len() >= 3 && args.contains(*w))
+                .collect();
+            if sub_candidates.len() == 1 {
+                filter.subcommand = Some(sub_candidates[0].to_string());
+            }
+        }
+    }
+
+    let mut dir_matches = HashSet::new();
+    for word in words.iter().map(String::as_str) {
+        if is_stopword(word) || filter.program.as_deref() == Some(word) {
+            continue;
+        }
+        for dir in directories {
+            if std::path::Path::new(dir).file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(word)) {
+                dir_matches.insert(dir.clone());
+            }
+        }
+    }
+    if dir_matches.len() == 1 {
+        filter.directory = dir_matches.into_iter().next();
+    }
+
+    filter
+}
+
+fn resolve_marker(word: &str, programs: &HashMap<String, HashSet<String>>, directories: &HashSet<String>, filter: &mut SearchFilter) {
+    if programs.contains_key(word) {
+        filter.program = Some(word.to_string());
+        return;
+    }
+    if let Some(program) = filter.program.as_deref() {
+        if let Some(args) = programs.get(program) {
+            if args.contains(word) {
+                filter.subcommand = Some(word.to_string());
+                return;
+            }
+        }
+    }
+    let mut matches = HashSet::new();
+    for dir in directories {
+        if std::path::Path::new(dir).file_name().is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(word)) {
+            matches.insert(dir.clone());
+        }
+    }
+    if matches.len() == 1 {
+        filter.directory = matches.into_iter().next();
+    }
+}
+
+/// Strips `$word` filter markers out of `query` and resolves them into a `SearchFilter`. Markers are
+/// only recognized as complete whitespace-delimited tokens whose body is plain (letters, digits, `-`,
+/// `_`, `.`), so `$HOME/x`, `${x}` and `$(...)` are left untouched. Returns the stripped query, the
+/// filter derived from markers, and whether any marker was found.
+pub fn parse_markers(query: &str, programs: &HashMap<String, HashSet<String>>, directories: &HashSet<String>) -> (String, SearchFilter, bool) {
+    let mut stripped = String::with_capacity(query.len());
+    let mut filter = SearchFilter::default();
+    let mut has_markers = false;
+    let mut chars = query.chars().peekable();
+    let mut at_boundary = true;
+
+    while let Some(c) = chars.next() {
+        if c == '$' && at_boundary {
+            let mut word = String::new();
+            while let Some(&next) = chars.peek() {
+                if next.is_alphanumeric() || next == '-' || next == '_' || next == '.' {
+                    word.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if !word.is_empty() && chars.peek().map_or(true, |c| c.is_whitespace()) {
+                let lower = word.to_lowercase();
+                has_markers = true;
+                resolve_marker(&lower, programs, directories, &mut filter);
+                stripped.push_str(&word);
+                at_boundary = false;
+                continue;
+            }
+            stripped.push('$');
+            stripped.push_str(&word);
+            at_boundary = false;
+            continue;
+        }
+        stripped.push(c);
+        at_boundary = c.is_whitespace();
+    }
+
+    (stripped, filter, has_markers)
+}
+
 fn add_program(entry: &SearchEntry, programs: &mut HashMap<String, HashSet<String>>) {
     let Some(program) = entry.program().map(|p| p.to_lowercase()) else { return };
     let words: Vec<&str> = entry.command.split_whitespace().collect();
@@ -447,5 +560,128 @@ mod tests {
         state.add(&Run { command: "ls".into(), directory: "/repo/a".into(), started_at: 100.0, exit_code: 0, session: "s".into() });
         let ls = &state.entries["ls"];
         assert_eq!((ls.source.as_str(), ls.runs, ls.runs_here, ls.runs_project, ls.frecency), ("captured", 1, 1, 1, 1.0));
+    }
+
+    #[test]
+    fn query_filter_extracts_program_and_subcommand() {
+        let programs = HashMap::from([
+            ("bun".to_string(), HashSet::from(["i".to_string(), "create".to_string(), "init".to_string()])),
+        ]);
+        let filter = query_filter("how do i create a new bun project", &programs, &HashSet::new());
+        assert_eq!(filter.program, Some("bun".to_string()));
+        assert_eq!(filter.subcommand, Some("create".to_string()));
+        assert_eq!(filter.directory, None);
+    }
+
+    #[test]
+    fn query_filter_does_not_treat_english_i_as_bun_subcommand() {
+        let programs = HashMap::from([
+            ("bun".to_string(), HashSet::from(["i".to_string(), "create".to_string()])),
+        ]);
+        let filter = query_filter("how do i install usearch with bun", &programs, &HashSet::new());
+        assert_eq!(filter.program, Some("bun".to_string()));
+        assert_eq!(filter.subcommand, None);
+    }
+
+    #[test]
+    fn query_filter_matches_directory_basename() {
+        let directories = HashSet::from(["/Users/arobida/Dev/Apps/smcli".to_string()]);
+        let filter = query_filter("how do i build my smcli project", &HashMap::new(), &directories);
+        assert_eq!(filter.directory, Some("/Users/arobida/Dev/Apps/smcli".to_string()));
+        assert_eq!(filter.program, None);
+        assert_eq!(filter.subcommand, None);
+    }
+
+    #[test]
+    fn query_filter_is_conservative_with_ambiguity() {
+        let programs = HashMap::from([
+            ("bun".to_string(), HashSet::from(["create".to_string()])),
+            ("git".to_string(), HashSet::from(["status".to_string()])),
+        ]);
+        let directories = HashSet::from(["/home/bun".to_string(), "/home/git".to_string()]);
+        let filter = query_filter("bun git create status", &programs, &directories);
+        assert_eq!(filter.program, None);
+        assert_eq!(filter.directory, None);
+    }
+
+    #[test]
+    fn query_filter_skips_directory_word_that_is_the_program() {
+        let programs = HashMap::from([
+            ("smcli".to_string(), HashSet::from(["build".to_string()])),
+        ]);
+        let directories = HashSet::from(["/Users/arobida/Dev/Apps/smcli".to_string()]);
+        let filter = query_filter("how do i build my smcli project", &programs, &directories);
+        assert_eq!(filter.program, Some("smcli".to_string()));
+        assert_eq!(filter.directory, None);
+    }
+
+    #[test]
+    fn explicit_filter_values_win_over_parsed() {
+        let mut explicit = SearchFilter { program: Some("git".into()), ..Default::default() };
+        let parsed = SearchFilter {
+            program: Some("bun".into()),
+            subcommand: Some("create".into()),
+            directory: Some("/x".into()),
+            ..Default::default()
+        };
+        explicit.merge_parsed(&parsed);
+        assert_eq!(explicit.program, Some("git".into()));
+        assert_eq!(explicit.subcommand, Some("create".into()));
+        assert_eq!(explicit.directory, Some("/x".into()));
+    }
+
+    #[test]
+    fn marker_parsing_extracts_program_and_subcommand() {
+        let programs = HashMap::from([
+            ("bun".to_string(), HashSet::from(["i".to_string(), "create".to_string()])),
+        ]);
+        let (stripped, filter, has_markers) = parse_markers("$bun command to $create new project", &programs, &HashSet::new());
+        assert!(has_markers);
+        assert_eq!(stripped, "bun command to create new project");
+        assert_eq!(filter.program, Some("bun".to_string()));
+        assert_eq!(filter.subcommand, Some("create".to_string()));
+    }
+
+    #[test]
+    fn marker_allows_short_subcommand() {
+        let programs = HashMap::from([
+            ("bun".to_string(), HashSet::from(["i".to_string(), "create".to_string()])),
+        ]);
+        let (_, filter, _) = parse_markers("$bun $i usearch", &programs, &HashSet::new());
+        assert_eq!(filter.program, Some("bun".to_string()));
+        assert_eq!(filter.subcommand, Some("i".to_string()));
+    }
+
+    #[test]
+    fn unknown_markers_are_left_as_words() {
+        let programs = HashMap::from([
+            ("bun".to_string(), HashSet::from(["create".to_string()])),
+        ]);
+        let (stripped, filter, has_markers) = parse_markers("$bun $unknown stuff", &programs, &HashSet::new());
+        assert!(has_markers);
+        assert_eq!(stripped, "bun unknown stuff");
+        assert_eq!(filter.program, Some("bun".to_string()));
+        assert_eq!(filter.subcommand, None);
+    }
+
+    #[test]
+    fn shell_like_dollar_expressions_stay_intact() {
+        let programs = HashMap::<String, HashSet<String>>::new();
+        let directories = HashSet::new();
+        for query in ["echo $HOME/x", "echo ${x}", "echo $(date)"] {
+            let (stripped, filter, has_markers) = parse_markers(query, &programs, &directories);
+            assert!(!has_markers, "{query}");
+            assert_eq!(stripped, query);
+            assert!(filter.is_empty(), "{query}");
+        }
+    }
+
+    #[test]
+    fn stripped_marker_text_is_literal_when_it_reads_as_command() {
+        let programs = HashMap::from([
+            ("bun".to_string(), HashSet::from(["create".to_string()])),
+        ]);
+        let (stripped, _, _) = parse_markers("$bun $create", &programs, &HashSet::new());
+        assert!(is_literal_query(&stripped, &programs));
     }
 }
