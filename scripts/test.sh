@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# An inherited SMCLI_* or XDG_* variable can change results (SMCLI_RANKING_OFF disables the ranking floors).
+unset "${!SMCLI_@}" XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME
 
 cargo test --workspace
 cargo build --workspace

@@ -21,8 +21,8 @@ from concurrent.futures import ThreadPoolExecutor
 smcli = os.path.abspath(sys.argv[1])
 # Unix socket paths are limited to ~104 bytes, so keep the runtime directory short.
 root = tempfile.mkdtemp(prefix="smcli-svc.", dir="/tmp")
-# SMCLI_SERVICE is left unset: starting the service as needed is the default.
-env = {k: v for k, v in os.environ.items() if k not in ("SMCLI_SERVICE", "SMCLI_SERVICE_BIN")}
+# Inherited SMCLI_*/XDG_* variables could change results; only this file's settings reach the CLI.
+env = {k: v for k, v in os.environ.items() if not k.startswith("SMCLI_") and k not in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME")}
 env.update(SMCLI_DB=f"{root}/history.db", SMCLI_RUNTIME_DIR=f"{root}/run", SMCLI_CONFIG=f"{root}/config.json", HOME=root)
 
 

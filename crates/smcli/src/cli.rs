@@ -625,7 +625,9 @@ fn prune(
             let (id, command, d) = row?;
             if !filter.allows(&command, &d) {
                 ids.push(id);
-                commands.push(command);
+                if !commands.contains(&command) {
+                    commands.push(command);
+                }
             }
         }
     }
@@ -643,21 +645,28 @@ fn prune(
             ))
         })? {
             let (id, command, q, d) = row?;
-            if !filter.allows(&command, &d) || (!q.is_empty() && !filter.allows(&q, &d)) {
+            // Only a rejected query removes a selection on its own; selections of a pruned command go with it.
+            if filter.allows(&command, &d) && !q.is_empty() && !filter.allows(&q, &d) {
                 picks.push(id);
-                if !commands.contains(&command) {
-                    commands.push(command);
-                }
             }
         }
+    }
+    let mut selection_removed = picks.len();
+    for command in &commands {
+        selection_removed += tx.query_row(
+            "SELECT count(*) FROM command_selections WHERE command = ?",
+            [command],
+            |r| r.get::<_, i64>(0),
+        )? as usize;
     }
     if dry {
         for command in &commands {
             println!("{command}");
         }
         tx.rollback()?;
-        println!("{} records would be removed.", commands.len());
+        println!("{} commands and {} selections would be removed.", ids.len(), selection_removed);
     } else {
+        let removed = ids.len();
         for id in ids {
             tx.execute("DELETE FROM commands WHERE id=?", [id])?;
         }
@@ -667,10 +676,9 @@ fn prune(
         for command in &commands {
             tx.execute("DELETE FROM command_selections WHERE command=?", [command])?;
         }
-        let removed = commands.len();
         tx.commit()?;
         db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
-        println!("Removed {} records.", removed);
+        println!("Removed {removed} commands and {selection_removed} selections.");
         if removed > 0 {
             // The index still holds the pruned text until rebuilt.
             if let Err(e) = search_engine(c, home, env).and_then(|e| e.reindex(&corpus(c, home, env, None, now())?)) {
@@ -791,8 +799,18 @@ fn import(
                 "INSERT OR IGNORE INTO sessions(id,user,host,shell) VALUES(?,?,'unknown',?)",
                 rusqlite::params![session, user, shell],
             )?;
-            tx.execute("INSERT INTO commands(session,started_at,directory,command,exit_code,flags) VALUES(?,?,?,?,?,?)",rusqlite::params![session,stamp,text("directory")?,command,r["exitCode"].as_i64().ok_or_else(||anyhow::anyhow!("Missing exitCode"))?,smcli_core::parse::command_flags(command).join(" ")])?;
-            count += 1;
+            let directory = text("directory")?;
+            let exit_code = r["exitCode"].as_i64().ok_or_else(|| anyhow::anyhow!("Missing exitCode"))?;
+            // Repeat imports must not double run counts: this import-only natural key skips a stored record.
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM commands WHERE session = ? AND started_at = ? AND command = ? AND directory = ? AND exit_code = ?)",
+                rusqlite::params![session, stamp, command, directory, exit_code],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                tx.execute("INSERT INTO commands(session,started_at,directory,command,exit_code,flags) VALUES(?,?,?,?,?,?)",rusqlite::params![session,stamp,directory,command,exit_code,smcli_core::parse::command_flags(command).join(" ")])?;
+                count += 1;
+            }
         }
     }
     tx.commit()?;
@@ -1225,6 +1243,61 @@ mod tests {
         lock.lock()?;
         assert!(!index_health(&captured, &dir, &env, &corpus).healthy);
         drop(lock);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prune_keeps_clean_selections_of_allowed_commands() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("smcli-prune-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let c = CapturedHistory::new(dir.join("history.db"));
+        let db = c.open_connection()?;
+        db.execute_batch(
+            "INSERT INTO sessions(id,user,host,shell) VALUES('s','test','unknown','zsh');
+             INSERT INTO commands(session,started_at,directory,command,exit_code) VALUES
+               ('s',1700000000.0,'/tmp','git push',0),
+               ('s',1700000001.0,'/tmp','secret-cmd',0);
+             INSERT INTO command_selections(query,command,kind,directory,selected_at) VALUES
+               ('AKIAABCDEFGHIJKLMNOP','git push','search','/tmp',1700000002.0),
+               ('push','git push','search','/tmp',1700000003.0),
+               ('push','secret-cmd','search','/tmp',1700000004.0);",
+        )?;
+        drop(db);
+        let filter = CaptureFilter::new(&SmcliConfig {
+            history_filter: Some(vec!["^secret".into()]),
+            ..Default::default()
+        })?;
+        prune(&c, &dir, &HashMap::new(), &filter, false)?;
+        let db = c.open_connection()?;
+        let commands: Vec<String> = db
+            .prepare("SELECT command FROM commands ORDER BY id")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(commands, ["git push"]);
+        let selections: Vec<String> = db
+            .prepare("SELECT query FROM command_selections ORDER BY id")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(selections, ["push"]);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_import_is_idempotent() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("smcli-legacy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let c = CapturedHistory::new(dir.join("history.db"));
+        let source = dir.join("legacy.jsonl");
+        let record = serde_json::json!({"timestamp":"2024-01-01T00:00:00Z","user":"test","shell":"zsh","command":"git status","directory":"/tmp","exitCode":0}).to_string();
+        std::fs::write(&source, record)?;
+        for _ in 0..2 {
+            import(&c, &dir, &HashMap::new(), false, false, Some(source.clone()))?;
+        }
+        let rows = records(&c)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["runCount"], 1);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

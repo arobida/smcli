@@ -135,13 +135,21 @@ fn within(path: &str, root: &str) -> bool {
     !root.is_empty() && (path == root || (root != "/" && path.starts_with(&format!("{root}/"))))
 }
 
-/// The text embedded for an entry: the command plus labeled fields, so queries naming a tool or option
-/// land near the right commands. With `labeled` false (static models such as Potion, which mean-pool tokens and
-/// would dilute the command with repeated names and label words), only the command and its recorded intent are
-/// embedded.
+/// Index identity for an entry: the full command plus intent when `labeled` is false, which health
+/// compares to the stored `doc`. Labeled text is the contextual document. Static models do not embed
+/// this string; they embed `embedding_text`, so a 1,500-character cut never becomes the identity.
 pub fn search_document(entry: &SearchEntry, labeled: bool) -> String {
+    render_document(entry, labeled, if labeled { 1_500 } else { usize::MAX })
+}
+
+/// Bounded command plus intent. The only text a static model should see.
+pub(crate) fn embedding_text(entry: &SearchEntry) -> String {
+    render_document(entry, false, 1_500)
+}
+
+fn render_document(entry: &SearchEntry, labeled: bool, command_limit: usize) -> String {
     // Long commands (heredocs, pasted scripts) are cut so they fit embedding contexts with their labels intact.
-    let mut lines = vec![entry.command.chars().take(1_500).collect::<String>()];
+    let mut lines = vec![entry.command.chars().take(command_limit).collect::<String>()];
     let intent = entry.intent.as_deref().filter(|i| !i.is_empty()).map(|i| i.replace('\n', " "));
     if !labeled {
         lines.extend(intent);

@@ -46,6 +46,7 @@ struct State {
     /// Built on the first suggest and dropped whenever another process changes the database.
     index: Option<SuggestionIndex>,
     data_version: i64,
+    history_revision: u64,
     last_activity: Instant,
     /// The corpus is rebuilt after any outside write, the engine when the config changes.
     engine: Option<(SmcliConfig, Arc<HistorySearch>)>,
@@ -94,8 +95,13 @@ impl Service {
                     let state = service.lock();
                     service.history.selection_scores(root, now(), &state.db).unwrap_or_default()
                 }),
-                Box::new(move |root, path, mode, query| {
+                Box::new(move |root, path, mode, query, request| {
                     let Some(service) = record_handle.upgrade() else { return Ok(()) };
+                    let filter = CaptureFilter::new(&SmcliConfig::load(&service.config_path(request))?)?;
+                    let directory = request.directory.as_deref().unwrap_or("");
+                    if !filter.allows(query, directory) {
+                        return Ok(());
+                    }
                     let mut state = service.lock();
                     state.last_activity = Instant::now();
                     service.history.record_selection(root, path, mode, query, now(), &state.db)
@@ -108,7 +114,7 @@ impl Service {
                 idle,
                 user: user_name(),
                 environment,
-                state: Mutex::new(State { db, index: None, data_version: version, last_activity: Instant::now(), engine: None, corpus: None }),
+                state: Mutex::new(State { db, index: None, data_version: version, history_revision: 0, last_activity: Instant::now(), engine: None, corpus: None }),
                 searching: Mutex::new(()),
                 active: AtomicUsize::new(0),
                 contexts: ContextCache::new(),
@@ -286,9 +292,8 @@ impl Service {
             pipestatus: request.pipestatus.clone(), event: Some(event.clone()),
         };
         let inserted = self.history.append(&run, request.native_file.as_deref().unwrap_or(""), Some(&state.db))?;
-        // Our own write moved data_version; keep the caches by updating them in place instead.
-        state.data_version = data_version(&state.db)?;
         if inserted {
+            state.history_revision += 1;
             let run = Run { command: command.clone(), directory: directory.clone(), started_at: started, exit_code, session: session.clone() };
             if let Some(index) = state.index.as_mut() {
                 if !index.add(&run) {
@@ -373,18 +378,25 @@ impl Service {
         }
     }
 
-    fn current_engine(&self, state: &mut State, request: &ServiceRequest) -> Result<Arc<HistorySearch>> {
+    fn current_engine(&self, request: &ServiceRequest) -> Result<Arc<HistorySearch>> {
+        self.load_engine(request, || {})
+    }
+
+    fn load_engine(&self, request: &ServiceRequest, before_build: impl FnOnce()) -> Result<Arc<HistorySearch>> {
         let path = self.config_path(request);
         let config = SmcliConfig::load(&path)?;
-        if let Some((current, engine)) = &state.engine
+        if let Some((current, engine)) = &self.lock().engine
             && *current == config
         {
             return Ok(Arc::clone(engine));
         }
         let mut environment = self.environment.clone();
         environment.insert("SMCLI_CONFIG".into(), path.to_string_lossy().into_owned());
+        before_build();
         let engine = Arc::new(search_engine(&self.history, &self.home(), &environment)?);
-        state.engine = Some((config, Arc::clone(&engine)));
+        if SmcliConfig::load(&path)? == config {
+            self.lock().engine = Some((config, Arc::clone(&engine)));
+        }
         Ok(engine)
     }
 
@@ -394,15 +406,7 @@ impl Service {
         std::thread::spawn(move || {
             let _searching = service.searching.lock();
             let request = ServiceRequest::new(Operation::Search);
-            let path = service.config_path(&request);
-            if let Ok(config) = SmcliConfig::load(&path) {
-                let mut environment = service.environment.clone();
-                environment.insert("SMCLI_CONFIG".into(), path.to_string_lossy().into_owned());
-                if let Ok(engine) = search_engine(&service.history, &service.home(), &environment) {
-                    let mut state = service.lock();
-                    state.engine = Some((config, Arc::new(engine)));
-                }
-            }
+            let _ = service.current_engine(&request);
         });
     }
 
@@ -420,7 +424,8 @@ impl Service {
         let result = (|| -> Result<ServiceResponse> {
             let context = self.ranking_context(request, directory);
             let project = context.project_root.clone().filter(|_| context.uses(Signal::Project));
-            let (engine, signals) = {
+            let engine = self.current_engine(request)?;
+            let signals = {
                 let mut state = self.lock();
                 Self::refresh(&mut state)?;
                 let index = self.current_index(&mut state)?;
@@ -432,8 +437,7 @@ impl Service {
                     signals.previous = Some(previous);
                 }
                 signals.context = Some(context.clone());
-                let engine = self.current_engine(&mut state, request)?;
-                (engine, signals)
+                signals
             };
             // Read native history files and stats outside `state` so records don't wait on I/O.
             let (entries, programs) = self.current_corpus(request, directory, project.as_deref())?;
@@ -451,6 +455,11 @@ impl Service {
     // shortcut: copies the corpus per search; share it (Arc + copy-on-record) if it shows up in profiles.
     fn current_corpus(&self, request: &ServiceRequest, directory: &str, project: Option<&str>)
         -> Result<(HashMap<String, SearchEntry>, HashMap<String, HashSet<String>>)> {
+        self.build_corpus(request, directory, project, || {})
+    }
+
+    fn build_corpus(&self, request: &ServiceRequest, directory: &str, project: Option<&str>, before_publish: impl FnOnce())
+        -> Result<(HashMap<String, SearchEntry>, HashMap<String, HashSet<String>>)> {
         let mut environment = self.environment.clone();
         environment.remove("HISTFILE");
         environment.remove("SHELL");
@@ -461,18 +470,19 @@ impl Service {
             .iter()
             .map(|f| {
                 let meta = std::fs::metadata(&f.path).ok();
-                format!("{} {} {}", f.path.display(), meta.as_ref().map_or(-1, |m| m.len() as i64), meta.map_or(0, |m| m.mtime()))
+                format!("{} {:?}", f.path.display(), meta.map(|m| (m.len(), m.mtime(), m.mtime_nsec(), m.dev(), m.ino())))
             })
             .collect();
         let version = {
-            let state = self.lock();
+            let mut state = self.lock();
+            Self::refresh(&mut state)?;
             if let Some(c) = state.corpus.as_ref().filter(|c| {
                 c.state.directory == directory && c.state.project.as_deref() == project && c.native == stamp
                     && c.built.elapsed() < Duration::from_secs(300)
             }) {
                 return Ok((c.state.entries.clone(), c.state.programs.clone()));
             }
-            state.data_version
+            (state.data_version, state.history_revision)
         };
         let native: Vec<String> =
             files.iter().filter_map(|f| f.read().ok()).flat_map(|t| t.split('\n').map(String::from).collect::<Vec<_>>()).collect();
@@ -480,12 +490,110 @@ impl Service {
         let captured = self.history.command_stats(Some(directory), project, as_of)?;
         let corpus = CorpusState::new(captured, &native, directory, project, as_of);
         let copies = (corpus.entries.clone(), corpus.programs.clone());
+        before_publish();
         let mut state = self.lock();
-        // A record that landed while this was built is missing from it: use it once, rebuild next search.
-        if state.data_version == version {
+        Self::refresh(&mut state)?;
+        // Never replace an updated cache with a snapshot taken before a committed record.
+        if (state.data_version, state.history_revision) == version {
             state.corpus = Some(SearchCorpus { native: stamp, built: Instant::now(), state: corpus });
         }
         Ok(copies)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    struct Fixture { service: Arc<Service>, home: PathBuf }
+    impl Fixture {
+        fn new() -> Self {
+            let home = std::env::temp_dir().join(format!("smcli-service-c-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            std::fs::create_dir_all(&home).unwrap();
+            let history = CapturedHistory::new(home.join("history.db"));
+            let environment = HashMap::from([("HOME".into(), home.to_string_lossy().into_owned()), ("SMCLI_CONFIG".into(), home.join("config.toml").to_string_lossy().into_owned())]);
+            let location = ServiceLocation::new(&history.path, &environment);
+            let service = Service::new(history, location, Duration::from_secs(600), environment).unwrap();
+            Self { service, home }
+        }
+        fn request(&self, op: Operation) -> ServiceRequest {
+            let mut r = ServiceRequest::new(op);
+            r.directory = Some(self.home.to_string_lossy().into_owned());
+            r
+        }
+        fn record(&self) {
+            let mut r = self.request(Operation::Record);
+            r.event = Some("01234567-89ab-4cde-8012-3456789abcde".into());
+            r.command = Some("echo concurrent".into());
+            r.shell = Some("zsh".into());
+            r.session = Some("test".into());
+            r.exit_code = Some(0);
+            self.service.record(&r).unwrap();
+            assert_eq!(self.service.lock().history_revision, 1);
+        }
+    }
+    impl Drop for Fixture { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.home); } }
+
+    #[test]
+    fn file_selection_filters_query_and_actual_directory() {
+        let f = Fixture::new();
+        let mut r = f.request(Operation::Select);
+        r.path = Some("example.txt".into());
+        r.mode = Some("grep".into());
+        r.query = Some("AKIAIOSFODNN7EXAMPLE".into());
+        f.service.file_search.select(&r);
+        let count = || f.service.lock().db.query_row("SELECT count(*) FROM file_selections", [], |row| row.get::<_, i64>(0)).unwrap();
+        assert_eq!(count(), 0);
+        std::fs::write(f.home.join("config.toml"), r#"{"cwdFilter":[".*"]}"#).unwrap();
+        r.query = Some("ordinary".into());
+        f.service.file_search.select(&r);
+        assert_eq!(count(), 0);
+        std::fs::write(f.home.join("config.toml"), "{}").unwrap();
+        f.service.file_search.select(&r);
+        assert_eq!(count(), 1);
+    }
+
+    #[test]
+    fn record_during_corpus_build_prevents_stale_publication() {
+        let f = Fixture::new();
+        let r = f.request(Operation::Search);
+        let directory = r.directory.as_deref().unwrap();
+        f.service.build_corpus(&r, directory, None, || f.record()).unwrap();
+        assert!(f.service.lock().corpus.is_none());
+        let (entries, _) = f.service.current_corpus(&r, directory, None).unwrap();
+        assert!(entries.contains_key("echo concurrent"));
+    }
+
+    #[test]
+    fn equal_length_native_rewrite_invalidates_corpus() {
+        let f = Fixture::new();
+        let path = f.home.join(".zsh_history");
+        std::fs::write(&path, "echo before\n").unwrap();
+        let first = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut r = f.request(Operation::Search);
+        r.histfile = Some(path.to_string_lossy().into_owned());
+        r.login_shell = Some("/bin/zsh".into());
+        let directory = r.directory.as_deref().unwrap();
+        f.service.current_corpus(&r, directory, None).unwrap();
+        std::fs::write(&path, "echo after!\n").unwrap();
+        let seconds = first.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let nanos = (first.duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() + 1) % 1_000_000_000;
+        let modified = std::time::UNIX_EPOCH + Duration::new(seconds, nanos);
+        std::fs::File::options().write(true).open(&path).unwrap().set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
+        let (entries, _) = f.service.current_corpus(&r, directory, None).unwrap();
+        assert!(entries.contains_key("echo after!"));
+        assert!(!entries.contains_key("echo before"));
+    }
+
+    #[test]
+    fn engine_reload_does_not_hold_state_lock() {
+        let f = Fixture::new();
+        let r = f.request(Operation::Search);
+        f.service.load_engine(&r, || {
+            assert!(f.service.state.try_lock().is_ok());
+            f.record();
+        }).unwrap();
+        assert!(f.service.lock().engine.is_some());
     }
 }
 

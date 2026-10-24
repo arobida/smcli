@@ -40,7 +40,6 @@ pub enum Mode {
     History,
     Files,
     Grep,
-    Directory,
 }
 impl Mode {
     pub fn as_str(self) -> &'static str {
@@ -48,7 +47,6 @@ impl Mode {
             Self::History => "history",
             Self::Files => "files",
             Self::Grep => "grep",
-            Self::Directory => "directory",
         }
     }
 }
@@ -250,7 +248,7 @@ pub fn run(
 ) -> Result<Option<Choice>> {
     let search = search.map(|mut callback| worker(move |q: &String| callback(q)));
     let files = files.map(|mut callback| worker(move |(mode, q, _): &(Mode, String, u8)| {
-        callback(if *mode == Mode::Directory { Mode::Files } else { *mode }, q)
+        callback(*mode, q)
     }));
     let mut file_busy = false;
     let mut semantic_busy = false;
@@ -262,7 +260,7 @@ pub fn run(
     let mut selected = 0usize;
     let mut semantic: Option<(String, Vec<String>)> = None;
     let mut global_files = false;
-    let mut kind = if picker.mode == Mode::Directory { 1 } else { 0 };
+    let mut kind = 0;
     let mut fetched = None;
     let mut tick = 0u8;
     let mut fade_at = Instant::now();
@@ -277,7 +275,7 @@ pub fn run(
     let mut filtered: Option<((String, bool), Vec<String>)> = None;
     let starred: HashSet<String> = picker.candidates[..picker.suggestion_count].iter().cloned().collect();
     loop {
-        let local = matches!(picker.mode, Mode::Files | Mode::Directory) && !global_files;
+        let local = picker.mode == Mode::Files && !global_files;
         let current = (picker.mode, picker.query.clone(), kind);
         if let Some((_, replies)) = &files {
             if let Ok((request, result)) = replies.try_recv() {
@@ -285,7 +283,7 @@ pub fn run(
                 if !local && request == current {
                     match result {
                         Ok(result) => {
-                            hits = if matches!(picker.mode, Mode::Files | Mode::Directory) {
+                            hits = if picker.mode == Mode::Files {
                                 filter_kind(result.hits, kind)
                             } else { result.hits };
                             status = if result.complete { String::new() } else {
@@ -369,13 +367,13 @@ pub fn run(
             let area = frame.area();
             cols = area.width;
             let history = picker.mode == Mode::History;
-            let label = if matches!(picker.mode, Mode::Files | Mode::Directory) { match kind { 1 => "folders", 2 => "files", _ => "files+dirs" } } else if history { picker.title.as_deref().unwrap_or("history") } else { picker.mode.as_str() };
+            let label = if picker.mode == Mode::Files { match kind { 1 => "folders", 2 => "files", _ => "files+dirs" } } else if history { picker.title.as_deref().unwrap_or("history") } else { picker.mode.as_str() };
             let [header_area, filter_area, search_area, navigation_area, list_area, stripe_area, global_area] = picker_layout(area);
             let boxed = search_area.height == 3;
             // Files modes name their scope so directory and project search never look alike.
             let scope = match picker.mode {
-                Mode::Files | Mode::Directory if local => format!("in {}", std::env::current_dir().map(|d| visible(&d.display().to_string())).unwrap_or_default()),
-                Mode::Files | Mode::Directory => "across your system".into(),
+                Mode::Files if local => format!("in {}", std::env::current_dir().map(|d| visible(&d.display().to_string())).unwrap_or_default()),
+                Mode::Files => "across your system".into(),
                 Mode::Grep => format!("in {}", std::env::current_dir().map(|d| visible(&d.display().to_string())).unwrap_or_default()),
                 _ => String::new(),
             };
@@ -443,14 +441,14 @@ pub fn run(
             frame.render_stateful_widget(list, list_area, &mut state);
             let filters = if history {
                 vec![("tab", "semantic")]
-            } else if matches!(picker.mode, Mode::Files | Mode::Directory) {
+            } else if picker.mode == Mode::Files {
                 vec![("^A", if local { "global search" } else { "cwd search" }), ("^F", "dirs/files")]
             } else {
                 vec![]
             };
             frame.render_widget(Paragraph::new(hint_line(&filters)), filter_area);
             frame.render_widget(Paragraph::new(hint_line(&[("[ ⏎ ]", "accept"), ("↑↓", "move"), ("PgUp/PgDn", "page")])), navigation_area);
-            let mut globals = vec![("esc", "cancel"), ("^T", if matches!(picker.mode, Mode::Files | Mode::Directory) { "history" } else { "files" })];
+            let mut globals = vec![("esc", "cancel"), ("^T", if picker.mode == Mode::Files { "history" } else { "files" })];
             if grep_available(global_files) {
                 globals.push(("^G", if picker.mode == Mode::Grep { "history" } else { "grep" }));
             }
@@ -536,7 +534,7 @@ pub fn run(
                     Mode::Grep
                 };
                 picker.mode = if picker.mode == target
-                    || (target == Mode::Files && picker.mode == Mode::Directory)
+                    
                 {
                     Mode::History
                 } else {
@@ -546,7 +544,7 @@ pub fn run(
                 selected = 0;
                 status.clear();
             }
-            KeyCode::Char('f') if ctrl && matches!(picker.mode, Mode::Files | Mode::Directory) => {
+            KeyCode::Char('f') if ctrl && picker.mode == Mode::Files => {
                 kind = (kind + 1) % 3;
                 selected = 0;
             }
@@ -566,7 +564,7 @@ pub fn run(
                 selected = 0;
                 status.clear();
             }
-            KeyCode::Char('a') if ctrl && matches!(picker.mode, Mode::Files | Mode::Directory) => {
+            KeyCode::Char('a') if ctrl && picker.mode == Mode::Files => {
                 global_files = !global_files;
                 selected = 0;
             }

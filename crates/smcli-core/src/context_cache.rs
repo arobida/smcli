@@ -441,9 +441,11 @@ mod tests {
                 (n == 0).then(|| GitStatus::parse("# branch.head main", now()))
             }),
         );
-        let start = Instant::now();
-        assert!(cache.context(directory).status_pending);
-        assert!(start.elapsed() < Duration::from_millis(300));
+        let (context_tx, context_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| context_tx.send(cache.context(directory).status_pending).unwrap());
+            assert!(context_rx.recv_timeout(Duration::from_secs(10)).expect("context discovery blocked"));
+        });
         release_tx.send(()).unwrap();
         let context = wait(&cache, directory);
         assert_eq!(context.status.unwrap().branch.as_deref(), Some("main"));

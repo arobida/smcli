@@ -79,8 +79,9 @@ pub fn history_files(home: &Path, environment: &HashMap<String, String>) -> Resu
             files.push(HistoryFile { path: file, shell });
         }
         let sessions = home.join(format!(".{name}_sessions"));
-        if sessions.exists() {
-            let mut entries: Vec<PathBuf> = std::fs::read_dir(&sessions)?.filter_map(|e| e.ok().map(|e| e.path())).collect();
+        if sessions.is_dir() {
+            let Ok(entries) = std::fs::read_dir(&sessions) else { continue };
+            let mut entries: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
             entries.sort_by_key(|p| p.file_name().map(|n| n.to_os_string()));
             for entry in entries {
                 if matches!(entry.extension().and_then(|e| e.to_str()), Some("history" | "historynew")) {
@@ -101,6 +102,21 @@ pub fn history_files(home: &Path, environment: &HashMap<String, String>) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreadable_optional_session_directory_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = dir.path().join(".bash_history");
+        std::fs::write(&history, "echo usable\n").unwrap();
+        let sessions = dir.path().join(".bash_sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        std::fs::write(sessions.join("session.history"), "echo session\n").unwrap();
+        std::fs::remove_dir_all(&sessions).unwrap();
+        std::fs::write(&sessions, "not a directory").unwrap();
+        let files = history_files(dir.path(), &HashMap::new()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].read().unwrap(), "echo usable\n");
+    }
 
     #[test]
     fn read_bash_and_zsh_history() {

@@ -193,7 +193,15 @@ if [[ ${_smcli_installed-} != 1 ]]; then
 fi
 # smcli: history picker on Up and Ctrl-R, for keys no other tool has bound. Set SMCLI_NO_KEYS=1 before this line to
 # keep readline's keys; SMCLI_EXTRA_KEYS=1 adds Left and Right on an empty line, Ctrl-Right and Alt-;.
-if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]] && (( BASH_VERSINFO[0] >= 4 )); then
+if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]] && (( BASH_VERSINFO[0] < 4 )); then
+    # Warn once per database, not on every shell start.
+    _smcli_dir=${SMCLI_DB:-$HOME/.local/share/smcli/history.db}; _smcli_dir=${_smcli_dir%/*}
+    if [[ ! -e $_smcli_dir/.bash3-warned ]]; then
+        echo "smcli: picker key bindings require Bash 4+; use 'smcli pick' or upgrade Bash (history recording remains active)." >&2
+        mkdir -p "$_smcli_dir" && : > "$_smcli_dir/.bash3-warned"
+    fi
+    unset _smcli_dir
+elif [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
     _smcli_pick_bin=\#(binary)
     # Bash 4 counts READLINE_POINT in bytes (5.0 and later in characters) while ${var:offset} counts characters,
     # so on Bash 4 slice and measure in the C locale. The local LC_ALL ends with the function.
@@ -228,7 +236,7 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]] && (( BASH_VERSINFO[0] >= 4 )); then
         if [[ -z $READLINE_LINE ]]; then _smcli_pick --suggest
         elif (( READLINE_POINT < ${#READLINE_LINE} )); then READLINE_POINT=$((READLINE_POINT + 1)); fi
     }
-    # Ctrl-T opens the picker on this directory's files; Tab there searches the whole project.
+    # Ctrl-T opens the picker on this directory's files; Ctrl-A toggles whole-project search.
     _smcli_pick_files() { _smcli_pick --files; }
     # Ctrl-G searches file contents.
     _smcli_pick_grep() { _smcli_pick --grep; }
@@ -359,7 +367,7 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
     zle -N _smcli_pick_up
     zle -N _smcli_pick_left
     zle -N _smcli_pick_right
-    # Ctrl-T opens the picker on this directory's files; Tab there searches the whole project.
+    # Ctrl-T opens the picker on this directory's files; Ctrl-A toggles whole-project search.
     _smcli_pick_files() { _smcli_pick --files; }
     zle -N _smcli_pick_files
     # Ctrl-G searches file contents.
@@ -488,7 +496,7 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
             commandline -f backward-char
         end
     end
-    # Ctrl-T opens the picker on this directory's files; Tab there searches the whole project.
+    # Ctrl-T opens the picker on this directory's files; Ctrl-A toggles whole-project search.
     function _smcli_pick_files
         _smcli_pick --files
     end

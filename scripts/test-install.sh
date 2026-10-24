@@ -8,8 +8,9 @@ from=$(cd "${1:?usage: test-install.sh <bin dir>}" && pwd)
 home=$(mktemp -d)
 runtime=$(mktemp -d /tmp/smcli-inst.XXXXXX)
 trap 'HOME="$home" "$home/bin/smcli" service stop >/dev/null 2>&1 || true; rm -rf "$home" "$runtime"' EXIT
+# An inherited SMCLI_* or XDG_* variable can change results; the checks set their own.
+unset "${!SMCLI_@}" XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME ZDOTDIR
 export HOME=$home SMCLI_RUNTIME_DIR=$runtime SHELL=/bin/zsh
-unset SMCLI_DB SMCLI_CONFIG ZDOTDIR XDG_CONFIG_HOME SMCLI_SERVICE
 fail() { printf 'test-install: %s\n' "$*" >&2; exit 1; }
 
 printf 'alias ll="ls -l"\n' > "$home/.zshrc"
@@ -26,9 +27,62 @@ grep -q '^alias ll="ls -l"$' "$home/.zshrc" || fail "install lost the user's own
 grep -Eq '"leftKey" ?: true' "$home/.config/smcli/config.json" || fail "--keys was not saved"
 zsh -fc "source '$home/.zshrc'; typeset -f _smcli_record > /dev/null" || fail "zsh did not load the hooks"
 fish --version > /dev/null 2>&1 && { fish -c "source '$home/.config/fish/config.fish'; functions -q _smcli_record" || fail "fish did not load the hooks"; }
+
+# Malformed marker blocks are rejected and the file is preserved.
+malformed_check() {
+    grep -q 'malformed smcli block' "$home/out" || fail "$1 diagnostic"
+}
+printf 'pre\n# >>> smcli >>>\npartial\n' > "$home/.zshrc"
+bash scripts/install.sh --from "$from" --prefix "$home/bin" --shells zsh --keys left --yes > "$home/out" 2>&1 \
+    && fail "install should refuse a file with a missing end marker"
+malformed_check "missing-end marker"
+grep -q '^partial$' "$home/.zshrc" || fail "missing-end file lost content"
+! grep -q '^# <<< smcli <<<$' "$home/.zshrc" || fail "missing-end file gained an end marker"
+
+printf 'pre\n# <<< smcli <<<\n# >>> smcli >>>\npost\n' > "$home/.zshrc"
+bash scripts/install.sh --from "$from" --prefix "$home/bin" --shells zsh --keys left --yes > "$home/out" 2>&1 \
+    && fail "install should refuse a file with reversed markers"
+malformed_check "reversed marker"
+grep -q '^post$' "$home/.zshrc" || fail "reversed-marker file lost content"
+
+printf 'pre\n# >>> smcli >>>\n# >>> smcli >>>\npost\n# <<< smcli <<<\n' > "$home/.zshrc"
+bash scripts/install.sh --from "$from" --prefix "$home/bin" --shells zsh --keys left --yes > "$home/out" 2>&1 \
+    && fail "install should refuse a file with duplicate begin markers"
+malformed_check "duplicate marker"
+grep -q '^post$' "$home/.zshrc" || fail "duplicate-marker file lost content"
+
+# Restore a valid .zshrc before the remaining checks.
+printf 'alias ll="ls -l"\n' > "$home/.zshrc"
+bash scripts/install.sh --from "$from" --prefix "$home/bin" --shells zsh --keys left --yes > "$home/out" 2>&1 \
+    || { cat "$home/out"; fail "install failed after malformed tests"; }
+
 "$home/bin/smcli" service status > /dev/null || fail "service not running after install"
 SMCLI_SYNC=1 "$home/bin/smcli" record zsh s1 /tmp 0 "" "" "" "" "echo exported-marker"
 [[ -f $home/.local/share/smcli/history.db ]] || fail "no database"
+
+# Malformed blocks are also rejected during uninstall.
+printf 'pre\n# >>> smcli >>>\npartial\n' > "$home/.zshrc"
+bash "$home/bin/smcli-uninstall" --yes --prefix "$home/bin" > "$home/out" 2>&1 \
+    && fail "uninstall should refuse a file with a missing end marker"
+malformed_check "uninstall missing-end marker"
+grep -q '^partial$' "$home/.zshrc" || fail "uninstall missing-end file lost content"
+
+printf 'pre\n# <<< smcli <<<\n# >>> smcli >>>\npost\n' > "$home/.zshrc"
+bash "$home/bin/smcli-uninstall" --yes --prefix "$home/bin" > "$home/out" 2>&1 \
+    && fail "uninstall should refuse a file with reversed markers"
+malformed_check "uninstall reversed marker"
+grep -q '^post$' "$home/.zshrc" || fail "uninstall reversed-marker file lost content"
+
+printf 'pre\n# >>> smcli >>>\n# >>> smcli >>>\npost\n# <<< smcli <<<\n' > "$home/.zshrc"
+bash "$home/bin/smcli-uninstall" --yes --prefix "$home/bin" > "$home/out" 2>&1 \
+    && fail "uninstall should refuse a file with duplicate begin markers"
+malformed_check "uninstall duplicate marker"
+grep -q '^post$' "$home/.zshrc" || fail "uninstall duplicate-marker file lost content"
+
+# Restore valid hooks before the normal uninstall checks.
+printf 'alias ll="ls -l"\n' > "$home/.zshrc"
+bash scripts/install.sh --from "$from" --prefix "$home/bin" --shells zsh --keys left --yes > "$home/out" 2>&1 \
+    || { cat "$home/out"; fail "install failed restoring hooks before uninstall tests"; }
 
 # A missing confirmation changes nothing.
 "$home/bin/smcli-uninstall" < /dev/null > /dev/null 2>&1 && fail "uninstall without --yes should refuse"

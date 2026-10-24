@@ -4,7 +4,7 @@ use fff_search::{FilePicker, FilePickerOptions, SharedFilePicker, SharedFrecency
 use smcli_core::{context::ProjectContext, service_location::relative_insert, service_protocol::{FileHit, FileIndexInfo, ServiceRequest, ServiceResponse}};
 
 type Scores = Box<dyn Fn(&str) -> HashMap<String, f64> + Send + Sync>;
-type Record = Box<dyn Fn(&str, &str, &str, &str) -> Result<()> + Send + Sync>;
+type Record = Box<dyn Fn(&str, &str, &str, &str, &ServiceRequest) -> Result<()> + Send + Sync>;
 /// Owns one fff instance for one root. An evicted index lives until its last request ends.
 struct OwnedIndex(SharedFilePicker);
 impl std::ops::Deref for OwnedIndex {
@@ -160,7 +160,7 @@ impl FileSearch {
         }
         let Some(root) = Self::root(directory) else { return ServiceResponse::failure("failed", format!("Cannot resolve {directory}.")); };
         let query: String = request.query.as_deref().unwrap_or("").chars().take(1000).collect();
-        match (self.record)(&root, path, mode, &query) {
+        match (self.record)(&root, path, mode, &query, request) {
             Ok(()) => { let mut response = ServiceResponse::new(true); response.root = Some(root); response }
             Err(e) => ServiceResponse::failure("failed", e.to_string()),
         }
@@ -207,7 +207,7 @@ mod tests {
         }
     }
     impl Drop for Repo { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
-    fn search(capacity: usize) -> FileSearch { FileSearch::new(capacity, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(|_, _, _, _| Ok(()))) }
+    fn search(capacity: usize) -> FileSearch { FileSearch::new(capacity, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(|_, _, _, _, _| Ok(()))) }
     #[test]
     fn files_relative_insert_and_grep_coordinates() {
         fn send_sync<T: Send + Sync>() {} send_sync::<FileSearch>();
@@ -226,7 +226,7 @@ mod tests {
     #[test]
     fn selection_records_and_rejects_escape() {
         let repo = Repo::new(); let recorded = Arc::new(Mutex::new(Vec::new())); let out = recorded.clone();
-        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(move |r, p, m, q| { out.lock().unwrap().push((r.to_string(), p.to_string(), m.to_string(), q.to_string())); Ok(()) }));
+        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(move |r, p, m, q, _| { out.lock().unwrap().push((r.to_string(), p.to_string(), m.to_string(), q.to_string())); Ok(()) }));
         let mut request = repo.request(Operation::Select, "example"); request.path = Some("src/example.txt".into()); request.mode = Some("files".into());
         assert!(search.select(&request).ok);
         assert_eq!(recorded.lock().unwrap()[0], (repo.0.to_string_lossy().into_owned(), "src/example.txt".into(), "files".into(), "example".into()));

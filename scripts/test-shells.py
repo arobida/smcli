@@ -292,6 +292,8 @@ def check(t, variant, env, home, directory):
     if variant.exit_trap:
         t.send("trap 'printf bye >> \"$HOME/exit-trap\"' EXIT")
     output = t.send(init_line(kind))
+    # macOS ships Bash 3.2, which gets a one-time notice that picker keys need Bash 4+.
+    output = "\n".join(l for l in output.splitlines() if "require Bash 4+" not in l)
     assert "smcli:" not in output, output
     t.send("printf repeat")
     t.send("printf repeat")

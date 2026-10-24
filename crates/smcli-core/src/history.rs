@@ -628,9 +628,15 @@ fn insert(db: &Connection, row: &Insert, transaction: bool) -> Result<bool> {
         Ok(inserted > 0)
     })();
     if transaction {
-        match &result {
-            Ok(_) => db.execute_batch("COMMIT")?,
-            Err(_) => { let _ = db.execute_batch("ROLLBACK"); }
+        if result.is_ok() {
+            if let Err(error) = db.execute_batch("COMMIT") {
+                // A failed COMMIT (e.g. a reader holding the lock on a DELETE-journal database) leaves the
+                // transaction open; roll it back so the next record on this connection can start fresh.
+                let _ = db.execute_batch("ROLLBACK");
+                return Err(error.into());
+            }
+        } else {
+            let _ = db.execute_batch("ROLLBACK");
         }
     }
     result
@@ -706,6 +712,35 @@ mod tests {
         assert!(CapturedHistory::new(&public).open_connection().is_err());
         assert!(parse_pipestatus("0 1 x").is_err());
         assert_eq!(parse_pipestatus(" ").unwrap(), None);
+    }
+
+    /// A reader holding a DELETE-journal database's shared lock makes COMMIT fail with SQLITE_BUSY after the
+    /// writes succeeded; the insert must roll back so the same connection can record again.
+    #[test]
+    fn failed_commit_rolls_back_for_the_next_record() {
+        let (_dir, log) = temp_db();
+        {
+            let db = log.open_connection().unwrap();
+            // WAL is only enabled during migration, so a current-schema database can still be DELETE-journal.
+            db.execute_batch("PRAGMA journal_mode = DELETE").unwrap();
+        }
+        let reader = Connection::open(&log.path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader.query_row("SELECT count(*) FROM commands", [], |r| r.get(0)).unwrap();
+        let writer = Connection::open(&log.path).unwrap();
+        writer.busy_timeout(std::time::Duration::from_millis(100)).unwrap();
+        let row = Insert {
+            session: "s1", user: "u", host: "h", shell: "zsh",
+            started_at: 1_700_000_000.0, duration_ms: None,
+            directory: "/tmp", command: "echo hi", exit_code: 0,
+            uuid: None, pipestatus: None,
+        };
+        assert!(insert(&writer, &row, true).is_err());
+        reader.execute_batch("ROLLBACK").unwrap();
+        // The same connection must be usable again, and the failed row must not exist.
+        assert!(insert(&writer, &row, true).unwrap());
+        let rows: i64 = writer.query_row("SELECT count(*) FROM commands", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 1);
     }
 
     #[test]

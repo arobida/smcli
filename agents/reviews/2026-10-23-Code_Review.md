@@ -2,6 +2,22 @@
 
 The current working tree fixes most of the October 22 safety defects, but still has four immediate data/privacy risks: shell configuration truncation, failed-commit recovery, unfiltered file-selection queries, and over-broad pruning. Search also has a cache-publication race and several retrieval/filtering defects, including both new Codex findings. This review checks the supplied reports against the working tree at HEAD `16c3200`, including pre-existing uncommitted search changes, rather than assuming that an old finding or a claimed fix remains true. No implementation code was changed. `make ranking` passed: suggest MRR 1.000/top-1 1.00; search MRR 0.962/top-1 0.92 across 13 cases. The remaining Swift project-search miss is still present; the changed query set means the new aggregate is not a like-for-like improvement over the older 11-case baseline.
 
+## Fix status — 2026-10-24
+
+Fixed in the working tree (uncommitted), each with a regression test; `make test` and `make fresh` pass, `make ranking` unchanged (search MRR 0.962):
+
+- **Fixed:** #1–#12, #14, #15, #18, #19, #21.
+- **#19 note:** the Bash 3.2 notice prints once per database directory (stamp file `.bash3-warned`); `scripts/test-shells.py` ignores that line.
+- **#8 note:** an index built before the fix may show as stale in `smcli health` for commands over 1,500 characters until the next search rewrites them.
+- **#11 note:** the model-identity collision was not tested directly.
+
+Not done:
+
+- **#13 picker fallback performance:** it touches `cli.rs`, which another fix was already changing at the same time; it was held back to avoid conflicts. Next in line.
+- **#16 musl descriptors:** needs an owner decision: support musl or exclude it.
+- **#17 licensing:** owner decisions and license texts, tracked in `agents/plans/shipit-checklist.md`.
+- **#20, #22–#25:** nice-to-have or accepted limitations; deferred to a later pass.
+
 ## Sources and verification
 
 Source labels below mean:

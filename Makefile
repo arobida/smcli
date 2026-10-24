@@ -2,7 +2,10 @@ PYTHON ?= python3
 DIST := dist
 STAMP := $(shell date +%Y%m%d-%H%M%S)-$(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)
 
-.PHONY: build release fresh test clean run baseline ranking linux docs notices
+.PHONY: build release fresh test test-rust test-shells test-service test-install clean run baseline ranking linux docs notices
+
+PKG ?=
+FILTER ?=
 
 # Debug build.
 build:
@@ -12,8 +15,8 @@ build:
 release:
 	cargo build --workspace --release
 	@mkdir -p $(DIST)
-	cp target/release/smcli $(DIST)/smcli-$(STAMP)
-	cp target/release/smcli-service $(DIST)/smcli-service-$(STAMP)
+	cp $${CARGO_TARGET_DIR:-target}/release/smcli $(DIST)/smcli-$(STAMP)
+	cp $${CARGO_TARGET_DIR:-target}/release/smcli-service $(DIST)/smcli-service-$(STAMP)
 	ln -sf smcli-$(STAMP) $(DIST)/smcli
 	ln -sf smcli-service-$(STAMP) $(DIST)/smcli-service
 	@echo "Built $(DIST)/smcli-$(STAMP) (latest: $(DIST)/smcli)"
@@ -30,18 +33,32 @@ fresh:
 test:
 	bash scripts/test.sh
 
+# One slice of the gate, for the edit/test loop. Each assumes `make build` output.
+test-rust:
+	cargo test $(if $(PKG),-p $(PKG),--workspace) $(FILTER)
+
+test-shells: build
+	$(PYTHON) scripts/test-shells.py "$$(cd "$${CARGO_TARGET_DIR:-target}/debug" && pwd)/smcli"
+
+test-service: build
+	$(PYTHON) scripts/test-service.py "$$(cd "$${CARGO_TARGET_DIR:-target}/debug" && pwd)/smcli"
+
+test-install: build
+	bash scripts/test-install.sh "$$(cd "$${CARGO_TARGET_DIR:-target}/debug" && pwd)"
+
 # Scores suggest and search ranking on the fixed query set (MRR, top-1, top-3) and lists the misses.
 ranking:
 	cargo test --release -p smcli-search --test ranking -- --nocapture
 
 # Black-box baseline of the current CLI and generated hooks; never reads real history.
-baseline: release
-	$(PYTHON) scripts/bench-baseline.py --binary "$(CURDIR)/$(DIST)/smcli" $(BENCH_ARGS)
+baseline:
+	cargo build --workspace --release
+	$(PYTHON) scripts/bench-baseline.py --binary "$$(cd "$${CARGO_TARGET_DIR:-target}/release" && pwd)/smcli" $(BENCH_ARGS)
 
 # Builds and runs the full test suite on Linux in Docker (needs a running daemon); Linux output stays in a volume.
 linux:
-	docker run --rm -v "$(CURDIR)":/src -w /src -v smcli-cargo:/usr/local/cargo/registry -v smcli-target:/target \
-		-e CARGO_TARGET_DIR=/target rust:latest sh -c 'apt-get update -qq && apt-get install -y -qq zsh fish python3 > /dev/null && git config --global --add safe.directory "*" && bash scripts/test.sh'
+	docker run --rm -v "$(CURDIR)":/src -w /src -v smcli-cargo:/usr/local/cargo/registry -v smcli-cargo-git:/usr/local/cargo/git -v smcli-target:/target \
+		-e CARGO_TARGET_DIR=/target rust:1.99 sh -c 'apt-get update -qq && apt-get install -y -qq zsh fish python3 sqlite3 git > /dev/null && git config --global --add safe.directory "*" && bash scripts/test.sh'
 
 # Formats every hand-written markdown doc with iwe. Generated docs are skipped: regenerate them instead.
 GENERATED_DOCS := THIRD_PARTY_NOTICES

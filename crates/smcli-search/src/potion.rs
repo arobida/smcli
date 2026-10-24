@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{hash::{Hash, Hasher}, path::Path};
 
 use anyhow::Result;
 use model2vec_rs::model::StaticModel;
@@ -34,8 +34,11 @@ impl Potion {
     /// A model directory (`potionPath` in the config).
     pub fn from_dir(directory: &Path) -> Result<Self> {
         let model = StaticModel::from_pretrained(directory, None, None, None)?;
-        let slug: String = directory.to_string_lossy().chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
-        Ok(Self::with(model, slug))
+        let canonical = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+        let slug: String = canonical.to_string_lossy().chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        canonical.hash(&mut hasher);
+        Ok(Self::with(model, format!("{slug}-{:016x}", hasher.finish())))
     }
 
     fn with(model: StaticModel, identity: String) -> Self {

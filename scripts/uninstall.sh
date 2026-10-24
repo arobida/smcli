@@ -76,9 +76,25 @@ fi
 # 2. Stop the service (it would otherwise keep the database open until it idles out).
 [[ -x $smcli ]] && SMCLI_DB="$db" "$smcli" service stop > /dev/null 2>&1 || true
 
+validate_block() {  # $1: file
+    [[ -f $1 ]] || return 0
+    local state=closed line
+    while IFS= read -r line || [[ -n $line ]]; do
+        if [[ $line == "$begin" ]]; then
+            [[ $state == closed ]] || return 1
+            state=open
+        elif [[ $line == "$end" ]]; then
+            [[ $state == open ]] || return 1
+            state=closed
+        fi
+    done < "$1"
+    [[ $state == closed ]]
+}
+
 # 3. Shell hooks: only the marked block install.sh wrote; the rest of each file is kept as is.
 for file in "${rc_files[@]}"; do
     [[ -f $file ]] && grep -qxF "$begin" "$file" || continue
+    validate_block "$file" || die "malformed smcli block in $file; not modifying"
     tmp=$(mktemp "$file.smcli.XXXXXX")
     awk -v b="$begin" -v e="$end" '$0 == b {skip = 1; next} skip && $0 == e {skip = 0; next} !skip' "$file" > "$tmp"
     cat "$tmp" > "$file" && rm -f "$tmp"

@@ -84,8 +84,24 @@ hook_line() {
         fish) printf '%s shell-init fish | source\n' "$quoted" ;;
     esac
 }
+validate_block() {  # $1: file
+    [[ -f $1 ]] || return 0
+    local state=closed line
+    while IFS= read -r line || [[ -n $line ]]; do
+        if [[ $line == "$begin" ]]; then
+            [[ $state == closed ]] || return 1
+            state=open
+        elif [[ $line == "$end" ]]; then
+            [[ $state == open ]] || return 1
+            state=closed
+        fi
+    done < "$1"
+    [[ $state == closed ]]
+}
+
 remove_block() {  # $1: file
     [[ -f $1 ]] && grep -qxF "$begin" "$1" || return 0
+    validate_block "$1" || return 1
     local tmp
     tmp=$(mktemp "$1.smcli.XXXXXX")
     awk -v b="$begin" -v e="$end" '$0 == b {skip = 1; next} skip && $0 == e {skip = 0; next} !skip' "$1" > "$tmp"
@@ -102,8 +118,9 @@ for shell in ${shells//,/ }; do
     case $shell in zsh|bash|fish) ;; *) die "unsupported shell: $shell (zsh, bash or fish)" ;; esac
     file=$(rc_file "$shell")
     mkdir -p "$(dirname "$file")"
+    [[ -f $file ]] && { validate_block "$file" || die "malformed smcli block in $file; not modifying"; }
     [[ -f $file ]] && cp -p "$file" "$file.smcli-backup"
-    remove_block "$file"
+    remove_block "$file" || die "malformed smcli block in $file; not modifying"
     printf '\n%s\n# Added by smcli install.sh; remove with smcli-uninstall. Keep it below other tools that bind keys.\n%s\n%s\n' \
         "$begin" "$(hook_line "$shell")" "$end" >> "$file"
     hooked+=("$shell ($file)")

@@ -1,5 +1,5 @@
 //! Port of `RankingQualityTests.swift`: a fixed query set over a deterministic synthetic history, scored by mean
-//! reciprocal rank and top-1/top-3. `make rs-ranking` prints the scores; the test fails below the floors.
+//! reciprocal rank and top-1/top-3. `make ranking` prints the scores; the test fails below the floors.
 //! The fixture never touches real history: it builds real directories (manifests, `.git` markers) under a
 //! temporary root, since project and Git context are read from disk.
 

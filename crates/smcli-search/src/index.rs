@@ -12,14 +12,14 @@ use taladb::fts::HybridQuery;
 use taladb::json::filter_from_json;
 use taladb::{Database, Stage, TypedCollection, Value};
 
-use crate::corpus::{Hit, SearchSignals, coverage, is_literal_query, parse_markers, program_arguments, query_filter, rerank, search_document};
+use crate::corpus::{Hit, SearchSignals, coverage, embedding_text, is_literal_query, parse_markers, program_arguments, query_filter, rerank, search_document};
 use crate::{Potion, ShellTokenizer};
 
 /// One indexed command; metadata fields mirror `SearchFilter` so filters narrow candidates before ranking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexedCommand {
-    /// `search_document` text: the identity, and what is embedded.
+    /// Full-command identity (`search_document`), not the truncated text that is embedded.
     pub doc: String,
     pub command: String,
     pub terms: String,
@@ -131,17 +131,23 @@ impl HistorySearch {
                 &computed
             }
         };
-        // Derive filters from the query itself before touching the index. Explicit `$word` markers
-        // take priority and are strict; otherwise plain words are auto-parsed into filters.
+        // Explicit `$word` markers take priority over automatic parsing. A marker that resolves to a
+        // program, subcommand, or directory is strict; unresolved marker text (`$HOME`) is ordinary query text.
         let directories: HashSet<String> = corpus.values().filter_map(|e| e.last_directory.clone()).collect();
         let (stripped, marked_filter, has_markers) = parse_markers(query, programs, &directories);
         let parsed_filter = if has_markers { marked_filter } else { query_filter(query, programs, &directories) };
         // Literal queries lean on keywords; intent queries weigh both legs equally. Both see the
         // stripped query so `$word` markers do not accidentally make a query literal.
         let literal = is_literal_query(&stripped, programs);
+        let parsed_any = has_constraint(&parsed_filter);
+        let mut merged_filter = filter.clone();
+        if parsed_any {
+            merged_filter.merge_parsed(&parsed_filter);
+        }
         // No history yet: nothing to embed, but project commands can still answer.
         if corpus.is_empty() {
-            let hits = signals.additions(&stripped, corpus, &HashSet::new(), filter, now);
+            let active = addition_filter(filter, &merged_filter, has_markers, parsed_any, false);
+            let hits = signals.additions(&stripped, corpus, &HashSet::new(), active, now);
             return Ok(rerank(hits, literal, &stripped, now, signals).into_iter().take(limit).collect());
         }
         let Some(_lock) = self.lock_index(20)? else {
@@ -197,11 +203,6 @@ impl HistorySearch {
                     .collect())
             }
         };
-        let parsed_any = parsed_filter.program.is_some() || parsed_filter.subcommand.is_some() || parsed_filter.directory.is_some();
-        let mut merged_filter = filter.clone();
-        if parsed_any {
-            merged_filter.merge_parsed(&parsed_filter);
-        }
         let active_filter: &SearchFilter = if parsed_any { &merged_filter } else { filter };
         let mut hits: Vec<Hit> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
@@ -217,7 +218,7 @@ impl HistorySearch {
         // Auto-parsed filters get a safety net: if they return too few hits, fall back to the
         // explicit filter. When the parsed filter produced no hits at all it was likely wrong, so
         // the fallback is unscaled; otherwise fallback hits are damped so filtered hits rank first.
-        // Markers are strict and do not fall back.
+        // A resolved marker is strict and does not fall back. Unresolved marker text is not a constraint.
         let parsed_useful = parsed_any && !hits.is_empty();
         if hits.len() < limit && parsed_any && !has_markers {
             let mut results = search_with(filter)?;
@@ -232,7 +233,7 @@ impl HistorySearch {
             }
         }
         drop(db);
-        let final_filter: &SearchFilter = if parsed_useful { &merged_filter } else { filter };
+        let final_filter = addition_filter(filter, &merged_filter, has_markers, parsed_any, parsed_useful);
         let existing: HashSet<String> = hits.iter().map(|h| h.0.command.clone()).collect();
         hits.extend(signals.additions(&stripped, corpus, &existing, final_filter, now));
         Ok(rerank(hits, literal, &stripped, now, signals).into_iter().take(limit).collect())
@@ -249,68 +250,92 @@ impl HistorySearch {
 
     /// Brings `commands` in line with `corpus`. Returns the number of documents now indexed.
     fn sync(&self, commands: &TypedCollection<IndexedCommand>, corpus: &HashMap<String, SearchEntry>) -> Result<usize> {
-        // Documents are keyed by their text, so an entry whose labels change is re-embedded.
-        // Static models get the bare command; contextual models would get the labeled document.
-        let wanted: HashMap<String, IndexedCommand> = corpus
+        // Keyed by the full command, not the truncated embedding text: two pasted scripts that share a
+        // 1,500-character prefix must both stay retrievable. Vectors and terms still see only that bounded text.
+        let wanted: HashMap<String, (IndexedCommand, String)> = corpus
             .values()
             .map(|entry| {
-                let doc = search_document(entry, false);
-                (doc.clone(), IndexedCommand::new(entry, doc))
+                let embed = embedding_text(entry);
+                (entry.command.clone(), (IndexedCommand::new(entry, search_document(entry, false)), embed))
             })
             .collect();
         let indexed = fingerprints(commands)?;
-        let stale: Vec<&String> = indexed.keys().filter(|doc| !wanted.contains_key(*doc)).collect();
+        let stale: Vec<&String> = indexed
+            .iter()
+            .filter(|(command, (doc, _))| wanted.get(*command).map(|(row, _)| &row.doc != doc).unwrap_or(true))
+            .map(|(command, _)| command)
+            .collect();
         if !stale.is_empty() {
-            commands.delete_many(json!({"doc": {"$in": stale}}))?;
+            commands.delete_many(json!({"command": {"$in": stale}}))?;
         }
-        // Unchanged documents with new usage keep their vectors.
-        for (doc, meta) in &indexed {
-            if let Some(command) = wanted.get(doc).filter(|c| &c.meta != meta) {
-                commands.update_one(json!({"doc": doc}), json!({"$set": command.metadata()}))?;
+        // Same identity and embedding text: usage changes update metadata and keep the vector.
+        for (command, (doc, meta)) in &indexed {
+            if let Some((row, _)) = wanted.get(command).filter(|(row, _)| &row.doc == doc && &row.meta != meta) {
+                commands.update_one(json!({"command": command}), json!({"$set": row.metadata()}))?;
             }
         }
-        let mut missing: Vec<&String> = wanted.keys().filter(|doc| !indexed.contains_key(*doc)).collect();
+        let mut missing: Vec<&String> = wanted
+            .keys()
+            .filter(|command| match indexed.get(*command) {
+                None => true,
+                Some((doc, _)) => &wanted[*command].0.doc != doc,
+            })
+            .collect();
         missing.sort();
         for batch in missing.chunks(256) {
-            let texts: Vec<String> = batch.iter().map(|d| d.to_string()).collect();
+            let texts: Vec<String> = batch.iter().map(|command| wanted[*command].1.clone()).collect();
             let vectors = self.potion.embed(&texts);
             let documents: Vec<IndexedCommand> = batch
                 .iter()
                 .zip(vectors)
-                .map(|(doc, embedding)| IndexedCommand { terms: ShellTokenizer::encoded(doc), embedding, ..wanted[*doc].clone() })
+                .map(|(command, embedding)| IndexedCommand {
+                    terms: ShellTokenizer::encoded(&wanted[*command].1),
+                    embedding,
+                    ..wanted[*command].0.clone()
+                })
                 .collect();
             commands.insert_many(&documents)?;
         }
         Ok(wanted.len())
     }
 
-    /// The index file, ready to search; rebuilt when unreadable (it is a cache of the history).
+    /// The index file, ready to search. Only a corrupt or incompatible cache is discarded; other errors keep it.
     fn open_index(&self, name: &str) -> Result<Database> {
+        self.open_cached(name, |db| self.setup_index(db))
+    }
+
+    fn setup_index(&self, db: &Database) -> Result<()> {
+        let commands = db.typed::<IndexedCommand>("commands")?;
+        for field in ["doc", "program", "subcommand", "author", "lastRun"] {
+            commands.create_index(field)?;
+        }
+        let indexes = commands.raw().list_indexes()?;
+        if !indexes.fts.iter().any(|f| f == "terms") {
+            commands.create_fts_index("terms")?;
+        }
+        if !indexes.vector.iter().any(|f| f == "embedding") {
+            // Exact search: faster than HNSW below tens of thousands of commands.
+            commands.create_vector_index("embedding", self.potion.dimension(), None, None)?;
+        }
+        Ok(())
+    }
+
+    /// `setup` is injected so a test can fail setup without corrupting the file.
+    fn open_cached(&self, name: &str, setup: impl Fn(&Database) -> Result<()>) -> Result<Database> {
         self.remove_old_indexes();
         let path = self.directory.join(format!("{name}.taladb"));
-        let setup = |db: &Database| -> Result<()> {
-            let commands = db.typed::<IndexedCommand>("commands")?;
-            for field in ["doc", "program", "subcommand", "author", "lastRun"] {
-                commands.create_index(field)?;
-            }
-            let indexes = commands.raw().list_indexes()?;
-            if !indexes.fts.iter().any(|f| f == "terms") {
-                commands.create_fts_index("terms")?;
-            }
-            if !indexes.vector.iter().any(|f| f == "embedding") {
-                // Exact search: faster than HNSW below tens of thousands of commands.
-                commands.create_vector_index("embedding", self.potion.dimension(), None, None)?;
-            }
-            Ok(())
+        let open = || -> Result<Database> {
+            let db = taladb::open(&path)?;
+            setup(&db)?;
+            Ok(db)
         };
-        match taladb::open(&path).map_err(anyhow::Error::from).and_then(|db| setup(&db).map(|_| db)) {
+        match open() {
             Ok(db) => Ok(db),
-            Err(_) => {
+            Err(err) if index_cache_unusable(&err) => {
                 self.remove_files(name);
-                let db = taladb::open(&path)?;
-                setup(&db)?;
-                Ok(db)
+                open().map_err(|retry| retry.context(format!("while rebuilding a corrupt index: {err:#}")))
             }
+            Err(err) => Err(err),
         }
     }
 
@@ -383,16 +408,53 @@ impl HistorySearch {
     }
 }
 
-/// Each indexed document's metadata fingerprint. Projected, since decoding every embedding is slow.
-fn fingerprints(commands: &TypedCollection<IndexedCommand>) -> Result<HashMap<String, String>> {
-    let rows = commands.raw().aggregate(vec![Stage::Project { fields: vec!["doc".into(), "meta".into()], include: true, keep_id: false }])?;
+/// Each indexed command's document identity and metadata fingerprint. Projected, since decoding every embedding is slow.
+fn fingerprints(commands: &TypedCollection<IndexedCommand>) -> Result<HashMap<String, (String, String)>> {
+    let rows = commands.raw().aggregate(vec![Stage::Project {
+        fields: vec!["command".into(), "doc".into(), "meta".into()],
+        include: true,
+        keep_id: false,
+    }])?;
     Ok(rows
         .iter()
-        .filter_map(|row| match (row.get("doc"), row.get("meta")) {
-            (Some(Value::Str(doc)), Some(Value::Str(meta))) => Some((doc.clone(), meta.clone())),
+        .filter_map(|row| match (row.get("command"), row.get("doc"), row.get("meta")) {
+            (Some(Value::Str(command)), Some(Value::Str(doc)), Some(Value::Str(meta))) => Some((command.clone(), (doc.clone(), meta.clone()))),
             _ => None,
         })
         .collect())
+}
+
+fn has_constraint(filter: &SearchFilter) -> bool {
+    filter.program.is_some() || filter.subcommand.is_some() || filter.directory.is_some()
+}
+
+/// Picks and project additions keep a resolved `$word` marker even when retrieval is empty.
+/// An automatic parse is kept only when it actually matched. Unresolved marker text is not a constraint.
+fn addition_filter<'a>(explicit: &'a SearchFilter, merged: &'a SearchFilter, has_markers: bool, parsed_any: bool, retrieved: bool) -> &'a SearchFilter {
+    if (has_markers && parsed_any) || retrieved { merged } else { explicit }
+}
+
+/// Corrupt or incompatible cache. A full disk, a permission error, or a failed setup step is not.
+/// redb reports a bad magic number as InvalidData text, not as `Corrupted`.
+fn index_cache_unusable(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let msg = cause.to_string();
+        msg.contains("Manual upgrade required")
+            || msg.contains("file is version")
+            || msg.contains("corrupt")
+            || msg.contains("Not a redb database")
+            || msg.contains("magic number mismatch")
+            || matches!(
+                cause.downcast_ref::<taladb::TalaDbError>(),
+                Some(
+                    taladb::TalaDbError::Serialization(_)
+                        | taladb::TalaDbError::Postcard(_)
+                        | taladb::TalaDbError::VectorDimensionMismatch { .. }
+                        | taladb::TalaDbError::TypeError { .. }
+                        | taladb::TalaDbError::Migration(_)
+                )
+            )
+    })
 }
 
 /// Search without the index: commands sharing the query's words, by how much of the query they cover.
@@ -400,7 +462,7 @@ fn fingerprints(commands: &TypedCollection<IndexedCommand>) -> Result<HashMap<St
 /// same parsing done on the indexed path so a held lock does not change ranking behavior.
 fn text_fallback(query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter, literal: bool,
                  signals: &SearchSignals, now: f64, parsed_filter: &SearchFilter, has_markers: bool) -> Vec<SearchEntry> {
-    let parsed_any = parsed_filter.program.is_some() || parsed_filter.subcommand.is_some() || parsed_filter.directory.is_some();
+    let parsed_any = has_constraint(parsed_filter);
     let mut merged_filter = filter.clone();
     if parsed_any {
         merged_filter.merge_parsed(parsed_filter);
@@ -423,7 +485,8 @@ fn text_fallback(query: &str, corpus: &HashMap<String, SearchEntry>, limit: usiz
         }
     }
     let parsed_useful = parsed_any && !hits.is_empty();
-    if hits.len() < limit && !has_markers {
+    // A resolved marker is strict. Unresolved `$HOME` text must not suppress ordinary matching.
+    if hits.len() < limit && !(has_markers && parsed_any) {
         let mut fallback: Vec<Hit> = corpus
             .values()
             .filter(|e| filter.allows(e))
@@ -438,7 +501,7 @@ fn text_fallback(query: &str, corpus: &HashMap<String, SearchEntry>, limit: usiz
             }
         }
     }
-    let final_filter: &SearchFilter = if parsed_useful { &merged_filter } else { filter };
+    let final_filter = addition_filter(filter, &merged_filter, has_markers, parsed_any, parsed_useful);
     let existing: HashSet<String> = hits.iter().map(|h| h.0.command.clone()).collect();
     hits.extend(signals.additions(query, corpus, &existing, final_filter, now));
     rerank(hits, literal, query, now, signals).into_iter().take(limit).collect()
@@ -586,5 +649,94 @@ mod tests {
         let hits = engine.search("ps", &corpus, 3, &by_author, None, &none, 0.0).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].command, "docker ps");
+    }
+
+    #[test]
+    fn unresolved_markers_still_match_when_the_index_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HistorySearch::new(dir.path().join("index"), Potion::bundled().unwrap());
+        let corpus: HashMap<String, SearchEntry> = ["echo hello", "git status", "docker ps"]
+            .iter()
+            .map(|c| (c.to_string(), SearchEntry::new(c, 1, "native")))
+            .collect();
+        let held = engine.lock_index(1).unwrap().unwrap();
+        let unresolved = engine.search("echo $HOME", &corpus, 5, &SearchFilter::default(), None, &SearchSignals::default(), 0.0).unwrap();
+        assert!(unresolved.iter().any(|e| e.command == "echo hello"), "{unresolved:?}");
+        let strict = engine.search("$git ps", &corpus, 5, &SearchFilter::default(), None, &SearchSignals::default(), 0.0).unwrap();
+        assert!(strict.iter().any(|e| e.command == "git status"), "{strict:?}");
+        assert!(!strict.iter().any(|e| e.command == "docker ps"), "{strict:?}");
+        drop(held);
+    }
+
+    #[test]
+    fn strict_markers_reject_outside_selections_when_nothing_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HistorySearch::new(dir.path().join("index"), Potion::bundled().unwrap());
+        let mut git = SearchEntry::new("git status", 1, "captured");
+        git.last_directory = Some("/repo".into());
+        let mut docker = SearchEntry::new("docker ps", 1, "captured");
+        docker.last_directory = Some("/other".into());
+        let corpus: HashMap<String, SearchEntry> = [(git.command.clone(), git), (docker.command.clone(), docker)].into_iter().collect();
+        let mut picks = smcli_core::ranking::SelectionLog::default();
+        picks.add("git other", "docker ps", 0.0);
+        let signals = SearchSignals { picks, ..Default::default() };
+        let query = "$git $other";
+        let indexed = engine.search(query, &corpus, 5, &SearchFilter::default(), None, &signals, 0.0).unwrap();
+        assert!(indexed.is_empty(), "indexed: {indexed:?}");
+        let held = engine.lock_index(1).unwrap().unwrap();
+        let locked = engine.search(query, &corpus, 5, &SearchFilter::default(), None, &signals, 0.0).unwrap();
+        assert!(locked.is_empty(), "locked: {locked:?}");
+        drop(held);
+    }
+
+    #[test]
+    fn colliding_command_prefixes_keep_both_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HistorySearch::new(dir.path().join("index"), Potion::bundled().unwrap());
+        let prefix = "x".repeat(1_500);
+        let alpha = format!("{prefix} ALPHA");
+        let beta = format!("{prefix} BETA");
+        let mut first = SearchEntry::new(&alpha, 1, "captured");
+        let mut second = SearchEntry::new(&beta, 2, "captured");
+        first.intent = Some("paste".into());
+        second.intent = Some("paste".into());
+        let corpus = HashMap::from([(alpha.clone(), first.clone()), (beta.clone(), second.clone())]);
+        engine.search("x", &corpus, 5, &SearchFilter::default(), None, &SearchSignals::default(), 0.0).unwrap();
+        let rows = indexed_commands(&engine);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows.iter().find(|r| r.command == alpha).unwrap().embedding, rows.iter().find(|r| r.command == beta).unwrap().embedding);
+
+        first.runs = 9;
+        let corpus = HashMap::from([(alpha.clone(), first), (beta.clone(), second)]);
+        engine.search("x", &corpus, 5, &SearchFilter::default(), None, &SearchSignals::default(), 0.0).unwrap();
+        let rows = indexed_commands(&engine);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows.iter().find(|r| r.command == alpha).unwrap().runs, 9);
+        assert_eq!(rows.iter().find(|r| r.command == beta).unwrap().runs, 2);
+    }
+
+    #[test]
+    fn setup_failure_keeps_the_cache_and_corrupt_cache_is_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HistorySearch::new(dir.path().join("index"), Potion::bundled().unwrap());
+        let corpus: HashMap<String, SearchEntry> = [("docker ps".into(), SearchEntry::new("docker ps", 1, "native"))].into_iter().collect();
+        engine.search("docker", &corpus, 1, &SearchFilter::default(), None, &SearchSignals::default(), 0.0).unwrap();
+        let name = engine.index_name();
+        let err = match engine.open_cached(&name, |_| bail!("transient setup I/O failure")) {
+            Err(err) => err,
+            Ok(_) => panic!("setup failure was ignored"),
+        };
+        assert!(err.to_string().contains("transient setup I/O failure"), "{err:#}");
+        assert_eq!(indexed_commands(&engine).len(), 1);
+
+        let path = engine.directory.join(format!("{name}.taladb"));
+        std::fs::write(&path, b"this is not a taladb file").unwrap();
+        let hits = engine.search("docker", &corpus, 1, &SearchFilter::default(), None, &SearchSignals::default(), 0.0).unwrap();
+        assert_eq!(hits[0].command, "docker ps");
+    }
+
+    fn indexed_commands(engine: &HistorySearch) -> Vec<IndexedCommand> {
+        let db = engine.open_index(&engine.index_name()).unwrap();
+        db.typed::<IndexedCommand>("commands").unwrap().find(json!({})).unwrap()
     }
 }

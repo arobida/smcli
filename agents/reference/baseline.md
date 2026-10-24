@@ -23,7 +23,6 @@ From the repository root:
 make baseline                                 # in-process, writes dist/baseline.json
 make baseline BENCH_ARGS="--service on --output dist/baseline-service.json"   # through the service, plus repositories
 make baseline BENCH_ARGS="--service on --rows 1000 --repo-files 10000"        # a short service run
-make fff-smoke
 make test
 ```
 
@@ -37,8 +36,8 @@ context, fff `files` and `grep` through the socket (cold = first request of a fr
 Python 3.9+, Bash and Zsh are used for the Unix benchmark. Shells are discovered on
 `PATH`; absent shells are omitted from the report. `make test` also runs a tiny
 10-row/one-sample benchmark as a functional harness check, without performance
-thresholds. fff is built by `make fff` (a prerequisite of `build`, `release`, `fresh` and `test`;
-Cargo must be installed) and linked statically into `smcli-service`.
+thresholds. The pinned `fff-search` crate is a Cargo dependency of `smcli-service`, built with the
+rest of the workspace.
 
 ## Request path (Swift implementation, 2026-10-20)
 
