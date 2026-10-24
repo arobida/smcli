@@ -35,8 +35,11 @@ pub fn render_with_keys(
     };
     let template = match shell {
         "bash" => {
-            r###"# smcli: opt-in metadata capture. Native HISTFILE is left untouched.
-# Hook: bash-preexec when it is loaded, else PS0 (Bash 4.4+), else a DEBUG trap (SMCLI_BASH_HOOK=debug forces it).
+            r###"# smcli: opt-in metadata capture. Native HISTFILE is left untouched. Records commands Bash retains in history;
+# pipeline status is unavailable. In PS0/bash-preexec mode, an unchanged history number is ambiguous with
+# ignoredups, so when HISTCONTROL/HISTIGNORE exclusions are configured that command is conservatively omitted.
+# HISTIGNORE's bare & pattern is not interpreted. Hook: bash-preexec when loaded, else PS0 (Bash 4.4+),
+# else a DEBUG trap (SMCLI_BASH_HOOK=debug forces it).
 if [[ ${_smcli_installed-} != 1 ]]; then
     _smcli_mode=debug
     if [[ ${SMCLI_BASH_HOOK-} != debug ]]; then
@@ -282,7 +285,8 @@ elif [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
 fi"###
         }
         "zsh" => {
-            r###"# smcli: opt-in metadata capture. Native HISTFILE is left untouched.
+            r###"# smcli: opt-in metadata capture. Native HISTFILE is left untouched. HISTORY_IGNORE is honored; other
+# zshaddhistory hooks may reject commands without smcli knowing. Pipeline statuses are recorded.
 if [[ ${_smcli_installed-} != 1 ]]; then
     zmodload -F zsh/datetime p:EPOCHREALTIME p:EPOCHSECONDS 2>/dev/null
     _smcli_bin=\#(binary)
@@ -411,7 +415,8 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
 fi"###
         }
         "fish" => {
-            r###"# smcli: opt-in metadata capture. Native history is left untouched.
+            r###"# smcli: opt-in metadata capture. Native history is left untouched. fish_should_add_to_history and private mode
+# exclusions are honored; pipeline statuses are recorded. Start times have whole-second precision.
 if not set -q _smcli_installed
     set -g _smcli_installed 1
     set -g _smcli_bin \#(fishBinary)

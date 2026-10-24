@@ -448,8 +448,9 @@ def exclusions(t, variant, env):
         assert commands(env)[-2:] == ["printf dup", "printf dup"], commands(env)[-4:]
         t.send("HISTCONTROL=ignoreboth")
         t.send(" printf hidden")
-        t.send("HISTIGNORE='printf ignored*'")
+        t.send("HISTIGNORE='printf ignored*:printf bare&'")
         t.send("printf ignored1")
+        t.send("printf bare&")
         t.send("HISTIGNORE=; HISTCONTROL=")
     elif kind == "zsh":
         t.send("setopt HIST_IGNORE_SPACE HIST_IGNORE_DUPS")
@@ -476,6 +477,9 @@ def exclusions(t, variant, env):
     seen = commands(env)
     assert seen[-1] == "printf visible-after", seen[-4:]
     assert not any(word in c for c in seen for word in ("hidden", "AKIA", "ignored1", "private1")), seen[-8:]
+    if kind == "bash":
+        # Bare & in HISTIGNORE means previous-command duplicate to Bash, not a glob to smcli.
+        assert "printf bare&" in seen, seen[-8:]
 
 
 def exit_status(t, variant, env, home):

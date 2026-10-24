@@ -851,14 +851,10 @@ fn pick(
     .into_iter()
     .map(|s| s.command)
     .collect();
+    let user = user_name();
     let recent = match served.and_then(|r| r.recent) {
         Some(r) => r,
-        None => records(c)?
-            .into_iter()
-            .rev()
-            .filter(|r| r["user"].as_str() == Some(&user_name()))
-            .filter_map(|r| r["command"].as_str().map(String::from))
-            .collect(),
+        None => c.picker_recents(&user, 50)?,
     };
     let native = smcli_search::native::history_files(home, env)?
         .iter()
@@ -911,6 +907,8 @@ fn pick(
         let d = d.clone();
         let context = context.clone();
         let service = ServiceClient::new(&c.path, &env, &std::env::current_exe()?);
+        // The in-process fallback is built on first use and reused for the rest of the picker session.
+        let fallback = std::cell::OnceCell::new();
         move |q: &str| -> Result<Vec<String>> {
         let mut r = ServiceRequest::new(Operation::Search);
         r.query = Some(q.into());
@@ -925,15 +923,20 @@ fn pick(
             .and_then(|r| r.hits)
         {
             Some(h) => h,
-            None => search_engine(&c, &home, &env)?.search(
-                q,
-                &corpus(&c, &home, &env, context.project_root.as_deref(), now())?,
-                100,
-                &SearchFilter::default(),
-                None,
-                &search_signals(&c, Some(context.clone()))?,
-                now(),
-            )?,
+            None => {
+                let (engine, corpus, signals) = match fallback.get() {
+                    Some(built) => built,
+                    None => {
+                        let built = (
+                            search_engine(&c, &home, &env)?,
+                            corpus(&c, &home, &env, context.project_root.as_deref(), now())?,
+                            search_signals(&c, Some(context.clone()))?,
+                        );
+                        fallback.get_or_init(|| built)
+                    }
+                };
+                engine.search(q, corpus, 100, &SearchFilter::default(), None, signals, now())?
+            }
         };
         Ok(hits.into_iter().map(|h| h.command).collect())
         }

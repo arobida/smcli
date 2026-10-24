@@ -139,6 +139,7 @@ impl ProjectContext {
             let text = read_small_file(&format!("{directory}/{file}"), 1 << 20);
             let text = text.as_deref();
             let names = match *kind {
+                // shortcut: literal name: "..." on target-like constructors only, upgrade to a structured reader for computed names and other declarations
                 "swift" => matches(r#"\.(?:executableTarget|target|testTarget|plugin|macro)\(\s*name:\s*"([^"]+)""#, text),
                 "node" => node_scripts(text, &mut project, &has),
                 "rust" => cargo_targets(text, &mut project),
@@ -364,6 +365,41 @@ mod tests {
         assert_eq!(context.projects[1].scripts["package.json"], ["dev", "test"]);
         assert_eq!(context.projects[1].package_manager.as_deref(), Some("yarn"));
         assert_eq!(context.repo_relative.as_deref(), Some("tools"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Literal `name: "..."` on target-like constructors only. Dependencies, other constructors, and computed names stay out.
+    #[test]
+    fn swift_manifest_keeps_literal_target_names_only() {
+        let root = tempfile_dir();
+        std::fs::write(format!("{root}/Package.swift"), r#"
+// swift-tools-version: 6.0
+import PackageDescription
+let libName = "Computed"
+let package = Package(
+    name: "api",
+    dependencies: [
+        .package(url: "https://github.com/example/CSQLite.git", from: "1.0.0"),
+    ],
+    targets: [
+        .executableTarget(name: "App"),
+        .target(name: "Lib", dependencies: [.product(name: "CSQLite", package: "CSQLite")]),
+        .testTarget(name: "AppTests"),
+        .plugin(name: "Gen"),
+        .macro(
+            name: "Str"
+        ),
+        .target(name: libName),
+        .target(name: makeName("Nope")),
+        .binaryTarget(name: "BinLib", path: "Bin.zip"),
+        .systemLibrary(name: "CLib"),
+    ]
+)
+"#).unwrap();
+        let context = ProjectContext::discover(&root);
+        let project = &context.projects[0];
+        assert_eq!(project.kind, "swift");
+        assert_eq!(project.scripts["Package.swift"], ["App", "Lib", "AppTests", "Gen", "Str"]);
         std::fs::remove_dir_all(root).unwrap();
     }
 

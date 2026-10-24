@@ -325,6 +325,21 @@ impl CapturedHistory {
         Ok(log)
     }
 
+    /// Recent commands for the picker, newest first and bounded. Avoids the full export window query.
+    pub fn picker_recents(&self, user: &str, limit: usize) -> Result<Vec<String>> {
+        if !self.exists() {
+            return Ok(vec![]);
+        }
+        let db = self.connect(false)?;
+        let mut statement = db.prepare(
+            "SELECT c.command FROM commands c JOIN sessions s ON s.id = c.session
+             WHERE s.user = ? AND c.deleted_at IS NULL AND NOT smcli_internal(c.command)
+             ORDER BY c.started_at DESC, c.id DESC LIMIT ?",
+        )?;
+        let rows = statement.query_map(params![user, limit as i64], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The last command `session` ran (not counting smcli's own), for transitions.
     pub fn previous_command(&self, session: &str, user: &str, db: &Connection) -> Result<Option<String>> {
         let mut statement = db.prepare(
@@ -756,5 +771,27 @@ mod tests {
         std::fs::set_permissions(&log.path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let stats = log.command_stats(None, None, 10.0).unwrap();
         assert_eq!(stats["git commit -m x --amend"].flags, ["-m", "--amend"]);
+    }
+
+    #[test]
+    fn picker_recents_are_bounded_and_user_filtered() {
+        let (_dir, log) = temp_db();
+        let db = log.open_connection().unwrap();
+        db.execute_batch(
+            "INSERT INTO sessions(id,user,host,shell) VALUES
+             ('s1','alice','host','zsh'),('s2','bob','host','zsh');
+             INSERT INTO commands(session,started_at,directory,command,exit_code) VALUES
+             ('s1',1700000000.0,'/tmp','git status',0),
+             ('s1',1700000001.0,'/tmp','smcli search x',0),
+             ('s1',1700000002.0,'/tmp','ls -la',0),
+             ('s2',1700000003.0,'/tmp','bob-only',0),
+             ('s1',1700000004.0,'/tmp','git log',0);",
+        ).unwrap();
+        drop(db);
+        let recents = log.picker_recents("alice", 2).unwrap();
+        assert_eq!(recents, ["git log", "ls -la"]);
+        assert_eq!(log.picker_recents("alice", 10).unwrap().len(), 3);
+        assert!(log.picker_recents("alice", 10).unwrap().iter().all(|c| c != "smcli search x"));
+        assert!(log.picker_recents("bob", 10).unwrap().iter().all(|c| c != "git log"));
     }
 }

@@ -42,7 +42,7 @@ const fn in_session(c: Case, session: &'static str) -> Case {
 
 use Kind::{Search, Suggest};
 
-const CASES: [Case; 29] = [
+const CASES: [Case; 34] = [
     // Directory: the command used where you are.
     case("directory", Suggest, "webapp", "npm run ", "npm run dev"),
     case("directory", Suggest, "api/Sources/Lib", "swift b", "swift build"),
@@ -54,6 +54,13 @@ const CASES: [Case; 29] = [
     case("project", Suggest, "mono/packages/ui/src", "npm run ", "npm run docs"),
     case("project", Search, "api/Sources/App", "swift test", "swift test --filter Lib"),
     case("project", Search, "mono/packages/ui/src", "npm run", "npm run docs"),
+    // Same signal, other queries: a sibling build habit, the named in-project test, and the other package's script.
+    case("project", Suggest, "api/Sources/App", "swift b", "swift build"),
+    case("project", Suggest, "api/Sources/Lib", "swift test", "swift test --filter Lib"),
+    case("project", Search, "api/Sources/App", "swift build", "swift build"),
+    case("project", Search, "mono/packages/core", "npm run", "npm run bundle"),
+    // Used here beats the same habit in a sibling directory of the project.
+    case("project", Search, "api/Sources/Lib", "swift package", "swift package update"),
     // Transitions: what usually comes after the command you just ran.
     in_session(case("transition", Suggest, "notes", "git ", "git commit -m wip"), "live1"),
     in_session(case("transition", Suggest, "notes", "make ", "make lint"), "live2"),
@@ -197,6 +204,8 @@ impl World {
         self.habit("git diff", "webapp", 20);
         self.habit("swift build", "api/Sources/Lib", 50);
         self.habit("swift test --filter Lib", "api/Sources/Lib", 12);
+        self.habit("swift package update", "api/Sources/Lib", 6);
+        self.habit("swift package resolve", "api/Sources/App", 6);
         self.habit("swift test --parallel", "tools", 16);
         self.habit("swift build -c release", "tools", 15);
         self.habit("make release", "other", 25);

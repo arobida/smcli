@@ -111,8 +111,10 @@ impl ServiceClient {
         None
     }
 
-    /// Starts the service detached in its own session, with no terminal. macOS and glibc close
-    /// inherited descriptors above stdio; musl keeps them.
+    /// Starts the service detached in its own session, with no terminal. Inherited descriptors
+    /// above stdio are closed in the child so the service cannot keep a shell FIFO or redirected fd
+    /// open: macOS via CLOEXEC_DEFAULT, glibc 2.34+ via `posix_spawn_file_actions_addclosefrom_np`,
+    /// musl (no closefrom action) via one close action per descriptor listed in /proc/self/fd.
     fn launch(&self) -> bool {
         use std::os::unix::ffi::OsStrExt;
         let Ok(executable) = CString::new(self.executable.as_os_str().as_bytes()) else { return false; };
@@ -142,7 +144,13 @@ impl ServiceClient {
             }
             #[cfg(all(target_os = "linux", target_env = "gnu"))]
             {
+                // glibc ≥ 2.34 resolves this to close_range(2) in the child.
                 status |= libc::posix_spawn_file_actions_addclosefrom_np(&mut actions, 3);
+            }
+            #[cfg(all(target_os = "linux", not(target_env = "gnu")))]
+            {
+                // Child-side only: this process keeps its database and socket descriptors.
+                for fd in Self::open_fds() { status |= libc::posix_spawn_file_actions_addclose(&mut actions, fd); }
             }
             let mut pid = 0;
             if status == 0 { status = libc::posix_spawn(&mut pid, executable.as_ptr(), &actions, &attributes, argv.as_ptr(), envp.as_ptr()); }
@@ -150,6 +158,14 @@ impl ServiceClient {
             libc::posix_spawnattr_destroy(&mut attributes);
             status == 0
         }
+    }
+
+    /// Descriptors above stdio open in this process. The listing's own fd is included but closed by
+    /// the time the child runs; musl ignores close errors there.
+    #[cfg(all(target_os = "linux", any(test, not(target_env = "gnu"))))]
+    fn open_fds() -> Vec<i32> {
+        let Ok(entries) = std::fs::read_dir("/proc/self/fd") else { return vec![]; };
+        entries.flatten().filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok()).filter(|&fd| fd >= 3).collect()
     }
 }
 
@@ -167,6 +183,16 @@ mod tests {
         let alias = dir.path().join("alias");
         std::os::unix::fs::symlink(&target, &alias).unwrap();
         assert_eq!(ServiceClient::service_executable(&alias), std::fs::canonicalize(dir.path()).unwrap().join("smcli-service-build"));
+    }
+    /// The musl close list runs on any Linux host: it names an open descriptor and never stdio.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_fds_lists_extra_descriptors_only() {
+        use std::os::fd::AsRawFd;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let fds = ServiceClient::open_fds();
+        assert!(fds.contains(&file.as_file().as_raw_fd()));
+        assert!(fds.iter().all(|&fd| fd >= 3));
     }
     #[test]
     fn modes_and_repeatable_operations() {

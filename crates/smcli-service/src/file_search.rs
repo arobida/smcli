@@ -121,9 +121,9 @@ impl FileSearch {
             };
             let mut response = ServiceResponse::new(true);
             let hits = if grep {
-                // Plain-text content search (smart case), up to `limit` matches within 1000 ms.
+                // fff checks the deadline between files, including before any match; not a hard I/O timeout.
                 let parsed = fff_search::grep::parse_grep_query(query);
-                let page = picker.grep(&parsed, &GrepSearchOptions { page_limit: limit as usize, max_matches_per_file: 0, time_budget_ms: 1000, max_file_size: 10 * 1024 * 1024, ..Default::default() });
+                let page = picker.grep(&parsed, &grep_options(limit as usize));
                 if page.next_file_offset != 0 { response.partial = Some(true); }
                 page.matches.iter().map(|m| {
                     let mut h = hit(page.files[m.file_index]);
@@ -175,6 +175,10 @@ impl FileSearch {
     }
 }
 
+fn grep_options(limit: usize) -> GrepSearchOptions {
+    GrepSearchOptions { page_limit: limit, max_matches_per_file: 0, time_budget_ms: 1000, enforce_time_budget: true, max_file_size: 10 * 1024 * 1024, ..Default::default() }
+}
+
 /// fff names the state; shown like `git status --short`: index column, then work tree.
 /// Clean files and anything outside a repository have none.
 fn git(status: &str) -> Option<String> {
@@ -208,6 +212,36 @@ mod tests {
     }
     impl Drop for Repo { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
     fn search(capacity: usize) -> FileSearch { FileSearch::new(capacity, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(|_, _, _, _, _| Ok(()))) }
+    #[test]
+    fn grep_budget_applies_before_the_first_match() {
+        let options = grep_options(50);
+        assert_eq!(options.time_budget_ms, 1000);
+        assert!(options.enforce_time_budget);
+    }
+
+    #[test]
+    #[ignore = "synthetic large-tree benchmark"]
+    fn measure_zero_match_budget() {
+        let repo = Repo::new();
+        let content = "abcdefghij0123456789\n".repeat(1600);
+        for i in 0..5000 {
+            std::fs::write(repo.0.join(format!("src/{i}.txt")), &content).unwrap();
+        }
+        let search = search(1);
+        let (index, _) = search.index(repo.0.to_str().unwrap()).unwrap();
+        let guard = index.read().unwrap();
+        let picker = guard.as_ref().unwrap();
+        let query = fff_search::grep::parse_grep_query("abcdefghij0123456789_not_present");
+        for budget in [1, 1000] {
+            for enforce in [false, true] {
+                let start = Instant::now();
+                let page = picker.grep(&query, &GrepSearchOptions { time_budget_ms: budget, enforce_time_budget: enforce, ..grep_options(50) });
+                eprintln!("5000 files, budget={budget}ms enforce={enforce}: {:?}, partial={}", start.elapsed(), page.next_file_offset != 0);
+                assert!(page.matches.is_empty());
+            }
+        }
+    }
+
     #[test]
     fn files_relative_insert_and_grep_coordinates() {
         fn send_sync<T: Send + Sync>() {} send_sync::<FileSearch>();

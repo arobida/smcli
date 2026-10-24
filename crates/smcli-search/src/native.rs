@@ -7,6 +7,7 @@ use anyhow::Result;
 pub enum Shell {
     Bash,
     Zsh,
+    Fish,
 }
 
 /// A native shell history file. Read only: smcli never writes one.
@@ -19,6 +20,15 @@ pub struct HistoryFile {
 impl HistoryFile {
     pub fn read(&self) -> Result<String> {
         let mut bytes = std::fs::read(&self.path)?;
+        if self.shell == Shell::Fish {
+            let text = String::from_utf8_lossy(&bytes);
+            return Ok(text
+                .lines()
+                .filter_map(|line| line.strip_prefix("- cmd: "))
+                .map(unquote_fish)
+                .collect::<Vec<_>>()
+                .join("\n"));
+        }
         if self.shell == Shell::Zsh {
             // Zsh escapes non-ASCII bytes with Meta (0x83), followed by byte XOR 32.
             let mut decoded = Vec::with_capacity(bytes.len());
@@ -52,6 +62,28 @@ impl HistoryFile {
             }
         }
         Ok(lines.join("\n"))
+    }
+}
+
+/// Fish history stores YAML-like records; accept only simple single-line `- cmd:` scalars.
+fn unquote_fish(command: &str) -> String {
+    let command = command.trim();
+    if let Some(value) = command.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        value.replace("''", "'")
+    } else if let Some(value) = command.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        value.replace("\\\\", "\\").replace("\\\"", "\"")
+    } else {
+        // Fish writes `\\` for a backslash and `\n` for a newline in a multi-line command.
+        let mut out = String::with_capacity(command.len());
+        let mut chars = command.chars();
+        while let Some(c) = chars.next() {
+            match (c, chars.clone().next()) {
+                ('\\', Some('\\')) => { out.push('\\'); chars.next(); }
+                ('\\', Some('n')) => { out.push('\n'); chars.next(); }
+                _ => out.push(c),
+            }
+        }
+        out
     }
 }
 
@@ -90,6 +122,10 @@ pub fn history_files(home: &Path, environment: &HashMap<String, String>) -> Resu
             }
         }
     }
+    let fish = home.join(".local/share/fish/fish_history");
+    if fish.is_file() {
+        files.push(HistoryFile { path: fish, shell: Shell::Fish });
+    }
     if let Some(path) = environment.get("HISTFILE").filter(|p| !p.is_empty()) {
         let shell = if environment.get("SHELL").is_some_and(|s| s.ends_with("/bash")) { Shell::Bash } else { Shell::Zsh };
         files.push(HistoryFile { path: PathBuf::from(path), shell });
@@ -116,6 +152,22 @@ mod tests {
         let files = history_files(dir.path(), &HashMap::new()).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].read().unwrap(), "echo usable\n");
+    }
+
+    #[test]
+    fn reads_fish_commands_without_modifying_native_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let fish_dir = dir.path().join(".local/share/fish");
+        std::fs::create_dir_all(&fish_dir).unwrap();
+        let fish = fish_dir.join("fish_history");
+        let source = "- cmd: echo plain\n  when: 1700000000\n- cmd: 'echo it''s quoted'\n  when: 1700000001\n\
+                      - cmd: printf a\\\\tb\\nls\n  when: 1700000002\n";
+        std::fs::write(&fish, source).unwrap();
+        let files = history_files(dir.path(), &HashMap::new()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].shell, Shell::Fish);
+        assert_eq!(files[0].read().unwrap(), "echo plain\necho it's quoted\nprintf a\\tb\nls");
+        assert_eq!(std::fs::read_to_string(fish).unwrap(), source);
     }
 
     #[test]

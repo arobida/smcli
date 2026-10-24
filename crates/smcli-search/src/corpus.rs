@@ -437,11 +437,12 @@ pub fn rerank(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &Se
             let exact = !terms.is_empty() && terms.is_subset(&words);
             why.push(if exact { "exact words" } else if literal { "keyword match" } else { "semantic match" }.into());
             let mut boost = 1.0 + 0.15 * entry.frecency.ln_1p();
+            // Here outweighs elsewhere in the project. ranking.rs passes with project >= 0.9 and here in (project, 1.3].
             if entry.runs_here > 0 {
-                boost += 0.35 * (entry.runs_here as f64 / entry.runs.max(1) as f64 + 0.25).min(1.0);
+                boost += 1.1 * (entry.runs_here as f64 / entry.runs.max(1) as f64 + 0.25).min(1.0);
                 why.push("used here".into());
             } else if entry.runs_project > 0 && uses(context, Signal::Project) {
-                boost += 0.45 * (entry.runs_project as f64 / entry.runs.max(1) as f64 + 0.25).min(1.0);
+                boost += 1.0 * (entry.runs_project as f64 / entry.runs.max(1) as f64 + 0.25).min(1.0);
                 why.push("used in this project".into());
             }
             if entry.last_run_epoch().is_some_and(|last| now - last < 7.0 * 86_400.0) {

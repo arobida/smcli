@@ -136,7 +136,9 @@ fn worker<Q: Send + 'static, R: Send + 'static>(
     let (requests, incoming) = mpsc::channel::<Q>();
     let (outgoing, results) = mpsc::channel();
     std::thread::spawn(move || {
-        while let Ok(query) = incoming.recv() {
+        while let Ok(mut query) = incoming.recv() {
+            // A running callback cannot be interrupted, but queued intermediate queries are obsolete.
+            while let Ok(latest) = incoming.try_recv() { query = latest; }
             let result = callback(&query);
             if outgoing.send((query, result)).is_err() { break; }
         }
@@ -262,6 +264,8 @@ pub fn run(
     let mut global_files = false;
     let mut kind = 0;
     let mut fetched = None;
+    let mut observed = None;
+    let mut changed_at = Instant::now();
     let mut tick = 0u8;
     let mut fade_at = Instant::now();
     // Displayed sunset width. It eases toward the selection instead of jumping.
@@ -277,6 +281,10 @@ pub fn run(
     loop {
         let local = picker.mode == Mode::Files && !global_files;
         let current = (picker.mode, picker.query.clone(), kind);
+        if observed.as_ref() != Some(&current) {
+            observed = Some(current.clone());
+            changed_at = Instant::now();
+        }
         if let Some((_, replies)) = &files {
             if let Ok((request, result)) = replies.try_recv() {
                 file_busy = false;
@@ -328,19 +336,21 @@ pub fn run(
             selected = 0;
             status.clear();
             if picker.mode == Mode::Grep && picker.query.is_empty() {
-                fetched = Some(current);
+                fetched = Some(current.clone());
                 status = "type to search file contents".into();
             } else if let Some((requests, _)) = &files {
-                if !file_busy {
+                if !file_busy && changed_at.elapsed() >= Duration::from_millis(100)
+                    && !event::poll(Duration::ZERO)? {
                     file_busy = requests.send(current.clone()).is_ok();
-                    fetched = Some(current);
+                    fetched = Some(current.clone());
                 }
             } else {
-                fetched = Some(current);
+                fetched = Some(current.clone());
                 status = "files and grep need smcli-service".into();
             }
         }
-        let busy = file_busy || semantic_busy;
+        let file_pending = !local && picker.mode != Mode::History && fetched.as_ref() != Some(&current);
+        let busy = file_busy || semantic_busy || file_pending;
         if busy && spun.elapsed() >= Duration::from_millis(80) {
             spinner = (spinner + 1) % 10;
             spun = Instant::now();
@@ -491,8 +501,13 @@ pub fn run(
             }
         }
         tick = 3;
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let key = match event::read()? {
+            Event::Resize(columns, rows) => {
+                terminal.terminal.resize(Rect::new(0, 0, columns, rows))?;
+                continue;
+            }
+            Event::Key(key) => key,
+            _ => continue,
         };
         if key.kind == KeyEventKind::Release {
             continue;
@@ -744,7 +759,6 @@ impl TerminalSession {
             .map_err(anyhow::Error::from)
             .and_then(|_| {
                 // Like Swift: a terminal reporting no size (some ptys) is drawn as 24x80.
-                // shortcut: the size is read once, so a resize mid-pick is not followed; re-read per frame if that matters.
                 let (columns, rows) = ratatui::crossterm::terminal::size().ok().filter(|&(_, rows)| rows > 0).unwrap_or((80, 24));
                 let viewport = Viewport::Fixed(ratatui::layout::Rect::new(0, 0, columns, rows));
                 Ok(Terminal::with_options(CrosstermBackend::new(display), TerminalOptions { viewport })?)
@@ -769,6 +783,22 @@ impl Drop for TerminalSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fixed_viewport_can_shrink_and_grow() {
+        let mut terminal = Terminal::with_options(
+            ratatui::backend::TestBackend::new(100, 30),
+            TerminalOptions { viewport: Viewport::Fixed(Rect::new(0, 0, 100, 30)) },
+        ).unwrap();
+        for (columns, rows) in [(40, 8), (120, 40)] {
+            terminal.backend_mut().resize(columns, rows);
+            terminal.resize(Rect::new(0, 0, columns, rows)).unwrap();
+            terminal.draw(|frame| {
+                assert_eq!(frame.area(), Rect::new(0, 0, columns, rows));
+                assert_eq!(picker_layout(frame.area())[6].bottom(), rows);
+            }).unwrap();
+        }
+    }
+
     #[test]
     fn grep_is_only_available_outside_global_search() {
         assert!(grep_available(false));
@@ -884,6 +914,25 @@ mod tests {
 #[cfg(test)]
 mod worker_tests {
     use super::*;
+
+    #[test]
+    fn worker_skips_obsolete_queued_queries() {
+        let (started, running) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let (requests, replies) = worker(move |query: &usize| {
+            started.send(*query).unwrap();
+            if *query == 0 { wait.recv().unwrap(); }
+            *query
+        });
+        requests.send(0).unwrap();
+        assert_eq!(running.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+        for query in 1..=10 { requests.send(query).unwrap(); }
+        release.send(()).unwrap();
+        assert_eq!(replies.recv_timeout(Duration::from_secs(2)).unwrap(), (0, 0));
+        assert_eq!(running.recv_timeout(Duration::from_secs(2)).unwrap(), 10);
+        assert_eq!(replies.recv_timeout(Duration::from_secs(2)).unwrap(), (10, 10));
+        assert!(replies.try_recv().is_err());
+    }
 
     #[test]
     fn callback_runs_off_thread_and_preserves_request_identity() {
