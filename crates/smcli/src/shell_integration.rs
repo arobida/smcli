@@ -284,7 +284,7 @@ elif [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
     _smcli_seen="${XDG_STATE_HOME:-$HOME/.local/state}/smcli/kept-keys-bash"
     if [[ $_smcli_kept != "$(cat "$_smcli_seen" 2>/dev/null)" ]]; then
         [[ -z $_smcli_kept ]] || printf 'smcli: kept existing key bindings:%s (bind -x them to _smcli_pick to switch).\n' "$_smcli_kept" >&2
-        mkdir -p "${_smcli_seen%/*}" 2>/dev/null && printf '%s' "$_smcli_kept" > "$_smcli_seen" 2>/dev/null
+        mkdir -p "${_smcli_seen%/*}" 2>/dev/null && printf '%s' "$_smcli_kept" >| "$_smcli_seen" 2>/dev/null
     fi
     unset _smcli_seen
     unset _smcli_maps
@@ -420,7 +420,7 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
     typeset _smcli_seen=${XDG_STATE_HOME:-$HOME/.local/state}/smcli/kept-keys-zsh _smcli_list=${(j:, :)${(u)_smcli_kept}}
     if [[ $_smcli_list != "$(cat $_smcli_seen 2>/dev/null)" ]]; then
         (( $#_smcli_kept )) && print -u2 "smcli: kept existing key bindings: $_smcli_list (bindkey them to _smcli_pick to switch)."
-        mkdir -p ${_smcli_seen:h} 2>/dev/null && print -rn -- $_smcli_list > $_smcli_seen 2>/dev/null
+        mkdir -p ${_smcli_seen:h} 2>/dev/null && print -rn -- $_smcli_list >| $_smcli_seen 2>/dev/null
     fi
     unset _smcli_keymap _smcli_kept _smcli_seen _smcli_list
 fi"###
