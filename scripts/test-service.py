@@ -4,6 +4,7 @@
 Usage: test-service.py <path to smcli>  (smcli-service must sit next to it). Uses a throwaway database and
 runtime directory; never touches the user's history or a running service of theirs.
 """
+import errno
 import json
 from pathlib import Path
 import os
@@ -58,8 +59,10 @@ def raw(payload: bytes):
         connection.connect(socket_path())
         try:
             connection.sendall(payload)
-        except BrokenPipeError:
-            pass  # The service answers an oversized request and hangs up before reading the rest.
+        except OSError as error:
+            # Oversize rejection may close the socket mid-send (Darwin also reports ENOTCONN).
+            if len(payload) <= (1 << 20) or error.errno not in (errno.EPIPE, errno.ENOTCONN, errno.ECONNRESET):
+                raise
         reply = b""
         while not reply.endswith(b"\n"):
             chunk = connection.recv(65536)
@@ -102,7 +105,7 @@ server.listen(8)
 while True:
     connection, _ = server.accept()
     request = json.loads(connection.makefile().readline())
-    connection.sendall((json.dumps({"v": 1, "ok": True, "pid": os.getpid(), "duplicate": False}) + "\\n").encode())
+    connection.sendall((json.dumps({"v": 2, "ok": True, "pid": os.getpid(), "duplicate": False}) + "\\n").encode())
     connection.close()
     if request["op"] == "shutdown":
         os.unlink(path)
@@ -128,7 +131,7 @@ try:
 
     # Retry without duplicates: the same event ID twice is acknowledged twice, stored once.
     event = str(uuid.uuid4())
-    request = {"v": 1, "op": "record", "event": event, "command": "make retry", "shell": "zsh",
+    request = {"v": 2, "op": "record", "event": event, "command": "make retry", "shell": "zsh",
                "session": "raw", "directory": "/repo", "exitCode": 0, "startedAt": time.time()}
     line = (json.dumps(request) + "\n").encode()
     first_ack, second_ack = raw(line), raw(line)
@@ -149,7 +152,7 @@ try:
     open(f"{repo}/pkg/src/new.txt", "w").write("x")
     real = os.path.realpath(repo)
     begin = time.time()
-    answer = raw((json.dumps({"v": 1, "op": "context", "directory": repo + "/pkg/src"}) + "\n").encode())
+    answer = raw((json.dumps({"v": 2, "op": "context", "directory": repo + "/pkg/src"}) + "\n").encode())
     assert time.time() - begin < 1, "context must not wait for Git"
     ctx = answer["context"]
     assert answer["ok"] and ctx["repository"]["root"] == real and ctx["repository"]["branch"] == "main", answer
@@ -157,24 +160,24 @@ try:
     deadline = time.time() + 10
     while "status" not in ctx and time.time() < deadline:
         time.sleep(0.05)
-        ctx = raw((json.dumps({"v": 1, "op": "context", "directory": repo}) + "\n").encode())["context"]
+        ctx = raw((json.dumps({"v": 2, "op": "context", "directory": repo}) + "\n").encode())["context"]
     assert ctx["status"]["untracked"] == 1 and ctx["status"]["branch"] == "main", ctx
     cli = json.loads(run("context", "--json", "--dir", repo).stdout)
     assert cli["repository"]["root"] == real and cli["status"]["untracked"] == 1, cli
     assert json.loads(run("context", "--json", "--dir", "/").stdout).get("repository") is None
-    assert raw(b'{"v":1,"op":"context","directory":"relative"}\n')["error"]["code"] == "bad_request"
-    assert raw(b'{"v":1,"op":"context"}\n')["error"]["code"] == "bad_request"
+    assert raw(b'{"v":2,"op":"context","directory":"relative"}\n')["error"]["code"] == "bad_request"
+    assert raw(b'{"v":2,"op":"context"}\n')["error"]["code"] == "bad_request"
 
     # Malformed, unknown, oversized, wrong-version and unsupported requests get error responses.
     assert raw(b"not json\n")["error"]["code"] == "bad_request"
-    assert raw(b'{"v":1,"op":"rm"}\n')["error"]["code"] == "bad_request"
-    assert raw(b'{"v":1,"op":"record"}\n')["error"]["code"] == "bad_request"
+    assert raw(b'{"v":2,"op":"rm"}\n')["error"]["code"] == "bad_request"
+    assert raw(b'{"v":2,"op":"record"}\n')["error"]["code"] == "bad_request"
     assert raw(b'{"v":99,"op":"ping"}\n')["error"]["code"] == "version"
-    assert raw(b'{"v":1,"op":"files"}\n')["error"]["code"] == "bad_request"
-    assert raw(b'{"v":1,"op":"grep","directory":"/tmp","query":""}\n')["error"]["code"] == "bad_request"
-    assert raw(b'{"v":1,"op":"select","directory":"/tmp","path":"../x","mode":"files","query":"x"}\n')["error"]["code"] == "bad_request"
-    assert raw(b'{"v":1,"op":"select","directory":"/tmp","path":"/etc/passwd","mode":"files","query":"x"}\n')["error"]["code"] == "bad_request"
-    assert raw(b'{"v":1,"op":"suggest","directory":"relative"}\n')["error"]["code"] == "bad_request"
+    assert raw(b'{"v":2,"op":"files"}\n')["error"]["code"] == "bad_request"
+    assert raw(b'{"v":2,"op":"grep","directory":"/tmp","query":""}\n')["error"]["code"] == "bad_request"
+    assert raw(b'{"v":2,"op":"select","directory":"/tmp","path":"../x","mode":"files","query":"x"}\n')["error"]["code"] == "bad_request"
+    assert raw(b'{"v":2,"op":"select","directory":"/tmp","path":"/etc/passwd","mode":"files","query":"x"}\n')["error"]["code"] == "bad_request"
+    assert raw(b'{"v":2,"op":"suggest","directory":"relative"}\n')["error"]["code"] == "bad_request"
     assert raw(b"x" * (2 << 20) + b"\n")["error"]["code"] == "too_large"
     bad = dict(request, event="NOT-A-UUID")
     assert raw((json.dumps(bad) + "\n").encode())["error"]["code"] == "failed"
@@ -185,18 +188,18 @@ try:
     assert service_pid() == first, "bad input must not kill the service"
 
     # The picker's first draw: directory suggestions plus every command, most recent first.
-    picked = raw(b'{"v":1,"op":"pick","directory":"/repo","limit":3}\n')
+    picked = raw(b'{"v":2,"op":"pick","directory":"/repo","limit":3}\n')
     assert picked["ok"] and len(picked["suggestions"]) == 3, picked
     assert len(picked["recent"]) == len(set(picked["recent"])) and picked["suggestions"][0]["command"] in picked["recent"]
-    assert raw(b'{"v":1,"op":"pick","directory":"relative"}\n')["error"]["code"] == "bad_request"
+    assert raw(b'{"v":2,"op":"pick","directory":"relative"}\n')["error"]["code"] == "bad_request"
 
     # Search runs in the service, which keeps the index open between queries.
     def search(query):
-        reply = raw((json.dumps({"v": 1, "op": "search", "query": query, "directory": "/repo", "limit": 5}) + "\n").encode())
+        reply = raw((json.dumps({"v": 2, "op": "search", "query": query, "directory": "/repo", "limit": 5}) + "\n").encode())
         assert reply["ok"], reply
         return [hit["command"] for hit in reply["hits"]]
     assert search("git commit")[0].startswith("git commit -m"), search("git commit")
-    assert raw(b'{"v":1,"op":"search","directory":"/repo"}\n')["error"]["code"] == "bad_request"
+    assert raw(b'{"v":2,"op":"search","directory":"/repo"}\n')["error"]["code"] == "bad_request"
 
     # Writes that bypass the service (fallback, import, another tool) show up in its suggestions and search.
     run("record", "zsh", "s", "/repo", "0", "", "", "", "direct write", SMCLI_SERVICE="0")
@@ -282,6 +285,19 @@ try:
     assert "after old service" in [r["command"] for r in json.loads(run("history", "--json").stdout)]
     run("service", "stop")
 
+    # A protocol-v1 service must not silently omit the new signals: search falls back in-process.
+    fake = subprocess.Popen([sys.executable, "-c", FAKE_OLD_SERVICE.replace('"v": 2', '"v": 1'), socket_file])
+    try:
+        assert wait_for(lambda: os.path.exists(socket_file))
+        answer = json.loads(run("search", "after old service", "--json", SMCLI_SERVICE="connect").stdout)
+        assert any(hit["command"] == "after old service" for hit in answer), answer
+        assert fake.poll() is None, "fallback must not depend on replacing the old service"
+    finally:
+        fake.terminate()
+        fake.wait(timeout=10)
+        if os.path.exists(socket_file):
+            os.unlink(socket_file)
+
     # An idle service exits on its own.
     run("service", "start", SMCLI_SERVICE_IDLE="1")
     deadline = time.time() + 40
@@ -293,12 +309,12 @@ try:
     run("service", "start", SMCLI_FFF_MAX="2", SMCLI_FFF_IDLE="3")
 
     def ask(op, directory, query="", **extra):
-        reply = raw((json.dumps({"v": 1, "op": op, "directory": directory, "query": query, **extra}) + "\n").encode())
+        reply = raw((json.dumps({"v": 2, "op": op, "directory": directory, "query": query, **extra}) + "\n").encode())
         assert reply["ok"], reply
         return reply
 
     def indexes():
-        return raw(b'{"v":1,"op":"ping"}\n')["indexes"]
+        return raw(b'{"v":2,"op":"ping"}\n')["indexes"]
 
     def make_repo(name, files):
         path = f"{root}/{name}"
@@ -368,19 +384,19 @@ try:
     ask("select", src, "util", path="src/util.swift", mode="files")
     with sqlite3.connect(env["SMCLI_DB"]) as db:
         assert db.execute("SELECT root, path, mode, query FROM file_selections").fetchall() == [(repo_a, "src/util.swift", "files", "util")]
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 8
     assert "picked" in ask("files", repo_a, "util")["files"][0]["provenance"]
 
     # Ranking signals through the service: a command that follows the session's last one, then explicit picks.
     plain_dir = os.path.realpath(root)
 
     def rec(session, command, directory=plain_dir):
-        reply = raw((json.dumps({"v": 1, "op": "record", "event": str(uuid.uuid4()), "command": command, "shell": "zsh",
+        reply = raw((json.dumps({"v": 2, "op": "record", "event": str(uuid.uuid4()), "command": command, "shell": "zsh",
                                  "session": session, "directory": directory, "exitCode": 0}) + "\n").encode())
         assert reply["ok"], reply
 
     def suggested(prefix, **extra):
-        reply = raw((json.dumps({"v": 1, "op": "suggest", "directory": plain_dir, "prefix": prefix, "limit": 5, **extra}) + "\n").encode())
+        reply = raw((json.dumps({"v": 2, "op": "suggest", "directory": plain_dir, "prefix": prefix, "limit": 5, **extra}) + "\n").encode())
         assert reply["ok"], reply
         return reply["suggestions"]
     for i in range(4):
@@ -395,13 +411,18 @@ try:
     for _ in range(3):
         assert ask("select", plain_dir, "zzq ", command="zzq commit", mode="suggest")["ok"]
     for bad in ({"command": "", "mode": "suggest"}, {"command": "x", "mode": "other"}, {"command": "smcli search x", "mode": "search"}):
-        assert raw((json.dumps({"v": 1, "op": "select", "directory": plain_dir, "query": "q", **bad}) + "\n").encode())["ok"] is False
+        assert raw((json.dumps({"v": 2, "op": "select", "directory": plain_dir, "query": "q", **bad}) + "\n").encode())["ok"] is False
     # Picks pass the capture filter of the caller's config (not the one the service started with): a native-history
     # command the filter rejects, or a secret typed as the query, is acknowledged but not stored.
     other_config = f"{root}/other-config.json"
     Path(other_config).write_text(json.dumps({"historyFilter": ["^vault "]}))
+    before_filtered = rows()
+    filtered = {"v": 2, "op": "record", "event": str(uuid.uuid4()), "command": "vault login", "shell": "zsh",
+                "session": "filtered", "directory": plain_dir, "exitCode": 0, "config": other_config}
+    assert raw((json.dumps(filtered) + "\n").encode())["ok"]
+    assert rows() == before_filtered, "the service must apply the caller's capture filter"
     for command, query in (("vault login", "va"), ("zzq add", "AKIAABCDEFGHIJKLMNOP"), (" zzq add", "")):
-        sent = json.dumps({"v": 1, "op": "select", "directory": plain_dir, "query": query, "command": command,
+        sent = json.dumps({"v": 2, "op": "select", "directory": plain_dir, "query": query, "command": command,
                            "mode": "suggest", "config": other_config})
         assert raw((sent + "\n").encode())["ok"], command
     with sqlite3.connect(env["SMCLI_DB"]) as db:
@@ -411,6 +432,65 @@ try:
     # A fresh record is searchable at once (the corpus is updated in place), with no rebuild of the others.
     rec("t9", "zzq freshly recorded thing")
     assert search("zzq freshly recorded thing")[0] == "zzq freshly recorded thing", search("zzq freshly recorded thing")
+
+    # Frozen alias records: unsafe input, UUID retry and historical redefinitions.
+    fixture = Path(__file__).resolve().parent.parent / "crates/smcli-core/tests/fixtures/service_protocol/alias-records-v2.jsonl"
+    for line in fixture.read_text().splitlines():
+        message = json.loads(line)
+        answer = raw((line + "\n").encode())
+        assert answer["ok"] == (message["session"] != "unsafe-alias-fixture"), answer
+        assert "abc123" not in json.dumps(answer), answer
+    with sqlite3.connect(env["SMCLI_DB"]) as db:
+        variants = db.execute("SELECT command,expanded_command FROM commands WHERE directory='/alias-fixture' ORDER BY id").fetchall()
+    assert variants == [("oldalias", None), ("gst", "git status"), ("gl", "git log"), ("gl", "git ls-files")], variants
+    oversized = dict(message, event=str(uuid.uuid4()), expandedCommand="x" * 8193)
+    assert not raw((json.dumps(oversized) + "\n").encode())["ok"]
+    empty = dict(message, event=str(uuid.uuid4()), expandedCommand="")
+    assert not raw((json.dumps(empty) + "\n").encode())["ok"]
+    alias_config = f"{root}/alias-config.json"
+    Path(alias_config).write_text(json.dumps({"historyFilter": ["^git status$"]}))
+    blocked = dict(message, event=str(uuid.uuid4()), command="gst", expandedCommand="git status", config=alias_config)
+    count = rows()
+    assert raw((json.dumps(blocked) + "\n").encode())["ok"]
+    assert rows() == count
+    for mode in ("connect", "0"):
+        count = rows()
+        run("record", "--expanded", "git status", "zsh", "alias-filter", plain_dir, "0", "", "", "", "gst",
+            SMCLI_CONFIG=alias_config, SMCLI_SERVICE=mode)
+        assert rows() == count, "both forms must pass the filter on both record paths"
+        run("record", "--expanded", "git diff --stat", "zsh", "alias-local", plain_dir, "0", "", "", "", "gd", SMCLI_SERVICE=mode)
+    exported = json.loads(run("history", "--json").stdout)
+    assert sum(r.get("expandedCommand") == "git diff --stat" for r in exported) == 2, exported
+
+    # Search signals use the requesting CLI's PATH/cwd, not the service environment, and agree in fallback.
+    signal_bin = Path(root) / "signal-bin"
+    signal_bin.mkdir()
+    tool = signal_bin / "txbuild"
+    tool.write_bytes(b"binary fixture, never executed")
+    tool.chmod(0o755)
+    Path(plain_dir, "signal.md").write_text("")
+    rec("signal-tool", "txbuild signal.md")
+    rec("signal-file", "cat signal.md")
+    overrides = dict(PWD=plain_dir, PATH=str(signal_bin))
+    served = json.loads(run("search", "signal.md", "--json", **overrides).stdout)
+    fallback = json.loads(run("search", "signal.md", "--json", SMCLI_SERVICE="0", **overrides).stdout)
+    assert [h["command"] for h in served] == [h["command"] for h in fallback], (served, fallback)
+    for answer in (served, fallback):
+        by_command = {h["command"]: h.get("why", []) for h in answer}
+        assert "program found in PATH" in by_command["txbuild signal.md"], answer
+        assert "input file exists" in by_command["cat signal.md"], answer
+        assert all(root not in reason for reasons in by_command.values() for reason in reasons), answer
+    for off in ("path", "files", "path,files"):
+        disabled = json.loads(run("search", "signal.md", "--json", SMCLI_RANKING_OFF=off, **overrides).stdout)
+        local = json.loads(run("search", "signal.md", "--json", SMCLI_SERVICE="0", SMCLI_RANKING_OFF=off, **overrides).stdout)
+        assert [(h["command"], h.get("why")) for h in disabled] == [(h["command"], h.get("why")) for h in local], (off, disabled, local)
+        reasons = [r for h in disabled for r in h.get("why", [])]
+        if "path" in off:
+            assert "program found in PATH" not in reasons
+        if "files" in off:
+            assert "input file exists" not in reasons
+    no_snapshot = raw((json.dumps({"v": 2, "op": "search", "directory": plain_dir, "query": "$txbuild"}) + "\n").encode())
+    assert no_snapshot["ok"] and all("program found in PATH" not in h.get("why", []) for h in no_snapshot["hits"]), no_snapshot
 
     # Eviction: at most 2 instances, the least recently used goes first; idle ones are dropped.
     repo_b = make_repo("fffrepo-b", {"b.txt": "b\n"})
@@ -431,16 +511,16 @@ try:
     search_dir = env["SMCLI_DB"] + ".search"
     os.makedirs(f"{search_dir}/rs-commands-v0-potion-old-d256")
     open(f"{search_dir}/rs-commands-v0-potion-old-d256/index.pxkt", "w").write("old")
-    open(f"{search_dir}/rs-commands-v1-potion-othermodel-d256.taladb", "w").write("other")
+    open(f"{search_dir}/rs-commands-v3-potion-othermodel-d256.taladb", "w").write("other")
     run("reindex", SMCLI_SERVICE="0")
     left = sorted(n for n in os.listdir(search_dir) if n.startswith("rs-commands-v"))
-    assert "rs-commands-v0-potion-old-d256" not in left and "rs-commands-v1-potion-othermodel-d256.taladb" in left, left
-    assert "rs-commands-v1-potion-othermodel-d256" in run("health", SMCLI_SERVICE="0").stdout
+    assert "rs-commands-v0-potion-old-d256" not in left and "rs-commands-v3-potion-othermodel-d256.taladb" in left, left
+    assert "rs-commands-v3-potion-othermodel-d256" in run("health", SMCLI_SERVICE="0").stdout
     current = next(n for n in left if "othermodel" not in n)
     assert run("health", SMCLI_SERVICE="0", check=False).returncode == 0
     # The index manager lists both, marks the current one, and --prune deletes only the other model's.
     listed = {i["name"]: i["current"] for i in json.loads(run("indexes", "--json", SMCLI_SERVICE="0").stdout)}
-    assert listed == {"rs-commands-v1-potion-othermodel-d256": False, current.split(".")[0]: True}, listed
+    assert listed == {"rs-commands-v3-potion-othermodel-d256": False, current.split(".")[0]: True}, listed
     run("indexes", "--prune", SMCLI_SERVICE="0")
     assert not any("othermodel" in n for n in os.listdir(search_dir)) and os.path.exists(f"{search_dir}/{current}")
     run("service", "start")
@@ -475,7 +555,7 @@ try:
     with sqlite3.connect(env["SMCLI_DB"]) as db:
         db.execute("UPDATE commands SET deleted_at = NULL WHERE command = 'extwrite one'")
     assert suggested_commands("extwrite") == ["extwrite one"]
-    assert pid_alive(raw(b'{"v":1,"op":"ping"}\n')["pid"])
+    assert pid_alive(raw(b'{"v":2,"op":"ping"}\n')["pid"])
 
     # Large repository: 50k tracked files in 500 directories plus untracked ones. Nothing may block on Git or the
     # scan, and the answers must stay right. (Timings are printed; the bounds only catch a collapse.)
@@ -500,7 +580,7 @@ try:
     deep = f"{big}/pkg3/dir150"
     timings = {}
     begin = time.time()
-    answer = raw((json.dumps({"v": 1, "op": "context", "directory": deep}) + "\n").encode())
+    answer = raw((json.dumps({"v": 2, "op": "context", "directory": deep}) + "\n").encode())
     timings["context first"] = time.time() - begin
     assert answer["ok"] and answer["context"]["repository"]["root"] == big_real, answer
     assert timings["context first"] < 1, "context must not wait for Git, even on a large repository"
@@ -508,11 +588,11 @@ try:
     ctx = answer["context"]
     while "status" not in ctx and time.time() < deadline:
         time.sleep(0.1)
-        ctx = raw((json.dumps({"v": 1, "op": "context", "directory": deep}) + "\n").encode())["context"]
+        ctx = raw((json.dumps({"v": 2, "op": "context", "directory": deep}) + "\n").encode())["context"]
     timings["context status"] = time.time() - begin
     assert ctx["status"]["untracked"] == 5 and ctx["status"]["staged"] == 0, ctx
     begin = time.time()
-    again = raw((json.dumps({"v": 1, "op": "context", "directory": deep}) + "\n").encode())
+    again = raw((json.dumps({"v": 2, "op": "context", "directory": deep}) + "\n").encode())
     timings["context warm"] = time.time() - begin
     assert again["context"]["status"]["untracked"] == 5 and timings["context warm"] < 0.5
 
@@ -543,7 +623,7 @@ try:
     os.makedirs(plain)
     open(f"{plain}/loose.txt", "w").write("x")
     assert ask("files", plain, "loose")["root"] == os.path.realpath(plain)
-    assert raw((json.dumps({"v": 1, "op": "files", "directory": "/", "query": "x"}) + "\n").encode())["ok"] is False
+    assert raw((json.dumps({"v": 2, "op": "files", "directory": "/", "query": "x"}) + "\n").encode())["ok"] is False
     run("service", "stop", check=False)
 
     print("smcli-service tests passed.")

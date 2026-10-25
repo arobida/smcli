@@ -2,7 +2,10 @@
 
 These fixtures were generated from the Swift DTOs before the Swift sources were removed, and are now the frozen wire format: a protocol change edits them by hand and bumps the protocol version.
 
-- `requests.jsonl`: all ten operations, every request field, Unicode/escaped newlines, and finite double extremes.
+- `requests.jsonl`: frozen protocol-v1 requests for all ten operations, Unicode/escaped newlines, and finite double extremes.
+- `alias-records-v2.jsonl`: record-time expansion requests, including unsafe input, UUID retry and historical redefinition.
+- `alias-results-v2.jsonl`: explicit expansion provenance in suggestions/search and distinct `recentEntries` variants.
+- `requests-v2.jsonl`: protocol-v2 search requests with present, absent and empty `shellPath`, plus request-scoped `rankingOff` ablation. Neither field is persisted.
 - `responses.jsonl`: all response fields, nested suggestion/search/context/GitStatus/file DTOs, empty collections, omitted nils, and open-ended failure codes.
 - `decoding.jsonl`: Swift JSONDecoder's acceptance of missing/null/unknown fields, required nested keys (including initializer-defaulted properties), malformed JSON, version mismatches, and numeric boundaries.
 

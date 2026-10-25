@@ -44,7 +44,10 @@ fn round_trip<T: serde::Serialize + serde::de::DeserializeOwned>(fixture: &str) 
 #[test]
 fn swift_service_protocol_fixtures_round_trip() {
     round_trip::<ServiceRequest>(REQUESTS);
+    round_trip::<ServiceRequest>(include_str!("fixtures/service_protocol/requests-v2.jsonl"));
+    round_trip::<ServiceRequest>(include_str!("fixtures/service_protocol/alias-records-v2.jsonl"));
     round_trip::<ServiceResponse>(RESPONSES);
+    round_trip::<ServiceResponse>(include_str!("fixtures/service_protocol/alias-results-v2.jsonl"));
     let operations: Vec<_> = REQUESTS
         .lines()
         .map(|line| decode_line::<ServiceRequest>(line.as_bytes()).unwrap().op)
@@ -88,21 +91,21 @@ fn swift_service_protocol_decoding_contract() {
 
 #[test]
 fn service_protocol_defaults_omissions_and_versions() {
-    assert_eq!(VERSION, 1);
+    assert_eq!(VERSION, 2);
     assert_eq!(MAX_MESSAGE_BYTES, 1 << 20);
     assert_eq!(MAX_RESPONSE_BYTES, 64 << 20);
     assert_eq!(IO_TIMEOUT, 2.0);
     assert_eq!(MAX_CONNECTIONS, 64);
     assert_eq!(
         encode_line(&ServiceRequest::new(Operation::Ping)).unwrap(),
-        b"{\"v\":1,\"op\":\"ping\"}\n"
+        b"{\"v\":2,\"op\":\"ping\"}\n"
     );
     assert_eq!(
         encode_line(&ServiceResponse::new(true)).unwrap(),
-        b"{\"v\":1,\"ok\":true}\n"
+        b"{\"v\":2,\"ok\":true}\n"
     );
     let request: ServiceRequest =
-        decode_line(b"{\"v\":1,\"op\":\"ping\",\"command\":null}\n").unwrap();
+        decode_line(b"{\"v\":2,\"op\":\"ping\",\"command\":null}\n").unwrap();
     assert_eq!(request, ServiceRequest::new(Operation::Ping));
     assert_eq!(
         serde_json::to_value(SearchFilter::default()).unwrap(),
@@ -110,15 +113,28 @@ fn service_protocol_defaults_omissions_and_versions() {
     );
 
     // Version mismatch is not malformed JSON: future dispatch must issue the version failure.
-    let request: ServiceRequest = decode_line(b"{\"v\":2,\"op\":\"ping\"}").unwrap();
-    assert_eq!(request.v, 2);
-    let response = ServiceResponse::failure("version", "Protocol version 1 required.");
+    let request: ServiceRequest = decode_line(b"{\"v\":1,\"op\":\"ping\"}").unwrap();
+    assert_eq!(request.v, 1);
+    assert_eq!(request.shell_path, None);
+    let response = ServiceResponse::failure("version", "Protocol version 2 required.");
     assert_eq!(
         serde_json::to_value(response).unwrap(),
         json!({
-            "v": 1, "ok": false, "error": {"code": "version", "message": "Protocol version 1 required."}
+            "v": 2, "ok": false, "error": {"code": "version", "message": "Protocol version 2 required."}
         })
     );
+}
+
+#[test]
+fn shell_path_is_optional_bounded_and_separate_from_selected_path() {
+    let request: ServiceRequest = decode_line(br#"{"v":2,"op":"search","path":"/selected/file","shellPath":"/bin:/usr/bin"}"#).unwrap();
+    assert_eq!(request.path.as_deref(), Some("/selected/file"));
+    assert_eq!(request.shell_path.as_deref(), Some("/bin:/usr/bin"));
+    assert!(decode_line::<ServiceRequest>(br#"{"v":2,"op":"search","shellPath":123}"#).is_err());
+    assert_eq!(shell_path_snapshot(None), None);
+    assert_eq!(shell_path_snapshot(Some("/bin")), Some("/bin".into()));
+    assert_eq!(shell_path_snapshot(Some(&"x".repeat(MAX_SHELL_PATH_BYTES + 1))), None);
+    assert_eq!(shell_path_snapshot(Some("/bin\0/secret")), None);
 }
 
 #[test]

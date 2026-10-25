@@ -26,6 +26,7 @@ pub(crate) const MUTED: Style = Style::new().add_modifier(Modifier::DIM);
 pub(crate) const ACCENT: Style = Style::new().fg(Color::Magenta);
 pub(crate) const SELECTED: Style = Style::new().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD);
 use smcli_core::service_protocol::FileHit;
+use smcli_core::entry::{command_key, command_parts};
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
@@ -99,7 +100,7 @@ impl Picker {
         let mut add = |command: String| {
             let command = command.trim();
             if !command.is_empty()
-                && !smcli_core::parse::is_smcli_command(command)
+                && !history_internal(command)
                 && seen.insert(command.to_owned())
             {
                 candidates.push(command.to_owned());
@@ -109,10 +110,10 @@ impl Picker {
             add(command);
         }
         let suggestion_count = seen.len();
-        for command in recent.into_iter().chain(native.into_iter().rev()) {
+        for command in recent.into_iter().chain(native.into_iter().rev().map(|s| command_key(&s, None))) {
             let command = command.trim();
             if !command.is_empty()
-                && !smcli_core::parse::is_smcli_command(command)
+                && !history_internal(command)
                 && seen.insert(command.to_owned())
             {
                 candidates.push(command.to_owned());
@@ -429,7 +430,7 @@ pub fn run(
                 commands.iter().enumerate().take(selected + area.height as usize).map(|(i, c)| {
                     let sel = i == selected;
                     let mark = if starred.contains(c) { "* " } else { "  " };
-                    let spans = highlight(&visible(c));
+                    let spans = highlight(&history_label(c));
                     let mut line = vec![Span::styled(mark, if sel { Style::new() } else { MUTED })];
                     line.extend(if sel { plain(spans) } else { spans });
                     ListItem::new(Line::from(line))
@@ -610,6 +611,21 @@ fn contains_terms(text: &str, query: &str) -> bool {
         .all(|word| text.contains(word))
 }
 
+fn history_internal(key: &str) -> bool {
+    let (typed, expanded) = command_parts(key);
+    smcli_core::parse::is_smcli_command(expanded.as_deref().unwrap_or(&typed))
+}
+
+pub(crate) fn history_label(key: &str) -> String {
+    let (typed, expanded) = command_parts(key);
+    visible(&expanded.map_or(typed.clone(), |e| format!("{typed} → {e}")))
+}
+
+pub(crate) fn history_insert(key: &str) -> String {
+    let (typed, expanded) = command_parts(key);
+    expanded.unwrap_or(typed)
+}
+
 /// Preserve recency/suggestion order; nucleo does Unicode-aware substring matching.
 fn filter_history(candidates: &[String], query: &str) -> Vec<String> {
     let pattern = Pattern::new(
@@ -623,8 +639,10 @@ fn filter_history(candidates: &[String], query: &str) -> Vec<String> {
     candidates
         .iter()
         .filter(|c| {
+            let (typed, expanded) = command_parts(c);
+            let text = expanded.map_or(typed.clone(), |e| format!("{typed} {e}"));
             pattern
-                .score(Utf32Str::new(c, &mut buffer), &mut matcher)
+                .score(Utf32Str::new(&text, &mut buffer), &mut matcher)
                 .is_some()
         })
         .cloned()
@@ -813,6 +831,19 @@ mod tests {
         assert_eq!(cwd.iter().map(|h| (h.path.as_str(), h.insert.as_str())).collect::<Vec<_>>(), [("src/", "./")]);
         assert_eq!(filter_kind(vec![hit("x/y", "y")], 2).len(), 1);
     }
+    #[test]
+    fn alias_identity_display_and_insertion_are_separate() {
+        let first = command_key("gl", Some("git log"));
+        let second = command_key("gl", Some("git ls-files"));
+        let picker = Picker::new(vec![first.clone()], vec![second.clone()], vec!["gl".into()], String::new());
+        assert_eq!(picker.candidates.len(), 3);
+        assert_eq!(history_label(&first), "gl → git log");
+        assert_eq!(history_insert(&first), "git log");
+        assert_eq!(history_insert("gl"), "gl");
+        assert_eq!(filter_history(&picker.candidates, "ls-files"), [second], "{:?}", picker.candidates.iter().map(|s| history_label(s)).collect::<Vec<_>>());
+        assert_eq!(history_label(&command_key("g\x1b[31m", Some("git status"))), "g^[[31m → git status");
+    }
+
     #[test]
     fn history_order_filter_and_safe_display() {
         let p = Picker::new(

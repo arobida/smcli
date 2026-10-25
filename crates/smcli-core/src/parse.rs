@@ -166,6 +166,14 @@ pub fn shell_words(command: &str) -> Option<Vec<String>> {
     Some(words)
 }
 
+/// Conservative record-time alias vocabulary: no evaluation, assignments, quoting or shell operators.
+pub fn safe_expansion(text: &str) -> bool {
+    !text.is_empty() && text.len() <= 8_192 && text.trim() == text
+        && text.bytes().all(|c| c.is_ascii_alphanumeric() || b" _-./,:@%+~^".contains(&c))
+        && text.split(' ').all(|word| !word.is_empty() && !word.starts_with('~'))
+        && text.split(' ').next().is_some_and(|word| !word.starts_with('-'))
+}
+
 /// True when a command line runs smcli itself (`smcli …`, `/path/to/smcli …`, `swift run smcli …`),
 /// so searches and suggestions are not about the tool. Leading `VAR=value` assignments are skipped.
 pub fn is_smcli_command(command: &str) -> bool {
@@ -216,6 +224,17 @@ mod tests {
         assert!(CommandBreakdown::parse("echo $(date)").is_none());
         assert_eq!(command_flags("ls -la | grep --color=auto x"), ["-la", "--color"]);
         assert_eq!(shell_words(r#"echo "a\$b\c" # comment"#).unwrap(), ["echo", r"a$b\c"]);
+    }
+
+    #[test]
+    fn expansion_gate_never_accepts_shell_syntax_or_assignments() {
+        for text in ["git status", "git log --oneline -20", "git reset --soft HEAD~1", "./tool plain-argument"] {
+            assert!(safe_expansion(text), "{text}");
+        }
+        for text in ["", " git status", "git status ", "git  status", "TOKEN=abc123 ./deploy.sh", "echo $(id)", "echo `id`", "git status; pwd", "git status | cat", "git status > file", "git 'status'", "echo $HOME", "echo ~/secret", "echo\nsecret"] {
+            assert!(!safe_expansion(text), "{text}");
+        }
+        assert!(!safe_expansion(&"x".repeat(8_193)));
     }
 
     #[test]

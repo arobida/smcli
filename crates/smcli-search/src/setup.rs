@@ -25,13 +25,15 @@ pub fn corpus(captured: &CapturedHistory, home: &Path, environment: &HashMap<Str
 
 /// Signals for an in-process search, read from the database: the session's previous command and what followed it
 /// before, and earlier picks. (The service keeps these in memory.)
-pub fn search_signals(captured: &CapturedHistory, context: Option<RankingContext>) -> Result<SearchSignals> {
+pub fn search_signals(captured: &CapturedHistory, context: Option<RankingContext>, environment: &HashMap<String, String>) -> Result<SearchSignals> {
+    let shell_path = smcli_core::service_protocol::shell_path_snapshot(environment.get("PATH").map(String::as_str));
+    let directory = Some(working_directory(environment));
     if !captured.path.exists() {
-        return Ok(SearchSignals { context, ..Default::default() });
+        return Ok(SearchSignals { context, shell_path, directory, ..Default::default() });
     }
     let db = captured.open_connection()?;
     let user = user_name();
-    let mut signals = SearchSignals { picks: captured.picks(5_000, &db)?, ..Default::default() };
+    let mut signals = SearchSignals { picks: captured.picks(5_000, &db)?, shell_path, directory, ..Default::default() };
     if let Some(session) = context.as_ref().filter(|c| c.uses(Signal::Transition)).and_then(|c| c.session.as_deref())
         && let Some(previous) = captured.previous_command(session, &user, &db)? {
             signals.followers = captured.followers(&previous, &user, &db)?;

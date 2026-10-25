@@ -1,0 +1,6 @@
+{"v":2,"op":"record","event":"00000000-0000-4000-8000-000000000001","command":"oldalias","shell":"zsh","session":"alias-fixture","directory":"/alias-fixture","exitCode":0}
+{"v":2,"op":"record","event":"00000000-0000-4000-8000-000000000002","command":"gst","expandedCommand":"git status","shell":"zsh","session":"alias-fixture","directory":"/alias-fixture","exitCode":0}
+{"v":2,"op":"record","event":"00000000-0000-4000-8000-000000000003","command":"deploy","expandedCommand":"TOKEN=abc123 ./deploy.sh","shell":"bash","session":"unsafe-alias-fixture","directory":"/alias-fixture","exitCode":0}
+{"v":2,"op":"record","event":"00000000-0000-4000-8000-000000000002","command":"gst","expandedCommand":"git status --short","shell":"zsh","session":"alias-fixture","directory":"/alias-fixture","exitCode":0}
+{"v":2,"op":"record","event":"00000000-0000-4000-8000-000000000004","command":"gl","expandedCommand":"git log","shell":"bash","session":"alias-fixture","directory":"/alias-fixture","exitCode":0}
+{"v":2,"op":"record","event":"00000000-0000-4000-8000-000000000005","command":"gl","expandedCommand":"git ls-files","shell":"bash","session":"alias-fixture","directory":"/alias-fixture","exitCode":0}

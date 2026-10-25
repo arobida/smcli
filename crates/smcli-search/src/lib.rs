@@ -1,4 +1,5 @@
 pub mod corpus;
+mod filesystem;
 pub mod index;
 pub mod native;
 mod potion;

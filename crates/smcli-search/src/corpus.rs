@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use smcli_core::entry::{SearchEntry, SearchFilter};
+use smcli_core::entry::{SearchEntry, SearchFilter, command_key, command_parts};
 use smcli_core::history::{CommandStats, INTERRUPTED_EXIT_CODES, Run, USAGE_HALF_LIFE, answers_with_exit_code};
 use smcli_core::parse::{CommandBreakdown, command_flags, is_smcli_command, program_of};
 use smcli_core::ranking::{CandidateKind, RankingContext, SelectionLog, Signal, uses};
@@ -8,6 +8,10 @@ use smcli_core::time::{format_iso8601, now};
 
 /// Native history lines after which a run counts half; about two weeks for a busy shell, like captured usage.
 pub const NATIVE_HALF_LIFE: f64 = 1_000.0;
+
+/// Characters of command+intent that are indexed lexically. SQLite `TEXT` has no practical limit, so this
+/// ceiling keeps the keyword index bounded while still covering pasted scripts and heredocs.
+pub const LEXICAL_LIMIT: usize = 8_192;
 
 /// Merges captured stats and native history lines into one entry per distinct command.
 /// Native history keeps no record boundaries we can trust, so each line is one entry.
@@ -47,8 +51,8 @@ impl CorpusState {
         // stronger, so turning capture on does not throw away years of native habit.
         let lines: Vec<&str> = native.iter().map(|l| l.trim()).filter(|l| !l.is_empty() && !is_smcli_command(l)).collect();
         for (index, command) in lines.iter().enumerate() {
-            *state.native_counts.entry(command.to_string()).or_insert(0) += 1;
-            *state.native_usage.entry(command.to_string()).or_insert(0.0) +=
+            *state.native_counts.entry(command_key(command, None)).or_insert(0) += 1;
+            *state.native_usage.entry(command_key(command, None)).or_insert(0.0) +=
                 0.5f64.powf((lines.len() - 1 - index) as f64 / NATIVE_HALF_LIFE);
         }
         let commands: HashSet<String> = state.captured.keys().chain(state.native_counts.keys()).cloned().collect();
@@ -63,14 +67,16 @@ impl CorpusState {
 
     /// Adds one run the way `command_stats` would count it (see its columns), as the service does per record.
     pub fn add(&mut self, run: &Run) {
-        if is_smcli_command(&run.command) {
+        let key = command_key(&run.command, run.expanded_command.as_deref());
+        let primary = run.expanded_command.as_deref().unwrap_or(&run.command);
+        if is_smcli_command(primary) {
             return;
         }
-        let mut stats = self.captured.get(&run.command).cloned().unwrap_or_else(|| CommandStats {
+        let mut stats = self.captured.get(&key).cloned().unwrap_or_else(|| CommandStats {
             last_run: f64::NEG_INFINITY,
             last_directory: run.directory.clone(),
             last_exit_code: run.exit_code,
-            flags: command_flags(&run.command),
+            flags: command_flags(primary),
             ..Default::default()
         });
         stats.runs += 1;
@@ -80,7 +86,7 @@ impl CorpusState {
         }
         stats.frecency += 0.5f64.powf((self.as_of - run.started_at).max(0.0) / USAGE_HALF_LIFE);
         if INTERRUPTED_EXIT_CODES.contains(&run.exit_code) || run.exit_code == 0
-            || (run.exit_code == 1 && answers_with_exit_code(&run.command))
+            || (run.exit_code == 1 && answers_with_exit_code(primary))
         {
             stats.successes += 1;
         }
@@ -90,16 +96,17 @@ impl CorpusState {
         if self.project.as_deref().is_some_and(|p| within(&run.directory, p)) {
             stats.runs_project += 1;
         }
-        self.captured.insert(run.command.clone(), stats);
-        if let Some(entry) = self.make_entry(&run.command) {
+        self.captured.insert(key.clone(), stats);
+        if let Some(entry) = self.make_entry(&key) {
             add_program(&entry, &mut self.programs);
-            self.entries.insert(run.command.clone(), entry);
+            self.entries.insert(key, entry);
         }
     }
 
     fn make_entry(&self, command: &str) -> Option<SearchEntry> {
-        let mut entry = self.captured.get(command).filter(|_| !is_smcli_command(command)).map(|stats| SearchEntry {
-            command: command.into(),
+        let (typed, expanded) = command_parts(command);
+        let mut entry = self.captured.get(command).filter(|_| !is_smcli_command(expanded.as_deref().unwrap_or(&typed))).map(|stats| SearchEntry {
+            command: typed.clone(), expanded_command: expanded.clone(), alias_off: false,
             runs: stats.runs,
             last_run: Some(format_iso8601(stats.last_run, false)),
             last_directory: Some(stats.last_directory.clone()),
@@ -120,9 +127,9 @@ impl CorpusState {
             Some(entry) => entry.frecency = entry.frecency.max(usage),
             None => {
                 entry = Some(SearchEntry {
-                    flags: command_flags(command),
+                    flags: command_flags(&typed),
                     frecency: usage,
-                    ..SearchEntry::new(command, *count, "native")
+                    ..SearchEntry::new(&typed, *count, "native")
                 })
             }
         }
@@ -144,19 +151,31 @@ pub fn search_document(entry: &SearchEntry, labeled: bool) -> String {
 
 /// Bounded command plus intent. The only text a static model should see.
 pub(crate) fn embedding_text(entry: &SearchEntry) -> String {
-    render_document(entry, false, 1_500)
+    // Typed aliases are an exact lexical surface, not semantic noise beside the executable text.
+    let mut text = entry.primary().to_string();
+    if let Some(intent) = entry.intent.as_deref().filter(|i| !i.is_empty()) {
+        text.push('\n');
+        text.push_str(&intent.replace('\n', " "));
+    }
+    text.chars().take(1_500).collect()
+}
+
+/// Command plus intent for the keyword index, capped at `LEXICAL_LIMIT`.
+pub(crate) fn lexical_text(entry: &SearchEntry) -> String {
+    render_document(entry, false, LEXICAL_LIMIT)
 }
 
 fn render_document(entry: &SearchEntry, labeled: bool, command_limit: usize) -> String {
     // Long commands (heredocs, pasted scripts) are cut so they fit embedding contexts with their labels intact.
-    let mut lines = vec![entry.command.chars().take(command_limit).collect::<String>()];
+    let mut lines = vec![entry.primary().chars().take(command_limit).collect::<String>()];
+    lines.extend(entry.secondary().map(String::from));
     let intent = entry.intent.as_deref().filter(|i| !i.is_empty()).map(|i| i.replace('\n', " "));
     if !labeled {
         lines.extend(intent);
-        return lines.join("\n");
+        return lines.join("\n").chars().take(command_limit).collect();
     }
-    let parsed = CommandBreakdown::parse(&entry.command);
-    if let Some(program) = program_of(&entry.command, parsed.as_ref()) {
+    let parsed = CommandBreakdown::parse(entry.primary());
+    if let Some(program) = program_of(entry.primary(), parsed.as_ref()) {
         lines.push(format!("command: {program}"));
     }
     if let Some(subcommand) = parsed.and_then(|p| p.subcommand) {
@@ -187,7 +206,7 @@ pub fn is_literal_query(query: &str, programs: &HashMap<String, HashSet<String>>
             || (word.starts_with('$') && chars.len() > 1) || inner.contains(&':')
             || (word.contains('.') && !word.ends_with('.'))
     };
-    if words.iter().any(literal_word) {
+    if words.iter().any(literal_word) || (words.len() == 1 && first.contains('-')) {
         return true;
     }
     // A short query that reads as a command from the history (`git stash`, `make test`) is literal. Many
@@ -321,7 +340,7 @@ pub fn parse_markers(query: &str, programs: &HashMap<String, HashSet<String>>, d
 
 fn add_program(entry: &SearchEntry, programs: &mut HashMap<String, HashSet<String>>) {
     let Some(program) = entry.program().map(|p| p.to_lowercase()) else { return };
-    let words: Vec<&str> = entry.command.split_whitespace().collect();
+    let words: Vec<&str> = entry.primary().split_whitespace().collect();
     let index = words.iter().position(|w| w.split('/').rfind(|p| !p.is_empty()).is_some_and(|p| p.to_lowercase() == program));
     let next = index.and_then(|i| words.get(i + 1)).map(|w| w.to_lowercase());
     programs.entry(program).or_default().extend(next);
@@ -333,6 +352,8 @@ fn add_program(entry: &SearchEntry, programs: &mut HashMap<String, HashSet<Strin
 #[derive(Debug, Clone, Default)]
 pub struct SearchSignals {
     pub context: Option<RankingContext>,
+    pub shell_path: Option<String>,
+    pub directory: Option<String>,
     pub previous: Option<String>,
     pub followers: HashMap<String, i64>,
     pub picks: SelectionLog,
@@ -389,15 +410,15 @@ impl SearchSignals {
 
 /// The share of query words that are a word of the command or start one (`sto` for `storybook`), counting the
 /// pieces of `--continue`; 1 when all of them are.
+pub fn entry_coverage(entry: &SearchEntry, terms: &[String]) -> f64 {
+    coverage(entry.primary(), terms).max(entry.secondary().map_or(0.0, |s| coverage(s, terms)))
+}
+
 pub fn coverage(command: &str, terms: &[String]) -> f64 {
     if terms.is_empty() {
         return 0.0;
     }
-    let mut tokens: HashSet<String> = HashSet::new();
-    for word in command.to_lowercase().split_whitespace() {
-        tokens.insert(word.to_string());
-        tokens.extend(word.split(|c: char| !c.is_alphanumeric()).filter(|p| !p.is_empty()).map(String::from));
-    }
+    let tokens: HashSet<String> = crate::ShellTokenizer::tokenize(command).into_iter().collect();
     let matched = terms
         .iter()
         .filter(|term| tokens.iter().any(|t| t == *term || (term.chars().count() >= 2 && t.starts_with(term.as_str()))))
@@ -413,7 +434,7 @@ pub fn coverage(command: &str, terms: &[String]) -> f64 {
 /// `signals` adds the project, the previous command, earlier picks, project scripts and Git state, each with a `why`.
 pub fn rerank(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &SearchSignals) -> Vec<SearchEntry> {
     let query_terms: Vec<String> = query.to_lowercase().split_whitespace().map(String::from).collect();
-    let terms: HashSet<&str> = query_terms.iter().map(String::as_str).collect();
+    let terms = smcli_core::parse::shell_words(query).unwrap_or_default();
     let context = signals.context.as_ref();
     let picks = if uses(context, Signal::Selection) { signals.picks.weights(query, now) } else { HashMap::new() };
     let first_of = |kind| {
@@ -427,14 +448,24 @@ pub fn rerank(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &Se
     let empty = HashMap::new();
     let followed = if uses(context, Signal::Transition) { &signals.followers } else { &empty };
     let follow_total = followed.values().sum::<i64>() as f64;
+    // An extra typed spelling must not impose a BM25 length penalty on identical executable text.
+    let mut primary_relevance: HashMap<String, f64> = HashMap::new();
+    for (entry, relevance) in &hits {
+        primary_relevance.entry(entry.primary().into()).and_modify(|r| *r = r.max(*relevance)).or_insert(*relevance);
+    }
+    let evidence = crate::filesystem::evidence(&hits, signals,
+        uses(context, Signal::Path) && signals.shell_path.is_some(),
+        uses(context, Signal::Files) && signals.directory.is_some());
     let mut scored: Vec<(usize, SearchEntry, f64)> = hits
         .into_iter()
         .enumerate()
         .map(|(offset, (mut entry, mut relevance))| {
+            relevance = primary_relevance.get(entry.primary()).copied().unwrap_or(relevance);
             let mut why: Vec<String> = vec![];
-            let lower = entry.command.to_lowercase();
-            let words: HashSet<&str> = lower.split_whitespace().collect();
-            let exact = !terms.is_empty() && terms.is_subset(&words);
+            let exact = !terms.is_empty() && [Some(entry.primary()), entry.secondary()].into_iter().flatten().any(|text| {
+                let words = smcli_core::parse::shell_words(text).unwrap_or_default();
+                terms.iter().all(|term| words.iter().any(|word| word.eq_ignore_ascii_case(term)))
+            });
             why.push(if exact { "exact words" } else if literal { "keyword match" } else { "semantic match" }.into());
             let mut boost = 1.0 + 0.15 * entry.frecency.ln_1p();
             // Here outweighs elsewhere in the project. ranking.rs passes with project >= 0.9 and here in (project, 1.3].
@@ -453,12 +484,12 @@ pub fn rerank(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &Se
                 why.push(format!("used {} times", entry.runs));
             }
             if exact {
-                boost += if literal { 0.5 } else { 0.2 };
+                boost += if literal { 1.0 } else { 0.2 };
             }
             // A project command counts in proportion to how much of the query it matches, so an unrelated script does
             // not ride along on a hint or a habit.
             let covered = if hints.contains_key(&entry.command) || scripts.contains_key(&entry.command) {
-                coverage(&entry.command, &query_terms)
+                entry_coverage(&entry, &query_terms)
             } else {
                 0.0
             };
@@ -469,12 +500,12 @@ pub fn rerank(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &Se
                 boost += 0.8 * covered;
                 why.push(reason.clone());
             }
-            if let (Some(previous), Some(count)) = (&signals.previous, followed.get(&entry.command))
+            if let (Some(previous), Some(count)) = (&signals.previous, followed.get(&entry.key()))
                 && follow_total > 0.0 {
                     boost += *count as f64 / follow_total * (*count as f64 / 3.0).min(1.0);
-                    why.push(format!("often follows {previous}"));
+                    why.push(format!("often follows {}", command_parts(previous).0));
                 }
-            if let Some(weight) = picks.get(&entry.command) {
+            if let Some(weight) = picks.get(&entry.key()) {
                 boost += (0.75 * weight).min(1.5);
                 relevance = relevance.max(SearchSignals::pick_relevance(*weight));
                 why.push("picked for similar searches".into());
@@ -486,8 +517,18 @@ pub fn rerank(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &Se
                     why.push("always failed".into());
                 }
             }
+            let (available, present) = evidence.get(offset).copied().unwrap_or_default();
+            let mut score = relevance * boost.powf(relevance);
+            if available {
+                score += 0.1 * relevance;
+                why.push("program found in PATH".into());
+            }
+            if present {
+                score += 0.08 * relevance;
+                why.push("input file exists".into());
+            }
             entry.why = Some(why);
-            (offset, entry, relevance * boost.powf(relevance))
+            (offset, entry, score)
         })
         .collect();
     scored.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
@@ -508,6 +549,35 @@ mod tests {
             runs_here,
             ..SearchEntry::new(command, runs, "captured")
         }
+    }
+
+    #[test]
+    fn alias_documents_preserve_provenance_intent_caps_and_incremental_variants() {
+        let mut entry = SearchEntry { expanded_command: Some("git status".into()), intent: Some("authored purpose".into()), ..SearchEntry::new("gst", 1, "captured") };
+        assert_eq!(embedding_text(&entry), "git status\nauthored purpose");
+        assert_eq!(lexical_text(&entry), "git status\ngst\nauthored purpose");
+        assert_eq!(entry.program().as_deref(), Some("git"));
+        assert_eq!(entry.subcommand().as_deref(), Some("status"));
+        let key = entry.key();
+        assert_eq!(command_parts(&key), ("gst".into(), Some("git status".into())));
+        assert_ne!(key, command_key(&key, None));
+        entry.expanded_command = Some("x".repeat(9_000));
+        assert_eq!(embedding_text(&entry).chars().count(), 1_500);
+        assert_eq!(lexical_text(&entry).chars().count(), LEXICAL_LIMIT);
+        let root = tempfile::tempdir().unwrap();
+        let history = smcli_core::history::CapturedHistory::new(root.path().join("history.db"));
+        let db = history.open_connection().unwrap();
+        let mut state = CorpusState::new(HashMap::new(), &[], "/repo", None, 100.0);
+        for expanded in ["git log", "git ls-files"] {
+            let mut run = smcli_core::history::NewRun::new("gl", "zsh", "/repo", 0);
+            run.expanded_command = Some(expanded);
+            run.started_at = Some(99.0);
+            history.append(&run, "", Some(&db)).unwrap();
+            state.add(&Run { command: "gl".into(), expanded_command: Some(expanded.into()), directory: "/repo".into(), started_at: 99.0, exit_code: 0, session: "unknown".into() });
+        }
+        let rebuilt = CorpusState::new(history.command_stats(Some("/repo"), None, 100.0).unwrap(), &[], "/repo", None, 100.0);
+        assert_eq!(state.entries, rebuilt.entries);
+        assert_eq!(state.entries.len(), 2);
     }
 
     #[test]
@@ -566,7 +636,7 @@ mod tests {
         let mut state = CorpusState::new(HashMap::new(), &["ls".into(), "smcli x".into()], "/repo", Some("/repo"), 100.0);
         assert_eq!(state.entries["ls"].source, "native");
         assert!(!state.entries.contains_key("smcli x"));
-        state.add(&Run { command: "ls".into(), directory: "/repo/a".into(), started_at: 100.0, exit_code: 0, session: "s".into() });
+        state.add(&Run { command: "ls".into(), expanded_command: None, directory: "/repo/a".into(), started_at: 100.0, exit_code: 0, session: "s".into() });
         let ls = &state.entries["ls"];
         assert_eq!((ls.source.as_str(), ls.runs, ls.runs_here, ls.runs_project, ls.frecency), ("captured", 1, 1, 1, 1.0));
     }

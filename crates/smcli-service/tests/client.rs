@@ -148,7 +148,7 @@ fn client_talks_to_real_service() -> Result<()> {
 
     // send() deliberately hides version failures, so inspect the wire response as well.
     let mut wrong_version = ServiceRequest::new(Operation::Ping);
-    wrong_version.v = 2;
+    wrong_version.v = 1;
     let mut connection = connect_unix(&service.location.socket)?;
     connection.write(&encode_line(&wrong_version)?, TIMEOUT)?;
     let line = connection.read_line(MAX_RESPONSE_BYTES, TIMEOUT)?.context("Missing version response")?;

@@ -108,7 +108,7 @@ done
 
 # 4. Data: database (with its WAL and shared-memory files), search index, settings, service socket.
 if [[ -z $keep_data ]]; then
-    rm -rf "$db" "$db-wal" "$db-shm" "$db-journal" "$db.search"
+    rm -rf "$db" "$db-wal" "$db-shm" "$db-journal" "$db.search" "$db.v7.bak" "$db.migration.lock"
     rmdir "$(dirname "$db")" 2>/dev/null || true
     rm -f "$config"
     rmdir "$(dirname "$config")" 2>/dev/null || true

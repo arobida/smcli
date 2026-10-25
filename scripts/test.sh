@@ -18,6 +18,8 @@ output="$("$bin_dir/smcli")"
 [[ "$(HOME="$home" HISTFILE='' "$bin_dir/smcli" history)" == 'No saved Bash or Zsh history found.' ]]
 printf '#1700000000\necho bash\n' > "$home/.bash_history"
 printf ': 1700000000:0;echo zsh\n' > "$home/.zsh_history"
+cp "$home/.bash_history" "$home/bash-history.before"
+cp "$home/.zsh_history" "$home/zsh-history.before"
 output="$(HOME="$home" HISTFILE='' "$bin_dir/smcli" history)"
 expected="$(printf '==> %s/.bash_history <==\necho bash\n==> %s/.zsh_history <==\necho zsh' "$home" "$home")"
 [[ "$output" == "$expected" ]]
@@ -56,6 +58,10 @@ bash scripts/clean-dist.sh "$dist"
 python3 scripts/test-shells.py "$bin_dir/smcli"
 python3 scripts/test-service.py "$bin_dir/smcli"
 python3 scripts/test-file-picker.py "$bin_dir/smcli"
+python3 scripts/test-alias-picker.py "$bin_dir/smcli"
 bash scripts/test-install.sh "$bin_dir"
 python3 scripts/bench-baseline.py --binary "$bin_dir/smcli" --rows 10 --samples 1 --output "$home/baseline.json"
+cmp "$home/bash-history.before" "$home/.bash_history"
+cmp "$home/zsh-history.before" "$home/.zsh_history"
+printf 'Native history byte-equality checks passed.\n'
 printf 'smcli history tests passed.\n'

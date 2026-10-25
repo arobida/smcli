@@ -85,6 +85,11 @@ impl ServiceClient {
     fn exchange(&self, request: &ServiceRequest, spawn: bool, timeout: Duration) -> Option<ServiceResponse> {
         let mut request = request.clone();
         if request.config.is_none() { request.config = Some(self.config.clone()); }
+        if request.op == Operation::Search {
+            request.shell_path = service_protocol::shell_path_snapshot(self.environment.get("PATH").map(String::as_str));
+            request.ranking_off = Some(self.environment.get("SMCLI_RANKING_OFF")
+                .filter(|s| s.len() <= 256).cloned().unwrap_or_default());
+        }
         let mut connection = self.connect(spawn)?;
         // The private directory already keeps others out; also refuse a socket another user planted.
         if connection.peer_uid() != Some(unsafe { libc::getuid() }) { return None; }

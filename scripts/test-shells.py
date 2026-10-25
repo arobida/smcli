@@ -841,12 +841,142 @@ def run_shared_service(chosen):
           "killed mid-session, nothing lost or duplicated.")
 
 
+ARGV_STUB = """#!/usr/bin/env python3
+import os, sys
+path = os.environ.get("SMCLI_ARGV_LOG")
+if path:
+    with open(path, "a") as handle:
+        handle.write("\\0".join(sys.argv[1:]) + "\\n")
+"""
+
+
+def record_rows(path):
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_bytes().split(b"\n"):
+        if line:
+            rows.append([part.decode() for part in line.split(b"\0")])
+    return rows
+
+
+def typed_records(rows, command):
+    found = []
+    for argv in rows:
+        if not argv or argv[0] != "record":
+            continue
+        if argv[1:2] == ["--expanded"]:
+            expansion, fields = argv[2], argv[3:]
+        else:
+            expansion, fields = None, argv[1:]
+        if fields and fields[-1] == command:
+            found.append((expansion, fields, argv))
+    return found
+
+
+def define_alias(t, kind, name, body):
+    quoted = shlex.quote(body)
+    t.send(f"alias {name} {quoted}" if kind == "fish" else f"alias {name}={quoted}")
+
+
+def run_alias_capture(variant):
+    """The CLI does not accept --expanded yet, so a stub logs record argv."""
+    kind = variant.kind
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory).resolve()
+        runtime = tempfile.mkdtemp(prefix="smcli-sh.", dir="/tmp")
+        env = new_environment(home, runtime, variant)
+        log = home / "argv-log"
+        stub = home / "argv-stub"
+        stub.write_text(ARGV_STUB)
+        stub.chmod(0o755)
+        env["SMCLI_ARGV_LOG"] = str(log)
+        t = Terminal(variant.path, variant.args, env, str(home))
+        try:
+            t.drain()
+            setup_prompt(t, kind)
+            if variant.prelude:
+                t.send(variant.prelude)
+            t.send(init_line(kind))
+            quoted_stub = shlex.quote(str(stub))
+            t.send(f"set -g _smcli_bin {quoted_stub}" if kind == "fish" else f"_smcli_bin={quoted_stub}")
+
+            def expect(command, expansion):
+                rows = record_rows(log)
+                hits = typed_records(rows, command)
+                assert hits, (variant.label, command, rows[-6:])
+                got, fields, argv = hits[-1]
+                assert got == expansion, (variant.label, command, got, argv)
+                assert len(fields) == (8 if kind == "bash" else 9), (variant.label, command, fields)
+                assert fields[0] == kind and "--expanded" not in fields, (variant.label, fields)
+                if expansion is None:
+                    assert argv[1] != "--expanded", (variant.label, argv)
+
+            t.send("printf plain")
+            expect("printf plain", None)
+            define_alias(t, kind, "gst", "printf status")
+            t.send("gst")
+            expect("gst", "printf status")
+            t.send("gst --short")
+            expect("gst --short", "printf status --short")
+            define_alias(t, kind, "deploy", "TOKEN=abc123 ./deploy.sh")
+            t.send("deploy")
+            expect("deploy", None)
+            define_alias(t, kind, "sub", "printf $(printf hi)")
+            t.send("sub")
+            expect("sub", None)
+            define_alias(t, kind, "op", "printf a | cat")
+            t.send("op")
+            expect("op", None)
+            define_alias(t, kind, "quoted", 'printf "hi"')
+            t.send("quoted")
+            expect("quoted", None)
+            # Lookup is at preexec: the command redefines its own alias, and the next prompt must not win.
+            if kind == "fish":
+                t.send("function redefine_gl; alias gl 'printf files'; end")
+            else:
+                t.send("redefine_gl() { alias gl='printf files'; }")
+            define_alias(t, kind, "gl", "redefine_gl")
+            t.send("gl")
+            expect("gl", "redefine_gl")
+            define_alias(t, kind, "gl", "printf log")
+            t.send("gl")
+            expect("gl", "printf log")
+            define_alias(t, kind, "gl", "printf files")
+            t.send("gl extra")
+            expect("gl extra", "printf files extra")
+            define_alias(t, kind, "longcmd", "printf " + ("a" * 130))
+            t.send("longcmd")
+            expect("longcmd", None)
+            t.send("printf after-aliases")
+            expect("printf after-aliases", None)
+            if kind == "fish":
+                t.send("function custom_fn; echo custom-fn; end")
+                t.send("custom_fn")
+                expect("custom_fn", None)
+                t.send("abbr -a agst 'printf abbr-marker'")
+                t.send("agst")
+                rows = record_rows(log)
+                expanded = typed_records(rows, "printf abbr-marker") or typed_records(rows, "printf abbr-marker ")
+                assert expanded and expanded[-1][0] is None, (variant.label, rows[-4:])
+                assert not typed_records(rows, "agst"), (variant.label, rows[-4:])
+            leaked = [argv[2] for argv in record_rows(log) if argv[:2] == ["record", "--expanded"]]
+            assert not any(token in value for value in leaked for token in ("abc123", "$", "|", '"', "=", "'")), leaked
+            t.wait_exit(0)
+            print(f"{variant.label}: alias expansion capture passed.")
+        finally:
+            t.close()
+            stop_services(env)
+            shutil.rmtree(runtime, ignore_errors=True)
+
+
 found, skipped = variants()
 # SMCLI_TEST_ONLY=<substring of a variant label> narrows a run while debugging.
 only = os.environ.get("SMCLI_TEST_ONLY", "")
 found = [v for v in found if only in v.label]
 for variant in found:
     run_variant(variant)
+    run_alias_capture(variant)
 by_label = {v.label: v for v in found}
 zsh_variant = next((v for v in found if v.kind == "zsh"), None)
 if zsh_variant:

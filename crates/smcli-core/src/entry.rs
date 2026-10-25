@@ -4,22 +4,52 @@ use crate::time::parse_iso8601;
 /// Wire types from the service protocol; search and filtering behavior lives here.
 pub use crate::service_protocol::{SearchEntry, SearchFilter};
 
+/// Ordinary commands keep their historic key; NUL-prefixed JSON makes variant keys unambiguous.
+/// Escaping the prefix also keeps arbitrary native-file input collision-free.
+pub fn command_key(command: &str, expanded: Option<&str>) -> String {
+    if expanded.is_none() && !command.starts_with('\0') { return command.into(); }
+    format!("\0{}", serde_json::to_string(&(command, expanded)).unwrap())
+}
+
+pub fn command_parts(key: &str) -> (String, Option<String>) {
+    key.strip_prefix('\0').and_then(|s| serde_json::from_str(s).ok()).unwrap_or_else(|| (key.into(), None))
+}
+
 impl SearchEntry {
     pub fn new(command: &str, runs: i64, source: &str) -> Self {
         Self { command: command.into(), runs, source: source.into(), ..Default::default() }
     }
 
+    pub fn from_key(key: &str) -> Self {
+        let (command, expanded_command) = command_parts(key);
+        Self { command, expanded_command, source: "captured".into(), ..Default::default() }
+    }
+
+    pub fn key(&self) -> String { command_key(&self.command, self.expanded_command.as_deref()) }
+
+    pub fn primary(&self) -> &str {
+        if self.alias_off { &self.command } else { self.expanded_command.as_deref().unwrap_or(&self.command) }
+    }
+
+    pub fn secondary(&self) -> Option<&str> {
+        (!self.alias_off && self.expanded_command.is_some()).then_some(self.command.as_str())
+    }
+
     pub fn program(&self) -> Option<String> {
-        program_of(&self.command, CommandBreakdown::parse(&self.command).as_ref())
+        program_of(self.primary(), CommandBreakdown::parse(self.primary()).as_ref())
     }
 
     pub fn subcommand(&self) -> Option<String> {
-        CommandBreakdown::parse(&self.command)?.subcommand
+        CommandBreakdown::parse(self.primary())?.subcommand
     }
 
     pub fn last_run_epoch(&self) -> Option<f64> {
         self.last_run.as_deref().and_then(parse_iso8601)
     }
+}
+
+impl crate::service_protocol::Suggestion {
+    pub fn key(&self) -> String { command_key(&self.command, self.expanded_command.as_deref()) }
 }
 
 /// `directory` without a trailing slash, keeping "/" itself.

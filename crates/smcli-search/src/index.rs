@@ -7,12 +7,13 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 use smcli_core::entry::{SearchEntry, SearchFilter, trim_slash};
+use smcli_core::ranking::{Signal, uses};
 use smcli_core::parse::{CommandBreakdown, program_of};
 use taladb::fts::HybridQuery;
 use taladb::json::filter_from_json;
 use taladb::{Database, Stage, TypedCollection, Value};
 
-use crate::corpus::{Hit, SearchSignals, coverage, embedding_text, is_literal_query, parse_markers, program_arguments, query_filter, rerank, search_document};
+use crate::corpus::{Hit, SearchSignals, entry_coverage, embedding_text, is_literal_query, lexical_text, parse_markers, program_arguments, query_filter, rerank, search_document};
 use crate::{Potion, ShellTokenizer};
 
 /// One indexed command; metadata fields mirror `SearchFilter` so filters narrow candidates before ranking.
@@ -38,8 +39,8 @@ pub struct IndexedCommand {
 
 impl IndexedCommand {
     pub fn new(entry: &SearchEntry, doc: String) -> Self {
-        let parsed = CommandBreakdown::parse(&entry.command);
-        let program = program_of(&entry.command, parsed.as_ref());
+        let parsed = CommandBreakdown::parse(entry.primary());
+        let program = program_of(entry.primary(), parsed.as_ref());
         let subcommand = parsed.and_then(|p| p.subcommand);
         let mut dirs = vec![];
         let mut path = entry.last_directory.clone().unwrap_or_default();
@@ -54,7 +55,7 @@ impl IndexedCommand {
         let meta = format!("{program:?}\0{subcommand:?}\0{:?}\0{:?}\0{dirs:?}\0{last_run:?}\0{}", entry.flags, entry.author, entry.runs);
         // Terms are only needed on insert; `sync` fills them so unchanged commands skip tokenizing.
         Self {
-            doc, command: entry.command.clone(), terms: String::new(), embedding: vec![], program, subcommand,
+            doc, command: entry.key(), terms: String::new(), embedding: vec![], program, subcommand,
             flags: entry.flags.clone(), author: entry.author.clone(), dirs, last_run, runs: entry.runs, meta,
         }
     }
@@ -94,7 +95,7 @@ pub struct HistorySearch {
 }
 
 /// Swift's `commands-v*` files live in the same directory; this prefix keeps the two from deleting each other's index.
-const VERSION: &str = "rs-commands-v1";
+const VERSION: &str = "rs-commands-v3";
 
 impl HistorySearch {
     pub fn new(directory: impl Into<PathBuf>, potion: Potion) -> Self {
@@ -111,6 +112,15 @@ impl HistorySearch {
     /// When another process holds the index, search falls back to word matching over the corpus.
     pub fn search(&self, query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter,
                   programs: Option<&HashMap<String, HashSet<String>>>, signals: &SearchSignals, now: f64) -> Result<Vec<SearchEntry>> {
+        let alias_off = !uses(signals.context.as_ref(), Signal::Alias);
+        let typed_only = alias_off.then(|| corpus.iter().map(|(key, entry)| {
+            let mut entry = entry.clone();
+            entry.alias_off = true;
+            entry.flags = smcli_core::parse::command_flags(&entry.command);
+            (key.clone(), entry)
+        }).collect::<HashMap<_, _>>());
+        let corpus = typed_only.as_ref().unwrap_or(corpus);
+        let programs = if alias_off { None } else { programs };
         if query.trim().is_empty() && !filter.is_empty() {
             let mut matches: Vec<&SearchEntry> = corpus.values().filter(|e| filter.allows(e)).collect();
             matches.sort_by(|a, b| {
@@ -154,7 +164,7 @@ impl HistorySearch {
             // The service (or a reindex) holds the index; TalaDB refuses a second process, so no semantic leg.
             return Ok(text_fallback(&stripped, corpus, limit, filter, literal, signals, now, &parsed_filter, has_markers));
         };
-        let name = self.index_name();
+        let name = if alias_off { format!("{}-typed", self.index_name()) } else { self.index_name() };
         let db = self.open_index(&name)?;
         let commands = db.typed::<IndexedCommand>("commands")?;
         self.sync(&commands, corpus)?;
@@ -234,7 +244,7 @@ impl HistorySearch {
         }
         drop(db);
         let final_filter = addition_filter(filter, &merged_filter, has_markers, parsed_any, parsed_useful);
-        let existing: HashSet<String> = hits.iter().map(|h| h.0.command.clone()).collect();
+        let existing: HashSet<String> = hits.iter().map(|h| h.0.key()).collect();
         hits.extend(signals.additions(&stripped, corpus, &existing, final_filter, now));
         Ok(rerank(hits, literal, &stripped, now, signals).into_iter().take(limit).collect())
     }
@@ -251,18 +261,20 @@ impl HistorySearch {
     /// Brings `commands` in line with `corpus`. Returns the number of documents now indexed.
     fn sync(&self, commands: &TypedCollection<IndexedCommand>, corpus: &HashMap<String, SearchEntry>) -> Result<usize> {
         // Keyed by the full command, not the truncated embedding text: two pasted scripts that share a
-        // 1,500-character prefix must both stay retrievable. Vectors and terms still see only that bounded text.
-        let wanted: HashMap<String, (IndexedCommand, String)> = corpus
+        // 1,500-character prefix must both stay retrievable. Embeddings stay capped; lexical terms use a
+        // larger ceiling so tail words are searchable.
+        let wanted: HashMap<String, (IndexedCommand, String, String)> = corpus
             .values()
             .map(|entry| {
                 let embed = embedding_text(entry);
-                (entry.command.clone(), (IndexedCommand::new(entry, search_document(entry, false)), embed))
+                let lexical = lexical_text(entry);
+                (entry.key(), (IndexedCommand::new(entry, search_document(entry, false)), embed, lexical))
             })
             .collect();
         let indexed = fingerprints(commands)?;
         let stale: Vec<&String> = indexed
             .iter()
-            .filter(|(command, (doc, _))| wanted.get(*command).map(|(row, _)| &row.doc != doc).unwrap_or(true))
+            .filter(|(command, (doc, _))| wanted.get(*command).map(|(row, _, _)| &row.doc != doc).unwrap_or(true))
             .map(|(command, _)| command)
             .collect();
         if !stale.is_empty() {
@@ -270,7 +282,7 @@ impl HistorySearch {
         }
         // Same identity and embedding text: usage changes update metadata and keep the vector.
         for (command, (doc, meta)) in &indexed {
-            if let Some((row, _)) = wanted.get(command).filter(|(row, _)| &row.doc == doc && &row.meta != meta) {
+            if let Some((row, _, _)) = wanted.get(command).filter(|(row, _, _)| &row.doc == doc && &row.meta != meta) {
                 commands.update_one(json!({"command": command}), json!({"$set": row.metadata()}))?;
             }
         }
@@ -289,7 +301,7 @@ impl HistorySearch {
                 .iter()
                 .zip(vectors)
                 .map(|(command, embedding)| IndexedCommand {
-                    terms: ShellTokenizer::encoded(&wanted[*command].1),
+                    terms: ShellTokenizer::encoded(&wanted[*command].2),
                     embedding,
                     ..wanted[*command].0.clone()
                 })
@@ -474,12 +486,12 @@ fn text_fallback(query: &str, corpus: &HashMap<String, SearchEntry>, limit: usiz
         let mut filtered: Vec<Hit> = corpus
             .values()
             .filter(|e| merged_filter.allows(e))
-            .filter_map(|e| Some((e.clone(), Some(coverage(&e.command, &terms)).filter(|c| *c > 0.0)?)))
+            .filter_map(|e| Some((e.clone(), Some(entry_coverage(e, &terms)).filter(|c| *c > 0.0)?)))
             .collect();
         filtered.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.command.cmp(&b.0.command)));
         filtered.truncate((limit * 4).max(40));
         for (entry, score) in filtered {
-            if seen.insert(entry.command.clone()) {
+            if seen.insert(entry.key()) {
                 hits.push((entry, score));
             }
         }
@@ -490,19 +502,19 @@ fn text_fallback(query: &str, corpus: &HashMap<String, SearchEntry>, limit: usiz
         let mut fallback: Vec<Hit> = corpus
             .values()
             .filter(|e| filter.allows(e))
-            .filter_map(|e| Some((e.clone(), Some(coverage(&e.command, &terms)).filter(|c| *c > 0.0)?)))
+            .filter_map(|e| Some((e.clone(), Some(entry_coverage(e, &terms)).filter(|c| *c > 0.0)?)))
             .collect();
         fallback.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.command.cmp(&b.0.command)));
         fallback.truncate((limit * 4).max(40));
         let scale = if parsed_useful { 0.5 } else { 1.0 };
         for (entry, score) in fallback {
-            if seen.insert(entry.command.clone()) {
+            if seen.insert(entry.key()) {
                 hits.push((entry, score * scale));
             }
         }
     }
     let final_filter = addition_filter(filter, &merged_filter, has_markers, parsed_any, parsed_useful);
-    let existing: HashSet<String> = hits.iter().map(|h| h.0.command.clone()).collect();
+    let existing: HashSet<String> = hits.iter().map(|h| h.0.key()).collect();
     hits.extend(signals.additions(query, corpus, &existing, final_filter, now));
     rerank(hits, literal, query, now, signals).into_iter().take(limit).collect()
 }
@@ -510,6 +522,26 @@ fn text_fallback(query: &str, corpus: &HashMap<String, SearchEntry>, limit: usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_fallback_prefers_exact_tokens_and_identifier_parts() {
+        for (query, target, near) in [
+            ("main-branch", "git checkout main-branch", "git checkout main"),
+            ("HEAD~1", "git reset HEAD~1", "git reset HEAD~10"),
+            ("git reset --soft", "git reset --soft HEAD", "git reset --hard HEAD"),
+            ("bar tests", "xcodebuild -scheme FooBarTests", "run Bar"),
+            ("FooBar", "run FooBar", "run Foo"),
+        ] {
+            let corpus = [
+                (target.into(), SearchEntry { frecency: 1.0, successes: 1, ..SearchEntry::new(target, 1, "captured") }),
+                (near.into(), SearchEntry { frecency: 25.0, successes: 25, ..SearchEntry::new(near, 25, "captured") }),
+            ].into_iter().collect();
+            let literal = is_literal_query(query, &program_arguments(&corpus));
+            let hits = text_fallback(query, &corpus, 3, &SearchFilter::default(), literal,
+                &SearchSignals::default(), 0.0, &SearchFilter::default(), false);
+            assert_eq!(hits[0].command, target, "{query}: {hits:?}");
+        }
+    }
 
     #[test]
     fn map_search_filters_to_index_filters() {
@@ -733,6 +765,44 @@ mod tests {
         std::fs::write(&path, b"this is not a taladb file").unwrap();
         let hits = engine.search("docker", &corpus, 1, &SearchFilter::default(), None, &SearchSignals::default(), 0.0).unwrap();
         assert_eq!(hits[0].command, "docker ps");
+    }
+
+    #[test]
+    fn long_tail_terms_are_searchable() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HistorySearch::new(dir.path().join("index"), Potion::bundled().unwrap());
+        let prefix = "x".repeat(1_500);
+        let alpha = format!("{prefix} ALPHA");
+        let beta = format!("{prefix} BETA");
+        let corpus: HashMap<String, SearchEntry> = [
+            (alpha.clone(), SearchEntry::new(&alpha, 1, "captured")),
+            (beta.clone(), SearchEntry::new(&beta, 1, "captured")),
+        ]
+        .into_iter()
+        .collect();
+        let hits = engine.search("ALPHA", &corpus, 3, &SearchFilter::default(), None, &SearchSignals::default(), 0.0).unwrap();
+        assert_eq!(hits[0].command, alpha, "ALPHA tail did not retrieve the right command: {hits:?}");
+        let hits = engine.search("BETA", &corpus, 3, &SearchFilter::default(), None, &SearchSignals::default(), 0.0).unwrap();
+        assert_eq!(hits[0].command, beta, "BETA tail did not retrieve the right command: {hits:?}");
+    }
+
+    #[test]
+    #[ignore = "manual timing measurement; run explicitly for comparable warm/cold measurements"]
+    fn measure_long_entry_sync_overhead() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HistorySearch::new(dir.path().join("index"), Potion::bundled().unwrap());
+        let mut corpus: HashMap<String, SearchEntry> = HashMap::new();
+        for index in 0..5 {
+            // Each command is 8,000 characters of unique text so the lexical terms grow with the ceiling.
+            let body: String = (0usize..8_000).map(|i| (((i + index * 7) % 26) as u8 + b'a') as char).collect();
+            let command = format!("cmd {body}");
+            corpus.insert(command.clone(), SearchEntry::new(&command, 1, "captured"));
+        }
+        let started = std::time::Instant::now();
+        engine.search("x", &corpus, 1, &SearchFilter::default(), None, &SearchSignals::default(), 0.0).unwrap();
+        let sync_ms = started.elapsed().as_millis();
+        let size: u64 = engine.files(&engine.index_name()).iter().filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len())).sum();
+        println!("long-entry sync: {sync_ms} ms, index size: {size} bytes");
     }
 
     fn indexed_commands(engine: &HistorySearch) -> Vec<IndexedCommand> {

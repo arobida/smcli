@@ -64,9 +64,60 @@ if [[ ${_smcli_installed-} != 1 ]]; then
         _smcli_session=$$-$_smcli_epoch-$RANDOM
         # Exported so the picker and search know which session is asking (its last command picks transitions).
         export SMCLI_SESSION=$_smcli_session
+        _smcli_expanded=
+        # shortcut: PS0 can't assign a string without printing it, so that mode writes here and the prompt reads it. Upgrade if a command must not be able to forge this file.
+        _smcli_expfile=${TMPDIR:-/tmp}/smcli-exp-$$-$RANDOM
+        # Plain ASCII words and flags, single spaces, at most 128 bytes. Substitutions, assignments, operators and quotes are typed-only.
+        _smcli_safe() {
+            local LC_ALL=C s=$1 rest
+            [[ -n $s && ${#s} -le 128 ]] || return 1
+            rest=${s//[A-Za-z0-9 _-]/}
+            [[ -z $rest && $s != ' '* && $s != *' ' && $s != *'  '* && ${s%% *} == [A-Za-z_]* ]]
+        }
+        # bash 3.2 has no BASH_ALIASES. Parse `alias --` output; never eval it.
+        _smcli_alias_body() {
+            local line q="'"
+            line=$(alias -- "$1" 2>/dev/null) || return 0
+            [[ $line == "alias $1="* ]] || return 0
+            line=${line#"alias $1="}
+            [[ $line == "$q"*"$q" ]] || return 0
+            line=${line#"$q"}
+            line=${line%"$q"}
+            printf '%s' "$line"
+        }
+        # Look up the first word now. The next prompt would see an alias the command itself redefined.
+        _smcli_set_expanded() {
+            local typed=$1 name body
+            _smcli_expanded=
+            shopt -q expand_aliases || return 0
+            [[ $typed =~ ^[A-Za-z_][A-Za-z0-9_]*($|[[:space:]]) ]] || return 0
+            name=${typed%%[[:space:]]*}
+            if (( BASH_VERSINFO[0] >= 4 )); then
+                body=${BASH_ALIASES[$name]-}
+            else
+                body=$(_smcli_alias_body "$name")
+            fi
+            [[ -n $body && $body != *' ' ]] || return 0
+            _smcli_expanded=$body${typed#"$name"}
+            _smcli_safe "$_smcli_expanded" && [[ $_smcli_expanded != "$typed" ]] || _smcli_expanded=
+        }
+        _smcli_ps0_alias() {
+            local entry
+            _smcli_expanded=
+            entry=$(HISTTIMEFORMAT= builtin history 1 2>/dev/null) || true
+            # An unchanged history number is the previous command, not this one.
+            if [[ $entry =~ ^[[:space:]]*([0-9]+)[[:space:]]+(.*)$ && ${BASH_REMATCH[1]} != "$_smcli_history_number" ]]; then
+                _smcli_set_expanded "${BASH_REMATCH[2]}"
+            fi
+            printf '%s\n' "$_smcli_expanded" >| "$_smcli_expfile" 2>/dev/null || true
+        }
         _smcli_record() {
-            "$_smcli_bin" record bash "$_smcli_session" "$_smcli_directory" "$1" "$_smcli_started" "$2" \
-                "${HISTFILE-}" "$_smcli_command" || printf 'smcli: command metadata was not saved.\n' >&2
+            # --expanded precedes the existing positional fields and is omitted without a trusted expansion.
+            local -a args
+            args=(record)
+            _smcli_safe "${_smcli_expanded-}" && args+=(--expanded "$_smcli_expanded")
+            args+=(bash "$_smcli_session" "$_smcli_directory" "$1" "$_smcli_started" "$2" "${HISTFILE-}" "$_smcli_command")
+            "$_smcli_bin" "${args[@]}" || printf 'smcli: command metadata was not saved.\n' >&2
         }
         # Whether $1 matches one of the user's HISTIGNORE patterns (a bare & means "the previous line": not checked).
         _smcli_histignore() {
@@ -120,6 +171,7 @@ if [[ ${_smcli_installed-} != 1 ]]; then
                     fi
                     _smcli_history_number=${BASH_REMATCH[1]}
                 fi
+                _smcli_set_expanded "$_smcli_command"
             fi
             return "$prior_status"
         }
@@ -128,12 +180,18 @@ if [[ ${_smcli_installed-} != 1 ]]; then
             _smcli_pending=1
             _smcli_directory=$PWD
             if [[ -n ${EPOCHREALTIME-} ]]; then _smcli_t0=${EPOCHREALTIME/[.,]/}; else _smcli_t0=$(( (_smcli_epoch + SECONDS) * 1000000 )); fi
+            _smcli_set_expanded "$1"
         }
         _smcli_prompt() {
             local status=$? ended=${EPOCHREALTIME:-$((_smcli_epoch + SECONDS))} entry keep=1
             _smcli_armed=0
             if [[ $_smcli_pending == 1 ]]; then
                 _smcli_pending=0
+                if [[ $_smcli_mode == ps0 && -n ${_smcli_expfile-} ]]; then
+                    _smcli_expanded=
+                    [[ -s $_smcli_expfile ]] && IFS= read -r _smcli_expanded < "$_smcli_expfile"
+                    : >| "$_smcli_expfile"
+                fi
                 if [[ $_smcli_mode != debug ]]; then
                     printf -v _smcli_started '%d.%06d' $((_smcli_t0 / 1000000)) $((_smcli_t0 % 1000000))
                     _smcli_history_command || keep=
@@ -185,6 +243,8 @@ if [[ ${_smcli_installed-} != 1 ]]; then
                     else
                         PS0+='${_smcli_nul:$((_smcli_pending=1,_smcli_t0=(_smcli_epoch+SECONDS)*1000000,0)):0}'
                     fi
+                    # Length 0, so nothing is printed; the function writes the expansion before the command runs.
+                    PS0+='${_smcli_nul:0:$(_smcli_ps0_alias; printf 0)}'
                     _smcli_exit_trap
                 else
                     trap '_smcli_preexec "$BASH_COMMAND" "$?"' DEBUG
@@ -300,18 +360,50 @@ if [[ ${_smcli_installed-} != 1 ]]; then
     _smcli_pending=0
     _smcli_session=$$-${EPOCHSECONDS:-0}-$RANDOM
     export SMCLI_SESSION=$_smcli_session
+    _smcli_expanded=
+    _smcli_executed=
+    # Plain ASCII words and flags, single spaces, at most 128 bytes. Substitutions, assignments, operators and quotes are typed-only.
+    _smcli_safe() {
+        local s=$1 rest
+        (( $#s > 0 && $#s <= 128 )) || return 1
+        rest=${s//[A-Za-z0-9 _-]/}
+        [[ -z $rest && $s != \ * && $s != *\  && $s != *\ \ * && ${s%% *} == [A-Za-z_]* ]]
+    }
+    # $1 is preexec's typed text, $2 is preexec's $3. Only a confirmed leading regular alias is kept.
+    _smcli_alias() {
+        local typed=$1 executed=$2 name body expanded
+        [[ $typed == [A-Za-z_]* ]] || return
+        name=${typed%% *}
+        [[ $name != *[^A-Za-z0-9_]* && ( $typed == "$name" || $typed == "$name "* ) ]] || return
+        [[ -n ${aliases[$name]-} && -z ${galiases[$name]-} && -z ${saliases[$name]-} ]] || return
+        body=${aliases[$name]}
+        [[ $body == *' ' ]] && return
+        expanded=$body${typed#$name}
+        # $3 must be that expansion: a differing format is not proof, and a suppressed alias must not be labeled.
+        [[ $executed == "$expanded" ]] || return
+        _smcli_safe "$expanded" || return
+        [[ $expanded != "$typed" ]] || return
+        _smcli_expanded=$expanded
+    }
     _smcli_start() {
         _smcli_pending=0
+        _smcli_expanded=
+        _smcli_executed=
         # HISTORY_IGNORE is the user's own list of commands to keep out of history.
         if [[ -n ${HISTORY_IGNORE-} && $1 == ${~HISTORY_IGNORE} ]]; then return; fi
         _smcli_started=${EPOCHREALTIME-}
         _smcli_command=$1
+        _smcli_executed=$3
         _smcli_directory=$PWD
         _smcli_pending=1
+        _smcli_alias "$1" "$3"
     }
     _smcli_record() {
-        "$_smcli_bin" record zsh "$_smcli_session" "$_smcli_directory" "$1" "$3" "$_smcli_started" "$2" \
-            "${HISTFILE-}" "$_smcli_command" || printf 'smcli: command metadata was not saved.\n' >&2
+        local -a args
+        args=(record)
+        _smcli_safe "${_smcli_expanded-}" && args+=(--expanded "$_smcli_expanded")
+        args+=(zsh "$_smcli_session" "$_smcli_directory" "$1" "$3" "$_smcli_started" "$2" "${HISTFILE-}" "$_smcli_command")
+        "$_smcli_bin" "${args[@]}" || printf 'smcli: command metadata was not saved.\n' >&2
     }
     _smcli_finish() {
         local exit_code=$1 pipe=$2 ended=${EPOCHREALTIME-}
@@ -434,10 +526,56 @@ if not set -q _smcli_installed
     set -g _smcli_session $fish_pid-(date +%s)-(random)
     set -gx SMCLI_SESSION $_smcli_session
     set -g _smcli_pending 0
+    set -g _smcli_expanded
+    # Plain ASCII words and flags, single spaces, at most 128 bytes. Substitutions, assignments, operators and quotes are typed-only.
+    function _smcli_safe
+        set -l s $argv[1]
+        set -l n (string length -- $s)
+        test $n -gt 0; and test $n -le 128; or return 1
+        string match -qr -- '^[A-Za-z_][A-Za-z0-9_-]*( [A-Za-z0-9_-]+)*$' $s
+    end
+    # A generated alias function is one literal command forwarding $argv. Anything else, including abbreviations, is typed text.
+    function _smcli_alias_body
+        set -l name $argv[1]
+        functions -q -- $name; or return 0
+        set -l cmd
+        for line in (functions -- $name)
+            set -l trimmed (string trim -- $line)
+            if test -z "$trimmed"
+                continue
+            end
+            switch $trimmed
+                case '#*' 'function *' end
+                    continue
+            end
+            if test -n "$cmd"
+                return 0
+            end
+            set cmd $trimmed
+        end
+        set cmd (string trim -- (string replace -r -- ';$' '' $cmd))
+        # [$] is a literal dollar: fish single quotes do not treat backslash as an escape.
+        string match -qr -- '^[A-Za-z_][A-Za-z0-9_-]*( [A-Za-z0-9_-]+)* [$]argv$' $cmd; or return 0
+        string replace -r -- ' [$]argv$' '' $cmd
+    end
+    function _smcli_set_expanded
+        set -g _smcli_expanded
+        set -l m (string match -r -- '^([A-Za-z_][A-Za-z0-9_]*)( .*)?$' $argv[1])
+        or return 0
+        set -l body (_smcli_alias_body $m[2])
+        test -n "$body"; or return 0
+        set -l suffix ""
+        test (count $m) -ge 3; and set suffix $m[3]
+        set -l expanded "$body$suffix"
+        _smcli_safe "$expanded"; or return 0
+        test "$expanded" != "$argv[1]"; or return 0
+        set -g _smcli_expanded $expanded
+    end
     # Runs before each command: fish's private mode and fish_should_add_to_history keep a command out, as does smcli's own
-    # filter for a leading space.
+    # filter for a leading space. Abbreviations are already expanded in the buffer, so they are recorded as typed text.
     function _smcli_preexec --on-event fish_preexec
         set -g _smcli_pending 0
+        set -g _smcli_expanded
         test -n "$fish_private_mode"; and return
         if functions -q fish_should_add_to_history
             fish_should_add_to_history "$argv[1]"; or return
@@ -447,9 +585,14 @@ if not set -q _smcli_installed
         # Fish has no clock builtin, so start times are whole seconds; the duration is fish's own CMD_DURATION.
         set -g _smcli_started (date +%s)
         set -g _smcli_pending 1
+        _smcli_set_expanded "$argv[1]"
     end
     function _smcli_record
-        set -l args record fish $_smcli_session $_smcli_directory $argv[1] $argv[2] $argv[3] $argv[4] '' $_smcli_command
+        set -l args record
+        if _smcli_safe "$_smcli_expanded"
+            set -a args --expanded $_smcli_expanded
+        end
+        set -a args fish $_smcli_session $_smcli_directory $argv[1] $argv[2] $argv[3] $argv[4] '' $_smcli_command
         # Record in a disowned process so the prompt never waits.
         if test -n "$SMCLI_SYNC"
             command $_smcli_bin $args; or echo 'smcli: command metadata was not saved.' >&2
@@ -563,6 +706,21 @@ end"###
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_hooks_pass_optional_expanded_flag() {
+        for shell in ["bash", "zsh", "fish"] {
+            let hooks = render_with_keys(shell, "smcli", true, false, false, false, false).unwrap();
+            assert!(hooks.contains("--expanded"), "{shell} missing --expanded");
+            assert!(hooks.contains("128"), "{shell} missing the 128-byte gate");
+        }
+        let bash = render_with_keys("bash", "smcli", true, false, false, false, false).unwrap();
+        assert!(bash.contains("BASH_ALIASES") && bash.contains("alias --"));
+        let zsh = render_with_keys("zsh", "smcli", true, false, false, false, false).unwrap();
+        assert!(zsh.contains("_smcli_executed=$3") && zsh.contains("_smcli_alias \"$1\" \"$3\""));
+        let fish = render_with_keys("fish", "smcli", true, false, false, false, false).unwrap();
+        assert!(fish.contains("[$]argv") && !fish.contains("abbr -"));
+    }
 
     #[test]
     fn quotes_paths_and_preserves_template_like_path_text() {

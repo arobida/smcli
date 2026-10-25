@@ -252,7 +252,11 @@ impl Service {
     }
 
     fn ranking_context(&self, request: &ServiceRequest, directory: &str) -> RankingContext {
-        RankingContext::new(&self.contexts.context(directory), request.session.clone(), &self.environment)
+        let mut environment = self.environment.clone();
+        if let Some(off) = request.ranking_off.as_ref().filter(|s| s.len() <= 256) {
+            environment.insert("SMCLI_RANKING_OFF".into(), off.clone());
+        }
+        RankingContext::new(&self.contexts.context(directory), request.session.clone(), &environment)
     }
 
     /// Another process (a fallback record, an import, prune) changed the database: rebuild on next use.
@@ -283,18 +287,25 @@ impl Service {
         ) else {
             return Ok(ServiceResponse::failure("bad_request", "record needs event, command, shell, session, directory and exitCode."));
         };
+        let filter = CaptureFilter::new(&SmcliConfig::load(&self.config_path(request))?)?;
+        if !filter.allows_run(command, request.expanded_command.as_deref(), directory) {
+            let mut response = ServiceResponse::new(true);
+            response.event = Some(event.clone());
+            response.duplicate = Some(false);
+            return Ok(response);
+        }
         let mut state = self.lock();
         state.last_activity = Instant::now();
         Self::refresh(&mut state)?;
         let started = request.started_at.unwrap_or_else(now);
         let run = NewRun {
-            command, shell, directory, exit_code, session, started_at: Some(started), ended_at: request.ended_at,
+            command, expanded_command: request.expanded_command.as_deref(), shell, directory, exit_code, session, started_at: Some(started), ended_at: request.ended_at,
             pipestatus: request.pipestatus.clone(), event: Some(event.clone()),
         };
         let inserted = self.history.append(&run, request.native_file.as_deref().unwrap_or(""), Some(&state.db))?;
         if inserted {
             state.history_revision += 1;
-            let run = Run { command: command.clone(), directory: directory.clone(), started_at: started, exit_code, session: session.clone() };
+            let run = Run { command: command.clone(), expanded_command: request.expanded_command.clone(), directory: directory.clone(), started_at: started, exit_code, session: session.clone() };
             if let Some(index) = state.index.as_mut() {
                 if !index.add(&run) {
                     state.index = None;
@@ -331,7 +342,9 @@ impl Service {
         let mut response = ServiceResponse::new(true);
         response.suggestions = Some(index.suggestions(directory, prefix, limit as usize, Some(&context)));
         if pick {
-            response.recent = Some(index.recent());
+            let recent = index.recent();
+            response.recent_entries = Some(recent.iter().map(|key| smcli_core::entry::SearchEntry::from_key(key)).collect());
+            response.recent = Some(recent.iter().map(|key| smcli_core::entry::command_parts(key).0).collect());
         }
         Ok(response)
     }
@@ -344,6 +357,10 @@ impl Service {
         if !directory.starts_with('/') || command.is_empty() || command.len() > 1 << 16 || is_smcli_command(command) {
             return ServiceResponse::failure("bad_request", "select needs a command, a directory and a mode of suggest or search.");
         }
+        if request.expanded_command.as_deref().is_some_and(|e| !smcli_core::parse::safe_expansion(e) || is_smcli_command(e)) {
+            return ServiceResponse::failure("bad_request", "Invalid expanded command.");
+        }
+        let command = smcli_core::entry::command_key(command, request.expanded_command.as_deref());
         let query: String = request.query.as_deref().unwrap_or("").chars().take(1000).collect();
         let mut state = self.lock();
         state.last_activity = Instant::now();
@@ -352,10 +369,10 @@ impl Service {
             let filter = CaptureFilter::new(&SmcliConfig::load(&self.config_path(request))?)?;
             Self::refresh(&mut state)?;
             let time = now();
-            if self.history.record_pick(&query, command, mode, directory, &filter, time, &state.db)? {
+            if self.history.record_pick(&query, &command, mode, directory, &filter, time, &state.db)? {
                 state.data_version = data_version(&state.db)?;
                 if let Some(index) = state.index.as_mut() {
-                    index.add_pick(&query, command, time);
+                    index.add_pick(&query, &command, time);
                 }
             }
             Ok(())
@@ -434,7 +451,12 @@ impl Service {
                 let mut state = self.lock();
                 Self::refresh(&mut state)?;
                 let index = self.current_index(&mut state)?;
-                let mut signals = SearchSignals { picks: index.picks().clone(), ..Default::default() };
+                let mut signals = SearchSignals {
+                    picks: index.picks().clone(),
+                    shell_path: smcli_core::service_protocol::shell_path_snapshot(request.shell_path.as_deref()),
+                    directory: Some(directory.into()),
+                    ..Default::default()
+                };
                 if context.uses(Signal::Transition)
                     && let Some(previous) = request.session.as_deref().and_then(|s| index.previous_command(s))
                 {

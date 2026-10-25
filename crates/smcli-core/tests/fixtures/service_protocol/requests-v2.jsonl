@@ -1,0 +1,3 @@
+{"v":2,"op":"search","directory":"/tmp/project","query":"show files","shellPath":"/opt/bin:/usr/bin","rankingOff":"files"}
+{"v":2,"op":"search","directory":"/tmp/project","query":"show files"}
+{"v":2,"op":"search","directory":"/tmp/project","query":"show files","shellPath":""}

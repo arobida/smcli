@@ -11,6 +11,9 @@ pub enum Signal {
     Selection,
     Script,
     Hint,
+    Path,
+    Files,
+    Alias,
 }
 
 impl Signal {
@@ -21,6 +24,9 @@ impl Signal {
             "selection" => Self::Selection,
             "script" => Self::Script,
             "hint" => Self::Hint,
+            "path" => Self::Path,
+            "files" => Self::Files,
+            "alias" => Self::Alias,
             _ => return None,
         })
     }
@@ -300,7 +306,7 @@ pub fn apply_ranking_signals(
             if let Some(score) = scores.get_mut(command) {
                 let share = *count as f64 / total;
                 *score *= 1.0 + 6.0 * share * (*count as f64 / 3.0).min(1.0);
-                why.entry(command.clone()).or_default().push(format!("often follows {previous}"));
+                why.entry(command.clone()).or_default().push(format!("often follows {}", crate::entry::command_parts(previous).0));
             }
         }
     }

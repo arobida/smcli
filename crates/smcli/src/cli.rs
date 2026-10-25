@@ -94,6 +94,8 @@ enum Command {
     },
     #[command(hide = true)]
     Record {
+        #[arg(long, allow_hyphen_values = true)]
+        expanded: Option<String>,
         #[arg(num_args=5..=9, allow_hyphen_values=true)]
         fields: Vec<String>,
     },
@@ -226,7 +228,7 @@ pub fn run() -> Result<()> {
         Command::Context { json, dir } => {
             crate::context::run(&directory(dir, &env)?, json, &service)?
         }
-        Command::Record { fields } => record(&fields, &captured, &service, &filter()?)?,
+        Command::Record { fields, expanded } => record(&fields, expanded.as_deref(), &captured, &service, &filter()?)?,
         Command::Search(a) => {
             let filter = SearchFilter {
                 program: a.program,
@@ -272,7 +274,7 @@ pub fn run() -> Result<()> {
                         a.limit,
                         &filter,
                         None,
-                        &search_signals(&captured, Some(context))?,
+                        &search_signals(&captured, Some(context), &env)?,
                         now(),
                     )?
                 }
@@ -319,7 +321,7 @@ pub fn run() -> Result<()> {
                 print_json(&suggestions)?;
             } else {
                 for s in suggestions {
-                    println!("{}", s.command);
+                    println!("{}", crate::picker::history_label(&s.key()));
                 }
             }
         }
@@ -457,7 +459,7 @@ fn print_hits(hits: &[SearchEntry]) {
         if h.source == "native" {
             details.push("native history".into());
         }
-        println!("{}\n    {}", h.command, details.join("  "));
+        println!("{}\n    {}", crate::picker::history_label(&h.key()), details.join("  "));
         if let Some(why) = &h.why {
             if !why.is_empty() {
                 println!("    why: {}", why.join(", "));
@@ -475,15 +477,18 @@ fn epoch(s: &str) -> Result<Option<f64>> {
 }
 fn record(
     f: &[String],
+    expanded: Option<&str>,
     captured: &CapturedHistory,
     service: &ServiceClient,
     filter: &CaptureFilter,
 ) -> Result<()> {
     ensure!([5, 8, 9].contains(&f.len()), "Invalid record arguments");
     if f.len() == 5 {
-        if filter.allows(&f[3], &f[1]) {
+        if filter.allows_run(&f[3], expanded, &f[1]) {
+            let mut run = NewRun::new(&f[3], &f[0], &f[1], f[2].parse()?);
+            run.expanded_command = expanded;
             captured.append(
-                &NewRun::new(&f[3], &f[0], &f[1], f[2].parse()?),
+                &run,
                 &f[4],
                 None,
             )?;
@@ -491,11 +496,13 @@ fn record(
         return Ok(());
     }
     let tail = f.len() - 4;
-    if !filter.allows(&f[tail + 3], &f[2]) {
+    if !filter.allows_run(&f[tail + 3], expanded, &f[2]) {
         return Ok(());
     }
     captured.check_separate(&f[tail + 2])?;
     let mut run = NewRun::new(&f[tail + 3], &f[0], &f[2], f[3].parse()?);
+    run.expanded_command = expanded;
+    ensure!(expanded.is_none_or(|e| smcli_core::parse::safe_expansion(e) && e != run.command), "Invalid expanded command.");
     run.session = &f[1];
     run.started_at = Some(epoch(&f[tail])?.unwrap_or_else(now));
     run.ended_at = epoch(&f[tail + 1])?;
@@ -507,6 +514,7 @@ fn record(
     run.event = Some(uuid::Uuid::new_v4().to_string());
     let mut r = ServiceRequest::new(Operation::Record);
     r.command = Some(run.command.into());
+    r.expanded_command = run.expanded_command.map(String::from);
     r.shell = Some(run.shell.into());
     r.directory = Some(run.directory.into());
     r.exit_code = Some(run.exit_code);
@@ -530,12 +538,13 @@ fn records(c: &CapturedHistory) -> Result<Vec<serde_json::Value>> {
         return Ok(vec![]);
     }
     let db = c.open_connection()?;
-    let mut statement=db.prepare("SELECT c.started_at,c.duration_ms,s.user,s.host,s.id,s.shell,c.directory,c.command,c.exit_code,COUNT(*) OVER (PARTITION BY c.command ORDER BY c.started_at,c.id),c.uuid,c.author,c.intent,c.pipestatus,c.flags FROM commands c JOIN sessions s ON s.id=c.session WHERE c.deleted_at IS NULL ORDER BY c.started_at,c.id")?;
+    let mut statement=db.prepare("SELECT c.started_at,c.duration_ms,s.user,s.host,s.id,s.shell,c.directory,c.command,c.exit_code,COUNT(*) OVER (PARTITION BY c.command,c.expanded_command ORDER BY c.started_at,c.id),c.uuid,c.author,c.intent,c.pipestatus,c.flags,c.expanded_command FROM commands c JOIN sessions s ON s.id=c.session WHERE c.deleted_at IS NULL ORDER BY c.started_at,c.id")?;
     let rows=statement.query_map([],|r| {
         let command:String=r.get(7)?;
         let mut value=serde_json::json!({"timestamp":format_iso8601(r.get(0)?,true),"user":r.get::<_,String>(2)?,"host":r.get::<_,String>(3)?,"session":r.get::<_,String>(4)?,"shell":r.get::<_,String>(5)?,"directory":r.get::<_,String>(6)?,"command":command,"exitCode":r.get::<_,i64>(8)?,"runCount":r.get::<_,i64>(9)?});
-        if let Some(breakdown)=smcli_core::parse::CommandBreakdown::parse(&command) {value["breakdown"]=serde_json::to_value(breakdown).unwrap();}
-        for (name,index) in [("id",10),("author",11),("intent",12)] {if let Some(v)=r.get::<_,Option<String>>(index)? {value[name]=v.into();}}
+        let expanded: Option<String> = r.get(15)?;
+        if let Some(breakdown)=smcli_core::parse::CommandBreakdown::parse(expanded.as_deref().unwrap_or(&command)) {value["breakdown"]=serde_json::to_value(breakdown).unwrap();}
+        for (name,index) in [("id",10),("author",11),("intent",12),("expandedCommand",15)] {if let Some(v)=r.get::<_,Option<String>>(index)? {value[name]=v.into();}}
         if let Some(v)=r.get::<_,Option<i64>>(1)? {value["durationMs"]=v.into();}
         if let Some(v)=r.get::<_,Option<String>>(13)? {value["pipestatus"]=serde_json::json!(v.split_whitespace().filter_map(|s|s.parse::<i64>().ok()).collect::<Vec<_>>());}
         if let Some(v)=r.get::<_,Option<String>>(14)?.filter(|v| !v.trim().is_empty()) {value["flags"]=serde_json::json!(v.split_whitespace().collect::<Vec<_>>());}
@@ -609,19 +618,21 @@ fn prune(
     let mut ids = vec![];
     {
         let mut s =
-            tx.prepare("SELECT id,command,directory FROM commands ORDER BY started_at,id")?;
+            tx.prepare("SELECT id,command,directory,expanded_command FROM commands ORDER BY started_at,id")?;
         for row in s.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
             ))
         })? {
-            let (id, command, d) = row?;
-            if !filter.allows(&command, &d) {
+            let (id, command, d, expanded) = row?;
+            if !filter.allows(&command, &d) || expanded.as_deref().is_some_and(|e| !filter.allows(e, &d)) {
                 ids.push(id);
-                if !commands.contains(&command) {
-                    commands.push(command);
+                let key = smcli_core::entry::command_key(&command, expanded.as_deref());
+                if !commands.contains(&key) {
+                    commands.push(key);
                 }
             }
         }
@@ -641,7 +652,8 @@ fn prune(
         })? {
             let (id, command, q, d) = row?;
             // Only a rejected query removes a selection on its own; selections of a pruned command go with it.
-            if filter.allows(&command, &d) && !q.is_empty() && !filter.allows(&q, &d) {
+            let (typed, expanded) = smcli_core::entry::command_parts(&command);
+            if !filter.allows_run(&typed, expanded.as_deref(), &d) || (!q.is_empty() && !filter.allows(&q, &d)) {
                 picks.push(id);
             }
         }
@@ -656,7 +668,7 @@ fn prune(
     }
     if dry {
         for command in &commands {
-            println!("{command}");
+            println!("{}", smcli_core::entry::command_parts(command).0);
         }
         tx.rollback()?;
         println!("{} commands and {} selections would be removed.", ids.len(), selection_removed);
@@ -711,6 +723,7 @@ fn import(
                     .filter(|_| c.path.exists()),
         "Cannot import history into itself"
     );
+    let capture_filter = CaptureFilter::new(&SmcliConfig::load(&SmcliConfig::location(home, env))?)?;
     let mut db = c.open_connection()?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let mut count = 0;
@@ -788,22 +801,29 @@ fn import(
             let shell = text("shell")?;
             let session = format!("imported-{user}-{shell}");
             let command = text("command")?;
+            let expanded = match r.get("expandedCommand") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(serde_json::Value::String(text)) => Some(text.as_str()),
+                _ => bail!("Invalid expanded command."),
+            };
+            ensure!(expanded.is_none_or(|e| smcli_core::parse::safe_expansion(e) && e != command), "Invalid expanded command.");
             let stamp = parse_iso8601(text("timestamp")?)
                 .ok_or_else(|| anyhow::anyhow!("Invalid timestamp"))?;
+            let directory = text("directory")?;
+            let exit_code = r["exitCode"].as_i64().ok_or_else(|| anyhow::anyhow!("Missing exitCode"))?;
+            if expanded.is_some() && !capture_filter.allows_run(command, expanded, directory) { continue; }
             tx.execute(
                 "INSERT OR IGNORE INTO sessions(id,user,host,shell) VALUES(?,?,'unknown',?)",
                 rusqlite::params![session, user, shell],
             )?;
-            let directory = text("directory")?;
-            let exit_code = r["exitCode"].as_i64().ok_or_else(|| anyhow::anyhow!("Missing exitCode"))?;
             // Repeat imports must not double run counts: this import-only natural key skips a stored record.
             let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM commands WHERE session = ? AND started_at = ? AND command = ? AND directory = ? AND exit_code = ?)",
-                rusqlite::params![session, stamp, command, directory, exit_code],
+                "SELECT EXISTS(SELECT 1 FROM commands WHERE session = ? AND started_at = ? AND command = ? AND directory = ? AND exit_code = ? AND expanded_command IS ?)",
+                rusqlite::params![session, stamp, command, directory, exit_code, expanded],
                 |r| r.get(0),
             )?;
             if !exists {
-                tx.execute("INSERT INTO commands(session,started_at,directory,command,exit_code,flags) VALUES(?,?,?,?,?,?)",rusqlite::params![session,stamp,directory,command,exit_code,smcli_core::parse::command_flags(command).join(" ")])?;
+                tx.execute("INSERT INTO commands(session,started_at,directory,command,exit_code,flags,expanded_command) VALUES(?,?,?,?,?,?,?)",rusqlite::params![session,stamp,directory,command,exit_code,smcli_core::parse::command_flags(expanded.unwrap_or(command)).join(" "),expanded])?;
                 count += 1;
             }
         }
@@ -844,11 +864,11 @@ fn pick(
         None => c.suggestions(&user_name(), &d, "", 50, now(), Some(&context))?,
     }
     .into_iter()
-    .map(|s| s.command)
+    .map(|s| s.key())
     .collect();
     let user = user_name();
-    let recent = match served.and_then(|r| r.recent) {
-        Some(r) => r,
+    let recent = match served.and_then(|r| r.recent_entries) {
+        Some(r) => r.into_iter().map(|entry| entry.key()).collect(),
         None => c.picker_recents(&user, 50)?,
     };
     let native = smcli_search::native::history_files(home, env)?
@@ -925,7 +945,7 @@ fn pick(
                         let built = (
                             search_engine(&c, &home, &env)?,
                             corpus(&c, &home, &env, context.project_root.as_deref(), now())?,
-                            search_signals(&c, Some(context.clone()))?,
+                            search_signals(&c, Some(context.clone()), &env)?,
                         );
                         fallback.get_or_init(|| built)
                     }
@@ -933,7 +953,7 @@ fn pick(
                 engine.search(q, corpus, 100, &SearchFilter::default(), None, signals, now())?
             }
         };
-        Ok(hits.into_iter().map(|h| h.command).collect())
+        Ok(hits.into_iter().map(|h| h.key()).collect())
         }
     };
     let file_search = {
@@ -966,7 +986,9 @@ fn pick(
                 semantic,
             } => {
                 let mut r = ServiceRequest::new(Operation::Select);
-                r.command = Some(command.clone());
+                let (typed, expanded) = smcli_core::entry::command_parts(&command);
+                r.command = Some(typed);
+                r.expanded_command = expanded;
                 r.query = Some(query.clone());
                 r.directory = Some(d.clone());
                 r.mode = Some(if semantic { "search" } else { "suggest" }.into());
@@ -992,7 +1014,7 @@ fn pick(
                         Ok(())
                     })();
                 }
-                println!("{command}");
+                println!("{}", crate::picker::history_insert(&command));
             }
             Choice::File { hit, mode, query } => {
                 if hit.provenance != ["*"] {
@@ -1331,6 +1353,41 @@ mod tests {
             .collect::<rusqlite::Result<_>>()?;
         assert_eq!(selections, ["push"]);
         std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn alias_export_import_and_prune_keep_variant_identity() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("smcli-alias-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root)?;
+        let home = root.as_path();
+        let source = CapturedHistory::new(home.join("source.db"));
+        for expanded in ["git log", "git ls-files"] {
+            let mut run = NewRun::new("gl", "zsh", "/repo", 0);
+            run.expanded_command = Some(expanded);
+            run.started_at = Some(1_700_000_000.0);
+            source.append(&run, "", None)?;
+        }
+        let exported = records(&source)?;
+        assert!(exported.iter().all(|r| r["runCount"] == 1));
+        let jsonl = home.join("export.jsonl");
+        std::fs::write(&jsonl, exported.iter().map(|r| format!("{r}\n")).collect::<String>())?;
+        let target = CapturedHistory::new(home.join("target.db"));
+        let env = HashMap::from([("HISTFILE".into(), String::new())]);
+        import(&target, home, &env, false, false, Some(jsonl.clone()))?;
+        import(&target, home, &env, false, false, Some(jsonl))?;
+        assert_eq!(records(&target)?.len(), 2);
+        let db = target.open_connection()?;
+        let filter = CaptureFilter::new(&SmcliConfig { history_filter: Some(vec!["ls-files".into()]), ..Default::default() })?;
+        target.record_pick("gl", &smcli_core::entry::command_key("gl", Some("git log")), "search", "/repo", &CaptureFilter::standard(), now(), &db)?;
+        target.record_pick("gl", &smcli_core::entry::command_key("gl", Some("git ls-files")), "search", "/repo", &CaptureFilter::standard(), now(), &db)?;
+        prune(&target, home, &env, &filter, false)?;
+        let kept = records(&target)?;
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0]["expandedCommand"], "git log");
+        assert_eq!(db.query_row("SELECT count(*) FROM command_selections", [], |r| r.get::<_, i64>(0))?, 1);
+        drop(db);
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 

@@ -2,7 +2,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const VERSION: i64 = 1;
+pub const VERSION: i64 = 2;
+pub const MAX_SHELL_PATH_BYTES: usize = 8_192;
+
+/// Oversized snapshots are unknown, never truncated into a different PATH.
+pub fn shell_path_snapshot(path: Option<&str>) -> Option<String> {
+    path.filter(|p| p.len() <= MAX_SHELL_PATH_BYTES && !p.contains('\0')).map(String::from)
+}
 pub const MAX_MESSAGE_BYTES: usize = 1 << 20;
 pub const MAX_RESPONSE_BYTES: usize = 64 << 20;
 pub const IO_TIMEOUT: f64 = 2.0;
@@ -33,6 +39,8 @@ pub struct ServiceRequest {
     pub event: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -82,6 +90,10 @@ pub struct ServiceRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub login_shell: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranking_off: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
@@ -96,6 +108,7 @@ impl ServiceRequest {
             op,
             event: None,
             command: None,
+            expanded_command: None,
             shell: None,
             session: None,
             exit_code: None,
@@ -110,6 +123,8 @@ impl ServiceRequest {
             filter: None,
             histfile: None,
             login_shell: None,
+            shell_path: None,
+            ranking_off: None,
             path: None,
             mode: None,
             config: None,
@@ -133,6 +148,8 @@ pub struct ServiceResponse {
     pub suggestions: Option<Vec<Suggestion>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recent: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_entries: Option<Vec<SearchEntry>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hits: Option<Vec<SearchEntry>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -171,6 +188,7 @@ impl ServiceResponse {
             duplicate: None,
             suggestions: None,
             recent: None,
+            recent_entries: None,
             hits: None,
             context: None,
             files: None,
@@ -269,6 +287,8 @@ pub struct SearchFilter {
 #[serde(rename_all = "camelCase")]
 pub struct Suggestion {
     pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded_command: Option<String>,
     #[serde(serialize_with = "numbers::finite")]
     pub score: f64,
     #[serde(deserialize_with = "numbers::integer")]
@@ -286,7 +306,11 @@ pub struct Suggestion {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchEntry {
+    #[serde(skip)]
+    pub alias_off: bool,
     pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expanded_command: Option<String>,
     #[serde(deserialize_with = "numbers::integer")]
     pub runs: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -7,7 +7,7 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OpenFlags, params, params_from_iter, types::Value};
 
 use crate::config::CaptureFilter;
-use crate::entry::trim_slash;
+use crate::entry::{trim_slash, command_key, command_parts};
 use crate::parse::{CommandBreakdown, base_name, command_flags, is_smcli_command};
 use crate::ranking::{RankingContext, SelectionLog, Signal, apply_ranking_signals, suggestion_why, uses};
 use crate::time::{format_iso8601, now};
@@ -22,7 +22,7 @@ pub const INTERRUPTED_EXIT_CODES: [i64; 2] = [130, 141];
 const ANSWERING_PROGRAMS: [&str; 16] =
     ["grep", "egrep", "fgrep", "rg", "ag", "ack", "pgrep", "diff", "cmp", "colordiff", "test", "[", "which", "type", "command", "false"];
 
-pub const VERSION: i64 = 7;
+pub const VERSION: i64 = 8;
 /// A short-lived build stored usage scores in a `usage` table at version 4. Usage is now computed when read,
 /// so such databases are taken back to version 3, which every binary since flags can open.
 /// Real schema changes therefore start at version 5.
@@ -80,6 +80,11 @@ const MIGRATION_TO_V7: &str = "
     PRAGMA user_version = 7;
     ";
 
+const MIGRATION_TO_V8: &str = "
+    ALTER TABLE commands ADD COLUMN expanded_command TEXT;
+    PRAGMA user_version = 8;
+    ";
+
 pub fn answers_with_exit_code(command: &str) -> bool {
     let program = CommandBreakdown::parse(command).map(|b| b.main_command).or_else(|| command.split_whitespace().next().map(String::from));
     program.is_some_and(|p| ANSWERING_PROGRAMS.contains(&base_name(&p)))
@@ -129,6 +134,7 @@ pub struct CommandStats {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Run {
     pub command: String,
+    pub expanded_command: Option<String>,
     pub directory: String,
     pub started_at: f64,
     pub exit_code: i64,
@@ -140,6 +146,7 @@ pub struct Run {
 #[derive(Debug, Clone)]
 pub struct NewRun<'a> {
     pub command: &'a str,
+    pub expanded_command: Option<&'a str>,
     pub shell: &'a str,
     pub directory: &'a str,
     pub exit_code: i64,
@@ -154,7 +161,7 @@ pub struct NewRun<'a> {
 
 impl<'a> NewRun<'a> {
     pub fn new(command: &'a str, shell: &'a str, directory: &'a str, exit_code: i64) -> Self {
-        Self { command, shell, directory, exit_code, session: "unknown", started_at: None, ended_at: None, pipestatus: None, event: None }
+        Self { command, expanded_command: None, shell, directory, exit_code, session: "unknown", started_at: None, ended_at: None, pipestatus: None, event: None }
     }
 }
 
@@ -238,6 +245,9 @@ impl CapturedHistory {
         {
             bail!("Invalid shell, directory, exit code, pipestatus, session, or empty command.");
         }
+        if run.expanded_command.is_some_and(|text| !crate::parse::safe_expansion(text) || text == run.command) {
+            bail!("Invalid expanded command.");
+        }
         self.check_separate(native_file)?;
         // Converting an unbounded float to an integer saturates silently, and these come from shells and service clients.
         if ![run.started_at, run.ended_at].iter().all(|t| t.is_none_or(is_timestamp)) {
@@ -260,7 +270,7 @@ impl CapturedHistory {
         insert(db, &Insert {
             session: run.session, user: &user_name(), host: &host_name(), shell: run.shell, started_at: start,
             duration_ms: duration, directory: run.directory, command: run.command, exit_code: run.exit_code,
-            uuid: Some(&event), pipestatus: run.pipestatus.as_deref(),
+            uuid: Some(&event), pipestatus: run.pipestatus.as_deref(), expanded_command: run.expanded_command,
         }, true)
     }
 
@@ -303,7 +313,8 @@ impl CapturedHistory {
     /// command and to what was typed. Returns false when the filter kept it out.
     pub fn record_pick(&self, query: &str, command: &str, kind: &str, directory: &str, filter: &CaptureFilter, time: f64,
                        db: &Connection) -> Result<bool> {
-        if !filter.allows(command, directory) || (!query.is_empty() && !filter.allows(query, directory)) {
+        let (typed, expanded) = command_parts(command);
+        if !filter.allows_run(&typed, expanded.as_deref(), directory) || (!query.is_empty() && !filter.allows(query, directory)) {
             return Ok(false);
         }
         db.execute(
@@ -332,8 +343,8 @@ impl CapturedHistory {
         }
         let db = self.connect(false)?;
         let mut statement = db.prepare(
-            "SELECT c.command FROM commands c JOIN sessions s ON s.id = c.session
-             WHERE s.user = ? AND c.deleted_at IS NULL AND NOT smcli_internal(c.command)
+            "SELECT smcli_key(c.command,c.expanded_command) FROM commands c JOIN sessions s ON s.id = c.session
+             WHERE s.user = ? AND c.deleted_at IS NULL AND NOT smcli_internal(COALESCE(c.expanded_command,c.command))
              ORDER BY c.started_at DESC, c.id DESC LIMIT ?",
         )?;
         let rows = statement.query_map(params![user, limit as i64], |r| r.get::<_, String>(0))?;
@@ -343,8 +354,8 @@ impl CapturedHistory {
     /// The last command `session` ran (not counting smcli's own), for transitions.
     pub fn previous_command(&self, session: &str, user: &str, db: &Connection) -> Result<Option<String>> {
         let mut statement = db.prepare(
-            "SELECT c.command FROM commands c JOIN sessions s ON s.id = c.session
-             WHERE c.session = ? AND s.user = ? AND c.deleted_at IS NULL AND NOT smcli_internal(c.command)
+            "SELECT smcli_key(c.command,c.expanded_command) FROM commands c JOIN sessions s ON s.id = c.session
+             WHERE c.session = ? AND s.user = ? AND c.deleted_at IS NULL AND NOT smcli_internal(COALESCE(c.expanded_command,c.command))
              ORDER BY c.started_at DESC, c.id DESC LIMIT 1",
         )?;
         let mut rows = statement.query_map(params![session, user], |r| r.get(0))?;
@@ -355,10 +366,10 @@ impl CapturedHistory {
     pub fn followers(&self, previous: &str, user: &str, db: &Connection) -> Result<HashMap<String, i64>> {
         let mut statement = db.prepare(
             "SELECT command, count(*) FROM (
-                SELECT c.command AS command,
-                       LAG(c.command) OVER (PARTITION BY c.session ORDER BY c.started_at, c.id) AS prev
+                SELECT smcli_key(c.command,c.expanded_command) AS command,
+                       LAG(smcli_key(c.command,c.expanded_command)) OVER (PARTITION BY c.session ORDER BY c.started_at, c.id) AS prev
                 FROM commands c JOIN sessions s ON s.id = c.session
-                WHERE s.user = ? AND c.deleted_at IS NULL AND NOT smcli_internal(c.command)
+                WHERE s.user = ? AND c.deleted_at IS NULL AND NOT smcli_internal(COALESCE(c.expanded_command,c.command))
             ) WHERE prev = ? GROUP BY command",
         )?;
         let rows = statement.query_map(params![user, previous], |r| Ok((r.get(0)?, r.get(1)?)))?;
@@ -368,13 +379,13 @@ impl CapturedHistory {
     /// `user`'s live runs in the order `suggestions` reads them.
     pub fn runs(&self, user: &str, db: &Connection) -> Result<Vec<Run>> {
         let mut statement = db.prepare(
-            "SELECT c.command, c.directory, c.started_at, c.exit_code, c.session
+            "SELECT c.command, c.directory, c.started_at, c.exit_code, c.session, c.expanded_command
              FROM commands c JOIN sessions s ON s.id = c.session
              WHERE s.user = ? AND c.deleted_at IS NULL
              ORDER BY c.started_at, c.id",
         )?;
         let rows = statement.query_map([user], |r| {
-            Ok(Run { command: r.get(0)?, directory: r.get(1)?, started_at: r.get(2)?, exit_code: r.get(3)?, session: r.get(4)? })
+            Ok(Run { command: r.get(0)?, expanded_command: r.get(5)?, directory: r.get(1)?, started_at: r.get(2)?, exit_code: r.get(3)?, session: r.get(4)? })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -395,9 +406,9 @@ impl CapturedHistory {
                     SUM(smcli_decay(? - c.started_at)), SUM(c.exit_code IN (0, {interrupted})),
                     SUM(c.exit_code = 1),
                     SUM(? <> '' AND (c.directory = ? OR (? <> '/' AND substr(c.directory, 1, length(?) + 1) = ? || '/'))),
-                    SUM(? <> '' AND (c.directory = ? OR (? <> '/' AND substr(c.directory, 1, length(?) + 1) = ? || '/')))
+                    SUM(? <> '' AND (c.directory = ? OR (? <> '/' AND substr(c.directory, 1, length(?) + 1) = ? || '/'))), c.expanded_command
              FROM commands c
-             WHERE c.deleted_at IS NULL GROUP BY c.command"
+             WHERE c.deleted_at IS NULL GROUP BY c.command,c.expanded_command"
         );
         let mut values = vec![Value::Real(now)];
         values.extend([here; 5].iter().chain([root; 5].iter()).map(|s| Value::Text(s.to_string())));
@@ -407,9 +418,10 @@ impl CapturedHistory {
         while let Some(row) = rows.next()? {
             let command: String = row.get(0)?;
             let ones: i64 = row.get(10)?;
-            let answers = ones > 0 && answers_with_exit_code(&command);
+            let expanded: Option<String> = row.get(13)?;
+            let answers = ones > 0 && answers_with_exit_code(expanded.as_deref().unwrap_or(&command));
             let flags: Option<String> = row.get(7)?;
-            stats.insert(command, CommandStats {
+            stats.insert(command_key(&command, expanded.as_deref()), CommandStats {
                 runs: row.get(1)?,
                 last_run: row.get(2)?,
                 last_directory: row.get(3)?,
@@ -442,15 +454,17 @@ impl CapturedHistory {
         let mut answering: HashMap<String, bool> = HashMap::new();
         {
             let mut statement = db.prepare(
-                "SELECT c.command, c.directory, c.started_at, c.exit_code
+                "SELECT c.command, c.directory, c.started_at, c.exit_code, c.expanded_command
                  FROM commands c JOIN sessions s ON s.id = c.session
-                 WHERE s.user = ? AND c.deleted_at IS NULL AND substr(c.command, 1, length(?)) = ?
+                 WHERE s.user = ? AND c.deleted_at IS NULL AND (substr(c.command, 1, length(?)) = ? OR (? AND substr(c.expanded_command, 1, length(?)) = ?))
                  ORDER BY c.started_at, c.id",
             )?;
-            let mut rows = statement.query(params![user, prefix, prefix])?;
+            let mut rows = statement.query(params![user, prefix, prefix, uses(context, Signal::Alias), prefix, prefix])?;
             while let Some(row) = rows.next()? {
                 let command: String = row.get(0)?;
-                if is_smcli_command(&command) {
+                let expanded: Option<String> = row.get(4)?;
+                let primary = expanded.as_deref().unwrap_or(&command);
+                if is_smcli_command(primary) {
                     continue;
                 }
                 let run_directory: String = row.get(1)?;
@@ -469,12 +483,12 @@ impl CapturedHistory {
                     weight *= 2.0;
                 }
                 if exit_code != 0 && !INTERRUPTED_EXIT_CODES.contains(&exit_code) {
-                    let answers = *answering.entry(command.clone()).or_insert_with(|| answers_with_exit_code(&command));
+                    let answers = *answering.entry(command_key(&command, expanded.as_deref())).or_insert_with(|| answers_with_exit_code(primary));
                     if !(exit_code == 1 && answers) {
                         weight *= 0.25;
                     }
                 }
-                let tally = tallies.entry(command).or_default();
+                let tally = tallies.entry(command_key(&command, expanded.as_deref())).or_default();
                 tally.score += weight;
                 tally.runs += 1;
                 if run_directory == here { tally.runs_here += 1; }
@@ -504,11 +518,11 @@ impl CapturedHistory {
             .take(limit)
             .map(|(command, score)| match tallies.get(&command) {
                 None => Suggestion {
-                    why: suggestion_why(0, 0, why.get(&command)), command, score, runs: 0, runs_here: 0,
+                    why: suggestion_why(0, 0, why.get(&command)), expanded_command: command_parts(&command).1, command: command_parts(&command).0, score, runs: 0, runs_here: 0,
                     last_run: String::new(), last_exit_code: 0,
                 },
                 Some(t) => Suggestion {
-                    why: suggestion_why(t.runs_here, t.project_runs, why.get(&command)), command, score, runs: t.runs,
+                    why: suggestion_why(t.runs_here, t.project_runs, why.get(&command)), expanded_command: command_parts(&command).1, command: command_parts(&command).0, score, runs: t.runs,
                     runs_here: t.runs_here, last_run: format_iso8601(t.last_run, false), last_exit_code: t.last_exit_code,
                 },
             })
@@ -516,6 +530,35 @@ impl CapturedHistory {
     }
 
     // shortcut: `importAtuin`, `importLegacy`, `prune` and `records` are not ported yet; they come with their CLI commands in Phase 4.
+
+    /// VACUUM INTO includes committed WAL pages; a filesystem copy of history.db alone would not.
+    fn backup_before_v8(&self, db: &Connection) -> Result<()> {
+        let mut name = self.path.as_os_str().to_owned();
+        name.push(".v7.bak");
+        let path = PathBuf::from(name);
+        let created = match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&path) {
+            Ok(file) => Some(file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
+            Err(e) => return Err(e.into()),
+        };
+        if created.is_none() {
+            let info = std::fs::symlink_metadata(&path)?;
+            if !info.is_file() || info.uid() != unsafe { libc::getuid() } || info.mode() & 0o077 != 0 || info.len() == 0 {
+                bail!("Migration backup must be a nonempty private file owned by you.");
+            }
+            return Ok(());
+        }
+        let resolved = std::fs::canonicalize(path.parent().unwrap_or(Path::new(".")))?
+            .join(path.file_name().ok_or_else(|| anyhow!("Invalid migration backup path"))?);
+        let destination = resolved.to_str().ok_or_else(|| anyhow!("Invalid migration backup path"))?;
+        if let Err(error) = db.execute("VACUUM INTO ?", [destination]) {
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
+        }
+        created.unwrap().sync_all()?;
+        Ok(())
+    }
 
     fn connect(&self, write: bool) -> Result<Connection> {
         let path = &self.path;
@@ -557,6 +600,9 @@ impl CapturedHistory {
         db.create_scalar_function("smcli_decay", 1, deterministic, |c| {
             Ok(0.5f64.powf(c.get::<f64>(0)?.max(0.0) / USAGE_HALF_LIFE))
         })?;
+        db.create_scalar_function("smcli_key", 2, deterministic, |c| {
+            Ok(command_key(&c.get::<String>(0)?, c.get::<Option<String>>(1)?.as_deref()))
+        })?;
         // Lets a query skip smcli's own commands the way `is_smcli_command` does everywhere else.
         db.create_scalar_function("smcli_internal", 1, deterministic, |c| {
             Ok(is_smcli_command(&c.get::<Option<String>>(0)?.unwrap_or_default()))
@@ -571,13 +617,25 @@ impl CapturedHistory {
         }
         if write {
             if version != VERSION {
+                let mut lock_name = self.path.as_os_str().to_owned();
+                lock_name.push(".migration.lock");
+                let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(PathBuf::from(lock_name))?;
+                let info = lock.metadata()?;
+                if !info.is_file() || info.uid() != unsafe { libc::getuid() } || info.mode() & 0o077 != 0 {
+                    bail!("Migration lock must be a private file owned by you.");
+                }
+                lock.lock()?;
+                version = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+                let tables: i64 = db.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
+                if tables > 0 && version < 8 { self.backup_before_v8(&db)?; }
                 db.execute_batch("BEGIN IMMEDIATE")?;
                 let migrated = (|| -> Result<()> {
                     // Another terminal may have created or upgraded the schema while this one waited for the lock.
                     let tables: i64 = db.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
                     version = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
                     if tables == 0 {
-                        db.execute_batch(&[SCHEMA_V1, MIGRATION_TO_V2, MIGRATION_TO_V3, MIGRATION_TO_V5, MIGRATION_TO_V6, MIGRATION_TO_V7].concat())?;
+                        db.execute_batch(&[SCHEMA_V1, MIGRATION_TO_V2, MIGRATION_TO_V3, MIGRATION_TO_V5, MIGRATION_TO_V6, MIGRATION_TO_V7, MIGRATION_TO_V8].concat())?;
                     } else {
                         if version == 1 { db.execute_batch(MIGRATION_TO_V2)?; }
                         if version <= 2 {
@@ -590,6 +648,7 @@ impl CapturedHistory {
                         if version < 5 { db.execute_batch(MIGRATION_TO_V5)?; }
                         if version < 6 { db.execute_batch(MIGRATION_TO_V6)?; }
                         if version < 7 { db.execute_batch(MIGRATION_TO_V7)?; }
+                        if version < 8 { db.execute_batch(MIGRATION_TO_V8)?; }
                     }
                     Ok(())
                 })();
@@ -618,6 +677,7 @@ struct Insert<'a> {
     duration_ms: Option<i64>,
     directory: &'a str,
     command: &'a str,
+    expanded_command: Option<&'a str>,
     exit_code: i64,
     uuid: Option<&'a str>,
     pipestatus: Option<&'a [i64]>,
@@ -634,11 +694,11 @@ fn insert(db: &Connection, row: &Insert, transaction: bool) -> Result<bool> {
         // OR IGNORE skips a row whose uuid is already stored.
         let inserted = db.execute(
             "INSERT OR IGNORE INTO commands
-                (session, started_at, duration_ms, directory, command, exit_code, uuid, deleted_at, author, intent, flags, pipestatus)
-             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)",
+                (session, started_at, duration_ms, directory, command, exit_code, uuid, deleted_at, author, intent, flags, pipestatus, expanded_command)
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)",
             params![row.session, row.started_at, row.duration_ms, row.directory, row.command, row.exit_code, row.uuid,
-                    command_flags(row.command).join(" "),
-                    row.pipestatus.map(|p| p.iter().map(i64::to_string).collect::<Vec<_>>().join(" "))],
+                    command_flags(row.expanded_command.unwrap_or(row.command)).join(" "),
+                    row.pipestatus.map(|p| p.iter().map(i64::to_string).collect::<Vec<_>>().join(" ")), row.expanded_command],
         )?;
         Ok(inserted > 0)
     })();
@@ -748,7 +808,7 @@ mod tests {
             session: "s1", user: "u", host: "h", shell: "zsh",
             started_at: 1_700_000_000.0, duration_ms: None,
             directory: "/tmp", command: "echo hi", exit_code: 0,
-            uuid: None, pipestatus: None,
+            uuid: None, pipestatus: None, expanded_command: None,
         };
         assert!(insert(&writer, &row, true).is_err());
         reader.execute_batch("ROLLBACK").unwrap();
@@ -756,6 +816,79 @@ mod tests {
         assert!(insert(&writer, &row, true).unwrap());
         let rows: i64 = writer.query_row("SELECT count(*) FROM commands", [], |r| r.get(0)).unwrap();
         assert_eq!(rows, 1);
+    }
+
+    #[test]
+    #[ignore = "manual 100k-run suggestion fallback measurement"]
+    fn measure_suggestion_fallback_100k() {
+        let (_dir, log) = temp_db();
+        let db = log.open_connection().unwrap();
+        let user = user_name();
+        db.execute("INSERT INTO sessions VALUES ('bench',?,'host','zsh')", [&user]).unwrap();
+        db.execute_batch("WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<100000)
+            INSERT INTO commands(session,started_at,directory,command,exit_code)
+            SELECT 'bench',1700000000.0-n,'/repo',CASE WHEN n%1000=0 THEN 'git status' ELSE 'tool '||n END,0 FROM seq;").unwrap();
+        let mut scan = vec![];
+        let mut full = vec![];
+        for _ in 0..10 {
+            let start = std::time::Instant::now();
+            let hits = log.suggestions(&user, "/repo", "git status", 10, 1_700_000_001.0, None).unwrap();
+            assert_eq!(hits[0].runs, 100);
+            scan.push(start.elapsed().as_micros());
+            let start = std::time::Instant::now();
+            let _index = crate::suggestion_index::SuggestionIndex::new(log.runs(&user, &db).unwrap(), SelectionLog::default());
+            full.push(start.elapsed().as_micros());
+        }
+        scan.sort(); full.sort();
+        println!("100k suggestions, 10 samples (us): prefix SQL p50={} p95={}; full scan/index p50={} p95={}", scan[4], scan[9], full[4], full[9]);
+    }
+
+    #[test]
+    fn migration_8_preserves_nulls_and_retry_expansion() {
+        let (_dir, log) = temp_db();
+        std::fs::create_dir_all(log.path.parent().unwrap()).unwrap();
+        let old = Connection::open(&log.path).unwrap();
+        old.execute_batch(&[SCHEMA_V1, MIGRATION_TO_V2, MIGRATION_TO_V3, MIGRATION_TO_V5, MIGRATION_TO_V6, MIGRATION_TO_V7].concat()).unwrap();
+        old.execute_batch("PRAGMA journal_mode=WAL; INSERT INTO sessions VALUES ('s','u','h','zsh'); INSERT INTO commands(session,started_at,directory,command,exit_code) VALUES('s',1,'/','gst',0);").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&log.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let db = log.open_connection().unwrap();
+        assert_eq!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 8);
+        let backup_path = PathBuf::from(format!("{}.v7.bak", log.path.display()));
+        assert_eq!(std::fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777, 0o600);
+        let backup_bytes = std::fs::read(&backup_path).unwrap();
+        let backup = Connection::open(&backup_path).unwrap();
+        assert_eq!(backup.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 7);
+        assert_eq!(backup.query_row("SELECT command FROM commands", [], |r| r.get::<_, String>(0)).unwrap(), "gst");
+        assert!(backup.prepare("SELECT expanded_command FROM commands").is_err());
+        drop(old);
+        assert_eq!(db.query_row("SELECT expanded_command FROM commands", [], |r| r.get::<_, Option<String>>(0)).unwrap(), None);
+        let mut run = NewRun::new("gl", "bash", "/", 0);
+        run.expanded_command = Some("git log");
+        run.event = Some("00000000-0000-4000-8000-000000000000".into());
+        assert!(log.append(&run, "", Some(&db)).unwrap());
+        run.expanded_command = Some("git ls-files");
+        assert!(!log.append(&run, "", Some(&db)).unwrap());
+        let runs = log.runs(&user_name(), &db).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].expanded_command.as_deref(), Some("git log"));
+        drop(log.open_connection().unwrap());
+        assert_eq!(std::fs::read(backup_path).unwrap(), backup_bytes, "the first backup is never overwritten");
+    }
+
+    #[test]
+    fn failed_v8_alter_rolls_back_the_whole_migration() {
+        let (_dir, log) = temp_db();
+        std::fs::create_dir_all(log.path.parent().unwrap()).unwrap();
+        let old = Connection::open(&log.path).unwrap();
+        old.execute_batch(SCHEMA_V1).unwrap();
+        old.execute_batch("ALTER TABLE commands ADD COLUMN expanded_command TEXT; PRAGMA user_version=1;").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&log.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(log.open_connection().is_err());
+        assert_eq!(old.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert!(old.prepare("SELECT uuid FROM commands").is_err(), "earlier ALTERs must roll back too");
+        assert!(old.prepare("SELECT * FROM command_selections").is_err());
     }
 
     #[test]

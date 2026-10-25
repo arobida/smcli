@@ -4,6 +4,7 @@ use crate::history::{
     INTERRUPTED_EXIT_CODES, Run, Suggestion, USAGE_HALF_LIFE, answers_with_exit_code,
 };
 use crate::parse::is_smcli_command;
+use crate::entry::{command_key, command_parts};
 use crate::ranking::{
     RankingContext, SelectionLog, Signal, apply_ranking_signals, has_prefix, suggestion_why, uses,
 };
@@ -118,11 +119,11 @@ impl SuggestionIndex {
     /// replace the last-run fields. Returns false when the run is older than its session's last run,
     /// signalling that the index should be rebuilt from the database.
     pub fn add(&mut self, run: &Run) -> bool {
-        if is_smcli_command(&run.command) {
+        if is_smcli_command(run.expanded_command.as_deref().unwrap_or(&run.command)) {
             return true;
         }
         let started_at = run.started_at.min(now());
-        if !self.affinity.add(&run.session, &run.command, started_at) {
+        if !self.affinity.add(&run.session, &command_key(&run.command, run.expanded_command.as_deref()), started_at) {
             return false;
         }
         let mut run = run.clone();
@@ -142,17 +143,19 @@ impl SuggestionIndex {
     }
 
     fn tally(&mut self, run: &Run) {
+        let key = command_key(&run.command, run.expanded_command.as_deref());
+        let primary = run.expanded_command.as_deref().unwrap_or(&run.command);
         let mut weight = 2f64.powf((run.started_at - self.base) / USAGE_HALF_LIFE);
         if run.exit_code != 0 && !INTERRUPTED_EXIT_CODES.contains(&run.exit_code) {
             let answers = *self
                 .answering
-                .entry(run.command.clone())
-                .or_insert_with(|| answers_with_exit_code(&run.command));
+                .entry(key.clone())
+                .or_insert_with(|| answers_with_exit_code(primary));
             if !(run.exit_code == 1 && answers) {
                 weight *= 0.25;
             }
         }
-        let tally = self.commands.entry(run.command.clone()).or_default();
+        let tally = self.commands.entry(key.clone()).or_default();
         tally.score += weight;
         tally.runs += 1;
         if run.started_at >= tally.last_run {
@@ -163,7 +166,7 @@ impl SuggestionIndex {
             .directories
             .entry(run.directory.clone())
             .or_default()
-            .entry(run.command.clone())
+            .entry(key)
             .or_default();
         directory.score += weight;
         directory.runs += 1;
@@ -198,7 +201,10 @@ impl SuggestionIndex {
         let mut scores: HashMap<String, f64> = self
             .commands
             .iter()
-            .filter(|(c, _)| has_prefix(c, prefix))
+            .filter(|(c, _)| {
+                let (typed, expanded) = command_parts(c);
+                has_prefix(&typed, prefix) || (uses(context, Signal::Alias) && expanded.is_some_and(|e| has_prefix(&e, prefix)))
+            })
             .map(|(c, t)| (c.clone(), t.score))
             .collect();
         let mut project_runs: HashMap<String, i64> = HashMap::new();
@@ -276,7 +282,8 @@ impl SuggestionIndex {
                     last_run: tally.map_or_else(String::new, |t| format_iso8601(t.last_run, false)),
                     last_exit_code: tally.map_or(0, |t| t.last_exit_code),
                     why: explanation,
-                    command,
+                    expanded_command: command_parts(&command).1,
+                    command: command_parts(&command).0,
                 }
             })
             .collect()
@@ -332,6 +339,13 @@ mod tests {
             run.started_at = Some(now - (8 - i) as f64 * USAGE_HALF_LIFE / 2.0);
             history.append(&run, "", Some(&db))?;
         }
+        for expanded in ["git log", "git ls-files"] {
+            let mut run = NewRun::new("gl", "zsh", "/p", 0);
+            run.expanded_command = Some(expanded);
+            run.started_at = Some(now - 1.0);
+            run.session = expanded;
+            history.append(&run, "", Some(&db))?;
+        }
         history.record_pick(
             "git",
             "git diff",
@@ -354,7 +368,7 @@ mod tests {
             ..Default::default()
         };
         for directory in ["/p", "/p/", "/p/sub", "/", "/else"] {
-            for prefix in ["", "git", "cargo", "missing"] {
+            for prefix in ["", "git", "gl", "cargo", "missing"] {
                 for context in [None, Some(&context)] {
                     let scan =
                         history.suggestions(&user_name(), directory, prefix, 20, now, context)?;
@@ -378,6 +392,7 @@ mod tests {
         let mut index = SuggestionIndex::new(vec![], SelectionLog::default());
         let mut run = Run {
             command: "echo hi".into(),
+            expanded_command: None,
             directory: "/p".into(),
             started_at: 0.0,
             exit_code: 0,
@@ -406,6 +421,7 @@ mod tests {
         let mut index = SuggestionIndex::new(vec![], SelectionLog::default());
         let mut run = Run {
             command: "old".into(),
+            expanded_command: None,
             directory: "/p".into(),
             started_at: now - USAGE_HALF_LIFE,
             exit_code: 0,
@@ -430,6 +446,7 @@ mod tests {
         let mut index = SuggestionIndex::new(vec![], SelectionLog::default());
         let mut run = Run {
             command: "first".into(),
+            expanded_command: None,
             directory: "/p".into(),
             started_at: 100.0,
             exit_code: 0,
@@ -445,9 +462,9 @@ mod tests {
 
         // A fresh index built from chronologically sorted runs keeps the latest previous command.
         let sorted = vec![
-            Run { command: "first".into(), directory: "/p".into(), started_at: 100.0, exit_code: 0, session: "s".into() },
-            Run { command: "second".into(), directory: "/p".into(), started_at: 200.0, exit_code: 0, session: "s".into() },
-            Run { command: "third".into(), directory: "/p".into(), started_at: 300.0, exit_code: 0, session: "s".into() },
+            Run { command: "first".into(), expanded_command: None, directory: "/p".into(), started_at: 100.0, exit_code: 0, session: "s".into() },
+            Run { command: "second".into(), expanded_command: None, directory: "/p".into(), started_at: 200.0, exit_code: 0, session: "s".into() },
+            Run { command: "third".into(), expanded_command: None, directory: "/p".into(), started_at: 300.0, exit_code: 0, session: "s".into() },
         ];
         let fresh = SuggestionIndex::new(sorted, SelectionLog::default());
         assert_eq!(fresh.previous_command("s").as_deref(), Some("third"));

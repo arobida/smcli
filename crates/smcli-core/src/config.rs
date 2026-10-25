@@ -148,6 +148,10 @@ impl CaptureFilter {
         })
     }
 
+    pub fn allows_run(&self, command: &str, expanded: Option<&str>, directory: &str) -> bool {
+        self.allows(command, directory) && expanded.is_none_or(|text| self.allows(text, directory))
+    }
+
     pub fn allows(&self, command: &str, directory: &str) -> bool {
         if command.starts_with(' ') {
             return false;
