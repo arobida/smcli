@@ -3,11 +3,12 @@
 # service. Safe to rerun (upgrades in place). From a release archive it installs the binaries beside this script;
 # from a source checkout it builds them first (`make release`).
 #
-# Usage: install.sh [--prefix DIR] [--from DIR] [--shells LIST|all|none] [--keys LIST] [--yes]
+# Usage: install.sh [--prefix DIR] [--from DIR] [--shells LIST|all|none] [--keys LIST] [--atuin yes|no] [--yes]
 #   --prefix DIR    where the executables go (default ~/.local/bin)
 #   --from DIR      a directory holding smcli and smcli-service (default: beside this script, else build)
-#   --shells LIST   zsh,bash,fish to hook (default: your login shell; `all`: every one installed; `none`)
+#   --shells LIST   zsh,bash,fish to hook (default: your login shell, asking first in a terminal; `all`: every one installed; `none`)
 #   --keys LIST     picker keys: any of ctrl-r,left,right,ctrl-t,ctrl-g, or none (default: ask in a terminal, else ctrl-r,ctrl-t,ctrl-g)
+#   --atuin yes|no  import Atuin's history if found (default: ask in a terminal, else no); safe to rerun, duplicates are skipped
 #   --yes           don't ask anything; with no --keys, keeps the default keys (Up, Ctrl-R, Ctrl-T and Ctrl-G)
 set -euo pipefail
 
@@ -15,6 +16,7 @@ prefix="$HOME/.local/bin"
 from=""
 shells=""
 keys=""
+atuin=""
 yes=""
 while (( $# )); do
     case $1 in
@@ -22,8 +24,9 @@ while (( $# )); do
         --from) from=${2:?--from needs a directory}; shift 2 ;;
         --shells) shells=${2:?--shells needs a list}; shift 2 ;;
         --keys) keys=${2:?--keys needs a list}; shift 2 ;;
+        --atuin) atuin=${2:?--atuin needs yes or no}; shift 2; [[ $atuin == yes || $atuin == no ]] || { printf 'install.sh: --atuin takes yes or no\n' >&2; exit 2; } ;;
         --yes|-y) yes=1; shift ;;
-        -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) printf 'install.sh: unknown option %s (see --help)\n' "$1" >&2; exit 2 ;;
     esac
 done
@@ -61,6 +64,14 @@ for name in smcli smcli-service; do
     xattr -d com.apple.quarantine "$prefix/.$name.new" 2>/dev/null || true
     mv -f "$prefix/.$name.new" "$prefix/$name"
 done
+# Both executables load the default model from this folder beside them.
+model="$from/potion-shell-16m"
+[[ -d $model ]] || model="$here/../Models/potion-shell-16m"
+[[ -f $model/model.safetensors ]] || die "no potion-shell-16m model beside $from/smcli"
+rm -rf "$prefix/.potion-shell-16m.new"
+cp -RL "$model" "$prefix/.potion-shell-16m.new"
+rm -rf "$prefix/potion-shell-16m"
+mv "$prefix/.potion-shell-16m.new" "$prefix/potion-shell-16m"
 # The uninstaller ships with the install, so it works without the release archive or checkout.
 uninstaller="$here/uninstall.sh"
 [[ -f $uninstaller ]] && install -m 755 "$uninstaller" "$prefix/smcli-uninstall"
@@ -108,16 +119,27 @@ remove_block() {  # $1: file
     cat "$tmp" > "$1" && rm -f "$tmp"  # rewrite in place: keeps the file's permissions and any symlink
 }
 
+# Without --shells, a terminal user is asked per startup file; declining prints the line to add by hand.
+ask_hooks=""
+[[ -z $shells && -z $yes && -t 0 ]] && ask_hooks=1
 case $shells in
     "") shells=$(basename "${SHELL:-zsh}") ;;
     all) shells=$(for s in zsh bash fish; do command -v "$s" > /dev/null && printf '%s,' "$s"; done) ;;
 esac
 hooked=()
+manual=()
 for shell in ${shells//,/ }; do
     [[ $shell == none ]] && continue
     case $shell in zsh|bash|fish) ;; *) die "unsupported shell: $shell (zsh, bash or fish)" ;; esac
     file=$(rc_file "$shell")
     mkdir -p "$(dirname "$file")"
+    if [[ -n $ask_hooks ]]; then
+        read -r -p "Add the smcli hook to $file? (n: you add it yourself) [Y/n] " answer || answer=n
+        if [[ $answer == [nN]* ]]; then
+            manual+=("$file:" "    $(hook_line "$shell")")
+            continue
+        fi
+    fi
     [[ -f $file ]] && { validate_block "$file" || die "malformed smcli block in $file; not modifying"; }
     [[ -f $file ]] && cp -p "$file" "$file.smcli-backup"
     remove_block "$file" || die "malformed smcli block in $file; not modifying"
@@ -130,12 +152,28 @@ for shell in ${shells//,/ }; do
     fi
 done
 (( ${#hooked[@]} )) && say "Shell hooks added: ${hooked[*]}"
+if (( ${#manual[@]} )); then
+    say "Add this line near the end of your startup file (below other tools that bind keys):"
+    printf '%s\n' "${manual[@]}"
+fi
 
 # 3. Picker keys (and, when asked interactively, the search model).
 if [[ -n $keys ]]; then
     "$smcli" init --keys "$keys"
 elif [[ -z $yes && -t 0 ]]; then
     "$smcli" init
+fi
+
+# 3b. Atuin's history, read-only, so suggestions and search start with what you already ran.
+atuin_db="${ATUIN_DB_PATH:-${XDG_DATA_HOME:-$HOME/.local/share}/atuin/history.db}"
+if [[ -f $atuin_db && $atuin != no ]]; then
+    if [[ -z $atuin && -z $yes && -t 0 ]]; then
+        read -r -p "Found Atuin history at $atuin_db. Import it into smcli? [Y/n] " answer || answer=n
+        [[ $answer == [nN]* ]] || atuin=yes
+    fi
+    if [[ $atuin == yes ]]; then
+        "$smcli" import --atuin "$atuin_db" || printf 'warning: Atuin import failed; retry later with: smcli import --atuin\n' >&2
+    fi
 fi
 
 # 4. The service starts on demand; start it now to check it runs.

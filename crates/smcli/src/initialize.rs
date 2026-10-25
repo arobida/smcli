@@ -1,6 +1,6 @@
 use crate::cli::Init;
 use anyhow::{Result, bail};
-use smcli_core::config::SmcliConfig;
+use smcli_core::{config::SmcliConfig, service_client::ServiceClient};
 use std::{
     io::{self, IsTerminal, Write},
     path::Path,
@@ -22,7 +22,7 @@ fn ask(question: &str, default: bool) -> Result<bool> {
         }
     }
 }
-pub fn run(args: Init, path: &Path) -> Result<()> {
+pub fn run(args: Init, path: &Path, service: &ServiceClient) -> Result<()> {
     let mut config = SmcliConfig::load(path)?;
     if let Some(keys) = &args.keys {
         if !keys.is_empty() {
@@ -59,6 +59,11 @@ pub fn run(args: Init, path: &Path) -> Result<()> {
         bail!("Rust supports Potion only; use --default or --potion [DIR].");
     }
     if args.has_model() || args.keys.is_none() {
+        let wanted = args.potion.clone().filter(|s| !s.is_empty());
+        // The service holds the old model; stop it before loading the new one so they never share memory.
+        if wanted != config.potion_path && crate::cli::stop_service(service) {
+            println!("Stopped smcli-service to free the old model.");
+        }
         let model = match args.potion.as_deref().filter(|s| !s.is_empty()) {
             Some(p) => smcli_search::Potion::from_dir(Path::new(p))?,
             None => smcli_search::Potion::bundled()?,
@@ -67,7 +72,11 @@ pub fn run(args: Init, path: &Path) -> Result<()> {
             !model.embed(&["smcli".into()])[0].is_empty(),
             "Potion returned an empty embedding"
         );
-        config.potion_path = args.potion.filter(|s| !s.is_empty());
+        if wanted != config.potion_path {
+            println!("Changing the model rebuilds the search index with it on the next search; that search can take a while on a large history.");
+            println!("The old model's index stays on disk; `smcli indexes --prune` deletes it.");
+        }
+        config.potion_path = wanted;
         config.ollama_model = None;
         config.ollama_dimension = None;
         config.builtin = None;

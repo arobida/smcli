@@ -206,7 +206,11 @@ try:
     # So do its own records, and an index rebuilt by another process.
     record("served write")
     assert search("served write")[0] == "served write"
+    # reindex stops the service so its model is freed first; a restarted service serves the rebuilt index.
     run("reindex", SMCLI_SERVICE="0")
+    assert "not running" in run("service", "stop").stdout
+    run("service", "start")
+    first = service_pid()
     assert search("served write")[0] == "served write"
     served = json.loads(run("search", "served write", "--json").stdout)
     assert served[0]["command"] == "served write", served
@@ -434,6 +438,12 @@ try:
     assert "rs-commands-v1-potion-othermodel-d256" in run("health", SMCLI_SERVICE="0").stdout
     current = next(n for n in left if "othermodel" not in n)
     assert run("health", SMCLI_SERVICE="0", check=False).returncode == 0
+    # The index manager lists both, marks the current one, and --prune deletes only the other model's.
+    listed = {i["name"]: i["current"] for i in json.loads(run("indexes", "--json", SMCLI_SERVICE="0").stdout)}
+    assert listed == {"rs-commands-v1-potion-othermodel-d256": False, current.split(".")[0]: True}, listed
+    run("indexes", "--prune", SMCLI_SERVICE="0")
+    assert not any("othermodel" in n for n in os.listdir(search_dir)) and os.path.exists(f"{search_dir}/{current}")
+    run("service", "start")
 
     def index_files():
         return [f"{search_dir}/{n}" for n in os.listdir(search_dir) if n.startswith(current)]

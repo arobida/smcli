@@ -2,7 +2,7 @@ PYTHON ?= python3
 DIST := dist
 STAMP := $(shell date +%Y%m%d-%H%M%S)-$(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)
 
-.PHONY: build release fresh test test-rust test-shells test-service test-install clean run baseline ranking linux docs notices
+.PHONY: build release fresh install uninstall test test-rust test-shells test-service test-install clean run baseline ranking linux docs notices
 
 PKG ?=
 FILTER ?=
@@ -19,6 +19,7 @@ release:
 	cp $${CARGO_TARGET_DIR:-target}/release/smcli-service $(DIST)/smcli-service-$(STAMP)
 	ln -sf smcli-$(STAMP) $(DIST)/smcli
 	ln -sf smcli-service-$(STAMP) $(DIST)/smcli-service
+	rm -rf $(DIST)/potion-shell-16m && cp -R Models/potion-shell-16m $(DIST)/potion-shell-16m
 	@echo "Built $(DIST)/smcli-$(STAMP) (latest: $(DIST)/smcli)"
 	@echo ""
 	@echo "Try it in this shell (loads the zsh hooks from the new build):"
@@ -42,6 +43,16 @@ test-shells: build
 
 test-service: build
 	$(PYTHON) scripts/test-service.py "$$(cd "$${CARGO_TARGET_DIR:-target}/debug" && pwd)/smcli"
+
+# Installs the release build on this machine: binaries and model to ~/.local/bin, shell hooks, keys, service.
+# Pass installer flags with ARGS, e.g. make install ARGS="--shells all --yes".
+install: release
+	bash scripts/install.sh --from $(DIST) $(ARGS)
+
+# Uninstalls the release build on this machine, using the installed uninstaller when present.
+# Pass uninstaller flags with ARGS, e.g. make uninstall ARGS="--yes".
+uninstall:
+	if [ -x $(HOME)/.local/bin/smcli-uninstall ]; then $(HOME)/.local/bin/smcli-uninstall $(ARGS); else bash scripts/uninstall.sh $(ARGS); fi
 
 test-install: build
 	bash scripts/test-install.sh "$$(cd "$${CARGO_TARGET_DIR:-target}/debug" && pwd)"

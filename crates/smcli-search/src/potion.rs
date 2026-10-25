@@ -1,15 +1,9 @@
-use std::{hash::{Hash, Hasher}, path::Path};
+use std::{hash::{Hash, Hasher}, path::{Path, PathBuf}};
 
 use anyhow::Result;
 use model2vec_rs::model::StaticModel;
 
-macro_rules! model_file {
-    ($name:literal) => {
-        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Models/potion-shell-16m/", $name))
-    };
-}
-
-/// potion-shell-16m (fine-tuned potion-code-16M-v2), embedded in the binary or loaded from a directory. Load once per process; embed in batches.
+/// potion-shell-16m (fine-tuned potion-code-16M-v2), shipped as a folder beside the binaries or loaded from a directory. Load once per process; embed in batches.
 pub struct Potion {
     model: StaticModel,
     /// Names the model in the index file name, so another model never reuses these vectors.
@@ -20,15 +14,27 @@ pub struct Potion {
 impl Potion {
     pub const NAME: &str = "potion-shell-16m";
 
-    // Loads straight from the embedded bytes, so nothing is written to the runtime dir.
+    /// The default model: a `potion-shell-16m` folder beside the executable (dist/ or the install prefix),
+    /// else the checkout's `Models/` for dev builds and tests. One copy serves both binaries.
     pub fn bundled() -> Result<Self> {
-        let model = StaticModel::from_bytes(
-            model_file!("tokenizer.json"),
-            model_file!("model.safetensors"),
-            model_file!("config.json"),
-            None,
-        )?;
+        let directory = Self::bundled_dir().ok_or_else(|| {
+            anyhow::anyhow!("{} model not found beside the smcli executable; reinstall, or point `smcli init --potion DIR` at a model", Self::NAME)
+        })?;
+        let model = StaticModel::from_pretrained(&directory, None, None, None)?;
         Ok(Self::with(model, "bundled".into()))
+    }
+
+    fn bundled_dir() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok();
+        let beside = |p: Option<PathBuf>| p.and_then(|e| e.parent().map(|d| d.join(Self::NAME)));
+        [
+            beside(exe.as_ref().and_then(|e| std::fs::canonicalize(e).ok())),
+            beside(exe),
+            Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Models").join(Self::NAME)),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|d| d.join("model.safetensors").is_file())
     }
 
     /// A model directory (`potionPath` in the config).

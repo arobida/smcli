@@ -18,7 +18,14 @@ for _ in 1 2; do  # twice: a rerun replaces the block rather than adding another
     bash scripts/install.sh --from "$from" --prefix "$home/bin" --shells zsh,bash,fish --keys left --yes > "$home/out" 2>&1 \
         || { cat "$home/out"; fail "install failed"; }
 done
+# --atuin yes imports a found Atuin database; the import itself is covered by the Rust tests.
+mkdir -p "$home/.local/share/atuin"
+sqlite3 "$home/.local/share/atuin/history.db" "CREATE TABLE history (id TEXT PRIMARY KEY, timestamp INTEGER NOT NULL, duration INTEGER NOT NULL, exit INTEGER NOT NULL, command TEXT NOT NULL, cwd TEXT NOT NULL, session TEXT NOT NULL, hostname TEXT NOT NULL, deleted_at INTEGER); INSERT INTO history VALUES ('a1', 1700000000000000000, 5000000, 0, 'echo from-atuin', '/tmp', 'sess', 'host:user', NULL);"
+HOME="$home" bash scripts/install.sh --from "$from" --prefix "$home/bin" --shells none --keys left --atuin yes --yes > "$home/out" 2>&1 \
+    || { cat "$home/out"; fail "install with --atuin yes failed"; }
+HOME="$home" SMCLI_SERVICE=off "$home/bin/smcli" history | grep -q 'echo from-atuin' || { cat "$home/out"; fail "Atuin history not imported"; }
 for f in smcli smcli-service smcli-uninstall; do [[ -x $home/bin/$f ]] || fail "$f not installed"; done
+[[ -f $home/bin/potion-shell-16m/model.safetensors ]] || fail "model not installed"
 for f in .zshrc .bashrc .config/fish/config.fish; do
     [[ $(grep -c '^# >>> smcli >>>$' "$home/$f") == 1 ]] || fail "$f should hold one smcli block"
     grep -q "$home/bin/smcli' shell-init" "$home/$f" || fail "$f does not load the installed smcli"
@@ -112,10 +119,24 @@ for name in ("history.db", "history.json", "config.json"):
     assert stat.S_IMODE((export / name).stat().st_mode) == 0o600, name
 PY
 grep -q 'exported-marker' "$home/export/history.json" || fail "JSON export is missing the recorded command"
+python3 - "$home/export/history.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1]) as f:
+    records = json.load(f)
+rec = next(r for r in records if r["command"] == "echo exported-marker")
+assert rec["directory"] == "/tmp", "directory"
+assert rec["exitCode"] == 0, "exitCode"
+assert rec["session"] == "s1", "session"
+assert rec["shell"] == "zsh", "shell"
+assert isinstance(rec["timestamp"], str) and rec["timestamp"], "timestamp"
+# Optional metadata is present only when captured; when present it keeps its type.
+assert isinstance(rec.get("flags", []), list) and isinstance(rec.get("pipestatus", []), list), rec
+PY
 [[ $(sqlite3 "$home/export/history.db" "SELECT count(*) FROM commands WHERE command = 'echo exported-marker'") == 1 ]] \
     || fail "database copy is missing the recorded command"
 [[ -f $home/export/config.json ]] || fail "settings not exported"
-for f in bin/smcli bin/smcli-service bin/smcli-uninstall .local/share/smcli .config/smcli; do
+for f in bin/smcli bin/smcli-service bin/smcli-uninstall bin/potion-shell-16m .local/share/smcli .config/smcli; do
     [[ ! -e $home/$f ]] || fail "$f was not removed"
 done
 for f in .zshrc .bashrc .config/fish/config.fish; do

@@ -385,10 +385,15 @@ impl Service {
     fn load_engine(&self, request: &ServiceRequest, before_build: impl FnOnce()) -> Result<Arc<HistorySearch>> {
         let path = self.config_path(request);
         let config = SmcliConfig::load(&path)?;
-        if let Some((current, engine)) = &self.lock().engine
-            && *current == config
         {
-            return Ok(Arc::clone(engine));
+            let mut state = self.lock();
+            if let Some((current, engine)) = &state.engine
+                && *current == config
+            {
+                return Ok(Arc::clone(engine));
+            }
+            // Free the old model before loading the new one, so two are never resident; callers hold `searching`.
+            state.engine = None;
         }
         let mut environment = self.environment.clone();
         environment.insert("SMCLI_CONFIG".into(), path.to_string_lossy().into_owned());
@@ -594,6 +599,16 @@ mod tests {
             f.record();
         }).unwrap();
         assert!(f.service.lock().engine.is_some());
+    }
+
+    #[test]
+    fn engine_reload_drops_old_model_first() {
+        let f = Fixture::new();
+        let r = f.request(Operation::Search);
+        let old = f.service.current_engine(&r).unwrap();
+        f.service.lock().engine.as_mut().unwrap().0.ctrl_r_key = Some(false);
+        f.service.load_engine(&r, || assert!(f.service.lock().engine.is_none())).unwrap();
+        assert!(!Arc::ptr_eq(&old, &f.service.lock().engine.as_ref().unwrap().1));
     }
 }
 

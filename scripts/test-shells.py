@@ -232,7 +232,7 @@ def variants():
 def new_environment(home, runtime, variant, **extra):
     env = dict(os.environ, HOME=str(home), HISTFILE=str(home / "native"), SMCLI_DB=str(home / "captured.db"),
                SMCLI_RUNTIME_DIR=runtime, SMCLI_CONFIG=str(home / "config.json"), SMCLI_SYNC="1",
-               SHELL=variant.path, TERM="dumb", SMCLI_CANARY="canary-secret-4242", XDG_CONFIG_HOME=str(home / "config"))
+               SHELL=variant.path, TERM="dumb", SMCLI_CANARY="canary-secret-4242", XDG_CONFIG_HOME=str(home / "config"), XDG_STATE_HOME=str(home / "state"))
     for name in ("SMCLI_SERVICE", "SMCLI_BASH_HOOK", "SMCLI_NO_KEYS", "SMCLI_EXTRA_KEYS", "SMCLI_SERVICE_BIN", "ZDOTDIR"):
         env.pop(name, None)
     env.update(variant.extra_env)
@@ -632,6 +632,7 @@ def run_bash_plugins(variant):
                 t.send(line)
             output = t.send(init_line("bash"))
             assert "kept existing key bindings: \\C-r \\eOA" in output, output
+            assert "kept existing" not in t.send(init_line("bash")), "the kept-bindings note repeats in every shell"
             declared = t.send("declare -p PROMPT_COMMAND precmd_functions 2>/dev/null")
             # smcli's entry is in PROMPT_COMMAND, or in precmd_functions when bash-preexec owns the prompt hook.
             assert declared.count("printf") >= 2 and "_smcli_prompt" in declared, declared

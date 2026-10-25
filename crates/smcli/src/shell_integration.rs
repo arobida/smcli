@@ -280,7 +280,13 @@ elif [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
         _smcli_bind '\e[5C' _smcli_pick forward-word
         _smcli_bind '\e;' _smcli_pick ''
     fi
-    [[ -z $_smcli_kept ]] || printf 'smcli: kept existing key bindings:%s (bind -x them to _smcli_pick to switch).\n' "$_smcli_kept" >&2
+    # Told once per change, not in every new shell.
+    _smcli_seen="${XDG_STATE_HOME:-$HOME/.local/state}/smcli/kept-keys-bash"
+    if [[ $_smcli_kept != "$(cat "$_smcli_seen" 2>/dev/null)" ]]; then
+        [[ -z $_smcli_kept ]] || printf 'smcli: kept existing key bindings:%s (bind -x them to _smcli_pick to switch).\n' "$_smcli_kept" >&2
+        mkdir -p "${_smcli_seen%/*}" 2>/dev/null && printf '%s' "$_smcli_kept" > "$_smcli_seen" 2>/dev/null
+    fi
+    unset _smcli_seen
     unset _smcli_maps
 fi"###
         }
@@ -410,8 +416,13 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
     done
     # BSD and macOS ttys send Ctrl-T to the kernel as STATUS (load report) before zle sees it.
     (( \#(keyT) )) && [[ ${(j: :)_smcli_kept} != *'^T ('* ]] && stty status undef 2>/dev/null
-    (( $#_smcli_kept )) && print -u2 "smcli: kept existing key bindings: ${(j:, :)${(u)_smcli_kept}} (bindkey them to _smcli_pick to switch)."
-    unset _smcli_keymap _smcli_kept
+    # Told once per change, not in every new shell.
+    typeset _smcli_seen=${XDG_STATE_HOME:-$HOME/.local/state}/smcli/kept-keys-zsh _smcli_list=${(j:, :)${(u)_smcli_kept}}
+    if [[ $_smcli_list != "$(cat $_smcli_seen 2>/dev/null)" ]]; then
+        (( $#_smcli_kept )) && print -u2 "smcli: kept existing key bindings: $_smcli_list (bindkey them to _smcli_pick to switch)."
+        mkdir -p ${_smcli_seen:h} 2>/dev/null && print -rn -- $_smcli_list > $_smcli_seen 2>/dev/null
+    fi
+    unset _smcli_keymap _smcli_kept _smcli_seen _smcli_list
 fi"###
         }
         "fish" => {
@@ -519,7 +530,12 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
         _smcli_bind \e\[D _smcli_pick_left
         _smcli_bind \eOD _smcli_pick_left
     end
-    test (count $_smcli_kept) -eq 0; or echo "smcli: kept existing key bindings: $_smcli_kept (bind them to _smcli_pick to switch)." >&2
+    # Told once per change, not in every new shell.
+    set -l _smcli_seen (set -q XDG_STATE_HOME; and echo $XDG_STATE_HOME; or echo $HOME/.local/state)/smcli/kept-keys-fish
+    if test "$_smcli_kept" != "$(cat $_smcli_seen 2>/dev/null)"
+        test (count $_smcli_kept) -eq 0; or echo "smcli: kept existing key bindings: $_smcli_kept (bind them to _smcli_pick to switch)." >&2
+        mkdir -p (dirname $_smcli_seen) 2>/dev/null; and printf '%s' "$_smcli_kept" > $_smcli_seen 2>/dev/null
+    end
     functions -e _smcli_bind
     set -e _smcli_kept
 end"###

@@ -44,6 +44,8 @@ pigrok45=pi --model xai/grok-4.5 --thinking medium
 Use the Makefile for builds; don't hand-roll `cargo build` commands.
 
 - `make fresh` — clean release build for the user to test. Output: `dist/smcli-<timestamp>-<commit>`, with `dist/smcli` symlinked to the latest. It also prints the `eval` line that loads the zsh hooks from the new build; relay those commands to the user. Run this after changes the user will try out.
+- `make install` — release build, then `scripts/install.sh` installs it on this machine (binaries and model in `~/.local/bin`, shell hooks, keys, service; `ARGS="--yes"` etc. pass through).
+- `make uninstall` — runs `~/.local/bin/smcli-uninstall $(ARGS)`, falling back to `scripts/uninstall.sh`.
 - `make release` — same, without cleaning (faster). `make build` — debug build; `make run ARGS="..."` builds and runs the CLI.
 - `make test` — full test suite (`scripts/test.sh`): `cargo test --workspace`, then black-box CLI checks against a temp `HOME`, `SMCLI_DB` and `SMCLI_RUNTIME_DIR`.
 - Focused slices of the gate, each assuming `make build` output: `make test-rust` (`PKG=smcli-core FILTER=history`
@@ -56,7 +58,7 @@ Use the Makefile for builds; don't hand-roll `cargo build` commands.
 
 ## Architecture
 
-Cargo workspace (`crates/`), macOS and Linux, search included on both. Two executables, both embedding the potion-shell-16m model (fine-tuned potion-code-16M-v2, `Models/potion-shell-16m`) (`include_bytes!`, loaded from memory via model2vec-rs), so each can search alone:
+Cargo workspace (`crates/`), macOS and Linux, search included on both. Two executables sharing one copy of the potion-shell-16m model (fine-tuned potion-code-16M-v2, `Models/potion-shell-16m`), shipped as a `potion-shell-16m/` folder beside them (`make release` copies it into `dist/`, `install.sh` into the prefix; dev builds and tests fall back to the checkout's `Models/`). Either can load it, so each can search alone:
 
 - `smcli` (`crates/smcli`) — clap CLI, ratatui picker and menu, `shell-init` hook generation (`shell_integration.rs`).
 - `smcli-service` (`crates/smcli-service`) — long-lived owner of history state and the open search index, serving clients over a Unix-domain socket. Only it depends on `fff-search` (file search); the CLI and `smcli-core` must never link fff.
@@ -64,5 +66,7 @@ Cargo workspace (`crates/`), macOS and Linux, search included on both. Two execu
 Libraries: `smcli-core` (SQLite captured history at `~/.local/share/smcli/history.db`, capture filters, ranking/suggestions, config, socket client and protocol), `smcli-search` (hybrid BM25 + embedding search over captured and native history in a TalaDB index; Potion only).
 
 Client/service protocol (`smcli-core/src/service_protocol.rs`, frozen fixtures in `crates/smcli-core/tests/fixtures/service_protocol`): one newline-delimited JSON request and one response per connection, versioned. On a version mismatch or no service, the CLI falls back to doing the work in-process, so every operation must work both ways. The service identifies its binary by path/mtime/size so a rebuilt binary is detected.
+
+Models: `smcli init --potion DIR` switches model and `--default` goes back. A model's index is named by its identity, so a switch rebuilds the index on the next search, and init says so. Never hold two models at once: init and `smcli reindex` stop the service before loading a model, and the service drops its old engine before building a new one (`load_engine`). `smcli indexes [--prune]` lists every index on disk, marks the current model's, and deletes the others.
 
 Native shell history files are read-only: never rewrite them. smcli keeps its own SQLite log.

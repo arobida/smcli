@@ -66,6 +66,12 @@ enum Command {
         dir: Option<String>,
     },
     Reindex,
+    Indexes {
+        #[arg(long)]
+        prune: bool,
+        #[arg(long)]
+        json: bool,
+    },
     Health {
         #[arg(long)]
         json: bool,
@@ -203,7 +209,7 @@ pub fn run() -> Result<()> {
         std::process::exit(2)
     });
     match cli.command {
-        Command::Init(args) => crate::initialize::run(args, &config_path)?,
+        Command::Init(args) => crate::initialize::run(args, &config_path, &service)?,
         Command::ShellInit { shell } => {
             let c = match SmcliConfig::load(&config_path) {
                 Ok(c) => c,
@@ -318,7 +324,8 @@ pub fn run() -> Result<()> {
             }
         }
         Command::Reindex => println!(
-            "Reindexed {} commands.",
+            "{}Reindexed {} commands.",
+            if stop_service(&service) { "Stopped smcli-service to free its model. " } else { "" },
             search_engine(&captured, &home, &env)?.reindex(&corpus(
                 &captured,
                 &home,
@@ -327,6 +334,7 @@ pub fn run() -> Result<()> {
                 now()
             )?)?
         ),
+        Command::Indexes { prune, json } => indexes(&captured, &home, &env, prune, json)?,
         Command::Health { json } => {
             let corpus = corpus(&captured, &home, &env, None, now())?;
             let report = index_health(&captured, &home, &env, &corpus);
@@ -383,29 +391,15 @@ pub fn run() -> Result<()> {
                 std::process::exit(1);
             }
         }
+        Command::Service { action } if action == "stop" => println!(
+            "{}",
+            if stop_service(&service) { "smcli-service stopped." } else { "smcli-service was not running." }
+        ),
         Command::Service { action } => {
-            let stop = action == "stop";
             let response = service
-                .send(
-                    &ServiceRequest::new(if stop {
-                        Operation::Shutdown
-                    } else {
-                        Operation::Ping
-                    }),
-                    Some(action == "start"),
-                    Duration::from_secs(10),
-                )
+                .send(&ServiceRequest::new(Operation::Ping), Some(action == "start"), Duration::from_secs(10))
                 .filter(|r| r.ok);
-            if stop {
-                println!(
-                    "{}",
-                    if response.is_some() {
-                        "smcli-service stopped."
-                    } else {
-                        "smcli-service was not running."
-                    }
-                );
-            } else if let Some(pid) = response.and_then(|r| r.pid) {
+            if let Some(pid) = response.and_then(|r| r.pid) {
                 println!(
                     "smcli-service running (pid {pid}) at {} for {}",
                     service.socket().display(),
@@ -536,7 +530,7 @@ fn records(c: &CapturedHistory) -> Result<Vec<serde_json::Value>> {
         return Ok(vec![]);
     }
     let db = c.open_connection()?;
-    let mut statement=db.prepare("SELECT c.started_at,c.duration_ms,s.user,s.host,s.id,s.shell,c.directory,c.command,c.exit_code,COUNT(*) OVER (PARTITION BY c.command ORDER BY c.started_at,c.id),c.uuid,c.author,c.intent,c.pipestatus FROM commands c JOIN sessions s ON s.id=c.session WHERE c.deleted_at IS NULL ORDER BY c.started_at,c.id")?;
+    let mut statement=db.prepare("SELECT c.started_at,c.duration_ms,s.user,s.host,s.id,s.shell,c.directory,c.command,c.exit_code,COUNT(*) OVER (PARTITION BY c.command ORDER BY c.started_at,c.id),c.uuid,c.author,c.intent,c.pipestatus,c.flags FROM commands c JOIN sessions s ON s.id=c.session WHERE c.deleted_at IS NULL ORDER BY c.started_at,c.id")?;
     let rows=statement.query_map([],|r| {
         let command:String=r.get(7)?;
         let mut value=serde_json::json!({"timestamp":format_iso8601(r.get(0)?,true),"user":r.get::<_,String>(2)?,"host":r.get::<_,String>(3)?,"session":r.get::<_,String>(4)?,"shell":r.get::<_,String>(5)?,"directory":r.get::<_,String>(6)?,"command":command,"exitCode":r.get::<_,i64>(8)?,"runCount":r.get::<_,i64>(9)?});
@@ -544,6 +538,7 @@ fn records(c: &CapturedHistory) -> Result<Vec<serde_json::Value>> {
         for (name,index) in [("id",10),("author",11),("intent",12)] {if let Some(v)=r.get::<_,Option<String>>(index)? {value[name]=v.into();}}
         if let Some(v)=r.get::<_,Option<i64>>(1)? {value["durationMs"]=v.into();}
         if let Some(v)=r.get::<_,Option<String>>(13)? {value["pipestatus"]=serde_json::json!(v.split_whitespace().filter_map(|s|s.parse::<i64>().ok()).collect::<Vec<_>>());}
+        if let Some(v)=r.get::<_,Option<String>>(14)?.filter(|v| !v.trim().is_empty()) {value["flags"]=serde_json::json!(v.split_whitespace().collect::<Vec<_>>());}
         Ok(value)
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -1042,6 +1037,58 @@ struct IndexHealth {
     other_indexes: Vec<String>,
     problems: Vec<String>,
     healthy: bool,
+}
+
+/// Stops a running service so the model it holds is freed; never starts one.
+pub(crate) fn stop_service(service: &ServiceClient) -> bool {
+    service
+        .send(&ServiceRequest::new(Operation::Shutdown), Some(false), Duration::from_secs(10))
+        .is_some_and(|r| r.ok)
+}
+
+#[derive(serde::Serialize)]
+struct IndexInfo {
+    name: String,
+    bytes: u64,
+    current: bool,
+}
+
+/// Every `rs-commands-v*` index next to the history database, grouped by index name; `prune` deletes all but the current model's.
+fn indexes(captured: &CapturedHistory, home: &Path, env: &HashMap<String, String>, prune: bool, json: bool) -> Result<()> {
+    let engine = search_engine(captured, home, env)?;
+    let current = engine.index_name();
+    let mut found: std::collections::BTreeMap<String, IndexInfo> = Default::default();
+    let entries = match std::fs::read_dir(&engine.directory) {
+        Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in &entries {
+        let filename = entry.file_name().to_string_lossy().into_owned();
+        // Index names hold no dots, so everything before the first one groups the index with its side files.
+        let Some((name, _)) = filename.split_once('.').filter(|_| filename.starts_with("rs-commands-v")) else { continue };
+        let info = found.entry(name.to_string()).or_insert_with(|| IndexInfo { name: name.to_string(), bytes: 0, current: name == current });
+        info.bytes += entry.metadata()?.len();
+        if prune && !info.current {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    let list: Vec<_> = found.into_values().collect();
+    if json {
+        return print_json(&list);
+    }
+    println!("Index directory: {}", engine.directory.display());
+    if list.is_empty() {
+        println!("No indexes yet; the next search or `smcli reindex` builds {current}.");
+    }
+    for info in &list {
+        let state = if info.current { "current" } else if prune { "deleted" } else { "unused" };
+        println!("  {:<8} {:>12} bytes  {}", state, info.bytes, info.name);
+    }
+    if !prune && list.iter().any(|i| !i.current) {
+        println!("Unused indexes belong to other models; `smcli indexes --prune` deletes them.");
+    }
+    Ok(())
 }
 
 fn index_health(

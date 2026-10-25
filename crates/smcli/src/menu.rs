@@ -64,6 +64,12 @@ const ITEMS: &[Item] = &[
         command: "health",
     },
     Item {
+        title: "≡ Manage indexes",
+        detail: "List search indexes per model and their size",
+        prompt: None,
+        command: "indexes",
+    },
+    Item {
         title: "? Help",
         detail: "Show command-line usage",
         prompt: None,
