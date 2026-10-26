@@ -922,6 +922,26 @@ def run_alias_capture(variant):
             define_alias(t, kind, "deploy", "TOKEN=abc123 ./deploy.sh")
             t.send("deploy")
             expect("deploy", None)
+            if kind != "fish":
+                for name, body in (("parenassign", "(TOKEN=abc printf ok)"), ("appendassign", "TOKEN+=abc printf ok")):
+                    define_alias(t, kind, name, body)
+                    t.send(name)
+                    if name == "parenassign" and kind == "bash" and "PS0" not in variant.label:
+                        assert not any(hit[0] for hit in typed_records(record_rows(log), name)), variant.label
+                    else:
+                        expect(name, None)
+            if kind == "bash":
+                define_alias(t, kind, "singlequoted", "printf '%s' hi")
+                t.send("singlequoted")
+                expect("singlequoted", None if "3.2" in variant.label else "printf '%s' hi")
+                # Exercise the fallback directly even when the host only has modern Bash.
+                t.send(f'_smcli_alias_body singlequoted > {shlex.quote(str(home / "fallback-body"))}')
+                assert (home / "fallback-body").read_text() == "", variant.label
+                if "PS0" in variant.label:
+                    t.send(f'printf "%s" "$_smcli_expfile" > {shlex.quote(str(home / "transfer-path"))}')
+                    transfer = Path((home / "transfer-path").read_text())
+                    assert transfer.stat().st_mode & 0o777 == 0o600, variant.label
+                    assert transfer.parent.stat().st_mode & 0o777 == 0o700, variant.label
             define_alias(t, kind, "sub", "printf $(printf hi)")
             t.send("sub")
             expect("sub", None)
@@ -983,6 +1003,8 @@ def run_alias_capture(variant):
             sent = [argv[i + 1] for argv in record_rows(log) for i, a in enumerate(argv[:-1]) if a == "--expanded"]
             assert not any(token in value for value in sent for token in ("abc123", "$(", ">")), sent
             t.wait_exit(0)
+            if kind == "bash" and "PS0" in variant.label:
+                assert not transfer.exists() and not transfer.parent.exists(), variant.label
             print(f"{variant.label}: alias expansion capture passed.")
         finally:
             t.close()

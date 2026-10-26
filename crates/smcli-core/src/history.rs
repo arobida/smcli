@@ -400,15 +400,25 @@ impl CapturedHistory {
         let here = directory.map(trim_slash).unwrap_or("");
         let root = project.unwrap_or("");
         let interrupted = INTERRUPTED_EXIT_CODES.map(|c| c.to_string()).join(", ");
-        // SQLite returns the bare columns from the row holding MAX(started_at).
+        // Latest row by (started_at, id); aggregates still cover every run of the command.
         let sql = format!(
-            "SELECT c.command, COUNT(*), MAX(c.started_at), c.directory, c.exit_code, c.author, c.intent, c.flags,
-                    SUM(smcli_decay(? - c.started_at)), SUM(c.exit_code IN (0, {interrupted})),
-                    SUM(c.exit_code = 1),
-                    SUM(? <> '' AND (c.directory = ? OR (? <> '/' AND substr(c.directory, 1, length(?) + 1) = ? || '/'))),
-                    SUM(? <> '' AND (c.directory = ? OR (? <> '/' AND substr(c.directory, 1, length(?) + 1) = ? || '/'))), c.expanded_command
-             FROM commands c
-             WHERE c.deleted_at IS NULL GROUP BY c.command,c.expanded_command"
+            "SELECT command, runs, started_at, directory, exit_code, author, intent, flags,
+                    frecency, successes, ones, runs_here, runs_project, expanded_command
+             FROM (
+               SELECT c.command,
+                      COUNT(*) OVER win AS runs,
+                      c.started_at, c.directory, c.exit_code, c.author, c.intent, c.flags,
+                      SUM(smcli_decay(? - c.started_at)) OVER win AS frecency,
+                      SUM(c.exit_code IN (0, {interrupted})) OVER win AS successes,
+                      SUM(c.exit_code = 1) OVER win AS ones,
+                      SUM(? <> '' AND (c.directory = ? OR (? <> '/' AND substr(c.directory, 1, length(?) + 1) = ? || '/'))) OVER win AS runs_here,
+                      SUM(? <> '' AND (c.directory = ? OR (? <> '/' AND substr(c.directory, 1, length(?) + 1) = ? || '/'))) OVER win AS runs_project,
+                      c.expanded_command,
+                      ROW_NUMBER() OVER (PARTITION BY c.command, c.expanded_command ORDER BY c.started_at DESC, c.id DESC) AS rn
+               FROM commands c
+               WHERE c.deleted_at IS NULL
+               WINDOW win AS (PARTITION BY c.command, c.expanded_command)
+             ) WHERE rn = 1"
         );
         let mut values = vec![Value::Real(now)];
         values.extend([here; 5].iter().chain([root; 5].iter()).map(|s| Value::Text(s.to_string())));
@@ -773,6 +783,20 @@ mod tests {
         assert!(!log.append(&again, "", Some(&db)).unwrap());
         assert!(log.append(&NewRun::new("ls", "tcsh", "/", 0), "", Some(&db)).is_err());
         assert!(!log.record_pick("x", "AKIAABCDEFGHIJKLMNOP", "suggest", "/", &CaptureFilter::standard(), now, &db).unwrap());
+    }
+
+    #[test]
+    fn command_stats_breaks_last_run_ties_by_id() {
+        let (_dir, log) = temp_db();
+        let db = log.open_connection().unwrap();
+        let at = 1_700_000_000.0;
+        for (directory, exit) in [("/old", 0), ("/new", 1)] {
+            let mut run = NewRun::new("cat", "zsh", directory, exit);
+            run.started_at = Some(at);
+            log.append(&run, "", Some(&db)).unwrap();
+        }
+        let cat = &log.command_stats(None, None, at).unwrap()["cat"];
+        assert_eq!((cat.runs, cat.last_run, cat.last_directory.as_str(), cat.last_exit_code), (2, at, "/new", 1));
     }
 
     #[test]

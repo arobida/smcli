@@ -59,12 +59,16 @@ pub fn run(args: Init, path: &Path, service: &ServiceClient) -> Result<()> {
         bail!("Rust supports Potion only; use --default or --potion [DIR].");
     }
     if args.has_model() || args.keys.is_none() {
-        let wanted = args.potion.clone().filter(|s| !s.is_empty());
+        let wanted = if args.has_model() {
+            args.potion.as_deref().filter(|s| !s.is_empty()).map(persisted_potion).transpose()?
+        } else {
+            config.potion_path.clone()
+        };
         // The service holds the old model; stop it before loading the new one so they never share memory.
         if wanted != config.potion_path && crate::cli::stop_service(service) {
             println!("Stopped smcli-service to free the old model.");
         }
-        let model = match args.potion.as_deref().filter(|s| !s.is_empty()) {
+        let model = match wanted.as_deref() {
             Some(p) => smcli_search::Potion::from_dir(Path::new(p))?,
             None => smcli_search::Potion::bundled()?,
         };
@@ -90,6 +94,15 @@ pub fn run(args: Init, path: &Path, service: &ServiceClient) -> Result<()> {
     }
     Ok(())
 }
+/// A local directory is stored canonical, so a later command from another cwd finds it. An id is not a directory and is kept as given.
+fn persisted_potion(value: &str) -> std::io::Result<String> {
+    if Path::new(value).is_dir() {
+        std::fs::canonicalize(value).map(|path| path.to_string_lossy().into_owned())
+    } else {
+        Ok(value.to_owned())
+    }
+}
+
 fn choose(c: &mut SmcliConfig) -> Result<()> {
     let r = ask("Open history with Ctrl-R?", c.ctrl_r_key.unwrap_or(true))?;
     let l = ask(
@@ -108,4 +121,76 @@ fn choose(c: &mut SmcliConfig) -> Result<()> {
     c.ctrl_t_key = Some(t);
     c.ctrl_g_key = Some(g);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Init, persisted_potion, run};
+    use smcli_core::config::SmcliConfig;
+    use smcli_core::history::CapturedHistory;
+    use smcli_core::service_client::ServiceClient;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn init_keeps_custom_model_and_stores_absolute_or_id() {
+        let root = std::env::temp_dir().join(format!("smcli-init-{}", uuid::Uuid::new_v4()));
+        let _cleanup = Tmp(root.clone());
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(root.join("runtime")).unwrap();
+        let db = root.join("history.db");
+        let env = HashMap::from([
+            ("HOME".into(), home.to_string_lossy().into_owned()),
+            ("SMCLI_DB".into(), db.to_string_lossy().into_owned()),
+            ("SMCLI_RUNTIME_DIR".into(), root.join("runtime").to_string_lossy().into_owned()),
+        ]);
+        let database = CapturedHistory::location(&home, &env);
+        assert_eq!(database, db);
+        let service = ServiceClient::new(&database, &env, Path::new("/missing/smcli"));
+        let model = std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Models/potion-shell-16m")).unwrap();
+        let abs = model.to_string_lossy().into_owned();
+
+        let abs_cfg = home.join("abs.json");
+        run(init(Some(&abs)), &abs_cfg, &service).unwrap();
+        run(init(None), &abs_cfg, &service).unwrap();
+        assert_eq!(SmcliConfig::load(&abs_cfg).unwrap().potion_path.as_deref(), Some(abs.as_str()));
+
+        let rel = relative_from_cwd(&model);
+        let rel_cfg = home.join("rel.json");
+        run(init(Some(&rel)), &rel_cfg, &service).unwrap();
+        let saved = SmcliConfig::load(&rel_cfg).unwrap().potion_path.unwrap();
+        assert_eq!(saved, std::fs::canonicalize(&rel).unwrap().to_string_lossy());
+        assert_ne!(saved, rel);
+        assert!(Path::new(&saved).is_absolute());
+
+        let id = "minishlab/potion-code-16M-v2";
+        assert!(!Path::new(id).is_dir());
+        assert_eq!(persisted_potion(id).unwrap(), id);
+    }
+
+    fn init(potion: Option<&str>) -> Init {
+        Init { model: None, potion: potion.map(str::to_owned), builtin: false, default: false, keys: None }
+    }
+
+    fn relative_from_cwd(target: &Path) -> String {
+        let cwd = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let mut ups = 0;
+        let mut base = cwd.as_path();
+        while !target.starts_with(base) {
+            base = base.parent().expect("model and cwd share a prefix");
+            ups += 1;
+        }
+        let mut rel = PathBuf::new();
+        for _ in 0..ups { rel.push(".."); }
+        rel.push(target.strip_prefix(base).unwrap());
+        let rel = rel.to_string_lossy().into_owned();
+        assert!(!Path::new(&rel).is_absolute() && Path::new(&rel).is_dir(), "{rel}");
+        rel
+    }
+
+    struct Tmp(PathBuf);
+    impl Drop for Tmp {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
 }

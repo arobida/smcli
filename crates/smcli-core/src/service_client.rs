@@ -11,6 +11,13 @@ use crate::unix_socket::{SocketConnection, connect_unix};
 #[derive(PartialEq)]
 enum Mode { Off, Connect, Spawn }
 
+#[derive(Debug)]
+enum ExchangeError {
+    Unavailable,
+    /// The peer answered in another protocol version. `send` replaces that service.
+    Mismatch(ServiceResponse),
+}
+
 /// Talks to the smcli-service that owns one history database. Every call returns None rather than throwing when
 /// the service can't be used, so callers fall back to doing the work in-process.
 pub struct ServiceClient {
@@ -55,18 +62,33 @@ impl ServiceClient {
         resolved.with_file_name(format!("smcli-service{suffix}"))
     }
 
-    /// Sends one request. None means unreachable, timed out, or speaking another protocol version.
+    /// Sends one request. None means unreachable or timed out. A service speaking another protocol
+    /// version is stopped and replaced, the same way a stale build is.
     /// `timeout` bounds the wait for the reply; the first search after startup may build the whole index.
     pub fn send(&self, request: &ServiceRequest, spawn: Option<bool>, timeout: Duration) -> Option<ServiceResponse> {
         if self.mode == Mode::Off && spawn.is_none() { return None; }
         let spawning = spawn.unwrap_or(self.mode == Mode::Spawn);
-        let response = self.exchange(request, spawning, timeout)?;
+        let response = match self.exchange(request, spawning, timeout) {
+            Ok(response) => response,
+            Err(ExchangeError::Mismatch(stale)) if spawning || request.op == Operation::Shutdown => {
+                return self.replace(request, stale, spawning, timeout);
+            }
+            Err(_) => return None,
+        };
         if !spawning || request.op == Operation::Shutdown { return Some(response); }
         let Some(expected) = build(&self.executable) else { return Some(response); };
         if response.build.as_ref() == Some(&expected) { return Some(response); }
-        // Left running by another build: stop it, wait for its lock, and let this request start the current one.
-        let Some(old) = self.exchange(&ServiceRequest::new(Operation::Shutdown), false, Duration::from_secs(2)) else {
-            return Some(response);
+        self.replace(request, response, spawning, timeout)
+    }
+
+    /// Stop a service left by another build or protocol, wait for its lock, and repeat this request on the current one.
+    fn replace(&self, request: &ServiceRequest, stale: ServiceResponse, spawning: bool, timeout: Duration) -> Option<ServiceResponse> {
+        let mut shutdown = ServiceRequest::new(Operation::Shutdown);
+        // An older protocol rejects a current shutdown and keeps the socket.
+        if stale.v != service_protocol::VERSION { shutdown.v = stale.v; }
+        let old = match self.exchange(&shutdown, false, Duration::from_secs(2)) {
+            Ok(response) | Err(ExchangeError::Mismatch(response)) => response,
+            Err(ExchangeError::Unavailable) => return (request.op != Operation::Shutdown).then_some(stale),
         };
         if let Some(pid) = old.pid {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -74,15 +96,17 @@ impl ServiceClient {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+        // Stop must report the shutdown the socket accepted, not the version rejection that preceded it.
+        if request.op == Operation::Shutdown { return Some(old); }
         // A select would count the pick twice; record is safe because its event ID makes a retry a no-op.
-        if !Self::repeatable(request.op) { return Some(response); }
-        self.exchange(request, true, timeout)
+        if !spawning || !Self::repeatable(request.op) { return Some(stale); }
+        self.exchange(request, true, timeout).ok()
     }
 
     /// Requests the old service's answer can be replaced by the new one's without a second effect.
     fn repeatable(op: Operation) -> bool { !matches!(op, Operation::Select | Operation::Shutdown) }
 
-    fn exchange(&self, request: &ServiceRequest, spawn: bool, timeout: Duration) -> Option<ServiceResponse> {
+    fn exchange(&self, request: &ServiceRequest, spawn: bool, timeout: Duration) -> Result<ServiceResponse, ExchangeError> {
         let mut request = request.clone();
         if request.config.is_none() { request.config = Some(self.config.clone()); }
         if request.op == Operation::Search {
@@ -90,19 +114,27 @@ impl ServiceClient {
             request.ranking_off = Some(self.environment.get("SMCLI_RANKING_OFF")
                 .filter(|s| s.len() <= 256).cloned().unwrap_or_default());
         }
-        let mut connection = self.connect(spawn)?;
+        let Some(mut connection) = self.connect(spawn) else { return Err(ExchangeError::Unavailable); };
         // The private directory already keeps others out; also refuse a socket another user planted.
-        if connection.peer_uid() != Some(unsafe { libc::getuid() }) { return None; }
-        let line = encode_line(&request).ok()?;
-        if line.len() > service_protocol::MAX_MESSAGE_BYTES { return None; }
-        connection.write(&line, Duration::from_secs_f64(service_protocol::IO_TIMEOUT)).ok()?;
-        // The first suggest after startup loads history, so allow longer than a plain I/O timeout.
-        let reply = connection.read_line(service_protocol::MAX_RESPONSE_BYTES, timeout).ok()??;
-        let response: ServiceResponse = decode_line(&reply).ok()?;
-        if response.v != service_protocol::VERSION || response.error.as_ref().is_some_and(|e| e.code == "version") {
-            return None;
+        if connection.peer_uid() != Some(unsafe { libc::getuid() }) { return Err(ExchangeError::Unavailable); }
+        let Ok(line) = encode_line(&request) else { return Err(ExchangeError::Unavailable); };
+        if line.len() > service_protocol::MAX_MESSAGE_BYTES { return Err(ExchangeError::Unavailable); }
+        if connection.write(&line, Duration::from_secs_f64(service_protocol::IO_TIMEOUT)).is_err() {
+            return Err(ExchangeError::Unavailable);
         }
-        Some(response)
+        // The first suggest after startup loads history, so allow longer than a plain I/O timeout.
+        let Ok(Some(reply)) = connection.read_line(service_protocol::MAX_RESPONSE_BYTES, timeout) else {
+            return Err(ExchangeError::Unavailable);
+        };
+        let Ok(response) = decode_line::<ServiceResponse>(&reply) else { return Err(ExchangeError::Unavailable); };
+        if response.v != service_protocol::VERSION {
+            return Err(ExchangeError::Mismatch(response));
+        }
+        // Same version refusing our request is not a stale service; do not replace it.
+        if response.error.as_ref().is_some_and(|e| e.code == "version") {
+            return Err(ExchangeError::Unavailable);
+        }
+        Ok(response)
     }
     fn connect(&self, spawn: bool) -> Option<SocketConnection> {
         if let Ok(connection) = connect_unix(&self.location.socket) { return Some(connection); }
@@ -208,5 +240,76 @@ mod tests {
         for op in [Operation::Ping, Operation::Record, Operation::Suggest, Operation::Pick, Operation::Search, Operation::Context, Operation::Files, Operation::Grep] { assert!(ServiceClient::repeatable(op)); }
         assert!(!ServiceClient::repeatable(Operation::Select));
         assert!(!ServiceClient::repeatable(Operation::Shutdown));
+    }
+
+    /// A socket that rejects this protocol, the way an older service does, is stopped and replaced.
+    #[test]
+    fn old_version_socket_is_replaced_on_start_and_stop() {
+        let python = python3();
+        // Stop must not report the answering socket as absent.
+        let stopped = talk_to_old(&python, Operation::Shutdown, false);
+        assert!(stopped.ok, "{stopped:?}");
+        // Start replaces it with the service this client launches.
+        let started = talk_to_old(&python, Operation::Ping, true);
+        assert!(started.ok && started.v == service_protocol::VERSION, "{started:?}");
+    }
+
+    fn python3() -> String {
+        let output = std::process::Command::new("python3").arg("-c").arg("import sys; print(sys.executable)").output().expect("python3");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// Speaks protocol v1: rejects anything else, accepts its own shutdown, then exits.
+    fn talk_to_old(python: &str, op: Operation, spawn: bool) -> ServiceResponse {
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::Builder::new().prefix("smcli-").tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = temporary.path().join("history.db");
+        let marker = temporary.path().join("replaced");
+        let log = temporary.path().join("log");
+        let ready = temporary.path().join("ready");
+        let mut environment = HashMap::from([
+            ("SMCLI_RUNTIME_DIR".into(), temporary.path().to_string_lossy().into_owned()),
+        ]);
+        let socket = crate::service_location::ServiceLocation::new(&database, &environment).socket;
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let old = fixtures.join("old_service.py");
+        if spawn {
+            let stub = fixtures.join("replacement_service.py");
+            let wrapper = temporary.path().join("smcli-service");
+            std::fs::write(&wrapper, format!("#!/bin/sh\nexec {python} {stub} {socket} {marker}\n", stub = stub.display(), socket = socket.display(), marker = marker.display())).unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            environment.insert("SMCLI_SERVICE_BIN".into(), wrapper.to_string_lossy().into_owned());
+        }
+        let mut child = std::process::Command::new(python).arg(&old).arg(&socket).arg(&log).arg(&ready).spawn().unwrap();
+        let old_pid = child.id() as i32;
+        let _reap = KillOnDrop(old_pid);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(10)); }
+        assert!(ready.exists(), "old socket did not bind");
+        // Reap so the client's pid wait does not spin on a zombie.
+        std::thread::spawn(move || { let _ = child.wait(); });
+        let client = ServiceClient::new(&database, &environment, Path::new("/missing/smcli"));
+        let response = client.send(&ServiceRequest::new(op), Some(spawn), Duration::from_secs(5))
+            .unwrap_or_else(|| panic!("no reply; log={}", std::fs::read_to_string(&log).unwrap_or_default()));
+        let seen = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(seen.contains("1 shutdown"), "compatible shutdown was not sent: {seen}");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(old_pid, 0) } == 0 && Instant::now() < deadline { std::thread::sleep(Duration::from_millis(10)); }
+        assert_ne!(unsafe { libc::kill(old_pid, 0) }, 0, "old service still running");
+        assert!(!socket.exists() || marker.exists(), "socket still answers and was not replaced");
+        if spawn {
+            assert!(marker.exists(), "replacement service was not started");
+            if let Some(pid) = response.pid { unsafe { libc::kill(pid, libc::SIGTERM); } }
+        } else {
+            assert_eq!(response.pid, Some(old_pid));
+        }
+        response
+    }
+
+    struct KillOnDrop(i32);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) { unsafe { libc::kill(self.0, libc::SIGTERM); } }
     }
 }

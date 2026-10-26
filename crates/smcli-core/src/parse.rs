@@ -170,6 +170,7 @@ pub fn shell_words(command: &str) -> Option<Vec<String>> {
 /// (substitution, redirection, background) or assigns (`NAME=`, `${NAME:=}`) passes.
 pub fn safe_expansion(text: &str) -> bool {
     let assigns = |word: &str| word.split_once('=').is_some_and(|(name, _)| {
+        let name = name.strip_suffix('+').unwrap_or(name);
         name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
     });
     let braces_plain = text.split("${").skip(1).all(|rest| {
@@ -180,7 +181,7 @@ pub fn safe_expansion(text: &str) -> bool {
         && !["$(", "`", "<", ">"].iter().any(|bad| text.contains(bad))
         && !text.replace("&&", "").contains('&')
         && braces_plain
-        && text.split_whitespace().all(|word| !assigns(word.trim_start_matches(['"', '\''])))
+        && text.split(|c: char| c.is_whitespace() || ['(', '{', ';', '&', '|'].contains(&c)).all(|word| !assigns(word.trim_start_matches(['"', '\'', '(', '{', ';', '&', '|'])))
         && text.split_whitespace().next().is_some_and(|word| !word.starts_with('-'))
 }
 
@@ -245,7 +246,8 @@ mod tests {
         }
         for text in ["", " git status", "git status ", "TOKEN=abc123 ./deploy.sh", "a && TOKEN=x ./b", "env 'X=1' a",
             "echo $(id)", "echo `id`", "git status > file", "cat < file", "diff <(a) b", "sleep 1 &", "echo ${X:=1}",
-            "echo ${X:-$(id)}", "echo\nsecret", "echo\tx", "-rf /"] {
+            "echo ${X:-$(id)}", "echo\nsecret", "echo\tx", "-rf /", "(TOKEN=abc printf ok)",
+            "TOKEN+=abc printf ok", "printf ok;TOKEN=abc", "printf ok &&(TOKEN+=abc printf ok)"] {
             assert!(!safe_expansion(text), "{text}");
         }
         assert!(!safe_expansion(&"x".repeat(8_193)));

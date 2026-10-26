@@ -34,7 +34,7 @@ done
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
-[[ $(uname) == Darwin ]] || die "smcli installs on macOS 14 or later."
+[[ $(uname) == Darwin ]] || die "the installer is macOS-only; on Linux, copy smcli, smcli-service, and the potion-shell-16m/ folder into the same directory manually."
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ $prefix == /* ]] || prefix="$PWD/$prefix"
 

@@ -65,12 +65,18 @@ if [[ ${_smcli_installed-} != 1 ]]; then
         # Exported so the picker and search know which session is asking (its last command picks transitions).
         export SMCLI_SESSION=$_smcli_session
         _smcli_expanded=
-        # shortcut: PS0 can't assign a string without printing it, so that mode writes here and the prompt reads it. Upgrade if a command must not be able to forge this file.
-        _smcli_expfile=${TMPDIR:-/tmp}/smcli-exp-$$-$RANDOM
+        # PS0 writes in a subshell; transfer text through a private, uniquely created file.
+        _smcli_expdir= _smcli_expfile=
+        if [[ $_smcli_mode == ps0 ]]; then
+            _smcli_expdir=$(umask 077; mktemp -d "${SMCLI_RUNTIME_DIR:-${TMPDIR:-/tmp}}/smcli-exp.XXXXXXXXXX")
+            if [[ -n $_smcli_expdir ]]; then
+                _smcli_expfile=$(umask 077; mktemp "$_smcli_expdir/body.XXXXXXXXXX")
+            fi
+        fi
         # A cheap pre-check; smcli record applies the full rule (`safe_expansion`). Nothing that runs code or redirects is sent.
         _smcli_safe() {
             local LC_ALL=C s=$1
-            local assign="(^|[ ;&|\"'])[A-Za-z_][A-Za-z0-9_]*="
+            local assign="(^|[ ({;&|\"'])[A-Za-z_][A-Za-z0-9_]*\\+?="
             [[ -n $s && ${#s} -le 8192 ]] || return 1
             [[ $s != *[^\ -~]* && $s != *'$('* && $s != *'`'* && $s != *[\<\>]* ]] && ! [[ $s =~ $assign ]]
         }
@@ -81,6 +87,8 @@ if [[ ${_smcli_installed-} != 1 ]]; then
             [[ $line == "alias $1="* ]] || return 0
             line=${line#"alias $1="}
             [[ $line == "$q"*"$q" ]] || return 0
+            # Printed quote escapes are shell syntax, not the original body. Keep these typed-only.
+            [[ $line != *"$q\\$q$q"* ]] || return 0
             line=${line#"$q"}
             line=${line%"$q"}
             printf '%s' "$line"
@@ -109,7 +117,8 @@ if [[ ${_smcli_installed-} != 1 ]]; then
             if [[ $entry =~ ^[[:space:]]*([0-9]+)[[:space:]]+(.*)$ && ${BASH_REMATCH[1]} != "$_smcli_history_number" ]]; then
                 _smcli_set_expanded "${BASH_REMATCH[2]}"
             fi
-            printf '%s\n' "$_smcli_expanded" >| "$_smcli_expfile" 2>/dev/null || true
+            [[ -n $_smcli_expfile ]] || return 0
+            (umask 077; printf '%s\n' "$_smcli_expanded" >| "$_smcli_expfile") 2>/dev/null || true
         }
         _smcli_record() {
             # --expanded precedes the existing positional fields and is omitted without a trusted expansion.
@@ -222,7 +231,7 @@ if [[ ${_smcli_installed-} != 1 ]]; then
                 eval "set -- $existing"
                 existing=$3
             fi
-            trap "_smcli_prompt exit${existing:+; $existing}" EXIT
+            trap '_smcli_prompt exit; [[ -z $_smcli_expfile ]] || rm -f -- "$_smcli_expfile"; [[ -z $_smcli_expdir ]] || rmdir -- "$_smcli_expdir";'"${existing:+ $existing}" EXIT
         }
         case $_smcli_mode in
             bash-preexec)
@@ -368,7 +377,7 @@ if [[ ${_smcli_installed-} != 1 ]]; then
         (( $#s > 0 && $#s <= 8192 )) || return 1
         [[ $s != *[^\ -~]* && $s != *'$('* && $s != *'`'* && $s != *[\<\>]* ]] || return 1
         setopt localoptions norematchpcre
-        ! [[ $s =~ "(^|[ ;&|\"'])[A-Za-z_][A-Za-z0-9_]*=" ]]
+        ! [[ $s =~ "(^|[ ({;&|\"'])[A-Za-z_][A-Za-z0-9_]*\\+?=" ]]
     }
     # $1 is preexec's typed text, $2 is preexec's $3. Only a confirmed leading regular alias is kept.
     _smcli_alias() {
@@ -534,7 +543,7 @@ if not set -q _smcli_installed
         set -l n (string length -- $s)
         test $n -gt 0; and test $n -le 8192; or return 1
         not string match -qr -- '[^ -~]|\$\(|`|[<>]' $s; or return 1
-        not string match -qr -- '(^|[ ;&|"\'])[A-Za-z_][A-Za-z0-9_]*=' $s
+        not string match -qr -- '(^|[ ({;&|"\'])[A-Za-z_][A-Za-z0-9_]*\\+?=' $s
     end
     # A generated alias function is one literal command forwarding $argv. Anything else, including abbreviations, is typed text.
     function _smcli_alias_body

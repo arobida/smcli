@@ -210,7 +210,7 @@ impl Service {
 
     fn dispatch(&self, request: &ServiceRequest) -> ServiceResponse {
         if request.v != VERSION {
-            self.touch();
+            // A rejected version must not refresh idle time, or an old service never exits.
             return ServiceResponse::failure("version", format!("Protocol version {VERSION} required."));
         }
         let result = match request.op {

@@ -41,10 +41,7 @@ impl Potion {
     pub fn from_dir(directory: &Path) -> Result<Self> {
         let model = StaticModel::from_pretrained(directory, None, None, None)?;
         let canonical = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
-        let slug: String = canonical.to_string_lossy().chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        canonical.hash(&mut hasher);
-        Ok(Self::with(model, format!("{slug}-{:016x}", hasher.finish())))
+        Ok(Self::with(model, model_identity(&canonical)))
     }
 
     fn with(model: StaticModel, identity: String) -> Self {
@@ -65,5 +62,32 @@ impl Potion {
                 if v.iter().any(|x| *x != 0.0) { v } else { vec![1.0 / (v.len() as f32).sqrt(); v.len()] }
             })
             .collect()
+    }
+}
+
+/// Last path component (short) plus a hash of the full canonical path, so index filenames stay bounded.
+fn model_identity(canonical: &Path) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    let hash = format!("{:016x}", hasher.finish());
+    let slug: String = canonical.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+        .chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).take(32).collect();
+    format!("{}-{hash}", if slug.is_empty() { "model" } else { &slug })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_stays_short_for_a_long_model_path() {
+        let last = "m".repeat(245);
+        let path = PathBuf::from("/").join("a".repeat(200)).join(&last);
+        let id = model_identity(&path);
+        assert_eq!(id.len(), 32 + 1 + 16);
+        assert!(id.starts_with(&"m".repeat(32)));
+        let name = format!("rs-commands-v3-potion-shell-16m-{id}-d256-typed");
+        assert!(name.len() <= 255, "{name}");
+        assert_ne!(id, model_identity(&PathBuf::from("/").join("b".repeat(200)).join(&last)));
     }
 }

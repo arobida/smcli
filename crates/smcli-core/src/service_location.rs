@@ -107,28 +107,6 @@ pub fn relative_insert(path: &str, root: &str, directory: &str) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    struct Temporary(PathBuf);
-
-    impl Temporary {
-        fn new() -> Self {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "smcli-service-location-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            fs::create_dir(&path).unwrap();
-            Self(path)
-        }
-    }
-
-    impl Drop for Temporary {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
 
     #[test]
     fn fingerprint_known_path() {
@@ -157,8 +135,8 @@ mod tests {
 
     #[test]
     fn prepare_checks_private_directory() {
-        let temporary = Temporary::new();
-        let directory = temporary.0.join("runtime");
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("runtime");
         let environment = HashMap::from([("SMCLI_RUNTIME_DIR".to_owned(), directory.to_str().unwrap().to_owned())]);
         let location = ServiceLocation::new(Path::new("/tmp/history.db"), &environment);
         location.prepare().unwrap();
@@ -167,7 +145,7 @@ mod tests {
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
         assert!(location.prepare().is_err());
         fs::remove_dir(&directory).unwrap();
-        symlink(&temporary.0, &directory).unwrap();
+        symlink(temporary.path(), &directory).unwrap();
         assert!(location.prepare().is_err());
         fs::remove_file(&directory).unwrap();
         fs::write(&directory, "not a directory").unwrap();
@@ -176,23 +154,23 @@ mod tests {
 
     #[test]
     fn build_format() {
-        let temporary = Temporary::new();
-        let executable = temporary.0.join("binary");
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("binary");
         fs::write(&executable, "abc").unwrap();
         let file = fs::File::open(&executable).unwrap();
         file.set_times(fs::FileTimes::new().set_modified(
             std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123),
         )).unwrap();
-        let alias = temporary.0.join("alias");
+        let alias = temporary.path().join("alias");
         symlink(&executable, &alias).unwrap();
         assert_eq!(build(&alias), Some(format!("{}|1700000000.123|3", fs::canonicalize(&executable).unwrap().display())));
-        assert_eq!(build(&temporary.0.join("missing")), None);
+        assert_eq!(build(&temporary.path().join("missing")), None);
     }
 
     #[test]
     fn relative_insert_cases() {
-        let temporary = Temporary::new();
-        let root = fs::canonicalize(&temporary.0).unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temporary.path()).unwrap();
         fs::create_dir(root.join("x")).unwrap();
         fs::create_dir(root.join("y")).unwrap();
         let root = root.to_str().unwrap();

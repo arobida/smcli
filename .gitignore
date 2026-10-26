@@ -1,6 +1,7 @@
 .DS_Store
 .netrc
 dist/
+__pycache__/
 /target
 # Old Swift build output; delete it with rm -rf .build
 /.build

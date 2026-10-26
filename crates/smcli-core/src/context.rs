@@ -29,6 +29,11 @@ fn exists(path: &str) -> bool {
     std::fs::symlink_metadata(path).is_ok()
 }
 
+fn regular_file(path: &str) -> bool {
+    // metadata follows symlinks; opening a FIFO blocks until a writer connects.
+    std::fs::metadata(path).is_ok_and(|info| info.is_file())
+}
+
 fn parent(path: &str) -> String {
     match Path::new(path).parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_string_lossy().into_owned(),
@@ -41,6 +46,7 @@ pub fn real_path(path: &str) -> Option<String> {
 }
 
 fn read_small_file(path: &str, limit: u64) -> Option<String> {
+    if !regular_file(path) { return None; }
     let mut data = Vec::new();
     std::fs::File::open(path).ok()?.take(limit).read_to_end(&mut data).ok()?;
     Some(String::from_utf8_lossy(&data).trim().to_string())
@@ -125,7 +131,7 @@ impl ProjectContext {
     }
 
     fn project(directory: &str) -> Option<Project> {
-        let has = |file: &str| exists(&format!("{directory}/{file}"));
+        let has = |file: &str| regular_file(&format!("{directory}/{file}"));
         let found: Vec<(&str, &str)> =
             MANIFESTS.iter().filter_map(|(names, kind)| names.iter().find(|n| has(n)).map(|n| (*n, *kind))).collect();
         let primary = *found.first()?;
@@ -400,6 +406,34 @@ let package = Package(
         let project = &context.projects[0];
         assert_eq!(project.kind, "swift");
         assert_eq!(project.scripts["Package.swift"], ["App", "Lib", "AppTests", "Gen", "Str"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A FIFO named like a manifest must not block discovery; it is not a project.
+    #[test]
+    fn fifo_manifest_does_not_block() {
+        let root = tempfile_dir();
+        let manifest = format!("{root}/Cargo.toml");
+        let c_path = std::ffi::CString::new(manifest).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = root.clone();
+        std::thread::spawn(move || {
+            tx.send(ProjectContext::discover(&dir).projects.len()).ok();
+        });
+        let count = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("FIFO Cargo.toml blocked discovery");
+        assert_eq!(count, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn symlinked_manifest_is_read() {
+        let root = tempfile_dir();
+        std::fs::write(format!("{root}/real.toml"), "[package]\nname = \"linked\"\n").unwrap();
+        std::os::unix::fs::symlink("real.toml", format!("{root}/Cargo.toml")).unwrap();
+        let project = &ProjectContext::discover(&root).projects[0];
+        assert_eq!(project.kind, "rust");
+        assert_eq!(project.name.as_deref(), Some("linked"));
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -108,7 +108,7 @@ impl CorpusState {
         let mut entry = self.captured.get(command).filter(|_| !is_smcli_command(expanded.as_deref().unwrap_or(&typed))).map(|stats| SearchEntry {
             command: typed.clone(), expanded_command: expanded.clone(), alias_off: false,
             runs: stats.runs,
-            last_run: Some(format_iso8601(stats.last_run, false)),
+            last_run: Some(format_iso8601(stats.last_run, true)),
             last_directory: Some(stats.last_directory.clone()),
             last_exit_code: Some(stats.last_exit_code),
             source: "captured".into(),
@@ -753,6 +753,23 @@ mod tests {
             assert_eq!(stripped, query);
             assert!(filter.is_empty(), "{query}");
         }
+    }
+
+    #[test]
+    fn subsecond_last_run_survives_since_before_filters() {
+        let mut captured = HashMap::new();
+        captured.insert("cat".into(), CommandStats {
+            runs: 1,
+            last_run: 1_700_000_000.5,
+            last_directory: "/tmp".into(),
+            last_exit_code: 0,
+            successes: 1,
+            ..Default::default()
+        });
+        let entry = &search_corpus(captured, &[])["cat"];
+        assert_eq!(entry.last_run.as_deref(), Some("2023-11-14T22:13:20.500Z"));
+        assert!(SearchFilter { since: Some(1_700_000_000.25), ..Default::default() }.allows(entry));
+        assert!(!SearchFilter { before: Some(1_700_000_000.25), ..Default::default() }.allows(entry));
     }
 
     #[test]

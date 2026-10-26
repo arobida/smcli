@@ -7,7 +7,7 @@ smcli is two executables that must stay side by side:
   memory and powers the file and grep picker. `smcli` finds it in its own directory (`smcli` → `smcli-service`,
   `smcli-<build>` → `smcli-service-<build>`); set `SMCLI_SERVICE_BIN` to an absolute path to override.
 
-Both depend only on system libraries; the search model and the fff file-search library are built in.
+Both depend only on system libraries; the fff file-search library is built in. The Potion search model is shipped separately in the `potion-shell-16m/` folder beside both executables.
 
 Requirements: macOS 14 or later, or Linux. Bash 4+ for the picker keys (macOS's `/bin/bash` 3.2 still records history, without
 keys), any recent Zsh, or Fish.
@@ -65,6 +65,7 @@ Open a new terminal afterwards. The rest of this page is the same steps done by 
    ``` sh
    mkdir -p ~/.local/bin
    cp smcli smcli-service ~/.local/bin/
+      cp -R potion-shell-16m ~/.local/bin/
    ```
 
    Keep them together. Moving only `smcli` leaves it without its service: commands still work, but more slowly,
@@ -146,7 +147,7 @@ Then continue with [Set up your shell](#set-up-your-shell).
    ```
 
    Up always opens the picker. On an empty line in Bash and Zsh, Left opens the same history search as Ctrl-R and Right opens directory suggestions. A line that already has text keeps normal arrow movement. Then it offers any Ollama embedding models you have installed; the default is the
-   built-in potion-shell-16m model, which needs nothing extra.
+   potion-shell-16m model, installed in the `potion-shell-16m/` folder beside the executables.
 
    For scripts and dotfiles, use flags instead; they never ask:
 
