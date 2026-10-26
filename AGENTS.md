@@ -4,17 +4,17 @@ This file provides guidance to coding agents when working with code in this repo
 
 <-- Start of do not change this -->
 
-## Agent Team
+## Agent Team(can be referenced by saying ateam)
 
-By using the kero skill you are allowed to open new sessions with the list of agents I will provide. Whenever you are asked you should efficiently delegate task to the appropriate agent and act as the orchestrator and let them handle the tasks. The list will show two things first an alias followed by the command needed to open the agent in the new sesion.
+By using the kero skill you are allowed to open new sessions with the list of agents I will provide. Whenever you are asked you should efficiently delegate task to the appropriate agent and act as the orchestrator and let them handle the tasks. Do not perform redudant testing or rerun them unecessarily. The list will show two things first an alias followed by the command needed to open the agent in the new sesion.
 
 ### Agents List:
 
 pisol=pi --model openai/gpt-6.1-sol --thinking low
 piluna=pi --model openai/gpt-6-luna --thinking low
 pikcode=pi --model opencode-go/kimi-k2.7-code --thinking high
-pidpro=pi --model opencode-go/deepseek-v4-pro --thinking max
-ocflash-free=oc mini -m opencode/deepseek-v4.1-flash-free
+pidpro=pi --model opencode-go/deepseek-v4-pro --thinking high
+pidflash=pi --model opencode-go/deepseek-v4.1-flash --thinking high
 pigrok47=pi --model xai/grok-4.7 --thinking high
 pigrok46=pi --model xai/grok-4.6 --thinking high
 pigrok45=pi --model xai/grok-4.5 --thinking medium
@@ -22,16 +22,25 @@ pigrok45=pi --model xai/grok-4.5 --thinking medium
 #### Agent Affinities
 
 > Some agents are better at certain tasks than others(try to use free models as much as possible)
-> pikcode: great at writing code
-> pisol: complicated reasoning tasks
-> piluna: fast general purpose worker
-> pidpro: good general purpose model, very token efficient with prompt caching, and uses max reasoning
-> ocflash: a fast a free vision model for general purpose tasks
-> pigrok47: complicated reasoning tasks(not as good as pisol!)
-> pigrok46: general purpose model faster than pigrok47
-> pigrok45: decent model should stick to using with commit messages
+
+pikcode: great at writing code
+pisol: complicated reasoning tasks
+piluna: fast general purpose worker
+pidpro: good general purpose model, very token efficient with prompt caching
+pidflash: fast version pidpro with vision
+pigrok47: complicated reasoning tasks(not as good as pisol!)
+pigrok46: general purpose model faster than pigrok47
+pigrok45: decent model should stick to using with commit messages
 
 <-- End of do not edit -->
+
+### Dispatching to the team
+
+Delegate through `scripts/ateam.sh` instead of hand-rolled `kero new` loops: `bash scripts/ateam.sh <brief> <alias=command>...` (bash only; run it, don't source it from zsh), passing the `alias=command` lines above verbatim.
+
+- Starts every agent in parallel in the repo dir (each in its own kero session), waits for each prompt, then briefs it.
+- `<brief>` is one of: empty (start only), inline text (sent to every agent), a task file path, or a task directory; with a directory it briefs each agent from `<dir>/<alias>.task` — write one `.task` file per agent and pass the dir, so each gets `Read <dir>/<alias>.task and do exactly what it says.`
+- Prints `<alias>\t<session-id>` per agent; monitor with `kero wait` / `kero read`, `kero close` when done. `ATEAM_SHELL` (default zsh) and `ATEAM_DIR` (default `$PWD`) override.
 
 ## Search
 
