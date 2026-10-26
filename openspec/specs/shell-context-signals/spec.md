@@ -88,16 +88,16 @@ When a captured command starts with a shell alias, smcli SHALL store both the ty
 
 ### Requirement: Alias-aware search and insertion
 
-Search SHALL match an aliased entry by both its typed text and its expansion, with the expansion treated as the primary text. The picker SHALL show the typed alias as the main text, followed by an `@` marker and the expansion, dimmed and truncated to the row width. Picking SHALL insert the typed alias. Alias runs and direct runs of the expansion SHALL keep separate usage counts.
+Search SHALL match an aliased entry by both its typed text and its expansion, with the expansion treated as the primary text. The picker SHALL show the typed alias as the main text, followed by two spaces, a `↦` (maps to) marker and the expansion, dimmed and truncated to the row width. Picking SHALL insert the typed alias. Alias runs and direct runs of the expansion SHALL keep separate usage counts.
 
 #### Scenario: Search by expansion
 
 - **WHEN** history has `gst` recorded with expansion `git status`
-- **THEN** the query `git status` returns it, shown as `gst@ git status`
+- **THEN** the query `git status` returns it, shown as `gst  ↦ git status`
 
 #### Scenario: Insert expansion
 
-- **WHEN** the user picks `gst@ git status`
+- **WHEN** the user picks `gst  ↦ git status`
 - **THEN** the typed alias `gst` is inserted instead of the expansion, and nothing is run
 
 #### Scenario: Long expansion

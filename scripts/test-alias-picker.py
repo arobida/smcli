@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory(prefix="smcli-alias.", dir="/tmp") as directory
                             raise
                 visible = ansi.sub(b"", screen).decode(errors="replace")
                 if not sent and "esc cancel" in visible:
-                    assert f"{expected}@ " in visible and shown in visible, visible
+                    assert f"{expected}  ↦ " in visible and shown in visible, visible
                     os.write(fd, b"\r")
                     sent = True
                 done, status = os.waitpid(pid, os.WNOHANG)
@@ -77,6 +77,6 @@ with tempfile.TemporaryDirectory(prefix="smcli-alias.", dir="/tmp") as directory
         records = json.loads(subprocess.check_output([binary, "history", "--json"], env=env))
         assert [(r["command"], r["expandedCommand"]) for r in records] == [
             ("zzalias", expansion), ("gl", "git log"), ("gl", "git ls-files")]
-        print("Alias picker: @ labels, conflicting variants, service/fallback insertion, no execution passed.")
+        print("Alias picker: ↦ labels, conflicting variants, service/fallback insertion, no execution passed.")
     finally:
         subprocess.run([binary, "service", "stop"], env=env, capture_output=True)

@@ -618,7 +618,7 @@ fn history_internal(key: &str) -> bool {
 
 pub(crate) fn history_label(key: &str) -> String {
     let (typed, expanded) = command_parts(key);
-    visible(&expanded.map_or(typed.clone(), |e| format!("{typed}@ {e}")))
+    visible(&expanded.map_or(typed.clone(), |e| format!("{typed}  ↦ {e}")))
 }
 
 /// The alias as typed: the user knows what it means, and the shell expands it again when it runs.
@@ -626,12 +626,12 @@ pub(crate) fn history_insert(key: &str) -> String {
     command_parts(key).0
 }
 
-/// An alias row: the typed alias, an `@` mark, then its expansion dimmed and cut to fit `width`. The alias is never cut first.
+/// An alias row: the typed alias, a `↦` (maps to) mark, then its expansion dimmed and cut to fit `width`. The alias is never cut first.
 fn history_row(key: &str, width: usize) -> Vec<Span<'static>> {
     let (typed, expanded) = command_parts(key);
     let mut spans = highlight(&visible(&typed));
     let Some(expanded) = expanded else { return spans };
-    let room = width.saturating_sub(Line::from(spans.clone()).width() + 2);
+    let room = width.saturating_sub(Line::from(spans.clone()).width() + 4);
     let expanded = visible(&expanded);
     let shown = if Span::raw(expanded.as_str()).width() <= room {
         expanded
@@ -643,7 +643,7 @@ fn history_row(key: &str, width: usize) -> Vec<Span<'static>> {
         }
         if cut.is_empty() { String::new() } else { format!("{cut}…") }
     };
-    spans.push(Span::styled("@", ACCENT));
+    spans.extend([Span::raw("  "), Span::styled("↦", ACCENT)]);
     if !shown.is_empty() { spans.push(Span::styled(format!(" {shown}"), MUTED)); }
     spans
 }
@@ -859,25 +859,25 @@ mod tests {
         let second = command_key("gl", Some("git ls-files"));
         let picker = Picker::new(vec![first.clone()], vec![second.clone()], vec!["gl".into()], String::new());
         assert_eq!(picker.candidates.len(), 3);
-        assert_eq!(history_label(&first), "gl@ git log");
+        assert_eq!(history_label(&first), "gl  ↦ git log");
         assert_eq!(history_insert(&first), "gl");
         assert_eq!(history_insert("gl"), "gl");
         assert_eq!(filter_history(&picker.candidates, "ls-files"), [second], "{:?}", picker.candidates.iter().map(|s| history_label(s)).collect::<Vec<_>>());
-        assert_eq!(history_label(&command_key("g\x1b[31m", Some("git status"))), "g^[[31m@ git status");
+        assert_eq!(history_label(&command_key("g\x1b[31m", Some("git status"))), "g^[[31m  ↦ git status");
     }
 
     #[test]
     fn alias_rows_mark_the_alias_and_cut_only_the_expansion() {
         let text = |spans: Vec<Span>| spans.iter().map(|s| s.content.to_string()).collect::<String>();
         let key = command_key("mkal", Some(r#"$EDITOR $ZDOTDIR/conf.d/50-aliases.zsh && source "$ZDOTDIR/.zshrc""#));
-        assert_eq!(text(history_row(&key, 200)), r#"mkal@ $EDITOR $ZDOTDIR/conf.d/50-aliases.zsh && source "$ZDOTDIR/.zshrc""#);
+        assert_eq!(text(history_row(&key, 200)), r#"mkal  ↦ $EDITOR $ZDOTDIR/conf.d/50-aliases.zsh && source "$ZDOTDIR/.zshrc""#);
         let narrow = text(history_row(&key, 20));
-        assert_eq!(narrow, "mkal@ $EDITOR $ZDOT…");
+        assert_eq!(narrow, "mkal  ↦ $EDITOR $ZD…");
         assert_eq!(Span::raw(narrow).width(), 20);
-        assert_eq!(text(history_row(&key, 4)), "mkal@", "too narrow: the alias stays whole and the expansion goes");
+        assert_eq!(text(history_row(&key, 4)), "mkal  ↦", "too narrow: the alias stays whole and the expansion goes");
         assert_eq!(text(history_row("git status", 4)), "git status");
         let row = history_row(&key, 200);
-        assert!(row.iter().any(|s| s.content == "@" && s.style == ACCENT));
+        assert!(row.iter().any(|s| s.content == "↦" && s.style == ACCENT));
         assert_eq!(row.last().unwrap().style, MUTED);
         assert_eq!(history_insert(&key), "mkal");
     }
