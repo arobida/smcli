@@ -1012,6 +1012,75 @@ def run_alias_capture(variant):
             shutil.rmtree(runtime, ignore_errors=True)
 
 
+def run_at_completion(variant):
+    """Tab on @word offers a cwd file; ordinary Tab and SMCLI_NO_KEYS stay the shell's."""
+    kind = variant.kind
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory).resolve()
+        runtime = tempfile.mkdtemp(prefix="smcli-sh.", dir="/tmp")
+        env = new_environment(home, runtime, variant)
+        (home / "smcli-at-probe42.txt").write_text("ok\n")
+        (home / "my notes.txt").write_text("x\n")
+        (home / "zz space.txt").write_text("ok\n")
+        t = Terminal(variant.path, variant.args, env, str(home))
+        try:
+            t.drain()
+            setup_prompt(t, kind)
+            if variant.prelude:
+                t.send(variant.prelude)
+            t.send(init_line(kind))
+            t.type("printf %s my")
+            t.type("\t")
+            t.until_text("notes")
+            t.type("\n")
+            t.until_prompt()
+            t.type("printf %s @probe42")
+            t.type("\t")
+            t.until_text("smcli-at-probe42.txt")
+            t.type("\n")
+            out = t.until_prompt()
+            assert "smcli-at-probe42.txt" in out, (variant.label, out)
+            t.type("printf '%s\\n' @zz")
+            t.type("\t")
+            t.until_text("zz space.txt")
+            t.type("\n")
+            out = t.until_prompt()
+            assert "zz space.txt" in out, (variant.label, out)
+            t.send("true npm i @types/node")
+            assert commands(env)[-1] == "true npm i @types/node", (variant.label, commands(env)[-3:])
+            t.wait_exit(0)
+            print(f"{variant.label}: @ completion, quoted spaces, and ordinary Tab passed.")
+        finally:
+            t.close()
+            stop_services(env)
+            shutil.rmtree(runtime, ignore_errors=True)
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory).resolve()
+        runtime = tempfile.mkdtemp(prefix="smcli-sh.", dir="/tmp")
+        env = new_environment(home, runtime, variant, SMCLI_NO_KEYS="1")
+        (home / "smcli-at-probe42.txt").write_text("ok\n")
+        t = Terminal(variant.path, variant.args, env, str(home))
+        try:
+            t.drain()
+            setup_prompt(t, kind)
+            if variant.prelude:
+                t.send(variant.prelude)
+            t.send(init_line(kind))
+            bound = t.send({"bash": "bind -X", "zsh": "bindkey '^I'", "fish": "bind --user \\t"}[kind])
+            assert "_smcli_tab" not in bound and "_smcli_complete_widget" not in bound, (variant.label, bound)
+            t.type("printf %s @probe42")
+            t.type("\t")
+            t.type("\n")
+            t.until_prompt()
+            assert commands(env)[-1] == "printf %s @probe42", (variant.label, commands(env)[-3:])
+            t.wait_exit(0)
+            print(f"{variant.label}: SMCLI_NO_KEYS leaves Tab alone.")
+        finally:
+            t.close()
+            stop_services(env)
+            shutil.rmtree(runtime, ignore_errors=True)
+
+
 found, skipped = variants()
 # SMCLI_TEST_ONLY=<substring of a variant label> narrows a run while debugging.
 only = os.environ.get("SMCLI_TEST_ONLY", "")
@@ -1019,6 +1088,7 @@ found = [v for v in found if only in v.label]
 for variant in found:
     run_variant(variant)
     run_alias_capture(variant)
+    run_at_completion(variant)
 by_label = {v.label: v for v in found}
 zsh_variant = next((v for v in found if v.kind == "zsh"), None)
 if zsh_variant:

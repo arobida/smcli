@@ -218,6 +218,7 @@ impl Service {
             Operation::Context => return self.context(request),
             Operation::Files => return self.files(|f| f.files(request)),
             Operation::Grep => return self.files(|f| f.grep(request)),
+            Operation::Complete => return self.files(|f| f.complete(request)),
             Operation::Select if matches!(request.mode.as_deref(), Some("suggest" | "search")) => return self.select_command(request),
             Operation::Select => return self.files(|f| f.select(request)),
             Operation::Ping | Operation::Shutdown => {
@@ -334,19 +335,36 @@ impl Service {
         if !(1..=1000).contains(&limit) {
             return Ok(ServiceResponse::failure("bad_request", "limit must be 1 to 1000."));
         }
-        let context = self.ranking_context(request, directory);
-        let mut state = self.lock();
-        state.last_activity = Instant::now();
-        let index = self.current_index(&mut state)?;
+        let mut context = self.ranking_context(request, directory);
+        if context.uses(Signal::Tests) {
+            if let Some(root) = FileSearch::root(directory) {
+                context.candidates.extend(crate::test_candidates::test_candidates(&self.file_search, &root));
+            }
+        }
+        let evidence = FileSearch::root(directory).and_then(|root| self.file_search.ready(&root))
+            .map(crate::file_search::evidence::IndexEvidence);
+        let presence = |commands: &[String]| smcli_search::command_file_presence(commands, directory, evidence.as_ref().unwrap());
+        let git = |commands: &[String]| smcli_search::command_git_activity(commands, directory, evidence.as_ref().unwrap());
+        let idents = |commands: &[String]| crate::file_search::evidence::identifier_flags(evidence.as_ref().unwrap(), commands);
         let prefix = if pick { "" } else { request.prefix.as_deref().unwrap_or("") };
+        let (index, recent) = self.suggestion_snapshot(prefix, &context, pick)?;
         let mut response = ServiceResponse::new(true);
-        response.suggestions = Some(index.suggestions(directory, prefix, limit as usize, Some(&context)));
-        if pick {
-            let recent = index.recent();
+        response.suggestions = Some(index.suggestions_with_evidence(directory, prefix, limit as usize, now(), Some(&context),
+            evidence.as_ref().map(|_| &presence as &dyn Fn(&[String]) -> Vec<bool>),
+            evidence.as_ref().map(|_| &idents as &dyn Fn(&[String]) -> Vec<(bool, bool)>),
+            evidence.as_ref().map(|_| &git as &dyn Fn(&[String]) -> Vec<f64>)));
+        if let Some(recent) = recent {
             response.recent_entries = Some(recent.iter().map(|key| smcli_core::entry::SearchEntry::from_key(key)).collect());
             response.recent = Some(recent.iter().map(|key| smcli_core::entry::command_parts(key).0).collect());
         }
         Ok(response)
+    }
+
+    fn suggestion_snapshot(&self, prefix: &str, context: &RankingContext, pick: bool) -> Result<(SuggestionIndex, Option<Vec<String>>)> {
+        let mut state = self.lock();
+        state.last_activity = Instant::now();
+        let index = self.current_index(&mut state)?;
+        Ok((index.snapshot(prefix, Some(context)), pick.then(|| index.recent())))
     }
 
     /// Remembers which suggestion or search result the user chose for what they typed. Best effort for the picker.
@@ -469,7 +487,10 @@ impl Service {
             // Read native history files and stats outside `state` so records don't wait on I/O.
             let (entries, programs) = self.current_corpus(request, directory, project.as_deref())?;
             let filter = request.filter.clone().unwrap_or_default();
-            let hits = engine.search(query, &entries, limit as usize, &filter, Some(&programs), &signals, now())?;
+            let evidence = FileSearch::root(directory).and_then(|root| self.file_search.ready(&root))
+                .map(crate::file_search::evidence::IndexEvidence);
+            let hits = engine.search_with_evidence(query, &entries, limit as usize, &filter, Some(&programs), &signals, now(),
+                evidence.as_ref().map(|e| e as &dyn smcli_search::ProjectEvidence))?;
             let mut response = ServiceResponse::new(true);
             response.hits = Some(hits);
             Ok(response)
@@ -581,6 +602,33 @@ mod tests {
     }
 
     #[test]
+    fn record_during_suggestion_evidence_is_not_blocked() {
+        let f = Fixture::new();
+        let context = RankingContext::default();
+        let (snapshot, _) = f.service.suggestion_snapshot("", &context, false).unwrap();
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (done, recorded) = std::sync::mpsc::channel();
+        let directory = f.home.to_string_lossy().into_owned();
+        let completed = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let slow = |commands: &[String]| {
+                    entered.send(()).unwrap();
+                    wait.recv().unwrap();
+                    vec![false; commands.len()]
+                };
+                snapshot.suggestions_with_evidence(&directory, "", 10, now(), Some(&context), Some(&slow), None, None);
+            });
+            started.recv_timeout(Duration::from_secs(2)).unwrap();
+            scope.spawn(|| { f.record(); done.send(()).unwrap(); });
+            let completed = recorded.recv_timeout(Duration::from_secs(2)).is_ok();
+            release.send(()).unwrap();
+            completed
+        });
+        assert!(completed, "record waited for suggestion evidence");
+    }
+
+    #[test]
     fn record_during_corpus_build_prevents_stale_publication() {
         let f = Fixture::new();
         let r = f.request(Operation::Search);
@@ -631,6 +679,37 @@ mod tests {
         f.service.lock().engine.as_mut().unwrap().0.ctrl_r_key = Some(false);
         f.service.load_engine(&r, || assert!(f.service.lock().engine.is_none())).unwrap();
         assert!(!Arc::ptr_eq(&old, &f.service.lock().engine.as_ref().unwrap().1));
+    }
+
+    #[test]
+    fn suggest_includes_project_test_candidates() {
+        let f = Fixture::new();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("Cargo.toml"), "[package]\nname = \"testproj\"\nversion = \"0.1.0\"\n").unwrap();
+        std::fs::create_dir(project.path().join("src")).unwrap();
+        std::fs::write(project.path().join("src/lib.rs"), "#[test]\nfn my_test() {}\n").unwrap();
+        assert!(std::process::Command::new("git").args(["init", "-q"]).arg(project.path()).status().unwrap().success());
+        let mut warm = f.request(Operation::Files);
+        warm.directory = Some(project.path().to_string_lossy().into_owned());
+        warm.query = Some("".into());
+        assert!(f.service.file_search.files(&warm).ok);
+        let root = FileSearch::root(project.path().to_str().unwrap()).unwrap();
+        let test_candidates = crate::test_candidates::test_candidates(&f.service.file_search, &root);
+        assert!(test_candidates.iter().any(|c| c.command == "cargo test my_test"), "{test_candidates:?}");
+        let mut r = f.request(Operation::Suggest);
+        r.directory = Some(project.path().to_string_lossy().into_owned());
+        r.prefix = Some("cargo test".into());
+        let response = f.service.ranked(&r).unwrap();
+        let suggestions: Vec<_> = response.suggestions.unwrap();
+        let test = suggestions.iter().find(|s| s.command == "cargo test my_test").expect("{suggestions:?}");
+        assert!(test.why.as_ref().unwrap().iter().any(|w| w == "project test"), "{test:?}");
+        let mut off = f.request(Operation::Suggest);
+        off.directory = Some(project.path().to_string_lossy().into_owned());
+        off.prefix = Some("cargo test".into());
+        off.ranking_off = Some("tests".into());
+        let response = f.service.ranked(&off).unwrap();
+        let suggestions: Vec<_> = response.suggestions.unwrap();
+        assert!(!suggestions.iter().any(|s| s.command == "cargo test my_test"), "{suggestions:?}");
     }
 }
 

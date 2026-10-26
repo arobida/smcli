@@ -1,4 +1,5 @@
 mod cli;
+mod complete;
 mod context;
 mod highlight;
 mod initialize;

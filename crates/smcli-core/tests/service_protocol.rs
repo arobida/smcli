@@ -50,6 +50,7 @@ fn swift_service_protocol_fixtures_round_trip() {
     round_trip::<ServiceResponse>(include_str!("fixtures/service_protocol/alias-results-v2.jsonl"));
     let operations: Vec<_> = REQUESTS
         .lines()
+        .chain(include_str!("fixtures/service_protocol/requests-v2.jsonl").lines())
         .map(|line| decode_line::<ServiceRequest>(line.as_bytes()).unwrap().op)
         .collect();
     for op in [
@@ -61,6 +62,7 @@ fn swift_service_protocol_fixtures_round_trip() {
         Operation::Context,
         Operation::Files,
         Operation::Grep,
+        Operation::Complete,
         Operation::Select,
         Operation::Shutdown,
     ] {

@@ -10,9 +10,14 @@ pub enum Signal {
     Transition,
     Selection,
     Script,
+    Tests,
+    Git,
     Hint,
     Path,
     Files,
+    Index,
+    Expand,
+    Evidence,
     Alias,
 }
 
@@ -23,9 +28,14 @@ impl Signal {
             "transition" => Self::Transition,
             "selection" => Self::Selection,
             "script" => Self::Script,
+            "tests" => Self::Tests,
+            "git" => Self::Git,
             "hint" => Self::Hint,
             "path" => Self::Path,
             "files" => Self::Files,
+            "index" => Self::Index,
+            "expand" => Self::Expand,
+            "evidence" => Self::Evidence,
             "alias" => Self::Alias,
             _ => return None,
         })
@@ -35,6 +45,7 @@ impl Signal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateKind {
     Script,
+    Test,
     Hint,
 }
 
@@ -48,7 +59,7 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    fn new(command: String, kind: CandidateKind, reason: &str) -> Self {
+    pub fn new(command: String, kind: CandidateKind, reason: &str) -> Self {
         Self { command, kind, reason: reason.into() }
     }
 }
@@ -90,7 +101,7 @@ impl RankingContext {
     }
 
     pub fn candidates_of(&self, kind: CandidateKind) -> Vec<&Candidate> {
-        if !self.uses(if kind == CandidateKind::Script { Signal::Script } else { Signal::Hint }) {
+        if !self.uses(match kind { CandidateKind::Script => Signal::Script, CandidateKind::Test => Signal::Tests, CandidateKind::Hint => Signal::Hint }) {
             return vec![];
         }
         self.candidates.iter().filter(|c| c.kind == kind).collect()
@@ -300,6 +311,11 @@ pub fn apply_ranking_signals(
         scores.entry(script.command.clone()).and_modify(|s| *s *= 1.5).or_insert(0.3);
         why.entry(script.command.clone()).or_default().push(script.reason.clone());
     }
+    let tests = context.map_or(empty.clone(), |c| c.candidates_of(CandidateKind::Test));
+    for test in tests.iter().filter(|t| has_prefix(&t.command, prefix)) {
+        scores.entry(test.command.clone()).and_modify(|s| *s *= 1.5).or_insert(0.3);
+        why.entry(test.command.clone()).or_default().push(test.reason.clone());
+    }
     if let Some(previous) = previous.filter(|_| uses(context, Signal::Transition) && !followers.is_empty()) {
         let total = followers.values().sum::<i64>() as f64;
         for (command, count) in followers {
@@ -365,5 +381,12 @@ mod tests {
         assert_eq!(SelectionLog::similarity("docker ps", "docker"), 0.25);
         assert_eq!(SelectionLog::similarity("start containers", "start the containers"), 0.5 * 2.0 / 3.0);
         assert_eq!(SelectionLog::similarity("", "x"), 0.0);
+    }
+
+    #[test]
+    fn evidence_switch_parses() {
+        let off = RankingContext::disabled(&HashMap::from([("SMCLI_RANKING_OFF".into(), "evidence".into())]));
+        assert!(off.contains(&Signal::Evidence));
+        assert!(!RankingContext { off, ..Default::default() }.uses(Signal::Evidence));
     }
 }

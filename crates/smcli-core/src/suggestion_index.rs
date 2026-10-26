@@ -48,7 +48,7 @@ impl CommandAffinity {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Tally {
     score: f64,
     runs: i64,
@@ -65,7 +65,7 @@ impl Default for Tally {
         }
     }
 }
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct DirectoryTally {
     score: f64,
     runs: i64,
@@ -108,6 +108,20 @@ impl SuggestionIndex {
             index.add(&run);
         }
         index
+    }
+
+    /// Request-local ranking data, without the run log; use only for reading suggestions.
+    pub fn snapshot(&self, prefix: &str, context: Option<&RankingContext>) -> Self {
+        let mut commands = self.commands.clone();
+        commands.retain(|key, _| {
+            let (typed, expanded) = command_parts(key);
+            has_prefix(&typed, prefix) || (uses(context, Signal::Alias) && expanded.is_some_and(|e| has_prefix(&e, prefix)))
+        });
+        // Keep directory iteration order so floating-point accumulation is identical.
+        let mut directories = self.directories.clone();
+        for tallies in directories.values_mut() { tallies.retain(|key, _| commands.contains_key(key)); }
+        Self { base: self.base, commands, directories, answering: HashMap::new(), history: vec![],
+            affinity: self.affinity.clone(), picks: self.picks.clone() }
     }
 
     /// Remembers that `command` was picked for `query`, as `record_pick` stored it.
@@ -192,6 +206,13 @@ impl SuggestionIndex {
         now: f64,
         context: Option<&RankingContext>,
     ) -> Vec<Suggestion> {
+        self.suggestions_with_evidence(directory, prefix, limit, now, context, None, None, None)
+    }
+
+    pub fn suggestions_with_evidence(&self, directory: &str, prefix: &str, limit: usize, now: f64,
+        context: Option<&RankingContext>, evidence: Option<&dyn Fn(&[String]) -> Vec<bool>>,
+        identifiers: Option<&dyn Fn(&[String]) -> Vec<(bool, bool)>>,
+        git_activity: Option<&dyn Fn(&[String]) -> Vec<f64>>) -> Vec<Suggestion> {
         let here = if directory.len() > 1 {
             directory.strip_suffix('/').unwrap_or(directory)
         } else {
@@ -241,7 +262,7 @@ impl SuggestionIndex {
             .and_then(|c| c.session.as_ref())
             .and_then(|s| self.affinity.last.get(s));
         let followers = previous.map(|p| self.following(p)).unwrap_or_default();
-        let why = apply_ranking_signals(
+        let mut why = apply_ranking_signals(
             &mut scores,
             prefix,
             context,
@@ -249,6 +270,47 @@ impl SuggestionIndex {
             &followers,
             &self.picks.weights(prefix, now),
         );
+        if uses(context, Signal::Files) && uses(context, Signal::Index) && let Some(evidence) = evidence {
+            let keys: Vec<String> = scores.keys().cloned().collect();
+            let commands: Vec<String> = keys.iter().map(|key| {
+                if uses(context, Signal::Alias) { key.clone() } else { command_parts(key).0 }
+            }).collect();
+            for (command, present) in keys.iter().zip(evidence(&commands)) {
+                if present {
+                    *scores.get_mut(command).unwrap() += 0.08;
+                    why.entry(command.clone()).or_default().push("input file exists".into());
+                }
+            }
+        }
+        if uses(context, Signal::Git) && let Some(git_activity) = git_activity {
+            let keys: Vec<String> = scores.keys().cloned().collect();
+            let commands: Vec<String> = keys.iter().map(|key| {
+                if uses(context, Signal::Alias) { key.clone() } else { command_parts(key).0 }
+            }).collect();
+            for (command, activity) in keys.iter().zip(git_activity(&commands)) {
+                if activity > 0.0 {
+                    *scores.get_mut(command).unwrap() += 0.04 * activity;
+                    why.entry(command.clone()).or_default().push(if activity >= 1.0 { "edited".into() } else { "recently changed".into() });
+                }
+            }
+        }
+        if uses(context, Signal::Evidence) && let Some(identifiers) = identifiers {
+            let mut keys: Vec<String> = scores.keys().cloned().collect();
+            keys.sort_by(|a, b| scores[b].total_cmp(&scores[a]).then_with(|| a.cmp(b)));
+            let commands: Vec<String> = keys.iter().map(|key| {
+                let (typed, expanded) = command_parts(key);
+                if uses(context, Signal::Alias) { expanded.unwrap_or(typed) } else { typed }
+            }).collect();
+            for (key, (seen, defined)) in keys.into_iter().zip(identifiers(&commands)) {
+                if defined {
+                    *scores.get_mut(&key).unwrap() += 0.06;
+                    why.entry(key).or_default().push("defined in project".into());
+                } else if seen {
+                    *scores.get_mut(&key).unwrap() += 0.03;
+                    why.entry(key).or_default().push("found in project".into());
+                }
+            }
+        }
         let last = |c: &str| {
             self.commands
                 .get(c)
@@ -367,12 +429,39 @@ mod tests {
             }],
             ..Default::default()
         };
+        let present = |commands: &[String]| vec![true; commands.len()];
+        let plain = index.suggestions_at("/p", "", 100, now, None);
+        let boosted = index.suggestions_with_evidence("/p", "", 100, now, None, Some(&present), None, None);
+        for before in plain {
+            let after = boosted.iter().find(|s| s.command == before.command && s.expanded_command == before.expanded_command).unwrap();
+            assert!((after.score - before.score - 0.08).abs() < 1e-10);
+        }
+        let disabled = RankingContext { off: [Signal::Index].into(), ..Default::default() };
+        assert_eq!(index.suggestions_with_evidence("/p", "", 100, now, Some(&disabled), Some(&present), None, None),
+            index.suggestions_at("/p", "", 100, now, Some(&disabled)));
+        let alias_off = RankingContext { off: [Signal::Alias].into(), ..Default::default() };
+        let typed_presence = |commands: &[String]| {
+            assert_eq!(commands, ["gl", "gl"]);
+            vec![false; commands.len()]
+        };
+        let typed_identifiers = |commands: &[String]| {
+            assert_eq!(commands, ["gl", "gl"]);
+            vec![(false, false); commands.len()]
+        };
+        index.suggestions_with_evidence("/p", "gl", 100, now, Some(&alias_off), Some(&typed_presence), Some(&typed_identifiers), None);
         for directory in ["/p", "/p/", "/p/sub", "/", "/else"] {
             for prefix in ["", "git", "gl", "cargo", "missing"] {
                 for context in [None, Some(&context)] {
                     let scan =
                         history.suggestions(&user_name(), directory, prefix, 20, now, context)?;
                     let indexed = index.suggestions_at(directory, prefix, 20, now, context);
+                    let snapshot = index.snapshot(prefix, context);
+                    assert!(snapshot.history.is_empty());
+                    assert_eq!(indexed, snapshot.suggestions_at(directory, prefix, 20, now, context));
+                    let idents = |commands: &[String]| commands.iter().map(|c| (true, c.contains("test"))).collect();
+                    let git = |commands: &[String]| vec![0.5; commands.len()];
+                    assert_eq!(index.suggestions_with_evidence(directory, prefix, 20, now, context, Some(&present), Some(&idents), Some(&git)),
+                        snapshot.suggestions_with_evidence(directory, prefix, 20, now, context, Some(&present), Some(&idents), Some(&git)));
                     assert_eq!(indexed.len(), scan.len());
                     for (mut a, b) in indexed.into_iter().zip(scan) {
                         assert!((a.score - b.score).abs() < 1e-10);
@@ -468,5 +557,50 @@ mod tests {
         ];
         let fresh = SuggestionIndex::new(sorted, SelectionLog::default());
         assert_eq!(fresh.previous_command("s").as_deref(), Some("third"));
+    }
+
+    #[test]
+    fn defined_test_outranks_an_equal_habit_and_a_missed_budget_does_not() {
+        let now = 1_700_000_000.0;
+        let run = |command: &str, at: f64| Run {
+            command: command.into(), expanded_command: None, directory: "/p".into(),
+            started_at: at, exit_code: 0, session: "s".into(),
+        };
+        let index = SuggestionIndex::new(vec![
+            run("cargo test dedup_keeps_latest", now - 10.0),
+            run("cargo test old_removed_case", now - 1.0),
+        ], SelectionLog::default());
+        let defined = |commands: &[String]| commands.iter().map(|c| {
+            if c.contains("dedup_keeps_latest") { (true, true) } else { (false, false) }
+        }).collect();
+        let plain = index.suggestions_with_evidence("/p", "cargo test", 10, now, None, None, None, None);
+        let boosted = index.suggestions_with_evidence("/p", "cargo test", 10, now, None, None, Some(&defined), None);
+        assert_eq!(plain[0].command, "cargo test old_removed_case");
+        assert_eq!(boosted[0].command, "cargo test dedup_keeps_latest");
+        assert!(boosted[0].why.as_ref().unwrap().iter().any(|w| w == "defined in project"));
+        let timed_out = |_: &[String]| Vec::<(bool, bool)>::new();
+        assert_eq!(index.suggestions_with_evidence("/p", "cargo test", 10, now, None, None, Some(&timed_out), None), plain);
+        let off = RankingContext { off: [Signal::Evidence].into(), ..Default::default() };
+        let boom = |_: &[String]| -> Vec<(bool, bool)> { panic!("evidence off") };
+        assert_eq!(
+            index.suggestions_with_evidence("/p", "cargo test", 10, now, Some(&off), None, Some(&boom), None),
+            index.suggestions_with_evidence("/p", "cargo test", 10, now, Some(&off), None, None, None));
+    }
+
+    #[test]
+    fn test_candidate_carries_project_test_label() {
+        let index = SuggestionIndex::new(vec![], SelectionLog::default());
+        let context = RankingContext {
+            project_root: Some("/p".into()),
+            candidates: vec![Candidate {
+                command: "cargo test my_test".into(),
+                kind: CandidateKind::Test,
+                reason: "project test".into(),
+            }],
+            ..Default::default()
+        };
+        let suggestions = index.suggestions_at("/p", "cargo test", 10, 0.0, Some(&context));
+        let test = suggestions.iter().find(|s| s.command == "cargo test my_test").unwrap();
+        assert!(test.why.as_ref().unwrap().iter().any(|w| w == "project test"), "{test:?}");
     }
 }

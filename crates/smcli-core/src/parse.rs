@@ -262,3 +262,90 @@ mod tests {
         assert_eq!(program_of("/usr/bin/git status", CommandBreakdown::parse("/usr/bin/git status").as_ref()).as_deref(), Some("git"));
     }
 }
+
+/// Shell-like glob match supporting `**`, `*`, `?` and `[abc]` / `[a-z]` / `[!x]` classes.
+/// Both `pat` and `text` use `/` separators.
+pub fn glob_match(pat: &str, text: &str) -> bool {
+    if pat.starts_with("**") {
+        let rest = pat[2..].strip_prefix('/').unwrap_or(&pat[2..]);
+        if rest.is_empty() {
+            return true;
+        }
+        let mut s = text;
+        loop {
+            if glob_match(rest, s) {
+                return true;
+            }
+            let Some(c) = s.chars().next() else { return false };
+            s = &s[c.len_utf8()..];
+        }
+    }
+    if pat.starts_with('*') {
+        let rest = &pat[1..];
+        let mut s = text;
+        loop {
+            if glob_match(rest, s) {
+                return true;
+            }
+            match s.chars().next() {
+                Some('/') | None => return false,
+                Some(c) => s = &s[c.len_utf8()..],
+            }
+        }
+    }
+    let Some(pc) = pat.chars().next() else {
+        return text.is_empty();
+    };
+    if pc == '?' {
+        return match text.chars().next() {
+            Some('/') | None => false,
+            Some(c) => glob_match(&pat[pc.len_utf8()..], &text[c.len_utf8()..]),
+        };
+    }
+    if pc == '[' {
+        let Some(tc) = text.chars().next() else { return false };
+        if tc == '/' {
+            return false;
+        }
+        return match glob_class_eat(pat, tc) {
+            Some((true, rest)) => glob_match(rest, &text[tc.len_utf8()..]),
+            Some((false, _)) => false,
+            None => tc == '[' && glob_match(&pat[1..], &text[tc.len_utf8()..]),
+        };
+    }
+    match text.chars().next() {
+        Some(tc) if tc == pc => glob_match(&pat[pc.len_utf8()..], &text[tc.len_utf8()..]),
+        _ => false,
+    }
+}
+
+fn glob_class_eat(pat: &str, c: char) -> Option<(bool, &str)> {
+    let b = pat.as_bytes();
+    if b.first() != Some(&b'[') {
+        return None;
+    }
+    let mut i = 1;
+    let neg = i < b.len() && matches!(b[i], b'!' | b'^');
+    if neg {
+        i += 1;
+    }
+    let start = i;
+    let mut found = false;
+    while i < b.len() {
+        if b[i] == b']' && i > start {
+            return Some((found != neg, &pat[i + 1..]));
+        }
+        if i + 2 < b.len() && b[i + 1] == b'-' && b[i + 2] != b']' {
+            if c.is_ascii() && b[i] as char <= c && c <= b[i + 2] as char {
+                found = true;
+            }
+            i += 3;
+        } else {
+            if c == b[i] as char {
+                found = true;
+            }
+            i += 1;
+        }
+    }
+    None
+}

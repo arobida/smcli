@@ -357,6 +357,46 @@ elif [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
     fi
     unset _smcli_seen
     unset _smcli_maps
+fi
+# smcli: @ path completion. Typed text is unchanged unless completion is invoked.
+if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
+    _smcli_complete_bin=\#(binary)
+    if (( BASH_VERSINFO[0] >= 4 )); then
+        _smcli_tab_orig=complete
+        while IFS= read -r _smcli_bind_line; do
+            [[ $_smcli_bind_line == '"\t": '* ]] || continue
+            _smcli_tab_orig=${_smcli_bind_line#'"\t": '}
+            _smcli_tab_orig=${_smcli_tab_orig%.}
+            break
+        done < <(bind -p 2>/dev/null)
+        _smcli_tab() {
+            (( BASH_VERSINFO[0] >= 5 )) || local LC_ALL=C
+            local before=${READLINE_LINE:0:READLINE_POINT} after=${READLINE_LINE:READLINE_POINT}
+            local word=${before##*[[:space:]]} cmd=${READLINE_LINE%%[[:space:]]*} hit
+            if [[ $word == @* ]]; then
+                hit=$(SMCLI_SHELL=bash "$_smcli_complete_bin" complete --word "$word" --command "$cmd" --limit 1)
+                if [[ -n $hit ]]; then
+                    READLINE_LINE=${before%"$word"}$hit$after
+                    READLINE_POINT=$((${#before} - ${#word} + ${#hit}))
+                fi
+                bind '"\e[0n": redraw-current-line'
+            else
+                bind "\"\e[0n\": $_smcli_tab_orig"
+            fi
+        }
+        bind -x '"\C-x@": _smcli_tab'
+        bind '"\t": "\C-x@\e[0n"'
+    else
+        _smcli_complete() {
+            local cur=${COMP_WORDS[COMP_CWORD]} cmd=${COMP_WORDS[0]} line
+            COMPREPLY=()
+            [[ $cur == @* ]] || return
+            while IFS= read -r line; do
+                [[ -n $line ]] && COMPREPLY+=("$line")
+            done < <(SMCLI_SHELL=bash "$_smcli_complete_bin" complete --word "$cur" --command "$cmd")
+        }
+        complete -o bashdefault -o default -o nospace -F _smcli_complete printf echo cd pushd z cat npm true 2>/dev/null || true
+    fi
 fi"###
         }
         "zsh" => {
@@ -525,6 +565,32 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
         mkdir -p ${_smcli_seen:h} 2>/dev/null && print -rn -- $_smcli_list >| $_smcli_seen 2>/dev/null
     fi
     unset _smcli_keymap _smcli_kept _smcli_seen _smcli_list
+fi
+# smcli: @ path completion. Typed text is unchanged unless completion is invoked.
+if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
+    _smcli_complete_bin=\#(binary)
+    if [[ -z ${_smcli_tab_orig-} || $_smcli_tab_orig == _smcli_complete_widget ]]; then
+        _smcli_tab_orig=${${(z)"$(bindkey '^I')"}[-1]}
+        [[ -n $_smcli_tab_orig && $_smcli_tab_orig != (undefined-key|_smcli_complete_widget) ]] || _smcli_tab_orig=expand-or-complete
+    fi
+    _smcli_complete_widget() {
+        setopt localoptions noglob noshwordsplit
+        local word=${LBUFFER##*[[:space:]]} cmd=${${(z)BUFFER}[1]}
+        if [[ $word != @* ]]; then
+            zle "$_smcli_tab_orig"
+            return
+        fi
+        local -a hits
+        hits=("${(@f)${"$(SMCLI_SHELL=zsh "$_smcli_complete_bin" complete --word "$word" --command "$cmd" 2>/dev/null)"}}")
+        if (( $#hits == 1 )) && [[ -n $hits[1] ]]; then
+            LBUFFER="${LBUFFER%$word}${hits[1]}"
+        elif (( $#hits > 1 )); then
+            zle -M "${(F)hits}"
+        fi
+    }
+    zle -N _smcli_complete_widget
+    bindkey '^I' _smcli_complete_widget
+    bindkey -M viins '^I' _smcli_complete_widget 2>/dev/null || true
 fi"###
         }
         "fish" => {
@@ -692,6 +758,21 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
     end
     functions -e _smcli_bind
     set -e _smcli_kept
+end
+# smcli: @ path completion. Typed text is unchanged unless completion is invoked.
+if status is-interactive; and test -z "$SMCLI_NO_KEYS"
+    set -g _smcli_complete_bin \#(fishBinary)
+    function _smcli_complete_widget
+        set -l token (commandline -ct)
+        if string match -q -- '@*' -- $token
+            set -l cmd (commandline -op)
+            set -l hits (SMCLI_SHELL=fish command $_smcli_complete_bin complete --word "$token" --command $cmd[1])
+            test (count $hits) -eq 1; and commandline -t -- $hits[1]
+        else
+            commandline -f complete
+        end
+    end
+    bind \t _smcli_complete_widget
 end"###
         }
         _ => bail!("shell-init requires bash, zsh or fish."),
@@ -717,6 +798,16 @@ end"###
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn at_completion_hooks_call_smcli_complete() {
+        for shell in ["bash", "zsh", "fish"] {
+            let hooks = render_with_keys(shell, "smcli", true, false, false, false, false).unwrap();
+            assert!(hooks.contains("complete --word"), "{shell}");
+            assert!(hooks.contains("_smcli_complete"), "{shell}");
+            assert!(hooks.contains("SMCLI_NO_KEYS"), "{shell}");
+        }
+    }
 
     #[test]
     fn record_hooks_pass_optional_expanded_flag() {

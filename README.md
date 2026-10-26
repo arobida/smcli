@@ -58,7 +58,7 @@ in the shell to make recording synchronous.
 `shell-init` binds **Up** and **Ctrl-R** to history search. On an empty prompt in Bash and Zsh, **Left** opens that same search and **Right** opens directory suggestions, when you chose those keys in `smcli init`; a line that already has text keeps normal arrow movement. Start typing to filter every captured and native command
 (all words must match), press Tab for semantic search, Enter to put the command on your
 prompt, Esc to cancel. Text already on the prompt becomes the initial query. Set
-`SMCLI_NO_KEYS=1` before the `eval` to keep your shell's own keys, or `SMCLI_EXTRA_KEYS=1` to add Left and Right on an empty line, Ctrl-Right and Alt-;. Bash needs 4.0+. Fish keeps Right for autosuggestions.
+`SMCLI_NO_KEYS=1` before the `eval` to keep your shell's own keys, or `SMCLI_EXTRA_KEYS=1` to add Left and Right on an empty line, Ctrl-Right and Alt-;. Bash needs 4.0+. Fish keeps Right for autosuggestions. In the shell hooks, press Tab on a word starting with `@` to complete a project path; `cd` offers directories only, and glob characters use glob matching. Nothing changes unless you press Tab.
 
 ## Install
 
@@ -145,6 +145,8 @@ $ smcli --help
   each run is scored by recency (halves every 14 days), directory, and exit status.
   An optional prefix matches the start of the command literally. `--dir` requires an
   absolute path. Search and suggestions exclude commands recognized as invoking smcli.
+
+Project-index ranking switches are controlled by `SMCLI_RANKING_OFF`: `index`, `git`, `evidence`, `tests` and `expand` each disable a service-only signal; each signal can only raise rank. Add names comma-separated to disable multiple signals.
 
 ## Caveats
 

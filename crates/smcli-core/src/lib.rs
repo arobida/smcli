@@ -13,3 +13,4 @@ pub mod service_client;
 
 pub mod suggestion_index;
 pub mod context_cache;
+pub mod tests_discovery;

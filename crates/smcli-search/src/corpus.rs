@@ -389,7 +389,7 @@ impl SearchSignals {
         if terms.is_empty() {
             return added;
         }
-        let candidates = context.map(|c| [c.candidates_of(CandidateKind::Hint), c.candidates_of(CandidateKind::Script)].concat());
+        let candidates = context.map(|c| [c.candidates_of(CandidateKind::Hint), c.candidates_of(CandidateKind::Script), c.candidates_of(CandidateKind::Test)].concat());
         for candidate in candidates.unwrap_or_default() {
             if seen.contains(&candidate.command) || coverage(&candidate.command, &terms) != 1.0 {
                 continue;
@@ -433,6 +433,11 @@ pub fn coverage(command: &str, terms: &[String]) -> f64 {
 /// Failures lower the score without excluding: the failed command may be exactly what is wanted.
 /// `signals` adds the project, the previous command, earlier picks, project scripts and Git state, each with a `why`.
 pub fn rerank(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &SearchSignals) -> Vec<SearchEntry> {
+    rerank_with_evidence(hits, literal, query, now, signals, None)
+}
+
+pub fn rerank_with_evidence(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &SearchSignals,
+                            project: Option<&dyn crate::ProjectEvidence>) -> Vec<SearchEntry> {
     let query_terms: Vec<String> = query.to_lowercase().split_whitespace().map(String::from).collect();
     let terms = smcli_core::parse::shell_words(query).unwrap_or_default();
     let context = signals.context.as_ref();
@@ -444,7 +449,7 @@ pub fn rerank(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &Se
         }
         map
     };
-    let (scripts, hints) = (first_of(CandidateKind::Script), first_of(CandidateKind::Hint));
+    let (scripts, hints, tests) = (first_of(CandidateKind::Script), first_of(CandidateKind::Hint), first_of(CandidateKind::Test));
     let empty = HashMap::new();
     let followed = if uses(context, Signal::Transition) { &signals.followers } else { &empty };
     let follow_total = followed.values().sum::<i64>() as f64;
@@ -453,9 +458,10 @@ pub fn rerank(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &Se
     for (entry, relevance) in &hits {
         primary_relevance.entry(entry.primary().into()).and_modify(|r| *r = r.max(*relevance)).or_insert(*relevance);
     }
-    let evidence = crate::filesystem::evidence(&hits, signals,
+    let evidence = crate::filesystem::evidence_with_index(&hits, signals,
         uses(context, Signal::Path) && signals.shell_path.is_some(),
-        uses(context, Signal::Files) && signals.directory.is_some());
+        uses(context, Signal::Files) && signals.directory.is_some(), project);
+    let id_hits = identifier_hits(&hits, project, context);
     let mut scored: Vec<(usize, SearchEntry, f64)> = hits
         .into_iter()
         .enumerate()
@@ -488,7 +494,7 @@ pub fn rerank(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &Se
             }
             // A project command counts in proportion to how much of the query it matches, so an unrelated script does
             // not ride along on a hint or a habit.
-            let covered = if hints.contains_key(&entry.command) || scripts.contains_key(&entry.command) {
+            let covered = if hints.contains_key(&entry.command) || scripts.contains_key(&entry.command) || tests.contains_key(&entry.command) {
                 entry_coverage(&entry, &query_terms)
             } else {
                 0.0
@@ -497,6 +503,9 @@ pub fn rerank(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &Se
                 boost += 1.5 * covered;
                 why.push(reason.clone());
             } else if covered > 0.0 && let Some(reason) = scripts.get(&entry.command) {
+                boost += 0.8 * covered;
+                why.push(reason.clone());
+            } else if covered > 0.0 && let Some(reason) = tests.get(&entry.command) {
                 boost += 0.8 * covered;
                 why.push(reason.clone());
             }
@@ -517,7 +526,7 @@ pub fn rerank(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &Se
                     why.push("always failed".into());
                 }
             }
-            let (available, present) = evidence.get(offset).copied().unwrap_or_default();
+            let (available, present, git_activity) = evidence.get(offset).copied().unwrap_or_default();
             let mut score = relevance * boost.powf(relevance);
             if available {
                 score += 0.1 * relevance;
@@ -527,12 +536,37 @@ pub fn rerank(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &Se
                 score += 0.08 * relevance;
                 why.push("input file exists".into());
             }
+            if git_activity > 0.0 {
+                score += 0.04 * git_activity * relevance;
+                why.push(if git_activity >= 1.0 { "edited".into() } else { "recently changed".into() });
+            }
+            let (seen, defined) = command_identifier(entry.primary(), &id_hits);
+            if defined {
+                score += 0.06 * relevance;
+                why.push("defined in project".into());
+            } else if seen {
+                score += 0.03 * relevance;
+                why.push("found in project".into());
+            }
             entry.why = Some(why);
             (offset, entry, score)
         })
         .collect();
     scored.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
     scored.into_iter().map(|(_, entry, _)| entry).collect()
+}
+
+/// One lookup for the pool. Names the budget did not check are absent, which is neutral.
+fn identifier_hits(hits: &[Hit], project: Option<&dyn crate::ProjectEvidence>, context: Option<&RankingContext>) -> Vec<crate::evidence::IdentifierEvidence> {
+    let Some(project) = project.filter(|_| uses(context, Signal::Evidence)) else { return vec![] };
+    let refs: Vec<&str> = hits.iter().map(|(entry, _)| entry.primary()).collect();
+    let names = crate::identifiers::identifiers(&refs);
+    if names.is_empty() { return vec![] }
+    project.find_identifiers(&names, std::time::Duration::from_millis(20))
+}
+
+fn command_identifier(command: &str, found: &[crate::evidence::IdentifierEvidence]) -> (bool, bool) {
+    crate::evidence::command_flags(command, found)
 }
 
 #[cfg(test)]
@@ -779,5 +813,125 @@ mod tests {
         ]);
         let (stripped, _, _) = parse_markers("$bun $create", &programs, &HashSet::new());
         assert!(is_literal_query(&stripped, &programs));
+    }
+
+    #[test]
+    fn defined_test_ranks_first_and_a_missed_budget_stays_neutral() {
+        use crate::evidence::{IdentifierEvidence, ProjectEvidence};
+        use std::path::PathBuf;
+        use std::time::Duration;
+
+        struct Found(Vec<IdentifierEvidence>);
+        impl ProjectEvidence for Found {
+            fn exists(&self, paths: &[PathBuf]) -> Vec<bool> { vec![false; paths.len()] }
+            fn find_identifiers(&self, names: &[String], budget: Duration) -> Vec<IdentifierEvidence> {
+                assert_eq!(budget, Duration::from_millis(20));
+                self.0.iter().filter(|e| names.iter().any(|n| n == &e.name)).cloned().collect()
+            }
+        }
+        struct TimedOut;
+        impl ProjectEvidence for TimedOut {
+            fn exists(&self, paths: &[PathBuf]) -> Vec<bool> { vec![false; paths.len()] }
+            fn find_identifiers(&self, _: &[String], budget: Duration) -> Vec<IdentifierEvidence> {
+                assert_eq!(budget, Duration::from_millis(20));
+                vec![]
+            }
+        }
+        struct Boom;
+        impl ProjectEvidence for Boom {
+            fn exists(&self, paths: &[PathBuf]) -> Vec<bool> { vec![false; paths.len()] }
+            fn find_identifiers(&self, _: &[String], _: Duration) -> Vec<IdentifierEvidence> { panic!("evidence off") }
+        }
+
+        let hits = vec![
+            (entry("cargo test old_removed_case", 1, 0.0, None, 0), 1.0),
+            (entry("cargo test some_helper_name", 1, 0.0, None, 0), 1.0),
+            (entry("cargo test dedup_keeps_latest", 1, 0.0, None, 0), 1.0),
+        ];
+        let signals = SearchSignals::default();
+        let found = Found(vec![
+            IdentifierEvidence { name: "dedup_keeps_latest".into(), is_definition: true },
+            IdentifierEvidence { name: "some_helper_name".into(), is_definition: false },
+        ]);
+        let ranked = rerank_with_evidence(hits.clone(), true, "cargo test", 0.0, &signals, Some(&found));
+        assert_eq!(ranked.iter().map(|e| e.command.as_str()).collect::<Vec<_>>(), [
+            "cargo test dedup_keeps_latest", "cargo test some_helper_name", "cargo test old_removed_case",
+        ]);
+        assert!(ranked[0].why.as_ref().unwrap().iter().any(|w| w == "defined in project"));
+        assert!(ranked[1].why.as_ref().unwrap().iter().any(|w| w == "found in project"));
+        assert!(ranked[2].why.as_ref().unwrap().iter().all(|w| w != "defined in project" && w != "found in project"));
+
+        let plain = rerank(hits.clone(), true, "cargo test", 0.0, &signals);
+        let timed = rerank_with_evidence(hits.clone(), true, "cargo test", 0.0, &signals, Some(&TimedOut));
+        assert_eq!(plain.iter().map(|e| &e.command).collect::<Vec<_>>(), timed.iter().map(|e| &e.command).collect::<Vec<_>>());
+        assert_eq!(plain.iter().map(|e| &e.why).collect::<Vec<_>>(), timed.iter().map(|e| &e.why).collect::<Vec<_>>());
+
+        let mut off = SearchSignals::default();
+        off.context = Some(RankingContext { off: [Signal::Evidence].into(), ..Default::default() });
+        let disabled = rerank_with_evidence(hits.clone(), true, "cargo test", 0.0, &off, Some(&Boom));
+        let plain_off = rerank(hits, true, "cargo test", 0.0, &off);
+        assert_eq!(disabled.iter().map(|e| &e.command).collect::<Vec<_>>(), plain_off.iter().map(|e| &e.command).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn git_activity_boosts_edited_file_above_equal_habit() {
+        use crate::evidence::ProjectEvidence;
+        use std::path::PathBuf;
+        struct Gitty;
+        impl ProjectEvidence for Gitty {
+            fn exists(&self, paths: &[PathBuf]) -> Vec<bool> { vec![false; paths.len()] }
+            fn git_activity(&self, paths: &[PathBuf]) -> Vec<f64> {
+                paths.iter().map(|p| if p.to_string_lossy().contains("edited") { 1.0 } else { 0.0 }).collect()
+            }
+        }
+        let hits = vec![
+            (entry("cat edited.txt", 1, 0.0, None, 0), 1.0),
+            (entry("cat clean.txt", 1, 0.0, None, 0), 1.0),
+        ];
+        let signals = SearchSignals { directory: Some("/p".into()), ..Default::default() };
+        let ranked = rerank_with_evidence(hits, true, "cat", 0.0, &signals, Some(&Gitty));
+        assert_eq!(ranked[0].command, "cat edited.txt");
+        assert!(ranked[0].why.as_ref().unwrap().contains(&"edited".into()));
+    }
+
+    #[test]
+    fn usage_dominates_git_activity() {
+        use crate::evidence::ProjectEvidence;
+        use std::path::PathBuf;
+        struct Gitty;
+        impl ProjectEvidence for Gitty {
+            fn exists(&self, paths: &[PathBuf]) -> Vec<bool> { vec![false; paths.len()] }
+            fn git_activity(&self, paths: &[PathBuf]) -> Vec<f64> {
+                paths.iter().map(|p| if p.to_string_lossy().contains("edited") { 1.0 } else { 0.0 }).collect()
+            }
+        }
+        let hits = vec![
+            (entry("cat edited.txt", 1, 0.0, None, 0), 1.0),
+            (entry("cat clean.txt", 50, 100.0, None, 0), 0.9),
+        ];
+        let signals = SearchSignals { directory: Some("/p".into()), ..Default::default() };
+        let ranked = rerank_with_evidence(hits, true, "cat", 0.0, &signals, Some(&Gitty));
+        assert_eq!(ranked[0].command, "cat clean.txt");
+    }
+
+    #[test]
+    fn git_signal_off_does_not_call_git_activity() {
+        use crate::evidence::ProjectEvidence;
+        use std::path::PathBuf;
+        struct Boom;
+        impl ProjectEvidence for Boom {
+            fn exists(&self, paths: &[PathBuf]) -> Vec<bool> { vec![false; paths.len()] }
+            fn git_activity(&self, _: &[PathBuf]) -> Vec<f64> { panic!("git signal off") }
+        }
+        let hits = vec![
+            (entry("cat edited.txt", 1, 0.0, None, 0), 1.0),
+            (entry("cat clean.txt", 1, 0.0, None, 0), 1.0),
+        ];
+        let off = RankingContext { off: [Signal::Git].into(), ..Default::default() };
+        let signals = SearchSignals { directory: Some("/p".into()), context: Some(off), ..Default::default() };
+        let disabled = rerank_with_evidence(hits.clone(), true, "cat", 0.0, &signals, Some(&Boom));
+        let plain = rerank(hits, true, "cat", 0.0, &signals);
+        assert_eq!(disabled.iter().map(|e| &e.command).collect::<Vec<_>>(), plain.iter().map(|e| &e.command).collect::<Vec<_>>());
+        assert_eq!(disabled.iter().map(|e| &e.why).collect::<Vec<_>>(), plain.iter().map(|e| &e.why).collect::<Vec<_>>());
     }
 }

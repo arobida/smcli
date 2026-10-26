@@ -13,7 +13,7 @@ use taladb::fts::HybridQuery;
 use taladb::json::filter_from_json;
 use taladb::{Database, Stage, TypedCollection, Value};
 
-use crate::corpus::{Hit, SearchSignals, entry_coverage, embedding_text, is_literal_query, lexical_text, parse_markers, program_arguments, query_filter, rerank, search_document};
+use crate::corpus::{Hit, SearchSignals, entry_coverage, embedding_text, is_literal_query, lexical_text, parse_markers, program_arguments, query_filter, search_document};
 use crate::{Potion, ShellTokenizer};
 
 /// One indexed command; metadata fields mirror `SearchFilter` so filters narrow candidates before ranking.
@@ -112,6 +112,12 @@ impl HistorySearch {
     /// When another process holds the index, search falls back to word matching over the corpus.
     pub fn search(&self, query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter,
                   programs: Option<&HashMap<String, HashSet<String>>>, signals: &SearchSignals, now: f64) -> Result<Vec<SearchEntry>> {
+        self.search_with_evidence(query, corpus, limit, filter, programs, signals, now, None)
+    }
+
+    pub fn search_with_evidence(&self, query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter,
+                  programs: Option<&HashMap<String, HashSet<String>>>, signals: &SearchSignals, now: f64,
+                  evidence: Option<&dyn crate::ProjectEvidence>) -> Result<Vec<SearchEntry>> {
         let alias_off = !uses(signals.context.as_ref(), Signal::Alias);
         let typed_only = alias_off.then(|| corpus.iter().map(|(key, entry)| {
             let mut entry = entry.clone();
@@ -158,11 +164,11 @@ impl HistorySearch {
         if corpus.is_empty() {
             let active = addition_filter(filter, &merged_filter, has_markers, parsed_any, false);
             let hits = signals.additions(&stripped, corpus, &HashSet::new(), active, now);
-            return Ok(rerank(hits, literal, &stripped, now, signals).into_iter().take(limit).collect());
+            return Ok(crate::corpus::rerank_with_evidence(hits, literal, &stripped, now, signals, evidence).into_iter().take(limit).collect());
         }
         let Some(_lock) = self.lock_index(20)? else {
             // The service (or a reindex) holds the index; TalaDB refuses a second process, so no semantic leg.
-            return Ok(text_fallback(&stripped, corpus, limit, filter, literal, signals, now, &parsed_filter, has_markers));
+            return Ok(text_fallback_with_evidence(&stripped, corpus, limit, filter, literal, signals, now, &parsed_filter, has_markers, evidence));
         };
         let name = if alias_off { format!("{}-typed", self.index_name()) } else { self.index_name() };
         let db = self.open_index(&name)?;
@@ -242,11 +248,23 @@ impl HistorySearch {
                 }
             }
         }
-        drop(db);
         let final_filter = addition_filter(filter, &merged_filter, has_markers, parsed_any, parsed_useful);
+        let expansion = expansion_terms(&hits, &stripped, signals, evidence);
+        if !expansion.is_empty() {
+            let text = ShellTokenizer::encoded(&expansion.join(" "));
+            let expanded = raw.search_text_with("terms", &text, k, &Default::default(),
+                index_filter(final_filter).map(|f| filter_from_json(&f)).transpose()?)?;
+            let best = expanded.iter().map(|h| f64::from(h.score)).fold(0.0, f64::max);
+            for hit in expanded {
+                if let Some(entry) = command_of(&hit.document).and_then(|c| corpus.get(&c)).filter(|e| final_filter.allows(e)) {
+                    merge_expansion(&mut hits, entry, if best > 0.0 { f64::from(hit.score) / best } else { 0.0 });
+                }
+            }
+        }
+        drop(db);
         let existing: HashSet<String> = hits.iter().map(|h| h.0.key()).collect();
         hits.extend(signals.additions(&stripped, corpus, &existing, final_filter, now));
-        Ok(rerank(hits, literal, &stripped, now, signals).into_iter().take(limit).collect())
+        Ok(crate::corpus::rerank_with_evidence(hits, literal, &stripped, now, signals, evidence).into_iter().take(limit).collect())
     }
 
     /// Discards the index and embeds every command again. Returns the number embedded.
@@ -472,8 +490,15 @@ fn index_cache_unusable(err: &anyhow::Error) -> bool {
 /// Search without the index: commands sharing the query's words, by how much of the query they cover.
 /// `query` is already stripped of `$word` markers; `parsed_filter` and `has_markers` come from the
 /// same parsing done on the indexed path so a held lock does not change ranking behavior.
+#[cfg(test)]
 fn text_fallback(query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter, literal: bool,
                  signals: &SearchSignals, now: f64, parsed_filter: &SearchFilter, has_markers: bool) -> Vec<SearchEntry> {
+    text_fallback_with_evidence(query, corpus, limit, filter, literal, signals, now, parsed_filter, has_markers, None)
+}
+
+fn text_fallback_with_evidence(query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter, literal: bool,
+                 signals: &SearchSignals, now: f64, parsed_filter: &SearchFilter, has_markers: bool,
+                 evidence: Option<&dyn crate::ProjectEvidence>) -> Vec<SearchEntry> {
     let parsed_any = has_constraint(parsed_filter);
     let mut merged_filter = filter.clone();
     if parsed_any {
@@ -514,14 +539,83 @@ fn text_fallback(query: &str, corpus: &HashMap<String, SearchEntry>, limit: usiz
         }
     }
     let final_filter = addition_filter(filter, &merged_filter, has_markers, parsed_any, parsed_useful);
+    let expansion = expansion_terms(&hits, query, signals, evidence);
+    if !expansion.is_empty() {
+        for entry in corpus.values().filter(|e| final_filter.allows(e)) {
+            merge_expansion(&mut hits, entry, entry_coverage(entry, &expansion));
+        }
+    }
     let existing: HashSet<String> = hits.iter().map(|h| h.0.key()).collect();
     hits.extend(signals.additions(query, corpus, &existing, final_filter, now));
-    rerank(hits, literal, query, now, signals).into_iter().take(limit).collect()
+    crate::corpus::rerank_with_evidence(hits, literal, query, now, signals, evidence).into_iter().take(limit).collect()
+}
+
+fn expansion_terms(hits: &[Hit], query: &str, signals: &SearchSignals,
+                   evidence: Option<&dyn crate::ProjectEvidence>) -> Vec<String> {
+    if !uses(signals.context.as_ref(), Signal::Expand) { return vec![]; }
+    let terms: Vec<String> = query.to_lowercase().split_whitespace().map(String::from).collect();
+    // Normalized retrieval always gives the best hit 1.0; lexical coverage is an absolute confidence gate.
+    if terms.is_empty() || hits.iter().any(|(e, _)| entry_coverage(e, &terms) >= 0.75) { return vec![]; }
+    let Some(evidence) = evidence else { return vec![] };
+    let mut seen = HashSet::new();
+    evidence.grep_terms(&terms, std::time::Duration::from_millis(20)).into_iter()
+        .filter(|t| (3..=128).contains(&t.len()) && t.chars().all(|c| c.is_ascii_alphanumeric() || "_-".contains(c)))
+        .filter(|t| !terms.contains(t) && seen.insert(t.clone())).take(16).collect()
+}
+
+fn merge_expansion(hits: &mut Vec<Hit>, entry: &SearchEntry, score: f64) {
+    let bonus = 0.15 * score.clamp(0.0, 1.0);
+    if bonus == 0.0 { return; }
+    if let Some(hit) = hits.iter_mut().find(|h| h.0.key() == entry.key()) {
+        hit.1 = (hit.1 + bonus).min(1.0);
+    } else {
+        hits.push((entry.clone(), bonus));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expansion_finds_code_concepts_but_skips_strong_history_hits() {
+        struct Evidence(std::cell::Cell<usize>);
+        impl crate::ProjectEvidence for Evidence {
+            fn exists(&self, _: &[std::path::PathBuf]) -> Vec<bool> { vec![] }
+            fn grep_terms(&self, terms: &[String], budget: std::time::Duration) -> Vec<String> {
+                assert!(terms.iter().any(|t| t == "migration"));
+                assert_eq!(budget, std::time::Duration::from_millis(20));
+                self.0.set(self.0.get() + 1);
+                vec!["migrate".into()]
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HistorySearch::new(dir.path().join("index"), Potion::bundled().unwrap());
+        let corpus = ["cargo test --test migrate", "echo unrelated"].into_iter()
+            .map(|c| (c.into(), SearchEntry::new(c, 1, "native"))).collect();
+        let evidence = Evidence(std::cell::Cell::new(0));
+        let filter = SearchFilter::default();
+        let signals = SearchSignals::default();
+        for locked in [false, true] {
+            let _lock = locked.then(|| engine.lock_index(1).unwrap().unwrap());
+            if locked {
+                assert!(engine.search("migration tests", &corpus, 10, &filter, None, &signals, 0.0).unwrap().is_empty());
+            }
+            let hits = engine.search_with_evidence("migration tests", &corpus, 10, &filter, None, &signals, 0.0, Some(&evidence)).unwrap();
+            assert!(hits.iter().any(|e| e.command == "cargo test --test migrate"));
+            let calls = evidence.0.get();
+            let strong = engine.search_with_evidence("cargo test --test migrate", &corpus, 10, &filter, None, &signals, 0.0, Some(&evidence)).unwrap();
+            assert_eq!(evidence.0.get(), calls);
+            assert_eq!(strong, engine.search("cargo test --test migrate", &corpus, 10, &filter, None, &signals, 0.0).unwrap());
+            let disabled = SearchSignals { context: Some(smcli_core::ranking::RankingContext {
+                off: [Signal::Expand].into(), ..Default::default()
+            }), ..Default::default() };
+            assert_eq!(engine.search_with_evidence("migration tests", &corpus, 10, &filter, None, &disabled, 0.0, Some(&evidence)).unwrap(),
+                engine.search("migration tests", &corpus, 10, &filter, None, &disabled, 0.0).unwrap());
+            assert_eq!(evidence.0.get(), calls);
+        }
+        assert_eq!(evidence.0.get(), 2);
+    }
 
     #[test]
     fn text_fallback_prefers_exact_tokens_and_identifier_parts() {

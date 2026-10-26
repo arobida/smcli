@@ -99,6 +99,15 @@ enum Command {
         #[arg(num_args=5..=9, allow_hyphen_values=true)]
         fields: Vec<String>,
     },
+    #[command(hide = true)]
+    Complete {
+        #[arg(long, allow_hyphen_values = true)]
+        word: String,
+        #[arg(long, allow_hyphen_values = true)]
+        command: Option<String>,
+        #[arg(long, default_value = "50", value_parser = positive)]
+        limit: usize,
+    },
 }
 #[derive(Args)]
 pub struct Init {
@@ -229,6 +238,43 @@ pub fn run() -> Result<()> {
             crate::context::run(&directory(dir, &env)?, json, &service)?
         }
         Command::Record { fields, expanded } => record(&fields, expanded.as_deref(), &captured, &service, &filter()?)?,
+        Command::Complete { word, command, limit } => {
+            let word = word.strip_prefix('@').unwrap_or(&word);
+            let dirs_only = matches!(command.as_deref(), Some("cd" | "pushd" | "z"));
+            let cwd = working_directory(&env);
+            let shell = env.get("SMCLI_SHELL").map(String::as_str).unwrap_or("bash");
+            let mut request = ServiceRequest::new(Operation::Complete);
+            request.query = Some(word.to_string());
+            request.directory = Some(cwd.clone());
+            request.limit = Some(limit as i64);
+            request.dirs_only = Some(dirs_only);
+            let (paths, chosen) = match service
+                .send(&request, None, Duration::from_secs(10))
+                .filter(|r| r.ok)
+                .and_then(|r| r.files)
+            {
+                Some(hits) => {
+                    let chosen = (hits.len() == 1).then(|| hits[0].path.clone());
+                    let paths = hits
+                        .into_iter()
+                        .map(|h| if h.insert.is_empty() { h.path } else { h.insert })
+                        .collect();
+                    (paths, chosen)
+                }
+                None => (crate::complete::complete_local(Path::new(&cwd), word, dirs_only, limit), None),
+            };
+            if let Some(path) = chosen {
+                let mut r = ServiceRequest::new(Operation::Select);
+                r.directory = Some(cwd);
+                r.path = Some(path);
+                r.mode = Some("files".into());
+                r.query = Some(word.to_string());
+                let _ = service.send(&r, None, Duration::from_secs(2));
+            }
+            for path in paths {
+                println!("{}", crate::shell_quoting::quote(&path, shell));
+            }
+        }
         Command::Search(a) => {
             let filter = SearchFilter {
                 program: a.program,
@@ -1249,6 +1295,7 @@ mod tests {
     #[test]
     fn parse_flags_and_times() {
         assert!(Cli::try_parse_from(["smcli", "search", "git", "--flag", "--all"]).is_ok());
+        assert!(Cli::try_parse_from(["smcli", "complete", "--word", "@foo", "--command", "cd", "--limit", "5"]).is_ok());
         assert!(Cli::try_parse_from(["smcli", "suggest", "--limit", "0"]).is_err());
         assert_eq!(
             time("2024-01-01").unwrap(),

@@ -698,6 +698,7 @@ pub fn directory_entries(directory: &Path, limit: usize) -> Vec<FileHit> {
             line: None,
             column: None,
             text: None,
+            definition: None,
         })
         .collect()
 }
@@ -756,6 +757,7 @@ pub fn with_picked(
                 line: None,
                 column: None,
                 text: None,
+                definition: None,
             }
         })
         .collect();
@@ -846,7 +848,7 @@ mod tests {
     }
     #[test]
     fn project_folders_from_file_parents() {
-        let hit = |path: &str, insert: &str| FileHit { insert: insert.into(), path: path.into(), provenance: vec!["files".into()], git: None, line: None, column: None, text: None };
+        let hit = |path: &str, insert: &str| FileHit { insert: insert.into(), path: path.into(), provenance: vec!["files".into()], git: None, line: None, column: None, text: None, definition: None };
         let dirs = filter_kind(vec![hit("src/a.rs", "../src/a.rs"), hit("src/b.rs", "../src/b.rs"), hit("top.rs", "../top.rs")], 1);
         assert_eq!(dirs.iter().map(|h| (h.path.as_str(), h.insert.as_str())).collect::<Vec<_>>(), [("src/", "../src/")]);
         let cwd = filter_kind(vec![hit("src/a.rs", "a.rs")], 1);

@@ -25,6 +25,7 @@ pub enum Operation {
     Context,
     Files,
     Grep,
+    Complete,
     Select,
     Shutdown,
 }
@@ -98,6 +99,8 @@ pub struct ServiceRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirs_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<String>,
 }
 
@@ -127,6 +130,7 @@ impl ServiceRequest {
             ranking_off: None,
             path: None,
             mode: None,
+            dirs_only: None,
             config: None,
         }
     }
@@ -240,6 +244,8 @@ pub struct FileHit {
     pub column: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

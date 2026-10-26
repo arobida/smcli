@@ -1,4 +1,4 @@
-//! Request-scoped, positive-only filesystem evidence. Never consults fff or persists paths.
+//! Request-scoped, positive-only filesystem evidence.
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::Read;
@@ -10,6 +10,48 @@ use std::time::Duration;
 use smcli_core::parse::shell_words;
 
 use crate::corpus::{Hit, SearchSignals};
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+    use smcli_core::entry::SearchEntry;
+
+    struct All;
+    impl crate::ProjectEvidence for All {
+        fn exists(&self, paths: &[PathBuf]) -> Vec<bool> { vec![true; paths.len()] }
+    }
+
+    #[test]
+    fn index_and_probe_share_presence_rules() {
+        struct Disk;
+        impl crate::ProjectEvidence for Disk {
+            fn exists(&self, paths: &[PathBuf]) -> Vec<bool> { paths.iter().map(|p| p.exists()).collect() }
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("input.txt"), "data").unwrap();
+        let commands: Vec<String> = ["cat input.txt", "vim ./input.txt", "cat missing.txt", "touch input.txt", "cat '*.txt'", "cat -n input.txt"]
+            .into_iter().map(String::from).collect();
+        let hits = commands.iter().map(|c| (SearchEntry::new(c, 1, "native"), 1.0)).collect::<Vec<_>>();
+        let signals = SearchSignals { directory: Some(root.path().to_string_lossy().into_owned()), ..Default::default() };
+        assert_eq!(evidence_with_index(&hits, &signals, false, true, Some(&Disk)).into_iter().map(|(a, p, _)| (a, p)).collect::<Vec<_>>(),
+            evaluate(&commands, None, signals.directory.as_deref()));
+    }
+
+    #[test]
+    fn index_covers_the_whole_pool_and_keeps_path_rules() {
+        let signals = SearchSignals { directory: Some("/project".into()), ..Default::default() };
+        let mut hits: Vec<Hit> = (0..200).map(|i| (SearchEntry::new(&format!("cat src/{i}.rs"), 1, "native"), 1.0)).collect();
+        let result = evidence_with_index(&hits, &signals, false, true, Some(&All));
+        assert_eq!(result.len(), 200);
+        assert!(result.iter().all(|r| r.1));
+        hits.push((SearchEntry::new("touch output.txt", 1, "native"), 1.0));
+        hits.push((SearchEntry::new("cat '$HOME/x.rs'", 1, "native"), 1.0));
+        assert!(evidence_with_index(&hits, &signals, false, true, Some(&All))[200..].iter().all(|r| !r.1));
+        let mut disabled = signals;
+        disabled.context = Some(smcli_core::ranking::RankingContext { off: [smcli_core::ranking::Signal::Index, smcli_core::ranking::Signal::Git].into(), ..Default::default() });
+        assert_eq!(evidence_with_index(&hits, &disabled, false, true, Some(&All)), evidence(&hits, &disabled, false, true));
+    }
+}
 
 const POOL: usize = 40;
 const PATHS: usize = 4;
@@ -55,9 +97,43 @@ fn release_probe() {
 }
 
 /// A stuck filesystem keeps its one thread. A concurrent request waits out a healthy probe, then runs.
-pub(crate) fn evidence(hits: &[Hit], signals: &SearchSignals, path: bool, files: bool) -> Vec<(bool, bool)> {
+pub(crate) fn evidence(hits: &[Hit], signals: &SearchSignals, path: bool, files: bool) -> Vec<(bool, bool, f64)> {
+    evidence_with_index(hits, signals, path, files, None)
+}
+
+pub(crate) fn evidence_with_index(hits: &[Hit], signals: &SearchSignals, path: bool, files: bool,
+                                  index: Option<&dyn crate::ProjectEvidence>) -> Vec<(bool, bool, f64)> {
+    let use_index = files && smcli_core::ranking::uses(signals.context.as_ref(), smcli_core::ranking::Signal::Index);
+    let use_git = files && smcli_core::ranking::uses(signals.context.as_ref(), smcli_core::ranking::Signal::Git);
+    if let Some(index) = index.filter(|_| use_index || use_git) {
+        let mut result = evidence(hits, signals, path, false);
+        result.resize(hits.len(), (false, false, 0.0));
+        if let Some(cwd) = signals.directory.as_deref().map(Path::new).filter(|p| p.is_absolute()) {
+            let paths: Vec<Vec<PathBuf>> = hits.iter().map(|(entry, _)| {
+                shell_words(entry.primary()).map(|words| presence_paths(&words, cwd)).unwrap_or_default()
+            }).collect();
+            let flat: Vec<PathBuf> = paths.iter().flatten().cloned().collect();
+            if use_index {
+                let found = index.exists(&flat);
+                let mut offset = 0;
+                for (result, paths) in result.iter_mut().zip(&paths) {
+                    result.1 = (offset..offset + paths.len()).any(|i| found.get(i).copied().unwrap_or(false));
+                    offset += paths.len();
+                }
+            }
+            if use_git {
+                let activity = index.git_activity(&flat);
+                let mut offset = 0;
+                for (result, paths) in result.iter_mut().zip(&paths) {
+                    result.2 = (offset..offset + paths.len()).filter_map(|i| activity.get(i).copied()).fold(0.0, f64::max);
+                    offset += paths.len();
+                }
+            }
+        }
+        return result;
+    }
     let count = hits.len().min(POOL);
-    let neutral = vec![(false, false); count];
+    let neutral = vec![(false, false, 0.0); count];
     if count == 0 || (!path && !files) || !acquire_probe() {
         return neutral;
     }
@@ -79,12 +155,15 @@ pub(crate) fn evidence(hits: &[Hit], signals: &SearchSignals, path: bool, files:
         return neutral;
     }
     match receive.recv_timeout(WAIT) {
-        Ok(result) => result,
+        Ok(result) => result.into_iter().map(|(a, p)| (a, p, 0.0)).collect(),
         Err(_) => {
             let mut gate = lock_gate();
             if gate.inflight == 0 {
                 drop(gate);
-                return receive.try_recv().unwrap_or(neutral);
+                return match receive.try_recv() {
+                    Ok(result) => result.into_iter().map(|(a, p)| (a, p, 0.0)).collect(),
+                    Err(_) => neutral,
+                };
             }
             gate.hung = true;
             drop(gate);
@@ -175,18 +254,19 @@ fn present(words: &[String], cwd: &Path) -> bool {
 }
 
 fn present_in(words: &[String], cwd: &Path, local_ok: &mut HashMap<PathBuf, bool>) -> bool {
-    if !cwd.is_absolute() || !matches!(words[0].as_str(), "cat" | "bat" | "less" | "more" | "head" | "tail" | "wc" |
+    presence_paths(words, cwd).into_iter().any(|path| is_local(&path, local_ok) && path.metadata().is_ok())
+}
+
+fn presence_paths(words: &[String], cwd: &Path) -> Vec<PathBuf> {
+    if words.is_empty() || !cwd.is_absolute() || !matches!(words[0].as_str(), "cat" | "bat" | "less" | "more" | "head" | "tail" | "wc" |
         "file" | "vim" | "nvim" | "vi" | "nano" | "emacs" | "hx" | "code" | "open" | "source" | ".") {
-        return false;
+        return vec![];
     }
     words.iter().skip(1)
         .filter(|word| !word.starts_with('-') && !word.contains(|c: char| "$*?~![]{}<>|&;`\\".contains(c)))
         .filter(|word| word.contains('/') || word.contains('.') || word.contains(' '))
         .take(PATHS)
-        .any(|word| {
-            let path = cwd.join(word);
-            is_local(&path, local_ok) && path.metadata().is_ok()
-        })
+        .map(|word| cwd.join(word)).collect()
 }
 
 fn is_local(path: &Path, cache: &mut HashMap<PathBuf, bool>) -> bool {
@@ -310,7 +390,7 @@ mod tests {
             ..Default::default()
         };
         let one = evidence(&hits, &signals, true, true);
-        assert_eq!(one, vec![(true, false), (false, true)]);
+        assert_eq!(one, vec![(true, false, 0.0), (false, true, 0.0)]);
         let (left, right) = std::thread::scope(|scope| {
             let a = scope.spawn(|| evidence(&hits, &signals, true, true));
             let b = scope.spawn(|| evidence(&hits, &signals, true, true));

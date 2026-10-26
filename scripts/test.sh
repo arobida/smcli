@@ -55,6 +55,13 @@ ln -s smcli-2-b "$dist/smcli"
 ln -s smcli-service-2-b "$dist/smcli-service"
 bash scripts/clean-dist.sh "$dist"
 [[ "$(cd "$dist" && ls | tr '\n' ' ')" == 'smcli smcli-2-b smcli-service smcli-service-2-b ' ]]
+atdir="$(mktemp -d /tmp/smcli-at.XXXXXX)"
+touch "$atdir/smcli-at-probe42.txt"
+mkdir "$atdir/smcli-at-dir"
+[[ "$(cd "$atdir" && "$bin_dir/smcli" complete --word @probe42)" == smcli-at-probe42.txt ]]
+[[ "$(cd "$atdir" && "$bin_dir/smcli" complete --word @at-dir --command cd)" == smcli-at-dir/ ]]
+[[ -z "$(cd "$atdir" && "$bin_dir/smcli" complete --word @probe42 --command cd)" ]]
+rm -rf "$atdir"
 python3 scripts/test-shells.py "$bin_dir/smcli"
 python3 scripts/test-service.py "$bin_dir/smcli"
 python3 scripts/test-file-picker.py "$bin_dir/smcli"

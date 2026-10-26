@@ -1,4 +1,5 @@
 mod file_search;
+mod test_candidates;
 mod service;
 
 use std::collections::HashMap;
