@@ -42,6 +42,10 @@ Delegate through `scripts/ateam.sh` instead of hand-rolled `kero new` loops: `ba
 - `<brief>` is one of: empty (start only), inline text (sent to every agent), a task file path, or a task directory; with a directory it briefs each agent from `<dir>/<alias>.task` — write one `.task` file per agent and pass the dir, so each gets `Read <dir>/<alias>.task and do exactly what it says.`
 - Prints `<alias>\t<session-id>` per agent; monitor with `kero wait` / `kero read`, `kero close` when done. `ATEAM_SHELL` (default zsh) and `ATEAM_DIR` (default `$PWD`) override.
 
+## Git
+
+Stage, write commit messages, and push using [Stage, commit, and push](agents/reference/commits.md). Only commit or push when asked; follow that runbook for staging, caveman-commit message format, and remote push rules.
+
 ## Search
 
 - Code: semble (`semble search "<query>" crates scripts`). Always pass those paths, not the repo root: semble does not read `.git/info/exclude`, so a root search returns stale Swift copies from `.delta/worktrees`.

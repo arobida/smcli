@@ -7,6 +7,7 @@ Working notes, reviews and reference material for agents. Nothing here is built 
 
 - `baseline.md` — benchmark method, historical Swift-era latency numbers and the pinned fff verification notes.
 - `fff-licenses.md` — transitive license audit for the pinned fff, its Rust crates and bundled C code.
+- `commits.md` — stage, caveman-commit messages, and push-to-remote runbook for agents.
 
 ## plans/
 
