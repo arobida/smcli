@@ -13,3 +13,7 @@ Working notes, reviews and reference material for agents. Nothing here is built 
 - `roadmap.md` — open work that is not scheduled: Linux verification, fgrep, search, capture gaps, known limits and release items.
 - `shipit-checklist.md` — licensing and distribution checklist that must pass before any public binary ships.
 - `fgrep-notes.md` — fgrep behavior on large trees, measurements, and the remaining budget and debounce decisions.
+
+## reviews/
+
+[Codebase review (2026-10-26)](reviews/codebase-review-2026-10-26.md)

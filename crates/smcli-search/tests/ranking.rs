@@ -549,6 +549,74 @@ fn rank_record_time_aliases() {
     assert_eq!(fallback.iter().map(|e| e.key()).collect::<Vec<_>>(), strict.iter().map(|e| e.key()).collect::<Vec<_>>());
 }
 
+/// Alias evaluation: how each way of indexing an alias ranks it for plain-language queries, against competing commands.
+/// `SMCLI_ALIAS_EVAL_DISTRACTORS=<file>` adds one command per line (a local export of real history; never commit it).
+#[test]
+fn rank_alias_eval() {
+    use smcli_search::corpus::SearchSignals;
+    let cases: Vec<(&str, &str, Vec<&str>)> = include_str!("fixtures/alias-eval.tsv").lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| {
+            let f: Vec<&str> = l.split('\t').collect();
+            (f[0], f[1], f[2].split(" ;; ").collect())
+        })
+        .collect();
+    let mut distractors: Vec<String> = include_str!("fixtures/alias-eval-distractors.txt").lines().map(String::from).collect();
+    if let Ok(path) = std::env::var("SMCLI_ALIAS_EVAL_DISTRACTORS") {
+        distractors.extend(std::fs::read_to_string(path).unwrap().lines().filter(|l| !l.trim().is_empty()).map(String::from));
+    }
+    distractors.sort();
+    distractors.dedup();
+    let gated = cases.iter().filter(|c| !smcli_core::parse::safe_expansion(c.1)).count();
+    println!("  alias-eval   {} aliases, {} queries, {} distractors, {} expansions refused by the gate",
+        cases.len(), cases.iter().map(|c| c.2.len()).sum::<usize>(), distractors.len(), gated);
+    // Typed only (before alias capture), then the expansion as written.
+    let mut results = Vec::new();
+    for (label, with_expansion) in [("typed-only", false), ("expanded", true)] {
+        let root = tempfile::tempdir().unwrap();
+        let log = CapturedHistory::new(root.path().join("history.db"));
+        let db = log.open_connection().unwrap();
+        let add = |typed: &str, expanded: Option<&str>| {
+            for i in 0..2 {
+                let mut run = NewRun::new(typed, "zsh", "/alias-eval", 0);
+                run.expanded_command = expanded;
+                run.started_at = Some(NOW - 10.0 + f64::from(i));
+                log.append(&run, "", Some(&db)).unwrap();
+            }
+        };
+        for d in &distractors {
+            add(d, None);
+        }
+        for (typed, expanded, _) in &cases {
+            add(typed, Some(*expanded).filter(|e| with_expansion && smcli_core::parse::safe_expansion(e)));
+        }
+        let corpus = search_corpus(log.command_stats(Some("/alias-eval"), None, NOW).unwrap(), &[]);
+        let engine = HistorySearch::new(root.path().join("index"), Potion::bundled().unwrap());
+        let (mut all, mut git, mut personal) = (Score::default(), Score::default(), Score::default());
+        let mut ranks = Vec::new();
+        for (typed, expanded, queries) in &cases {
+            for query in queries {
+                let hits = engine.search(query, &corpus, 20, &SearchFilter::default(), None, &SearchSignals::default(), NOW).unwrap();
+                let rank = hits.iter().position(|e| e.command == *typed).map(|i| i + 1);
+                all.add(rank);
+                if expanded.starts_with("git ") { git.add(rank) } else { personal.add(rank) }
+                ranks.push((*typed, *query, rank));
+            }
+        }
+        println!("  {label:<16} all       {}", all.line());
+        println!("  {label:<16} git       {}", git.line());
+        println!("  {label:<16} personal  {}", personal.line());
+        results.push((label, all.mrr(), ranks));
+    }
+    let shipped = &results[1].2;
+    let missed: Vec<_> = shipped.iter().filter(|(_, _, r)| r.is_none_or(|r| r > 3)).collect();
+    println!("  expanded misses (rank > 3 or not in top 20): {}", missed.len());
+    for (typed, query, rank) in missed.iter().take(40) {
+        println!("    {typed:<14} {query:<45} {rank:?}");
+    }
+    assert!(results[1].1 > results[0].1, "recording expansions must beat typed-only");
+}
+
 /// Controlled equal-relevance hits isolate the signals from model noise; the ordinary cohorts above
 /// still exercise indexed retrieval, and index unit tests exercise the lock fallback.
 fn rank_filesystem_signal_cohorts() {

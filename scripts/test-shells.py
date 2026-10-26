@@ -880,7 +880,7 @@ def define_alias(t, kind, name, body):
 
 
 def run_alias_capture(variant):
-    """The CLI does not accept --expanded yet, so a stub logs record argv."""
+    """A stub logs record argv, so the test sees exactly what each hook sends."""
     kind = variant.kind
     with tempfile.TemporaryDirectory() as directory:
         home = Path(directory).resolve()
@@ -927,10 +927,30 @@ def run_alias_capture(variant):
             expect("sub", None)
             define_alias(t, kind, "op", "printf a | cat")
             t.send("op")
-            expect("op", None)
+            expect("op", "printf a | cat")
             define_alias(t, kind, "quoted", 'printf "hi"')
             t.send("quoted")
-            expect("quoted", None)
+            expect("quoted", 'printf "hi"')
+            define_alias(t, kind, "redir", "printf a > /dev/null")
+            t.send("redir")
+            expect("redir", None)
+            # Variables are stored as written and never read or evaluated.
+            assign = (lambda n, v: f"set -gx {n} {v}") if kind == "fish" else (lambda n, v: f"export {n}={v}")
+            t.send(assign("EDITOR", "printf"))
+            t.send(assign("ZDOTDIR", shlex.quote(str(home))))
+            t.send(assign("TOK", "abc123"))
+            mkal = 'printf $ZDOTDIR/x && printf "$ZDOTDIR/y"' if kind == "fish" else '$EDITOR $ZDOTDIR/x && printf "$ZDOTDIR/y"'
+            define_alias(t, kind, "mkal", mkal)
+            t.send("mkal")
+            expect("mkal", mkal)
+            define_alias(t, kind, "tok", "printf $TOK")
+            t.send("tok")
+            expect("tok", "printf $TOK")
+            t.send(assign("EVIL", shlex.quote(f"$(touch {home}/pwned)")))
+            define_alias(t, kind, "ev", "printf $EVIL")
+            t.send("ev")
+            expect("ev", "printf $EVIL")
+            assert not (home / "pwned").exists(), variant.label
             # Lookup is at preexec: the command redefines its own alias, and the next prompt must not win.
             if kind == "fish":
                 t.send("function redefine_gl; alias gl 'printf files'; end")
@@ -947,7 +967,7 @@ def run_alias_capture(variant):
             expect("gl extra", "printf files extra")
             define_alias(t, kind, "longcmd", "printf " + ("a" * 130))
             t.send("longcmd")
-            expect("longcmd", None)
+            expect("longcmd", "printf " + ("a" * 130))
             t.send("printf after-aliases")
             expect("printf after-aliases", None)
             if kind == "fish":
@@ -960,8 +980,8 @@ def run_alias_capture(variant):
                 expanded = typed_records(rows, "printf abbr-marker") or typed_records(rows, "printf abbr-marker ")
                 assert expanded and expanded[-1][0] is None, (variant.label, rows[-4:])
                 assert not typed_records(rows, "agst"), (variant.label, rows[-4:])
-            leaked = [argv[2] for argv in record_rows(log) if argv[:2] == ["record", "--expanded"]]
-            assert not any(token in value for value in leaked for token in ("abc123", "$", "|", '"', "=", "'")), leaked
+            sent = [argv[i + 1] for argv in record_rows(log) for i, a in enumerate(argv[:-1]) if a == "--expanded"]
+            assert not any(token in value for value in sent for token in ("abc123", "$(", ">")), sent
             t.wait_exit(0)
             print(f"{variant.label}: alias expansion capture passed.")
         finally:

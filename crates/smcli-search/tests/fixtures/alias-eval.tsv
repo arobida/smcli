@@ -1,0 +1,79 @@
+# alias<TAB>expansion as written<TAB>queries separated by " ;; "
+# Git aliases are oh-my-zsh's (public). Personal ones are modeled on a real user's zsh config with a neutral home.
+gst	git status	what changed in my repo ;; show working tree status ;; which files are modified
+gaa	git add --all	stage everything ;; add all changes to the index
+gcmsg	git commit --message	commit with a message ;; save my staged changes as a commit
+gcn!	git commit --verbose --no-edit --amend	amend the last commit without editing the message ;; fix up previous commit
+gco	git checkout	check out a branch ;; switch to another branch the old way
+gcb	git checkout -b	create a new branch and switch to it ;; start a feature branch
+gbd	git branch --delete	delete a local branch ;; remove a merged branch
+gd	git diff	show unstaged changes ;; diff my working copy
+gds	git diff --staged	show what is staged ;; diff of staged changes before commit
+gl	git pull	pull latest changes from remote ;; update my branch from origin
+gp	git push	push my commits ;; upload commits to the remote
+gpf!	git push --force	force push my branch ;; overwrite the remote branch
+glog	git log --oneline --decorate --graph	pretty commit graph ;; show branch history as a tree
+gsta	git stash push	stash my changes ;; put uncommitted work aside
+gstp	git stash pop	bring back stashed changes ;; restore my stash
+grhh	git reset --hard	throw away all local changes ;; hard reset the repo
+grbi	git rebase --interactive	interactive rebase ;; squash and reorder commits
+grbc	git rebase --continue	continue the rebase after fixing conflicts ;; resume rebasing
+gcp	git cherry-pick	apply a commit from another branch ;; cherry pick a commit
+gm	git merge	merge a branch into this one ;; combine branches
+gfa	git fetch --all --tags --prune --jobs=10	fetch every remote and prune deleted branches ;; refresh all remotes
+grv	git remote --verbose	list remotes with urls ;; where does this repo push to
+gswc	git switch --create	switch to a brand new branch ;; create branch with switch
+gbr	git branch --remotes	list remote branches ;; what branches exist on origin
+gcl	git clone --recurse-submodules	clone a repo with submodules ;; download a repository
+gclean	git clean --interactive -d	remove untracked files interactively ;; clean up stray files in the repo
+gwt	git worktree	manage git worktrees ;; work on two branches at once
+gignore	git update-index --assume-unchanged	stop tracking changes to a file locally ;; ignore local edits to a tracked file
+gbgd	LANG=C git branch --no-color -vv | grep ": gone\]" | cut -c 3- | awk '{print $1}' | xargs git branch -d	delete branches whose remote is gone ;; prune stale local branches
+gpr	git pull --rebase	pull and rebase on top ;; update without a merge commit
+gcm	git checkout $(git_main_branch)	go back to main ;; check out the default branch
+gpsup	git push --set-upstream origin $(git_current_branch)	push a new branch and set upstream ;; publish this branch
+grst	git restore --staged	unstage a file ;; remove a file from the index
+gstl	git stash list	list my stashes ;; what have I stashed
+gwip	git add -A; git rm $(git ls-files --deleted) 2> /dev/null; git commit --no-verify --no-gpg-sign --message "--wip-- [skip ci]"	save a work in progress commit ;; quick wip checkpoint
+gbl	git blame -w	who changed this line ;; blame a file
+gcf	git config --list	show all git settings ;; list git config
+gra	git remote add	add a new remote ;; connect repo to another origin
+grmc	git rm --cached	untrack a file but keep it on disk ;; remove file from git only
+gma	git merge --abort	abort the merge ;; cancel a conflicted merge
+gsb	git status --short --branch	compact status with branch ;; short status
+gbs	git bisect	find the commit that introduced a bug ;; binary search history
+gpristine	git reset --hard && git clean --force -dfx	make the repo pristine ;; nuke everything not committed
+gcount	git shortlog --summary --numbered	count commits per author ;; who contributed most
+mkal	$EDITOR $ZDOTDIR/conf.d/50-aliases.zsh && source "$ZDOTDIR/.zshrc"	create a new alias ;; edit my zsh aliases ;; add an alias
+newsh	source "$ZDOTDIR/.zshrc"	reload my shell config ;; apply zshrc changes
+zshconfig	$EDITOR $ZDOTDIR/.zshrc	edit zshrc ;; open my shell config
+ezsh	fresh ~/.config/zsh/	open my zsh config folder ;; browse shell dotfiles
+mkfu	cd $ZDOTDIR/functions	go to my zsh functions ;; where are my shell functions
+gconfig	$EDITOR ~/.config/ghostty/config	edit ghostty config ;; change terminal settings
+edconf	$EDITOR ~/.config/	open my config directory ;; edit dotfiles
+claude_config	$EDITOR "$HOME/Library/Application Support/Claude/claude_desktop_config.json"	edit claude desktop config ;; change mcp servers
+getmcp	pbcopy < "$HOME/Library/Application Support/Claude/claude_desktop_config.json" && echo "MCP config copied"	copy mcp config to clipboard ;; grab claude desktop settings
+cpd	pwd | pbcopy && echo "$PWD copied to clipboard"	copy current directory path ;; put cwd on the clipboard
+cplc	fc -ln -1 | sed "s/^[[:space:]]*//" | pbcopy	copy the last command ;; put previous command on clipboard
+fuz	fd --type f | fzf --preview "bat --color=always -- {}"	fuzzy find a file with preview ;; search files interactively
+lsbun	ls ~/.bun/install/global/node_modules | tv --ansi	list global bun packages ;; what did I install with bun
+lsal	alias | tv	browse my aliases ;; list all aliases
+lsen	tv env	browse environment variables ;; show env vars
+brewinfo	brew leaves | xargs brew desc	describe installed brew packages ;; what formulae do I have
+brewup	/home/u/.config/scripts/brewup.ts	update homebrew packages ;; upgrade brew
+aiup	/home/u/.config/scripts/aiup.ts	update ai coding tools ;; upgrade claude and codex clis
+toolup	/home/u/.config/scripts/toolup.ts	update my dev tools ;; upgrade cli tools
+cleanxcode	/home/u/.config/scripts/xcode-clean.sh	clean xcode derived data ;; free disk space from xcode
+history-stat	history 0 | awk '{print $2}' | sort | uniq -c | sort -n -r | head	most used commands ;; history statistics
+dirh	dirs -v	show directory stack ;; recent directories
+hd	hexdump -C	hex dump a file ;; view binary bytes
+oc	opencode	start opencode ;; open the ai coding agent
+lg	lazygit	open lazygit ;; git tui
+cl	clear	clear the screen ;; wipe terminal
+q	exit	close the shell ;; quit terminal
+cdi	zi	interactive directory jump ;; fuzzy cd
+xgen	xcodegen	generate xcode project ;; regenerate xcodeproj
+fl	fastlane	run fastlane ;; ios release automation
+spec	openspec	openspec cli ;; manage spec changes
+hrq	herdr server stop	stop the herdr server ;; shut down herdr
+python	python3	run python ;; python interpreter

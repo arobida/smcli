@@ -67,12 +67,12 @@ if [[ ${_smcli_installed-} != 1 ]]; then
         _smcli_expanded=
         # shortcut: PS0 can't assign a string without printing it, so that mode writes here and the prompt reads it. Upgrade if a command must not be able to forge this file.
         _smcli_expfile=${TMPDIR:-/tmp}/smcli-exp-$$-$RANDOM
-        # Plain ASCII words and flags, single spaces, at most 128 bytes. Substitutions, assignments, operators and quotes are typed-only.
+        # A cheap pre-check; smcli record applies the full rule (`safe_expansion`). Nothing that runs code or redirects is sent.
         _smcli_safe() {
-            local LC_ALL=C s=$1 rest
-            [[ -n $s && ${#s} -le 128 ]] || return 1
-            rest=${s//[A-Za-z0-9 _-]/}
-            [[ -z $rest && $s != ' '* && $s != *' ' && $s != *'  '* && ${s%% *} == [A-Za-z_]* ]]
+            local LC_ALL=C s=$1
+            local assign="(^|[ ;&|\"'])[A-Za-z_][A-Za-z0-9_]*="
+            [[ -n $s && ${#s} -le 8192 ]] || return 1
+            [[ $s != *[^\ -~]* && $s != *'$('* && $s != *'`'* && $s != *[\<\>]* ]] && ! [[ $s =~ $assign ]]
         }
         # bash 3.2 has no BASH_ALIASES. Parse `alias --` output; never eval it.
         _smcli_alias_body() {
@@ -362,12 +362,13 @@ if [[ ${_smcli_installed-} != 1 ]]; then
     export SMCLI_SESSION=$_smcli_session
     _smcli_expanded=
     _smcli_executed=
-    # Plain ASCII words and flags, single spaces, at most 128 bytes. Substitutions, assignments, operators and quotes are typed-only.
+    # A cheap pre-check; smcli record applies the full rule (`safe_expansion`). Nothing that runs code or redirects is sent.
     _smcli_safe() {
-        local s=$1 rest
-        (( $#s > 0 && $#s <= 128 )) || return 1
-        rest=${s//[A-Za-z0-9 _-]/}
-        [[ -z $rest && $s != \ * && $s != *\  && $s != *\ \ * && ${s%% *} == [A-Za-z_]* ]]
+        local s=$1
+        (( $#s > 0 && $#s <= 8192 )) || return 1
+        [[ $s != *[^\ -~]* && $s != *'$('* && $s != *'`'* && $s != *[\<\>]* ]] || return 1
+        setopt localoptions norematchpcre
+        ! [[ $s =~ "(^|[ ;&|\"'])[A-Za-z_][A-Za-z0-9_]*=" ]]
     }
     # $1 is preexec's typed text, $2 is preexec's $3. Only a confirmed leading regular alias is kept.
     _smcli_alias() {
@@ -527,12 +528,13 @@ if not set -q _smcli_installed
     set -gx SMCLI_SESSION $_smcli_session
     set -g _smcli_pending 0
     set -g _smcli_expanded
-    # Plain ASCII words and flags, single spaces, at most 128 bytes. Substitutions, assignments, operators and quotes are typed-only.
+    # A cheap pre-check; smcli record applies the full rule (`safe_expansion`). Nothing that runs code or redirects is sent.
     function _smcli_safe
         set -l s $argv[1]
         set -l n (string length -- $s)
-        test $n -gt 0; and test $n -le 128; or return 1
-        string match -qr -- '^[A-Za-z_][A-Za-z0-9_-]*( [A-Za-z0-9_-]+)*$' $s
+        test $n -gt 0; and test $n -le 8192; or return 1
+        not string match -qr -- '[^ -~]|\$\(|`|[<>]' $s; or return 1
+        not string match -qr -- '(^|[ ;&|"\'])[A-Za-z_][A-Za-z0-9_]*=' $s
     end
     # A generated alias function is one literal command forwarding $argv. Anything else, including abbreviations, is typed text.
     function _smcli_alias_body
@@ -555,7 +557,7 @@ if not set -q _smcli_installed
         end
         set cmd (string trim -- (string replace -r -- ';$' '' $cmd))
         # [$] is a literal dollar: fish single quotes do not treat backslash as an escape.
-        string match -qr -- '^[A-Za-z_][A-Za-z0-9_-]*( [A-Za-z0-9_-]+)* [$]argv$' $cmd; or return 0
+        string match -qr -- '^[^ ].* [$]argv$' $cmd; or return 0
         string replace -r -- ' [$]argv$' '' $cmd
     end
     function _smcli_set_expanded
@@ -712,7 +714,7 @@ mod tests {
         for shell in ["bash", "zsh", "fish"] {
             let hooks = render_with_keys(shell, "smcli", true, false, false, false, false).unwrap();
             assert!(hooks.contains("--expanded"), "{shell} missing --expanded");
-            assert!(hooks.contains("128"), "{shell} missing the 128-byte gate");
+            assert!(hooks.contains("8192"), "{shell} missing the 8192-byte gate");
         }
         let bash = render_with_keys("bash", "smcli", true, false, false, false, false).unwrap();
         assert!(bash.contains("BASH_ALIASES") && bash.contains("alias --"));

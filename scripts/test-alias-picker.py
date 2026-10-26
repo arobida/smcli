@@ -28,7 +28,7 @@ with tempfile.TemporaryDirectory(prefix="smcli-alias.", dir="/tmp") as directory
         subprocess.run([binary, "record", "--expanded", expanded, "zsh", "alias", directory, "0", "", "", "", typed],
                        env=dict(env, SMCLI_SERVICE="0"), check=True, capture_output=True)
 
-    def choose(query, expected, mode):
+    def choose(query, shown, expected, mode):
         output = root / "chosen"
         pid, fd = pty.fork()
         if pid == 0:
@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory(prefix="smcli-alias.", dir="/tmp") as directory
                             raise
                 visible = ansi.sub(b"", screen).decode(errors="replace")
                 if not sent and "esc cancel" in visible:
-                    assert "→" in visible and expected in visible, visible
+                    assert f"{expected}@ " in visible and shown in visible, visible
                     os.write(fd, b"\r")
                     sent = True
                 done, status = os.waitpid(pid, os.WNOHANG)
@@ -72,11 +72,11 @@ with tempfile.TemporaryDirectory(prefix="smcli-alias.", dir="/tmp") as directory
 
     try:
         for mode in ("0", "on"):
-            choose("zzalias", expansion, mode)
-            choose("ls-files", "git ls-files", mode)
+            choose("zzalias", expansion, "zzalias", mode)
+            choose("ls-files", "git ls-files", "gl", mode)
         records = json.loads(subprocess.check_output([binary, "history", "--json"], env=env))
         assert [(r["command"], r["expandedCommand"]) for r in records] == [
             ("zzalias", expansion), ("gl", "git log"), ("gl", "git ls-files")]
-        print("Alias picker: arrow labels, conflicting variants, service/fallback insertion, no execution passed.")
+        print("Alias picker: @ labels, conflicting variants, service/fallback insertion, no execution passed.")
     finally:
         subprocess.run([binary, "service", "stop"], env=env, capture_output=True)

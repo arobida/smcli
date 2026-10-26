@@ -166,12 +166,22 @@ pub fn shell_words(command: &str) -> Option<Vec<String>> {
     Some(words)
 }
 
-/// Conservative record-time alias vocabulary: no evaluation, assignments, quoting or shell operators.
+/// Record-time alias vocabulary: variables, quotes and `&&`, `||`, `|`, `;` are kept as text; nothing that runs code
+/// (substitution, redirection, background) or assigns (`NAME=`, `${NAME:=}`) passes.
 pub fn safe_expansion(text: &str) -> bool {
+    let assigns = |word: &str| word.split_once('=').is_some_and(|(name, _)| {
+        name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+    });
+    let braces_plain = text.split("${").skip(1).all(|rest| {
+        rest.split_once('}').is_some_and(|(name, _)| !name.is_empty() && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
+    });
     !text.is_empty() && text.len() <= 8_192 && text.trim() == text
-        && text.bytes().all(|c| c.is_ascii_alphanumeric() || b" _-./,:@%+~^".contains(&c))
-        && text.split(' ').all(|word| !word.is_empty() && !word.starts_with('~'))
-        && text.split(' ').next().is_some_and(|word| !word.starts_with('-'))
+        && text.bytes().all(|c| (b' '..=b'~').contains(&c))
+        && !["$(", "`", "<", ">"].iter().any(|bad| text.contains(bad))
+        && !text.replace("&&", "").contains('&')
+        && braces_plain
+        && text.split_whitespace().all(|word| !assigns(word.trim_start_matches(['"', '\''])))
+        && text.split_whitespace().next().is_some_and(|word| !word.starts_with('-'))
 }
 
 /// True when a command line runs smcli itself (`smcli …`, `/path/to/smcli …`, `swift run smcli …`),
@@ -227,11 +237,15 @@ mod tests {
     }
 
     #[test]
-    fn expansion_gate_never_accepts_shell_syntax_or_assignments() {
-        for text in ["git status", "git log --oneline -20", "git reset --soft HEAD~1", "./tool plain-argument"] {
+    fn expansion_gate_keeps_text_but_rejects_code_and_assignments() {
+        for text in ["git status", "git log --oneline -20", "git reset --soft HEAD~1", "./tool plain-argument",
+            r#"$EDITOR $ZDOTDIR/conf.d/50-aliases.zsh && source "$ZDOTDIR/.zshrc""#, "git status | cat", "git status; pwd",
+            "make || true", "git 'status'", "echo $HOME", "nvim ~/.zshrc", "cd ${HOME}/x", "git log --format=%h"] {
             assert!(safe_expansion(text), "{text}");
         }
-        for text in ["", " git status", "git status ", "git  status", "TOKEN=abc123 ./deploy.sh", "echo $(id)", "echo `id`", "git status; pwd", "git status | cat", "git status > file", "git 'status'", "echo $HOME", "echo ~/secret", "echo\nsecret"] {
+        for text in ["", " git status", "git status ", "TOKEN=abc123 ./deploy.sh", "a && TOKEN=x ./b", "env 'X=1' a",
+            "echo $(id)", "echo `id`", "git status > file", "cat < file", "diff <(a) b", "sleep 1 &", "echo ${X:=1}",
+            "echo ${X:-$(id)}", "echo\nsecret", "echo\tx", "-rf /"] {
             assert!(!safe_expansion(text), "{text}");
         }
         assert!(!safe_expansion(&"x".repeat(8_193)));

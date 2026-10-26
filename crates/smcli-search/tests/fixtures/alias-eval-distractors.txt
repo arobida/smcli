@@ -1,0 +1,150 @@
+alias
+alias gl 'printf log'
+alias gst 'printf status'
+tv alias
+mise alias ls
+eza | alias
+mise alias add -h
+mise alias set vlt@ envlt
+gh repo create
+gh repo create --private
+bun create tui
+bun create tauri-app
+npm create vite@latest
+oc agent create
+ghostty +new-window
+cd New\ Portfolio/
+git status
+git log --graph
+git diff --color
+git commit -m "fix typo"
+git push origin main
+git pull origin main
+git checkout main
+git branch -a
+git stash
+git rebase main
+git fetch
+git reset HEAD~1
+git clone https://github.com/user/repo.git
+git remote -v
+git tag v1.0.0
+git show HEAD
+git log -p src/main.rs
+docker ps
+docker compose up -d
+docker build -t app .
+docker logs -f web
+docker system prune -a
+kubectl get pods
+kubectl logs deploy/api
+npm install
+npm run dev
+npm test
+npm run build
+bun install
+bun run dev
+bun add zod
+pnpm install
+cargo build --release
+cargo test
+cargo clippy
+cargo fmt
+cargo run -- --help
+make test
+make build
+make release
+brew install ripgrep
+brew upgrade
+brew update
+brew list
+brew services restart postgresql
+xcodebuild -scheme App build
+xcrun simctl list
+swift build
+swift test
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uv run main.py
+uv sync
+ls -la
+ls ~/.config
+cd ..
+cd ~/Dev/Apps
+mkdir -p build
+rm -rf node_modules
+rm -rf ~/Library/Developer/Xcode/DerivedData
+cp .env.example .env
+mv old.txt new.txt
+cat README.md
+bat src/main.rs
+less log.txt
+tail -f /var/log/system.log
+head -n 20 data.csv
+grep -rn TODO src
+rg "fn main"
+fd -e rs
+find . -name "*.log" -delete
+du -sh *
+df -h
+top
+htop
+ps aux | grep node
+kill -9 1234
+lsof -i :3000
+curl -s https://api.github.com | jq .
+wget https://example.com/file.zip
+ssh user@server
+scp file.txt user@server:/tmp
+tar -czf backup.tar.gz dir
+unzip archive.zip
+chmod +x script.sh
+open .
+code .
+zed .
+nvim init.lua
+vim ~/.vimrc
+fresh notes.md
+echo $PATH
+export EDITOR=nvim
+env | grep API
+history | grep docker
+which python3
+man tar
+tldr tar
+exit
+clear
+pwd
+whoami
+date
+uptime
+ping google.com
+claude
+codex
+opencode
+claude mcp list
+gemini
+ollama run llama3
+skate list
+gum choose a b c
+fzf
+zoxide query dev
+chezmoi apply
+chezmoi edit ~/.zshrc
+tmux new -s work
+tmux attach
+herdr
+lazydocker
+gh pr create
+gh pr list
+gh issue list
+gh run watch
+fastlane beta
+pod install
+xcodegen generate
+openspec list
+openspec validate
+smcli search docker
+pbpaste | jq .
+sqlite3 history.db

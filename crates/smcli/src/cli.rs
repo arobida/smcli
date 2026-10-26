@@ -483,6 +483,9 @@ fn record(
     filter: &CaptureFilter,
 ) -> Result<()> {
     ensure!([5, 8, 9].contains(&f.len()), "Invalid record arguments");
+    // The hook only pre-checks; an expansion the full rule refuses is dropped, not the run: unsupported means typed-only.
+    let command = &f[if f.len() == 5 { 3 } else { f.len() - 1 }];
+    let expanded = expanded.filter(|e| smcli_core::parse::safe_expansion(e) && e != command);
     if f.len() == 5 {
         if filter.allows_run(&f[3], expanded, &f[1]) {
             let mut run = NewRun::new(&f[3], &f[0], &f[1], f[2].parse()?);
@@ -502,7 +505,6 @@ fn record(
     captured.check_separate(&f[tail + 2])?;
     let mut run = NewRun::new(&f[tail + 3], &f[0], &f[2], f[3].parse()?);
     run.expanded_command = expanded;
-    ensure!(expanded.is_none_or(|e| smcli_core::parse::safe_expansion(e) && e != run.command), "Invalid expanded command.");
     run.session = &f[1];
     run.started_at = Some(epoch(&f[tail])?.unwrap_or_else(now));
     run.ended_at = epoch(&f[tail + 1])?;

@@ -27,7 +27,8 @@ In the picker, Ctrl-T and Ctrl-G switch to files and grep and back to history; p
 suggest and search also weigh the project (nearest manifest), the shell session's previous command (SMCLI_SESSION, set by
 shell-init), commands you picked in the picker for a similar query, scripts and targets named in the project's manifest, and
 an operation in progress (a rebase suggests `git rebase --continue`). Search also favors commands whose program is on your
-PATH and whose input files exist here, and matches an alias by what it expanded to when it ran (picking inserts the expansion);
+PATH and whose input files exist here, and matches an alias by what it expanded to when it ran. The picker
+shows an alias as `name@ expansion` and inserts the name;
 --json and search show why. SMCLI_RANKING_OFF=project,transition,selection,script,hint,path,files,alias switches signals off.
 SMCLI_FFF_MAX (4) and SMCLI_FFF_IDLE (600 s) bound the service's file indexes.
 SMCLI_BASH_HOOK=debug makes Bash capture with a DEBUG trap even where bash-preexec or PS0 is available.
