@@ -569,14 +569,17 @@ fi
 # smcli: @ path completion. Typed text is unchanged unless completion is invoked.
 if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
     _smcli_complete_bin=\#(binary)
-    if [[ -z ${_smcli_tab_orig-} || $_smcli_tab_orig == _smcli_complete_widget ]]; then
+    if [[ -z ${_smcli_tab_orig-} || $_smcli_tab_orig == *_smcli_complete_widget ]]; then
         _smcli_tab_orig=${${(z)"$(bindkey '^I')"}[-1]}
-        [[ -n $_smcli_tab_orig && $_smcli_tab_orig != (undefined-key|_smcli_complete_widget) ]] || _smcli_tab_orig=expand-or-complete
+        [[ -n $_smcli_tab_orig && $_smcli_tab_orig != (undefined-key|*_smcli_complete_widget) ]] || _smcli_tab_orig=expand-or-complete
     fi
     _smcli_complete_widget() {
         setopt localoptions noglob noshwordsplit
         local word=${LBUFFER##*[[:space:]]} cmd=${${(z)BUFFER}[1]}
         if [[ $word != @* ]]; then
+            # Plugins that wrap Tab (fzf-tab, autosuggestions) can chain back into us: a re-entry does plain completion.
+            if (( ${_smcli_in_tab-0} )); then zle expand-or-complete; return; fi
+            local _smcli_in_tab=1
             zle "$_smcli_tab_orig"
             return
         fi
@@ -596,7 +599,8 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
     # Deferred plugins (fzf-tab, zsh-defer) rebind Tab after init: take it back before each prompt, chaining to theirs.
     _smcli_tab_rebind() {
         local bound=${${(z)"$(bindkey '^I')"}[-1]}
-        [[ $bound == _smcli_complete_widget ]] && return
+        # Autosuggestions renames wrapped widgets to *_smcli_complete_widget.
+        [[ $bound == *_smcli_complete_widget ]] && return
         [[ -n $bound && $bound != undefined-key ]] && _smcli_tab_orig=$bound
         bindkey '^I' _smcli_complete_widget
         bindkey -M viins '^I' _smcli_complete_widget 2>/dev/null || true
