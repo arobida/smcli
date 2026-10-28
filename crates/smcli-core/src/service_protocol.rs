@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const VERSION: i64 = 2;
+pub const VERSION: i64 = 3;
 pub const MAX_SHELL_PATH_BYTES: usize = 8_192;
 
 /// Oversized snapshots are unknown, never truncated into a different PATH.
@@ -102,6 +102,10 @@ pub struct ServiceRequest {
     pub dirs_only: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 impl ServiceRequest {
@@ -132,6 +136,8 @@ impl ServiceRequest {
             mode: None,
             dirs_only: None,
             config: None,
+            scope: None,
+            cwd: None,
         }
     }
 }

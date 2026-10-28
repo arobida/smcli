@@ -84,6 +84,7 @@ impl Service {
         let version = data_version(&db)?;
         let capacity = environment.get("SMCLI_FFF_MAX").and_then(|v| v.parse().ok()).unwrap_or(4);
         let fff_idle = Duration::from_secs_f64(environment.get("SMCLI_FFF_IDLE").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(600.0));
+        let home = PathBuf::from(environment.get("HOME").cloned().unwrap_or_else(|| "/".into()));
         // The file search reaches back into `state` through a weak handle, set once the service exists.
         let service = Arc::new_cyclic(|weak: &std::sync::Weak<Service>| {
             let (scores_handle, record_handle) = (weak.clone(), weak.clone());
@@ -106,6 +107,7 @@ impl Service {
                     state.last_activity = Instant::now();
                     service.history.record_selection(root, path, mode, query, now(), &state.db)
                 }),
+                home.clone(),
             );
             Service {
                 build: std::env::current_exe().ok().and_then(|exe| build(&exe)),

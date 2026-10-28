@@ -6,6 +6,7 @@ use smcli_core::{
     history::{CapturedHistory, NewRun, parse_pipestatus, user_name},
     ranking::RankingContext,
     service_client::ServiceClient,
+    service_location::relative_insert,
     service_protocol::{Operation, SearchEntry, SearchFilter, ServiceRequest},
     time::{format_iso8601, now, parse_iso8601},
 };
@@ -15,6 +16,8 @@ use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
+use crate::picker::{FileResults, Mode};
+use smcli_core::service_protocol::FileHit;
 
 // Swift-identical usage text, printed for no arguments, --help and parse errors.
 const USAGE: &str = include_str!("usage.txt");
@@ -938,8 +941,6 @@ fn pick(
         )
     };
     if files {
-        picker.project_files = env.get("SMCLI_FILES_QUERY").is_some_and(|q| !q.is_empty());
-        // `cd @` and friends: folders only.
         picker.kind = if env.contains_key("SMCLI_FILES_DIRS") { 1 } else { 0 };
     }
     picker.mode = if files {
@@ -953,64 +954,9 @@ fn pick(
     let root = project
         .repository
         .as_ref()
-        .map(|r| r.root.as_str())
-        .unwrap_or(&d);
-    let scores = if c.path.exists() {
-        c.open_connection()
-            .and_then(|db| c.selection_scores(root, now(), &db))
-            .unwrap_or_default()
-    } else {
-        HashMap::new()
-    };
-    let mut scores = scores;
-    let mut entries = crate::picker::directory_entries(Path::new(&d), 5000);
-    // `@` completion: paths this program was run with in the project rank first, at any depth, then fff's
-    // project-wide ranking, then the cwd listing.
-    if let Some(program) = env.get("SMCLI_FILES_COMMAND").filter(|_| files) {
-        let dirs = picker.kind == 1;
-        let base = Path::new(root).canonicalize().unwrap_or_else(|_| root.into());
-        for (command, stats) in c.command_stats(Some(&d), Some(root), now()).unwrap_or_default() {
-            let Some(words) = smcli_core::parse::shell_words(&command) else { continue };
-            if words.first() != Some(program) || stats.runs_project == 0 {
-                continue;
-            }
-            for word in words[1..].iter().filter(|w| !w.starts_with('-')) {
-                let Ok(path) = Path::new(&stats.last_directory).join(word).canonicalize() else { continue };
-                if dirs && !path.is_dir() {
-                    continue;
-                }
-                if let Ok(relative) = path.strip_prefix(&base).map(|r| r.to_string_lossy().into_owned()) {
-                    if !relative.is_empty() {
-                        *scores.entry(relative).or_default() += stats.frecency;
-                    }
-                }
-            }
-        }
-        let mut r = ServiceRequest::new(Operation::Complete);
-        r.query = Some(String::new());
-        r.directory = Some(d.clone());
-        r.limit = Some(200);
-        r.dirs_only = Some(false);
-        if let Some(found) = service.send(&r, None, Duration::from_secs(2)).filter(|r| r.ok).and_then(|r| r.files) {
-            // fff ranks files (frecency, git); a folder ranks by its best file.
-            let found: Vec<_> = if dirs {
-                let mut seen = std::collections::HashSet::new();
-                found
-                    .into_iter()
-                    .filter_map(|mut hit| {
-                        let cut = |p: &str| p.trim_end_matches('/').rsplit_once('/').map(|(d, _)| format!("{d}/"));
-                        (hit.path, hit.insert) = (cut(&hit.path)?, cut(&hit.insert)?);
-                        hit.git = None;
-                        seen.insert(hit.path.clone()).then_some(hit)
-                    })
-                    .collect()
-            } else {
-                found
-            };
-            entries.splice(0..0, found);
-        }
-    }
-    picker.local_files = crate::picker::with_picked(&scores, Path::new(root), Path::new(&d), entries, 5000);
+        .map(|r| r.root.clone())
+        .unwrap_or_else(|| d.clone());
+    picker.scope = Some(root.clone());
     let search = {
         let c = CapturedHistory::new(c.path.clone());
         let home = home.to_owned();
@@ -1053,25 +999,32 @@ fn pick(
         }
     };
     let file_search = {
-        let d = d.clone();
+        let cwd = d.clone();
+        let home = home.to_owned();
         let service = ServiceClient::new(&c.path, env, &std::env::current_exe()?);
-        move |mode: Mode, q: &str| -> Result<FileResults> {
+        let fallback = std::cell::OnceCell::new();
+        move |mode: Mode, q: &str, kind: u8, scope: &str, path: Option<&str>| -> Result<FileResults> {
         let mut r = ServiceRequest::new(if mode == Mode::Grep {
             Operation::Grep
         } else {
             Operation::Files
         });
-        r.directory = Some(d.clone());
+        r.directory = Some(scope.into());
         r.query = Some(q.into());
         r.limit = Some(100);
+        r.scope = Some(true);
+        r.cwd = Some(cwd.clone());
+        r.path = path.map(String::from);
         let response = service
-            .send(&r, None, Duration::from_secs(10))
-            .filter(|r| r.ok)
-            .ok_or_else(|| anyhow::anyhow!("Project file search and grep need smcli-service"))?;
-        Ok(FileResults {
-            hits: response.files.unwrap_or_default(),
-            complete: !response.partial.unwrap_or(false),
-        })
+            .send(&r, None, Duration::from_secs(10));
+        if let Some(response) = response.filter(|r| r.ok) {
+            return Ok(FileResults {
+                hits: response.files.unwrap_or_default(),
+                complete: !response.partial.unwrap_or(false),
+            });
+        }
+        let local = fallback.get_or_init(|| LocalFileSearch { cwd: cwd.clone().into(), home: home.clone() });
+        local.search(mode, q, kind, scope, path)
         }
     };
     if let Some(choice) = crate::picker::run(picker, Some(Box::new(search)), Some(Box::new(file_search)))? {
@@ -1112,10 +1065,10 @@ fn pick(
                 }
                 println!("{}", crate::picker::history_insert(&command));
             }
-            Choice::File { hit, mode, query } => {
+            Choice::File { hit, mode, query, scope } => {
                 if hit.provenance != ["*"] {
                     let mut r = ServiceRequest::new(Operation::Select);
-                    r.directory = Some(d.clone());
+                    r.directory = Some(scope);
                     r.path = Some(hit.path.clone());
                     r.mode = Some(mode.as_str().into());
                     r.query = Some(query);
@@ -1139,6 +1092,107 @@ fn pick(
     }
     Ok(())
 }
+
+struct LocalFileSearch {
+    cwd: PathBuf,
+    home: PathBuf,
+}
+
+impl LocalFileSearch {
+    fn search(&self, mode: Mode, query: &str, kind: u8, scope: &str, path: Option<&str>) -> Result<FileResults> {
+        let scope = Path::new(scope).canonicalize()?;
+        let scope_str = scope.to_string_lossy().into_owned();
+        let home_str = self.home.to_string_lossy().into_owned();
+        let cwd_str = self.cwd.to_string_lossy().into_owned();
+        let mut hits = Vec::new();
+        match mode {
+            Mode::Files => {
+                let mut files = Vec::new();
+                self.walk(&scope, &mut |p| {
+                    let rel = p.strip_prefix(&scope).unwrap().to_string_lossy().into_owned();
+                    if query.is_empty() || rel.to_lowercase().contains(&query.to_lowercase()) {
+                        files.push(rel);
+                    }
+                });
+                files.sort();
+                files.truncate(100);
+                if kind == 1 {
+                    let mut seen = std::collections::HashSet::new();
+                    for rel in files {
+                        if let Some(parent) = Path::new(&rel).parent() {
+                            let dir = parent.to_string_lossy().into_owned();
+                            if !dir.is_empty() && seen.insert(dir.clone()) {
+                                let path = format!("{dir}/");
+                                hits.push(self.file_hit(&path, &scope_str, &cwd_str, &home_str, "files"));
+                            }
+                        }
+                    }
+                } else {
+                    for rel in files {
+                        hits.push(self.file_hit(&rel, &scope_str, &cwd_str, &home_str, "files"));
+                    }
+                }
+            }
+            Mode::Grep => {
+                let target = path.map(|p| scope.join(p));
+                let sources: Vec<PathBuf> = if let Some(target) = target {
+                    vec![target]
+                } else {
+                    let mut files = Vec::new();
+                    self.walk(&scope, &mut |p| files.push(p.to_path_buf()));
+                    files
+                };
+                for file in sources {
+                    let rel = file.strip_prefix(&scope).unwrap().to_string_lossy().into_owned();
+                    let text = match std::fs::read_to_string(&file) {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    for (i, line) in text.lines().enumerate() {
+                        if let Some(pos) = line.to_lowercase().find(&query.to_lowercase()) {
+                            let mut hit = self.file_hit(&rel, &scope_str, &cwd_str, &home_str, "grep");
+                            hit.line = Some((i + 1) as i64);
+                            hit.column = Some((pos + 1) as i64);
+                            hit.text = Some(line.into());
+                            hits.push(hit);
+                            if hits.len() >= 100 { break; }
+                        }
+                    }
+                    if hits.len() >= 100 { break; }
+                }
+            }
+            _ => {}
+        }
+        Ok(FileResults { hits, complete: true })
+    }
+
+    fn walk(&self, dir: &Path, on_file: &mut dyn FnMut(&Path)) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.file_name().is_some_and(|n| n == ".git") { continue; }
+            if path.is_dir() {
+                self.walk(&path, on_file);
+            } else if path.is_file() {
+                on_file(&path);
+            }
+        }
+    }
+
+    fn file_hit(&self, path: &str, scope: &str, cwd: &str, home: &str, provenance: &str) -> FileHit {
+        FileHit {
+            insert: relative_insert(path, scope, cwd, Some(home)),
+            path: path.into(),
+            provenance: vec![provenance.into()],
+            git: None,
+            line: None,
+            column: None,
+            text: None,
+            definition: None,
+        }
+    }
+}
+
 #[derive(Default, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IndexHealth {

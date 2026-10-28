@@ -17,4 +17,4 @@ while b"\n" not in data:
     if not chunk:
         break
     data += chunk
-conn.sendall((json.dumps({"v": 2, "ok": True, "pid": os.getpid()}) + "\n").encode())
+conn.sendall((json.dumps({"v": 3, "ok": True, "pid": os.getpid()}) + "\n").encode())

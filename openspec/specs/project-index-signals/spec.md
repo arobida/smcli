@@ -1,6 +1,7 @@
 # project-index-signals Specification
 
 ## Purpose
+
 Defines the evidence the service draws from its live file index of the current project (file presence, Git state, identifiers, definitions) to rank and suggest history commands and to expand search queries.
 
 ## Requirements

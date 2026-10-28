@@ -1,6 +1,7 @@
 # path-completion Specification
 
 ## Purpose
+
 Lets the user complete file and directory paths from the current project on the command line by starting a word with `@`, ranked by the project index and the user's past picks.
 
 ## Requirements

@@ -30,9 +30,11 @@ fn prune(cache: &mut HashMap<String, Cached>, capacity: usize, now: Instant) {
 mod tests {
     use super::*;
     use smcli_core::service_protocol::{Operation, ServiceRequest};
+    use std::path::PathBuf;
 
     fn warm(root: &Path) -> FileSearch {
-        let search = FileSearch::new(2, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(|_, _, _, _, _| Ok(())));
+        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
+        let search = FileSearch::new(2, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(|_, _, _, _, _| Ok(())), home);
         let mut request = ServiceRequest::new(Operation::Files);
         request.directory = Some(root.to_string_lossy().into_owned());
         request.query = Some("lib".into());

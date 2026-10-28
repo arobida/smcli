@@ -30,7 +30,6 @@ use smcli_core::entry::{command_key, command_parts};
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
-    path::Path,
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -62,6 +61,7 @@ pub enum Choice {
         hit: FileHit,
         mode: Mode,
         query: String,
+        scope: String,
     },
 }
 #[derive(Debug)]
@@ -83,11 +83,15 @@ pub struct Picker {
     pub suggestion_count: usize,
     pub query: String,
     pub mode: Mode,
-    pub local_files: Vec<FileHit>,
+    /// The current file/grep search scope (absolute directory). Set by the caller before `run`.
+    pub scope: Option<String>,
+    /// When in grep mode after Tab on a file, the file path (scope-relative) to restrict hits to.
+    pub single_file_path: Option<String>,
+    /// The scope to return to when leaving single-file grep with Shift+Tab.
+    pub saved_file_scope: Option<String>,
     /// Replaces the "history" prompt label, e.g. for directory suggestions.
     pub title: Option<String>,
-    /// Files mode starts on whole-project search, showing only folders (1) or files (2) when set.
-    pub project_files: bool,
+    /// Files mode shows only folders (1) or files (2) when set.
     pub kind: u8,
 }
 impl Picker {
@@ -127,9 +131,10 @@ impl Picker {
             suggestion_count,
             query,
             mode: Mode::History,
-            local_files: Vec::new(),
+            scope: None,
+            single_file_path: None,
+            saved_file_scope: None,
             title: None,
-            project_files: false,
             kind: 0,
         }
     }
@@ -247,16 +252,37 @@ fn hint_line(hints: &[(&str, &str)]) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Search is invoked only on Tab (history) or Ctrl-A (files); files is invoked for project filenames and grep.
+/// Show paths under the home directory as `~/…`.
+fn abbreviate(path: &str, home: &str) -> String {
+    if path == home { return "~".into(); }
+    if let Some(rest) = path.strip_prefix(&format!("{home}/")) {
+        format!("~/{rest}")
+    } else {
+        path.into()
+    }
+}
+
+/// The parent of `scope`, or `None` if widening would go above `home` or outside it.
+fn widen_scope(scope: &str, home: &str) -> Option<String> {
+    let scope = std::path::Path::new(scope);
+    let parent = scope.parent()?;
+    let parent = parent.to_str()?;
+    if parent.is_empty() || parent.len() < home.len() || !parent.starts_with(home) {
+        return None;
+    }
+    Some(parent.into())
+}
+
+/// Search is invoked only on Tab (history); files/grep receive the current scope and optional single-file path.
 /// A file choice is unquoted: the CLI must validate the shell insertion context and quote it.
 pub fn run(
     mut picker: Picker,
     search: Option<Box<dyn FnMut(&str) -> Result<Vec<String>> + Send>>,
-    files: Option<Box<dyn FnMut(Mode, &str) -> Result<FileResults> + Send>>,
+    files: Option<Box<dyn FnMut(Mode, &str, u8, &str, Option<&str>) -> Result<FileResults> + Send>>,
 ) -> Result<Option<Choice>> {
     let search = search.map(|mut callback| worker(move |q: &String| callback(q)));
-    let files = files.map(|mut callback| worker(move |(mode, q, _): &(Mode, String, u8)| {
-        callback(*mode, q)
+    let files = files.map(|mut callback| worker(move |(mode, q, kind, scope, path): &(Mode, String, u8, String, Option<String>)| {
+        callback(*mode, q, *kind, scope, path.as_deref())
     }));
     let mut file_busy = false;
     let mut semantic_busy = false;
@@ -267,7 +293,6 @@ pub fn run(
     let mut saved = HashMap::new();
     let mut selected = 0usize;
     let mut semantic: Option<(String, Vec<String>)> = None;
-    let mut global_files = picker.project_files;
     let mut kind = picker.kind;
     let mut fetched = None;
     let mut observed = None;
@@ -284,9 +309,15 @@ pub fn run(
     let mut status = String::new();
     let mut filtered: Option<((String, bool), Vec<String>)> = None;
     let starred: HashSet<String> = picker.candidates[..picker.suggestion_count].iter().cloned().collect();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let cwd = std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+    if picker.scope.is_none() {
+        picker.scope = Some(cwd.clone());
+    }
     loop {
-        let local = picker.mode == Mode::Files && !global_files;
-        let current = (picker.mode, picker.query.clone(), kind);
+        let scope = picker.scope.clone().unwrap_or_else(|| cwd.clone());
+        let file_path = picker.single_file_path.clone();
+        let current = (picker.mode, picker.query.clone(), kind, scope.clone(), file_path.clone());
         if observed.as_ref() != Some(&current) {
             observed = Some(current.clone());
             changed_at = Instant::now();
@@ -294,7 +325,7 @@ pub fn run(
         if let Some((_, replies)) = &files {
             if let Ok((request, result)) = replies.try_recv() {
                 file_busy = false;
-                if !local && request == current {
+                if request == current {
                     match result {
                         Ok(result) => {
                             hits = if picker.mode == Mode::Files {
@@ -331,13 +362,7 @@ pub fn run(
                 }
             }
         }
-        if local {
-            hits = picker.local_files.iter().filter(|h| {
-                (kind == 0 || h.insert.ends_with('/') == (kind == 1))
-                    && contains_terms(&h.insert, &picker.query)
-            }).cloned().collect();
-            fetched = None;
-        } else if picker.mode != Mode::History && fetched.as_ref() != Some(&current) {
+        if picker.mode != Mode::History && fetched.as_ref() != Some(&current) {
             hits.clear();
             selected = 0;
             status.clear();
@@ -355,7 +380,7 @@ pub fn run(
                 status = "files and grep need smcli-service".into();
             }
         }
-        let file_pending = !local && picker.mode != Mode::History && fetched.as_ref() != Some(&current);
+        let file_pending = picker.mode != Mode::History && fetched.as_ref() != Some(&current);
         let busy = file_busy || semantic_busy || file_pending;
         if busy && spun.elapsed() >= Duration::from_millis(80) {
             spinner = (spinner + 1) % 10;
@@ -386,22 +411,23 @@ pub fn run(
             let label = if picker.mode == Mode::Files { match kind { 1 => "folders", 2 => "files", _ => "files+dirs" } } else if history { picker.title.as_deref().unwrap_or("history") } else { picker.mode.as_str() };
             let [header_area, filter_area, search_area, navigation_area, list_area, stripe_area, global_area] = picker_layout(area);
             let boxed = search_area.height == 3;
-            // Files modes name their scope so directory and project search never look alike.
-            let scope = match picker.mode {
-                Mode::Files if local => format!("in {}", std::env::current_dir().map(|d| visible(&d.display().to_string())).unwrap_or_default()),
-                Mode::Files => "across your system".into(),
-                Mode::Grep => format!("in {}", std::env::current_dir().map(|d| visible(&d.display().to_string())).unwrap_or_default()),
-                _ => String::new(),
-            };
-            frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!(" {label} "), ACCENT), Span::styled(scope, ACCENT.add_modifier(Modifier::BOLD)), Span::styled(" ›", ACCENT.add_modifier(Modifier::BOLD))])), header_area);
-            let found = if local {
-                format!("{count} results")
+            // Header shows cwd and current scope; single-file grep names the file as its scope.
+            let scope_label = if history {
+                String::new()
             } else {
-                format!("{count} {} results", if picker.mode == Mode::Grep { "grep" } else { "files" })
+                let displayed = if picker.mode == Mode::Grep && picker.single_file_path.is_some() {
+                    let file = picker.single_file_path.as_deref().unwrap();
+                    format!("{}/{}", abbreviate(&scope, &home), file)
+                } else {
+                    abbreviate(&scope, &home)
+                };
+                format!("{}  →  {}", abbreviate(&cwd, &home), displayed)
             };
+            frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!(" {label} "), ACCENT), Span::styled(scope_label, ACCENT.add_modifier(Modifier::BOLD)), Span::styled(" ›", ACCENT.add_modifier(Modifier::BOLD))])), header_area);
+            let found = format!("{count} {} results", if picker.mode == Mode::Grep { "grep" } else { "files" });
             let summary = if history {
                 visible(&status)
-            } else if hits.is_empty() && !local {
+            } else if hits.is_empty() {
                 if status.is_empty() { "no matches".into() } else { visible(&status) }
             } else if status.is_empty() { found } else { visible(&status) };
             let mut summary = Line::styled(format!(" {summary} "), MUTED);
@@ -442,7 +468,7 @@ pub fn run(
                 }).collect()
             } else {
                 hits.iter().map(|h| {
-                    let name = if local { &h.insert } else { &h.path };
+                    let name = &h.path;
                     let location = h.line.map(|n| format!(":{n}  {}", h.text.as_deref().unwrap_or(""))).unwrap_or_default();
                     ListItem::new(Line::from(vec![
                         Span::styled(format!("{} ", h.git.as_deref().unwrap_or("")), ACCENT),
@@ -458,16 +484,16 @@ pub fn run(
             let filters = if history {
                 vec![("tab", "semantic")]
             } else if picker.mode == Mode::Files {
-                vec![("^A", if local { "global search" } else { "cwd search" }), ("^F", "dirs/files")]
+                vec![("tab", "narrow"), ("⇧tab", "up"), ("^F", "dirs/files")]
+            } else if picker.mode == Mode::Grep {
+                vec![("⇧tab", "up")]
             } else {
                 vec![]
             };
             frame.render_widget(Paragraph::new(hint_line(&filters)), filter_area);
             frame.render_widget(Paragraph::new(hint_line(&[("[ ⏎ ]", "accept"), ("↑↓", "move"), ("PgUp/PgDn", "page")])), navigation_area);
             let mut globals = vec![("esc", "cancel"), ("^T", if picker.mode == Mode::Files { "history" } else { "files" })];
-            if grep_available(global_files) {
-                globals.push(("^G", if picker.mode == Mode::Grep { "history" } else { "grep" }));
-            }
+            globals.push(("^G", if picker.mode == Mode::Grep { "history" } else { "grep" }));
             globals.push(("^U", "clear"));
             let fade = if tick < 3 { Modifier::DIM } else { Modifier::empty() };
             frame.render_widget(Paragraph::new(stripe_line(area.width, shown, fade)), stripe_area);
@@ -544,23 +570,18 @@ pub fn run(
                         hit: hits[selected].clone(),
                         mode: picker.mode,
                         query: picker.query,
+                        scope,
                     })
                 });
             }
-            KeyCode::Char('t' | 'g') if ctrl && (key.code != KeyCode::Char('g') || grep_available(global_files)) => {
+            KeyCode::Char('t' | 'g') if ctrl => {
                 saved.insert(picker.mode, picker.query);
-                let target = if key.code == KeyCode::Char('t') {
-                    Mode::Files
-                } else {
-                    Mode::Grep
-                };
-                picker.mode = if picker.mode == target
-                    
-                {
-                    Mode::History
-                } else {
-                    target
-                };
+                if picker.mode == Mode::Grep {
+                    picker.single_file_path = None;
+                    picker.saved_file_scope = None;
+                }
+                let target = if key.code == KeyCode::Char('t') { Mode::Files } else { Mode::Grep };
+                picker.mode = if picker.mode == target { Mode::History } else { target };
                 picker.query = saved.get(&picker.mode).cloned().unwrap_or_default();
                 selected = 0;
                 status.clear();
@@ -571,7 +592,6 @@ pub fn run(
             }
             KeyCode::Char('u') if ctrl => {
                 picker.query.clear();
-                global_files = false;
                 selected = 0;
                 status.clear();
             }
@@ -585,13 +605,44 @@ pub fn run(
                 selected = 0;
                 status.clear();
             }
-            KeyCode::Char('a') if ctrl && picker.mode == Mode::Files => {
-                global_files = !global_files;
-                selected = 0;
-            }
             KeyCode::Tab if picker.mode == Mode::History && !picker.query.trim().is_empty() => {
                 if search.is_some() {
                     semantic_pending = Some(picker.query.clone());
+                }
+            }
+            KeyCode::Tab if picker.mode == Mode::Files && count > 0 => {
+                let hit = &hits[selected];
+                if hit.path.ends_with('/') {
+                    if let Ok(next) = std::path::Path::new(&scope).join(&hit.path).canonicalize() {
+                        picker.scope = Some(next.to_string_lossy().into_owned());
+                        picker.query.clear();
+                        selected = 0;
+                        status.clear();
+                    }
+                } else {
+                    saved.insert(Mode::Files, picker.query.clone());
+                    picker.saved_file_scope = Some(scope.clone());
+                    picker.single_file_path = Some(hit.path.clone());
+                    picker.mode = Mode::Grep;
+                    picker.query = saved.get(&Mode::Grep).cloned().unwrap_or_default();
+                    selected = 0;
+                    status.clear();
+                }
+            }
+            KeyCode::BackTab if picker.mode == Mode::Grep && picker.saved_file_scope.is_some() => {
+                picker.scope = picker.saved_file_scope.take();
+                picker.single_file_path = None;
+                picker.mode = Mode::Files;
+                picker.query = saved.get(&Mode::Files).cloned().unwrap_or_default();
+                selected = 0;
+                status.clear();
+            }
+            KeyCode::BackTab if picker.mode == Mode::Files => {
+                if let Some(parent) = widen_scope(&scope, &home) {
+                    picker.scope = Some(parent);
+                    picker.query.clear();
+                    selected = 0;
+                    status.clear();
                 }
             }
             KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
@@ -602,18 +653,6 @@ pub fn run(
             _ => {}
         }
     }
-}
-
-fn grep_available(global_files: bool) -> bool {
-    !global_files
-}
-
-fn contains_terms(text: &str, query: &str) -> bool {
-    let text = text.to_lowercase();
-    query
-        .to_lowercase()
-        .split_whitespace()
-        .all(|word| text.contains(word))
 }
 
 fn history_internal(key: &str) -> bool {
@@ -676,38 +715,6 @@ fn filter_history(candidates: &[String], query: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn directory_entries(directory: &Path, limit: usize) -> Vec<FileHit> {
-    let mut entries: Vec<_> = std::fs::read_dir(directory)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name() != ".git" && e.file_name() != ".DS_Store")
-        .map(|e| {
-            let metadata = e.metadata().ok();
-            (
-                e.file_name().to_string_lossy().into_owned(),
-                metadata.as_ref().is_some_and(|m| m.is_dir()),
-                metadata.and_then(|m| m.modified().ok()),
-            )
-        })
-        .collect();
-    entries.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)).then(a.0.cmp(&b.0)));
-    entries
-        .into_iter()
-        .take(limit)
-        .map(|(name, directory, _)| FileHit {
-            insert: format!("{name}{}", if directory { "/" } else { "" }),
-            path: name,
-            provenance: vec!["*".into()],
-            git: None,
-            line: None,
-            column: None,
-            text: None,
-            definition: None,
-        })
-        .collect()
-}
-
 /// Narrows project hits to files (2) or folders (1); the index lists only files, so folders are their matches' parents.
 // shortcut: folders only appear if a file inside them matches; add directory entries to the service index if that's not enough.
 fn filter_kind(hits: Vec<FileHit>, kind: u8) -> Vec<FileHit> {
@@ -722,57 +729,6 @@ fn filter_kind(hits: Vec<FileHit>, kind: u8) -> Vec<FileHit> {
             seen.insert(path.clone()).then(|| FileHit { insert: parent(&h.insert).unwrap_or_else(|| "./".to_string()), path, git: None, line: None, column: None, text: None, ..h })
         })
         .collect()
-}
-
-/// Previously selected paths that still exist lead the local directory entries.
-pub fn with_picked(
-    scores: &HashMap<String, f64>,
-    root: &Path,
-    directory: &Path,
-    entries: Vec<FileHit>,
-    limit: usize,
-) -> Vec<FileHit> {
-    let mut scores: Vec<_> = scores
-        .iter()
-        .filter(|(path, _)| root.join(path).exists())
-        .collect();
-    scores.sort_by(|a, b| b.1.total_cmp(a.1).then(a.0.cmp(b.0)));
-    let directory = directory
-        .canonicalize()
-        .unwrap_or_else(|_| directory.to_path_buf());
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let mut picked: Vec<_> = scores
-        .into_iter()
-        .take(limit)
-        .map(|(path, _)| {
-            let absolute = root.join(path);
-            let target: Vec<_> = absolute.components().collect();
-            let from: Vec<_> = directory.components().collect();
-            let common = target.iter().zip(&from).take_while(|(a, b)| a == b).count();
-            let insert = std::iter::repeat_n(std::path::Component::ParentDir, from.len() - common)
-                .chain(target[common..].iter().copied())
-                .collect::<std::path::PathBuf>()
-                .to_string_lossy()
-                .into_owned();
-            FileHit {
-                path: path.clone(),
-                insert,
-                provenance: vec!["*".into()],
-                git: None,
-                line: None,
-                column: None,
-                text: None,
-                definition: None,
-            }
-        })
-        .collect();
-    let shown: HashSet<_> = picked.iter().map(|hit| hit.insert.clone()).collect();
-    picked.extend(
-        entries
-            .into_iter()
-            .filter(|hit| !shown.contains(&hit.insert)),
-    );
-    picked
 }
 
 /// Never pass repository/history control characters through to the terminal.
@@ -847,11 +803,6 @@ mod tests {
     }
 
     #[test]
-    fn grep_is_only_available_outside_global_search() {
-        assert!(grep_available(false));
-        assert!(!grep_available(true));
-    }
-    #[test]
     fn project_folders_from_file_parents() {
         let hit = |path: &str, insert: &str| FileHit { insert: insert.into(), path: path.into(), provenance: vec!["files".into()], git: None, line: None, column: None, text: None, definition: None };
         let dirs = filter_kind(vec![hit("src/a.rs", "../src/a.rs"), hit("src/b.rs", "../src/b.rs"), hit("top.rs", "../top.rs")], 1);
@@ -903,36 +854,6 @@ mod tests {
         assert_eq!(visible("a\x1b[2J\n\u{9b}"), "a^[[2J↵ <U+009B>");
         assert!(filter_history(&p.candidates, "unmatched").is_empty());
         assert!(FileResults::default().complete);
-    }
-
-    #[test]
-    fn directory_and_picked_entries() {
-        let root = std::env::temp_dir().join(format!(
-            "smcli-picker-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(root.join("folder")).unwrap();
-        for name in ["file", ".hidden", ".git", ".DS_Store"] {
-            std::fs::write(root.join(name), "").unwrap();
-        }
-        let entries = directory_entries(&root, 200);
-        assert_eq!(entries.len(), 3);
-        assert!(entries.iter().all(|hit| hit.provenance == ["*"]));
-        assert_eq!(entries[0].insert, "folder/");
-        assert!(entries.iter().any(|h| h.path == ".hidden"));
-        let scores = HashMap::from([("file".into(), 2.0), ("missing".into(), 100.0)]);
-        let picked = with_picked(&scores, &root, &root, entries, 10);
-        assert_eq!(picked[0].insert, "file");
-        assert!(picked.iter().all(|hit| hit.provenance == ["*"]));
-        assert_eq!(picked.len(), 3);
-        let picked = with_picked(&scores, &root, &root.join("folder"), Vec::new(), 10);
-        assert_eq!(picked[0].insert, "../file");
-        assert!(contains_terms("Hello World/", "world HELLO"));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1014,19 +935,41 @@ mod worker_tests {
     fn callback_runs_off_thread_and_preserves_request_identity() {
         let ui_thread = std::thread::current().id();
         let (release, wait) = mpsc::channel();
-        let (requests, replies) = worker(move |query: &(Mode, String, u8)| {
+        let (requests, replies) = worker(move |query: &(Mode, String, String, Option<String>)| {
             assert_ne!(std::thread::current().id(), ui_thread);
             wait.recv().unwrap();
             query.1.clone()
         });
-        let request = (Mode::Grep, "old query".to_owned(), 2);
+        let request = (Mode::Grep, "old query".to_owned(), "/scope".into(), Some("file.rs".into()));
         requests.send(request.clone()).unwrap();
         assert!(matches!(replies.try_recv(), Err(mpsc::TryRecvError::Empty)));
         release.send(()).unwrap();
         let (identity, result) = replies.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(identity, request);
-        assert_ne!(identity, (Mode::Grep, "new query".to_owned(), 2));
+        assert_ne!(identity, (Mode::Grep, "new query".to_owned(), "/scope".into(), Some("file.rs".into())));
         assert_eq!(result, "old query");
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[test]
+    fn abbreviate_replaces_home_with_tilde() {
+        assert_eq!(abbreviate("/Users/u/Dev", "/Users/u"), "~/Dev");
+        assert_eq!(abbreviate("/Users/u", "/Users/u"), "~");
+        assert_eq!(abbreviate("/etc", "/Users/u"), "/etc");
+    }
+
+    #[test]
+    fn widen_scope_stops_at_home_and_outside_it() {
+        let home = "/Users/u";
+        assert_eq!(widen_scope("/Users/u/Dev/Apps", home), Some("/Users/u/Dev".into()));
+        assert_eq!(widen_scope("/Users/u", home), None);
+        assert_eq!(widen_scope("/Users/u/Dev", home), Some("/Users/u".into()));
+        assert_eq!(widen_scope("/var/log", home), None);
+        assert_eq!(widen_scope("/", home), None);
     }
 }
 

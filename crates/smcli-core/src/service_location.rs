@@ -81,26 +81,35 @@ pub fn build(executable: &Path) -> Option<String> {
     ))
 }
 
-/// `path` (under `root`) as seen from `directory`: `a.swift` from its own folder, `../x/b.swift` from a sibling.
-pub fn relative_insert(path: &str, root: &str, directory: &str) -> String {
-    let resolved = fs::canonicalize(directory).ok();
-    let real = resolved.as_ref().map(|path| path.to_string_lossy());
-    let real = real.as_deref().unwrap_or(directory);
-    let root_parts: Vec<_> = root.split('/').filter(|part| !part.is_empty()).collect();
-    let here: Vec<_> = real.split('/').filter(|part| !part.is_empty()).collect();
-    // A directory outside the root can't be expressed relative to it; the root-relative path is the best we have.
-    if !here.starts_with(&root_parts) {
+/// `path` (under `root`) as seen from `cwd`: `a.swift` from its own folder, otherwise `~/…` or absolute.
+pub fn relative_insert(path: &str, root: &str, cwd: &str, home: Option<&str>) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    let dir = path.ends_with('/');
+    let target = fs::canonicalize(Path::new(root).join(path));
+    let Ok(target) = target else {
         return path.to_owned();
-    }
-    let down = &here[root_parts.len()..];
-    let target: Vec<_> = path.split('/').collect();
-    let mut common = 0;
-    while common < down.len() && common < target.len() - 1 && down[common] == target[common] {
-        common += 1;
-    }
-    let mut parts = vec![".."; down.len() - common];
-    parts.extend_from_slice(&target[common..]);
-    parts.join("/")
+    };
+    let cwd = fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
+    let is_root = |p: &Path| p.as_os_str() == "/";
+    let result = if !is_root(&cwd) && let Ok(rel) = target.strip_prefix(&cwd) {
+        if rel.as_os_str().is_empty() {
+            ".".into()
+        } else {
+            rel.to_string_lossy().into_owned()
+        }
+    } else if let Some(home) = home {
+        let home = fs::canonicalize(home).unwrap_or_else(|_| PathBuf::from(home));
+        if !is_root(&home) && let Ok(rel) = target.strip_prefix(&home) {
+            format!("~/ {}", rel.to_string_lossy()).replace("/ ", "/")
+        } else {
+            target.to_string_lossy().into_owned()
+        }
+    } else {
+        target.to_string_lossy().into_owned()
+    };
+    if dir && !result.ends_with('/') { format!("{result}/") } else { result }
 }
 
 #[cfg(test)]
@@ -173,13 +182,41 @@ mod tests {
         let root = fs::canonicalize(temporary.path()).unwrap();
         fs::create_dir(root.join("x")).unwrap();
         fs::create_dir(root.join("y")).unwrap();
+        fs::write(root.join("x/a.swift"), "").unwrap();
+        fs::write(root.join("x/b.swift"), "").unwrap();
         let root = root.to_str().unwrap();
-        assert_eq!(relative_insert("x/a.swift", root, &format!("{root}/x")), "a.swift");
-        assert_eq!(relative_insert("x/b.swift", root, &format!("{root}/y")), "../x/b.swift");
-        assert_eq!(relative_insert("x/b.swift", root, "/"), "x/b.swift");
-        assert_eq!(relative_insert("x/b.swift", root, root), "x/b.swift");
-        assert_eq!(relative_insert("", root, root), "");
+        assert_eq!(relative_insert("x/a.swift", root, &format!("{root}/x"), None), "a.swift");
+        let abs = fs::canonicalize(Path::new(root).join("x/b.swift")).unwrap().to_string_lossy().into_owned();
+        assert_eq!(relative_insert("x/b.swift", root, &format!("{root}/y"), None), abs);
+        assert_eq!(relative_insert("x/b.swift", root, "/", None), abs);
+        assert_eq!(relative_insert("x/b.swift", root, root, None), "x/b.swift");
+        assert_eq!(relative_insert("", root, root, None), "");
         symlink(format!("{root}/x"), format!("{root}/alias")).unwrap();
-        assert_eq!(relative_insert("x/a.swift", root, &format!("{root}/alias")), "a.swift");
+        assert_eq!(relative_insert("x/a.swift", root, &format!("{root}/alias"), None), "a.swift");
+    }
+
+    #[test]
+    fn relative_insert_falls_back_to_home_or_absolute() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("home");
+        fs::create_dir_all(home.join("Dev/other")).unwrap();
+        fs::create_dir_all(home.join("elsewhere")).unwrap();
+        let root = home.join("Dev/project");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file.rs"), "").unwrap();
+        fs::write(home.join("elsewhere/out.rs"), "").unwrap();
+        let home = fs::canonicalize(&home).unwrap();
+        let root = fs::canonicalize(&root).unwrap();
+        let root = root.to_str().unwrap();
+        let home = home.to_str().unwrap();
+        // Inside cwd -> relative.
+        assert_eq!(relative_insert("file.rs", root, root, Some(home)), "file.rs");
+        // Outside cwd but under home -> ~/…
+        assert_eq!(relative_insert("file.rs", root, &format!("{home}/Dev/other"), Some(home)), "~/Dev/project/file.rs");
+        assert_eq!(relative_insert("../../elsewhere/out.rs", root, root, Some(home)), "~/elsewhere/out.rs");
+        // Outside home -> absolute.
+        fs::write(temporary.path().join("outside.rs"), "").unwrap();
+        let outside = fs::canonicalize(temporary.path().join("outside.rs")).unwrap();
+        assert_eq!(relative_insert("../../../outside.rs", root, root, Some(home)), outside.to_string_lossy());
     }
 }

@@ -45,6 +45,7 @@ fn round_trip<T: serde::Serialize + serde::de::DeserializeOwned>(fixture: &str) 
 fn swift_service_protocol_fixtures_round_trip() {
     round_trip::<ServiceRequest>(REQUESTS);
     round_trip::<ServiceRequest>(include_str!("fixtures/service_protocol/requests-v2.jsonl"));
+    round_trip::<ServiceRequest>(include_str!("fixtures/service_protocol/requests-v3.jsonl"));
     round_trip::<ServiceRequest>(include_str!("fixtures/service_protocol/alias-records-v2.jsonl"));
     round_trip::<ServiceResponse>(RESPONSES);
     round_trip::<ServiceResponse>(include_str!("fixtures/service_protocol/alias-results-v2.jsonl"));
@@ -93,21 +94,21 @@ fn swift_service_protocol_decoding_contract() {
 
 #[test]
 fn service_protocol_defaults_omissions_and_versions() {
-    assert_eq!(VERSION, 2);
+    assert_eq!(VERSION, 3);
     assert_eq!(MAX_MESSAGE_BYTES, 1 << 20);
     assert_eq!(MAX_RESPONSE_BYTES, 64 << 20);
     assert_eq!(IO_TIMEOUT, 2.0);
     assert_eq!(MAX_CONNECTIONS, 64);
     assert_eq!(
         encode_line(&ServiceRequest::new(Operation::Ping)).unwrap(),
-        b"{\"v\":2,\"op\":\"ping\"}\n"
+        b"{\"v\":3,\"op\":\"ping\"}\n"
     );
     assert_eq!(
         encode_line(&ServiceResponse::new(true)).unwrap(),
-        b"{\"v\":2,\"ok\":true}\n"
+        b"{\"v\":3,\"ok\":true}\n"
     );
     let request: ServiceRequest =
-        decode_line(b"{\"v\":2,\"op\":\"ping\",\"command\":null}\n").unwrap();
+        decode_line(b"{\"v\":3,\"op\":\"ping\",\"command\":null}\n").unwrap();
     assert_eq!(request, ServiceRequest::new(Operation::Ping));
     assert_eq!(
         serde_json::to_value(SearchFilter::default()).unwrap(),
@@ -118,11 +119,11 @@ fn service_protocol_defaults_omissions_and_versions() {
     let request: ServiceRequest = decode_line(b"{\"v\":1,\"op\":\"ping\"}").unwrap();
     assert_eq!(request.v, 1);
     assert_eq!(request.shell_path, None);
-    let response = ServiceResponse::failure("version", "Protocol version 2 required.");
+    let response = ServiceResponse::failure("version", "Protocol version 3 required.");
     assert_eq!(
         serde_json::to_value(response).unwrap(),
         json!({
-            "v": 2, "ok": false, "error": {"code": "version", "message": "Protocol version 2 required."}
+            "v": 3, "ok": false, "error": {"code": "version", "message": "Protocol version 3 required."}
         })
     );
 }

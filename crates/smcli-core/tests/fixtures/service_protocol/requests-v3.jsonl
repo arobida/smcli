@@ -1,0 +1,3 @@
+{"v":3,"op":"files","directory":"/project/crates","cwd":"/project","query":"picker","scope":true}
+{"v":3,"op":"grep","directory":"/project/crates","cwd":"/project","query":"KeyCode","scope":true,"path":"picker.rs"}
+{"v":3,"op":"complete","directory":"/project","cwd":"/project","query":"src/","limit":10,"dirsOnly":true,"scope":true}
