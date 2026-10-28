@@ -933,9 +933,15 @@ fn pick(
             vec![],
             recent,
             native,
-            if files || grep { String::new() } else { query },
+            // Ctrl-T's query is the whole command line, so files mode starts empty unless `@` completion names a word.
+            if files { env.get("SMCLI_FILES_QUERY").cloned().unwrap_or_default() } else if grep { String::new() } else { query },
         )
     };
+    if files {
+        picker.project_files = env.get("SMCLI_FILES_QUERY").is_some_and(|q| !q.is_empty());
+        // `cd @` and friends: folders only.
+        picker.kind = if env.contains_key("SMCLI_FILES_DIRS") { 1 } else { 0 };
+    }
     picker.mode = if files {
         Mode::Files
     } else if grep {
@@ -956,13 +962,55 @@ fn pick(
     } else {
         HashMap::new()
     };
-    picker.local_files = crate::picker::with_picked(
-        &scores,
-        Path::new(root),
-        Path::new(&d),
-        crate::picker::directory_entries(Path::new(&d), 5000),
-        5000,
-    );
+    let mut scores = scores;
+    let mut entries = crate::picker::directory_entries(Path::new(&d), 5000);
+    // `@` completion: paths this program was run with in the project rank first, at any depth, then fff's
+    // project-wide ranking, then the cwd listing.
+    if let Some(program) = env.get("SMCLI_FILES_COMMAND").filter(|_| files) {
+        let dirs = picker.kind == 1;
+        let base = Path::new(root).canonicalize().unwrap_or_else(|_| root.into());
+        for (command, stats) in c.command_stats(Some(&d), Some(root), now()).unwrap_or_default() {
+            let Some(words) = smcli_core::parse::shell_words(&command) else { continue };
+            if words.first() != Some(program) || stats.runs_project == 0 {
+                continue;
+            }
+            for word in words[1..].iter().filter(|w| !w.starts_with('-')) {
+                let Ok(path) = Path::new(&stats.last_directory).join(word).canonicalize() else { continue };
+                if dirs && !path.is_dir() {
+                    continue;
+                }
+                if let Ok(relative) = path.strip_prefix(&base).map(|r| r.to_string_lossy().into_owned()) {
+                    if !relative.is_empty() {
+                        *scores.entry(relative).or_default() += stats.frecency;
+                    }
+                }
+            }
+        }
+        let mut r = ServiceRequest::new(Operation::Complete);
+        r.query = Some(String::new());
+        r.directory = Some(d.clone());
+        r.limit = Some(200);
+        r.dirs_only = Some(false);
+        if let Some(found) = service.send(&r, None, Duration::from_secs(2)).filter(|r| r.ok).and_then(|r| r.files) {
+            // fff ranks files (frecency, git); a folder ranks by its best file.
+            let found: Vec<_> = if dirs {
+                let mut seen = std::collections::HashSet::new();
+                found
+                    .into_iter()
+                    .filter_map(|mut hit| {
+                        let cut = |p: &str| p.trim_end_matches('/').rsplit_once('/').map(|(d, _)| format!("{d}/"));
+                        (hit.path, hit.insert) = (cut(&hit.path)?, cut(&hit.insert)?);
+                        hit.git = None;
+                        seen.insert(hit.path.clone()).then_some(hit)
+                    })
+                    .collect()
+            } else {
+                found
+            };
+            entries.splice(0..0, found);
+        }
+    }
+    picker.local_files = crate::picker::with_picked(&scores, Path::new(root), Path::new(&d), entries, 5000);
     let search = {
         let c = CapturedHistory::new(c.path.clone());
         let home = home.to_owned();

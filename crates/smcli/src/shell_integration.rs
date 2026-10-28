@@ -492,7 +492,7 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
     _smcli_pick_bin=\#(binary)
     _smcli_pick() {
         local chosen code
-        chosen=$(SMCLI_SHELL=zsh SMCLI_LBUFFER=$LBUFFER "$_smcli_pick_bin" pick "$@" -- "$BUFFER" </dev/tty)
+        chosen=$(env SMCLI_SHELL=zsh SMCLI_LBUFFER=$LBUFFER "$_smcli_pick_bin" pick "$@" -- "$BUFFER" </dev/tty)
         code=$?
         if (( code == 0 )); then
             BUFFER=$chosen
@@ -585,12 +585,25 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
         if (( $#hits == 1 )) && [[ -n $hits[1] ]]; then
             LBUFFER="${LBUFFER%$word}${hits[1]}"
         elif (( $#hits > 1 )); then
-            zle -M "${(F)hits}"
+            # Several matches: pick one in the files picker, filtered by the word.
+            local chosen
+            chosen=$(env SMCLI_SHELL=zsh SMCLI_LBUFFER=${LBUFFER%$word} SMCLI_FILES_QUERY=${word#@} SMCLI_FILES_COMMAND=$cmd ${${(M)cmd:#(cd|pushd|z)}:+SMCLI_FILES_DIRS=1} "$_smcli_complete_bin" pick --files </dev/tty)
+            (( $? == 10 )) && LBUFFER="${LBUFFER%$word}$chosen"
+            zle reset-prompt
         fi
     }
     zle -N _smcli_complete_widget
-    bindkey '^I' _smcli_complete_widget
-    bindkey -M viins '^I' _smcli_complete_widget 2>/dev/null || true
+    # Deferred plugins (fzf-tab, zsh-defer) rebind Tab after init: take it back before each prompt, chaining to theirs.
+    _smcli_tab_rebind() {
+        local bound=${${(z)"$(bindkey '^I')"}[-1]}
+        [[ $bound == _smcli_complete_widget ]] && return
+        [[ -n $bound && $bound != undefined-key ]] && _smcli_tab_orig=$bound
+        bindkey '^I' _smcli_complete_widget
+        bindkey -M viins '^I' _smcli_complete_widget 2>/dev/null || true
+    }
+    _smcli_tab_rebind
+    autoload -Uz add-zsh-hook
+    add-zsh-hook precmd _smcli_tab_rebind
 fi"###
         }
         "fish" => {

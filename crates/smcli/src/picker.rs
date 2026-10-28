@@ -86,6 +86,9 @@ pub struct Picker {
     pub local_files: Vec<FileHit>,
     /// Replaces the "history" prompt label, e.g. for directory suggestions.
     pub title: Option<String>,
+    /// Files mode starts on whole-project search, showing only folders (1) or files (2) when set.
+    pub project_files: bool,
+    pub kind: u8,
 }
 impl Picker {
     /// Native history is oldest first; captured history is newest first.
@@ -126,6 +129,8 @@ impl Picker {
             mode: Mode::History,
             local_files: Vec::new(),
             title: None,
+            project_files: false,
+            kind: 0,
         }
     }
 }
@@ -262,8 +267,8 @@ pub fn run(
     let mut saved = HashMap::new();
     let mut selected = 0usize;
     let mut semantic: Option<(String, Vec<String>)> = None;
-    let mut global_files = false;
-    let mut kind = 0;
+    let mut global_files = picker.project_files;
+    let mut kind = picker.kind;
     let mut fetched = None;
     let mut observed = None;
     let mut changed_at = Instant::now();
