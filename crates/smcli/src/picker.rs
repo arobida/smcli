@@ -242,7 +242,62 @@ fn picker_layout(area: Rect) -> [Rect; 7] {
     rows
 }
 
-/// Inline (`@`-Tab): header, search, sunset underline, list hints, 7 results, global hints.
+/// Row colours from `LS_COLORS`: directories, the file default and `*.ext` entries. Backgrounds are dropped.
+struct LsColors {
+    dir: Style,
+    file: Style,
+    ext: Vec<(String, Style)>,
+}
+impl LsColors {
+    fn parse(spec: &str) -> Self {
+        // Unset: the terminal theme's own ANSI blue for directories and default foreground for files; LS_COLORS refines it.
+        let mut colors = Self { dir: Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD), file: Style::new(), ext: Vec::new() };
+        for entry in spec.split(':') {
+            let Some((key, codes)) = entry.split_once('=') else { continue };
+            match key {
+                "di" => colors.dir = sgr(codes),
+                "fi" => colors.file = sgr(codes),
+                _ => if let Some(ext) = key.strip_prefix("*.") { colors.ext.push((format!(".{}", ext.to_lowercase()), sgr(codes))) },
+            }
+        }
+        // Longest suffix wins: `.tar.gz` before `.gz`.
+        colors.ext.sort_by_key(|(ext, _)| std::cmp::Reverse(ext.len()));
+        colors
+    }
+    fn style(&self, path: &str) -> Style {
+        if path.ends_with('/') { return self.dir; }
+        let path = path.to_lowercase();
+        self.ext.iter().find(|(ext, _)| path.ends_with(ext.as_str())).map_or(self.file, |(_, style)| *style)
+    }
+}
+
+/// SGR codes to a foreground style. Unknown or truncated codes are skipped.
+fn sgr(codes: &str) -> Style {
+    let codes: Vec<u8> = codes.split(';').filter_map(|c| c.parse().ok()).collect();
+    let mut style = Style::new();
+    let mut i = 0;
+    while i < codes.len() {
+        match codes[i] {
+            1 => style = style.add_modifier(Modifier::BOLD),
+            2 => style = style.add_modifier(Modifier::DIM),
+            3 => style = style.add_modifier(Modifier::ITALIC),
+            4 => style = style.add_modifier(Modifier::UNDERLINED),
+            n @ 30..=37 => style = style.fg(Color::Indexed(n - 30)),
+            n @ 90..=97 => style = style.fg(Color::Indexed(n - 90 + 8)),
+            38 => match codes.get(i + 1..) {
+                Some([5, n, ..]) => { style = style.fg(Color::Indexed(*n)); i += 2; }
+                Some([2, r, g, b, ..]) => { style = style.fg(Color::Rgb(*r, *g, *b)); i += 4; }
+                _ => break,
+            },
+            48 => match codes.get(i + 1) { Some(5) => i += 2, Some(2) => i += 4, _ => break },
+            _ => {}
+        }
+        i += 1;
+    }
+    style
+}
+
+/// Inline (`@`-Tab): header, search, sunset underline, list hints, results, global hints.
 /// Slots match `picker_layout`; the sunset sits under the search and navigation is unused.
 fn inline_layout(area: Rect) -> [Rect; 7] {
     let list = area.height.saturating_sub(5);
@@ -268,6 +323,15 @@ fn abbreviate(path: &str, home: &str) -> String {
     } else {
         path.into()
     }
+}
+
+/// Where inline Tab moves: a directory hit itself, a file's parent. `None` when that is `scope` or outside it.
+fn tab_target(scope: &str, hit: &str) -> Option<String> {
+    let path = std::path::Path::new(scope).join(hit);
+    let dir = if hit.ends_with('/') { path } else { path.parent()?.to_path_buf() };
+    let dir = dir.canonicalize().ok()?;
+    let scope = std::path::Path::new(scope).canonicalize().ok()?;
+    (dir != scope && dir.starts_with(&scope)).then(|| dir.to_string_lossy().into_owned())
 }
 
 /// The parent of `scope`, or `None` if widening would go above `home` or outside it.
@@ -302,6 +366,7 @@ pub fn run(
     let inline_session = if inline { inline_height(rows).and_then(|height| TerminalSession::inline(height).ok()) } else { None };
     let mut terminal = match inline_session { Some(session) => session, None => TerminalSession::new()? };
     let terminal_inline = terminal.inline.is_some();
+    let ls_colors = LsColors::parse(&std::env::var("LS_COLORS").unwrap_or_default());
     let mut saved = HashMap::new();
     let mut selected = 0usize;
     let mut semantic: Option<(String, Vec<String>)> = None;
@@ -436,7 +501,14 @@ pub fn run(
                 };
                 format!("{}  →  {}", abbreviate(&cwd, &home), displayed)
             };
-            let header = Line::from(vec![Span::styled(format!(" {label} "), ACCENT), Span::styled(scope_label, ACCENT.add_modifier(Modifier::BOLD)), Span::styled(" ›", ACCENT.add_modifier(Modifier::BOLD))]);
+            let header = if compact && !history {
+                // Only the searched directory, which grows and shrinks as Tab moves in and out.
+                let mut path = abbreviate(&scope, &home);
+                if !path.ends_with('/') { path.push('/'); }
+                Line::from(vec![Span::styled(format!(" {label} @ "), ACCENT), Span::styled(visible(&path), ls_colors.dir)])
+            } else {
+                Line::from(vec![Span::styled(format!(" {label} "), ACCENT), Span::styled(scope_label, ACCENT.add_modifier(Modifier::BOLD)), Span::styled(" ›", ACCENT.add_modifier(Modifier::BOLD))])
+            };
             let found = if compact { format!("{count} Results") } else { format!("{count} {} results", if picker.mode == Mode::Grep { "grep" } else { "files" }) };
             let summary = if history {
                 visible(&status)
@@ -471,7 +543,7 @@ pub fn run(
             };
             page_size = list_block.inner(list_area).height.max(1) as usize;
             // Inline marks the selection with a yellow cursor and nudges it right instead of a full-row highlight.
-            let cursor = |sel: bool| if !compact { None } else if sel { Some(Span::styled("▌  ", Style::new().fg(Color::Yellow))) } else { Some(Span::raw(" ")) };
+            let cursor = |sel: bool| if !compact { None } else if sel { Some(Span::styled(" ▌", Style::new().fg(Color::Yellow))) } else { Some(Span::raw("  ")) };
             let items: Vec<ListItem> = if history {
                 // Rows past the selection plus one screen are never visible; skip building them.
                 commands.iter().enumerate().take(selected + area.height as usize).map(|(i, c)| {
@@ -488,10 +560,14 @@ pub fn run(
                     let name = &h.path;
                     let location = h.line.map(|n| format!(":{n}  {}", h.text.as_deref().unwrap_or(""))).unwrap_or_default();
                     ListItem::new(Line::from(cursor(i == selected).into_iter().chain([
-                        Span::styled(format!("{} ", h.git.as_deref().unwrap_or("")), ACCENT),
-                        Span::raw(visible(name)),
+                        Span::styled(if compact { String::new() } else { format!("{} ", h.git.as_deref().unwrap_or("")) }, ACCENT),
+                        Span::styled(visible(name), if compact { ls_colors.style(name) } else { Style::new() }),
                         Span::styled(visible(&location), MUTED),
-                        Span::styled(format!("  {}", h.provenance.join("+")), MUTED),
+                        // Inline: colour already tells dirs from files; git status and picked stay.
+                        Span::styled(if !compact { format!("  {}", h.provenance.join("+")) } else {
+                            [h.git.clone().unwrap_or_default(), if h.provenance.iter().any(|p| p == "picked") { "picked".into() } else { String::new() }]
+                                .into_iter().filter(|s| !s.trim().is_empty()).map(|s| format!("  {}", s.trim())).collect()
+                        }, MUTED),
                     ]).collect::<Vec<_>>()))
                 }).collect()
             };
@@ -519,7 +595,17 @@ pub fn run(
                 // The search underline is the sunset; the result count ends it.
                 let width = area.width.saturating_sub(summary.width() as u16);
                 cols = width;
-                let mut line = stripe_line(width, shown, fade, "─");
+                let filled = shown.min(width);
+                let mut line = if filled > 0 && filled < width {
+                    // A `╸` tip in the edge cell's colour leads the bar.
+                    let mut line = stripe_line(width, filled - 1, fade, "━");
+                    let rest = line.spans.pop();
+                    line.spans.push(Span::styled("╸", Style::new().fg(stripe_color(filled as usize - 1, width as usize)).add_modifier(fade)));
+                    line.spans.extend(rest.map(|span| Span::styled("━".repeat(span.content.chars().count() - 1), span.style)));
+                    line
+                } else {
+                    stripe_line(width, filled, fade, "━")
+                };
                 line.spans.extend(summary.spans);
                 frame.render_widget(Paragraph::new(line), stripe_area);
             } else {
@@ -638,6 +724,15 @@ pub fn run(
             KeyCode::Tab if picker.mode == Mode::History && !picker.query.trim().is_empty() => {
                 if search.is_some() {
                     semantic_pending = Some(picker.query.clone());
+                }
+            }
+            KeyCode::Tab if picker.mode == Mode::Files && count > 0 && terminal_inline => {
+                // Inline: a directory goes into itself, a file into its parent.
+                if let Some(next) = tab_target(&scope, &hits[selected].path) {
+                    picker.scope = Some(next);
+                    picker.query.clear();
+                    selected = 0;
+                    status.clear();
                 }
             }
             KeyCode::Tab if picker.mode == Mode::Files && count > 0 => {
@@ -775,9 +870,9 @@ pub(crate) fn visible(text: &str) -> String {
         .collect()
 }
 
-/// Inline picker height: the compact layout with 7 results, clamped under the prompt; `None` when too short to be useful.
+/// Inline picker height: the compact layout with 12 results, clamped under the prompt; `None` when too short to be useful.
 fn inline_height(rows: u16) -> Option<u16> {
-    Some(12.min(rows.saturating_sub(1))).filter(|&height| height >= 5)
+    Some(17.min(rows.saturating_sub(1))).filter(|&height| height >= 6)
 }
 
 pub(crate) struct TerminalSession {
@@ -884,20 +979,49 @@ mod tests {
 
     #[test]
     fn inline_viewport_sits_under_a_bottom_prompt() {
-        assert_eq!(inline_height(40), Some(12));
+        assert_eq!(inline_height(40), Some(17));
         assert_eq!(inline_height(10), Some(9));
-        assert_eq!(inline_height(5), None);
+        assert_eq!(inline_height(6), None);
         let mut backend = ratatui::backend::TestBackend::new(80, 24);
         // The cursor after `\r\n` from a prompt on the last row.
         ratatui::backend::Backend::set_cursor_position(&mut backend, (0, 23)).unwrap();
-        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport: Viewport::Inline(12) }).unwrap();
+        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport: Viewport::Inline(17) }).unwrap();
         let area = terminal.get_frame().area();
-        assert_eq!((area.y, area.height), (12, 12));
-        assert_eq!(area.y.saturating_sub(1), 11);
+        assert_eq!((area.y, area.height), (7, 17));
+        assert_eq!(area.y.saturating_sub(1), 6);
         let [header, filters, search, _, list, sunset, globals] = inline_layout(area);
         let order: Vec<u16> = [header, search, sunset, filters, list, globals].iter().map(|r| r.y).collect();
-        assert_eq!(order, [12, 13, 14, 15, 16, 23], "search, underline, list hints, 7 results, global hints");
-        assert_eq!(list.height, 7);
+        assert_eq!(order, [7, 8, 9, 10, 11, 23], "search, underline, list hints, 12 results, global hints");
+        assert_eq!(list.height, 12);
+    }
+
+    #[test]
+    fn ls_colors_match_dirs_and_longest_extension() {
+        let unset = LsColors::parse("");
+        assert_eq!(unset.style("src/"), Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD));
+        assert_eq!(unset.style("a.rs"), Style::new());
+        let colors = LsColors::parse("di=01;36:*.gz=31:*.tar.gz=38;5;208:*.RS=38;2;1;2;3:fi=00:x=bad:*.ok=38;5");
+        assert_eq!(colors.style("lib.d/"), Style::new().fg(Color::Indexed(6)).add_modifier(Modifier::BOLD));
+        assert_eq!(colors.style("a.TAR.GZ"), Style::new().fg(Color::Indexed(208)));
+        assert_eq!(colors.style("a.gz"), Style::new().fg(Color::Indexed(1)));
+        assert_eq!(colors.style("main.rs"), Style::new().fg(Color::Rgb(1, 2, 3)));
+        assert_eq!(colors.style("x.ok"), Style::new());
+        assert_eq!(sgr("41;32"), Style::new().fg(Color::Indexed(2)), "backgrounds dropped");
+    }
+
+    #[test]
+    fn inline_tab_enters_dirs_and_file_parents_inside_scope() {
+        let root = std::env::temp_dir().join(format!("smcli-tab-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/f.txt"), "").unwrap();
+        std::fs::write(root.join("top.txt"), "").unwrap();
+        let scope = root.canonicalize().unwrap();
+        let s = scope.to_str().unwrap();
+        assert_eq!(tab_target(s, "a/"), Some(scope.join("a").to_string_lossy().into_owned()));
+        assert_eq!(tab_target(s, "a/b/f.txt"), Some(scope.join("a/b").to_string_lossy().into_owned()));
+        assert_eq!(tab_target(s, "top.txt"), None, "parent is the scope");
+        assert_eq!(tab_target(s, "../"), None, "outside the scope");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
