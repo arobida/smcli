@@ -60,6 +60,21 @@ in the shell to make recording synchronous.
 prompt, Esc to cancel. Text already on the prompt becomes the initial query. Set
 `SMCLI_NO_KEYS=1` before the `eval` to keep your shell's own keys, or `SMCLI_EXTRA_KEYS=1` to add Left and Right on an empty line, Ctrl-Right and Alt-;. Bash needs 4.0+. Fish keeps Right for autosuggestions. In the shell hooks, press Tab on a word starting with `@` to complete a project path; `cd` offers directories only, and glob characters use glob matching. Nothing changes unless you press Tab.
 
+When `@`-Tab finds several matches (bash, zsh and fish), the files picker opens inline under the prompt,
+showing 12 results:
+
+- A blank `@` lists fff's suggestions first, marked ✨: files you open often or recently, files with git
+  changes, and each one's folder. The rest of fff's ranking follows. Once you type, matching files you
+  picked before are marked ✨ and lead.
+- Tab moves into the selected folder, or into a file's folder; Shift+Tab moves out. The header shows the
+  folder being searched, e.g. `files+dirs @ ~/project/src/`.
+- ^F cycles files+dirs, folders and files; ^G searches file contents; ^T switches to history; Enter
+  inserts the path; Esc leaves the line as it was. Resizing the window closes the picker.
+- Rows use your terminal theme's colours. Config options (in `~/.config/smcli/config.json`):
+  `"atCompletionLsColors": true` colours rows from `LS_COLORS`; `"atCompletionInline": false` uses the
+  fullscreen picker instead. Terminals that never report the cursor position also get the fullscreen
+  picker.
+
 ## Install
 
 See **[docs/install.md](docs/install.md)** to install a release or build from source, set up Zsh, Bash or Fish,
@@ -174,9 +189,7 @@ Project-index ranking switches are controlled by `SMCLI_RANKING_OFF`: `index`, `
   secrets (AWS, GitHub, GitLab, Slack, Stripe, Google, npm, Anthropic/OpenAI keys), and any
   matching regexes in the config file: `"historyFilter": ["^vault "]` for commands,
   `"cwdFilter": ["^/Users/me/secret"]` for directories. Set `"secretsFilter": false` to turn
-  off the secret patterns. In zsh, `@`-Tab with several matches opens the files picker inline
-  under the prompt; set `"atCompletionInline": false` for the fullscreen picker. Its rows use the terminal
-  theme's colours; set `"atCompletionLsColors": true` to colour them from `LS_COLORS`. `prune` applies the current filters to already-stored history
+  off the secret patterns. `prune` applies the current filters to already-stored history
   and compacts the database so deleted text is not left on disk.
 - `import --atuin` keeps Atuin's record UUIDs, so re-running it only adds new commands.
   It also carries over soft deletions (hidden from history, search, and suggestions) and
