@@ -23,7 +23,7 @@ pick opens the history picker: Up and Ctrl-R show all history, newest first. On 
 SMCLI_EXTRA_KEYS=1 also binds Left and Right on an empty line, Ctrl-Right and Alt-; (Bash and Zsh). Fish keeps Right for autosuggestions.
 Ctrl-T at the prompt (pick --files) opens files mode on this directory's entries; type to filter, Ctrl-F shows only
 directories, then only files, Tab searches the whole project with fff. Ctrl-G (pick --grep) searches file contents with fff.
-In the picker, Ctrl-T and Ctrl-G switch to files and grep and back to history; project search and grep need the service. Enter inserts the path at the cursor, quoted for your shell (SMCLI_SHELL), and never runs anything.
+In the picker, Ctrl-T and Ctrl-G switch to files and grep and back to history; project search and grep need the service. Ctrl-E edits path arguments in the selected history command: detected paths become `@` placeholders and the files picker opens on the first one. Enter replaces it with a quoted path; the command is left on the line and never run. Enter also inserts a path at the cursor, quoted for your shell (SMCLI_SHELL).
 suggest and search also weigh the project (nearest manifest), the shell session's previous command (SMCLI_SESSION, set by
 shell-init), commands you picked in the picker for a similar query, scripts and targets named in the project's manifest, and
 an operation in progress (a rebase suggests `git rebase --continue`). Search also favors commands whose program is on your

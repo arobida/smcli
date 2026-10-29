@@ -56,6 +56,7 @@ pub enum Choice {
         command: String,
         query: String,
         semantic: bool,
+        edit_paths: bool,
     },
     File {
         hit: FileHit,
@@ -601,6 +602,9 @@ pub fn run(
             frame.render_widget(Paragraph::new(hint_line(&filters)), filter_area);
             frame.render_widget(Paragraph::new(hint_line(&[("[ ⏎ ]", "accept"), ("↑↓", "move"), ("PgUp/PgDn", "page")])), navigation_area);
             let mut globals = vec![("esc", "cancel"), ("^T", if picker.mode == Mode::Files { "history" } else { "files" })];
+            if picker.mode == Mode::History {
+                globals.push(("^E", "edit paths"));
+            }
             globals.push(("^G", if picker.mode == Mode::Grep { "history" } else { "grep" }));
             globals.push(("^U", "clear"));
             let fade = if tick < 3 { Modifier::DIM } else { Modifier::empty() };
@@ -693,6 +697,7 @@ pub fn run(
                         command: commands[selected].clone(),
                         query: picker.query,
                         semantic: semantic_active,
+                        edit_paths: false,
                     })
                 } else {
                     Some(Choice::File {
@@ -718,6 +723,14 @@ pub fn run(
             KeyCode::Char('f') if ctrl && picker.mode == Mode::Files => {
                 kind = (kind + 1) % 3;
                 selected = 0;
+            }
+            KeyCode::Char('e') if ctrl && picker.mode == Mode::History && count > 0 => {
+                return Ok(Some(Choice::Command {
+                    command: commands[selected].clone(),
+                    query: picker.query,
+                    semantic: semantic_active,
+                    edit_paths: true,
+                }));
             }
             KeyCode::Char('u') if ctrl => {
                 picker.query.clear();

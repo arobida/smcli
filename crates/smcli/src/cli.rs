@@ -886,6 +886,22 @@ fn import(
     println!("Imported {count} records into {}.", c.path.display());
     Ok(())
 }
+fn command_directory(c: &CapturedHistory, user: &str, command_key: &str) -> Option<String> {
+    if !c.path.exists() {
+        return None;
+    }
+    let db = c.open_connection().ok()?;
+    let mut stmt = db
+        .prepare(
+            "SELECT c.directory FROM commands c JOIN sessions s ON s.id = c.session
+             WHERE smcli_key(c.command, c.expanded_command) = ? AND s.user = ?
+             ORDER BY c.started_at DESC, c.id DESC LIMIT 1",
+        )
+        .ok()?;
+    stmt.query_row(rusqlite::params![command_key, user], |r| r.get::<_, String>(0))
+        .ok()
+}
+
 fn pick(
     c: &CapturedHistory,
     service: &ServiceClient,
@@ -1036,6 +1052,7 @@ fn pick(
                 command,
                 query,
                 semantic,
+                edit_paths,
             } => {
                 let mut r = ServiceRequest::new(Operation::Select);
                 let (typed, expanded) = smcli_core::entry::command_parts(&command);
@@ -1066,7 +1083,17 @@ fn pick(
                         Ok(())
                     })();
                 }
-                println!("{}", crate::picker::history_insert(&command));
+                let typed = crate::picker::history_insert(&command);
+                if edit_paths {
+                    let dir = command_directory(c, &user, &command).unwrap_or_else(|| d.clone());
+                    if let Some((rewritten, pos)) = smcli_core::parse::path_placeholders(&typed, |path| {
+                        std::path::Path::new(&dir).join(path).exists()
+                    }) {
+                        print!("{}\x1f{}", &rewritten[..pos], &rewritten[pos + 1..]);
+                        std::process::exit(11);
+                    }
+                }
+                println!("{typed}");
             }
             Choice::File { hit, mode, query, scope } => {
                 if hit.provenance != ["*"] {

@@ -13,6 +13,8 @@ see `Models/`). Search works on macOS and Linux.
 
 ## Quickstart
 
+When a history command names paths, press **Ctrl-E** in the picker to replace detected paths with `@` placeholders and open the files picker on the first one. Enter fills it with a quoted path and leaves the command on the prompt; it never runs the command. Move to another `@` and press Tab to pick that path.
+
 ``` sh
 $ make release
 $ dist/smcli history

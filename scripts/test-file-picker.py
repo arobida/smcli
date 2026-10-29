@@ -81,6 +81,7 @@ def run(shell, path):
     env = dict(os.environ, HOME=home, TERM="xterm", SMCLI_DB=f"{home}/h.db", SMCLI_RUNTIME_DIR=f"{home}/run",
                SMCLI_CONFIG=f"{home}/config.json", **extra)
     env.pop("SMCLI_SERVICE", None)
+    subprocess.run([binary, "record", shell, repo, "0", "cp notes/a.md backup/", "test-session"], env=env, check=True)
     pid, fd = pty.fork()
     if pid == 0:
         signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -165,6 +166,21 @@ def run(shell, path):
         got = printed(until(lambda t: len(printed(t)) >= 3, "unicode output"))
         assert got == ["é", NAMES["t01"], "suffix"], f"{shell}: insertion after a multibyte character gave {got!r}"
         print(f"{shell}: no insertion inside quotes; insertion after multibyte text lands at the cursor.")
+
+        # Ctrl-E on recorded cp history rewrites paths and immediately opens the files picker.
+        settle()
+        buffer = b""
+        os.write(fd, b"notes/a.md\x1b[A")  # Search for the recorded command, not the previous selection.
+        until(lambda t: "esc cancel" in t and "cp notes/a.md backup/" in t, "history picker", render=screen)
+        os.write(fd, b"\x05")  # Ctrl-E: edit path arguments.
+        until(lambda t: "^F dirs/files" in t, "edit-path files picker", render=screen)
+        os.write(fd, b"t01\x01")
+        until(lambda t: "files results" in t, "edit-path file results", render=screen)
+        os.write(fd, b"\r")
+        settle()
+        line = CSI.sub(b"", buffer).decode(errors="replace")
+        assert "cp '" + NAMES["t01"] + "' @" in line, f"{shell}: Ctrl-E did not leave cp <path> @: {line!r}"
+        print(f"{shell}: Ctrl-E rewrites cp paths and opens the file picker.")
     finally:
         try:
             os.kill(pid, signal.SIGKILL)

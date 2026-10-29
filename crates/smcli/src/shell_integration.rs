@@ -295,6 +295,17 @@ elif [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
             _smcli_split "$chosen"
             READLINE_LINE=$_smcli_before$chosen\ $_smcli_after
             READLINE_POINT=$(( READLINE_POINT + _smcli_bytes + 1 ))
+        elif (( code == 11 )); then
+            # Edit paths: rewrite the command with @ placeholders and open the file picker on the first one.
+            local before=${chosen%%$'\x1f'*} after=${chosen#*$'\x1f'} picked
+            _smcli_split "$before@"
+            READLINE_LINE="$before@$after"
+            READLINE_POINT=$_smcli_bytes
+            picked=$(SMCLI_SHELL=bash SMCLI_LBUFFER="$before@" "$_smcli_pick_bin" pick --files </dev/tty)
+            (( $? == 10 )) || return
+            READLINE_LINE="$before$picked$after"
+            _smcli_split "$before$picked"
+            READLINE_POINT=$_smcli_bytes
         fi
         unset _smcli_before _smcli_after _smcli_bytes
     }
@@ -515,6 +526,15 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
         elif (( code == 10 )); then
             # A file or grep result: one quoted word, inserted at the cursor. Never run.
             LBUFFER+="$chosen "
+        elif (( code == 11 )); then
+            # Edit paths: rewrite the command with @ placeholders and open the file picker on the first one.
+            local before=${chosen%%$'\x1f'*} after=${chosen#*$'\x1f'} picked
+            BUFFER="$before@$after"
+            CURSOR=$((${#before} + 1))
+            picked=$(env SMCLI_SHELL=zsh SMCLI_LBUFFER="$before@" "$_smcli_pick_bin" pick --files </dev/tty)
+            (( $? == 10 )) || return
+            BUFFER="$before$picked$after"
+            CURSOR=$((${#before} + ${#picked}))
         fi
         zle reset-prompt
     }
@@ -735,6 +755,18 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
         else if test $code -eq 10
             # A file or grep result: one quoted word, inserted at the cursor. Never run.
             commandline -i -- (string join \n -- $chosen | string collect)" "
+        else if test $code -eq 11
+            # Edit paths: rewrite the command with @ placeholders and open the file picker on the first one.
+            set -l parts (string split \x1f --max 1 -- $chosen)
+            set -l before $parts[1]
+            set -l after $parts[2]
+            commandline -r -- "$before@$after"
+            commandline -C (math (string length -- $before) + 1)
+            set -lx SMCLI_LBUFFER "$before@"
+            set -l picked (SMCLI_SHELL=fish command $_smcli_bin pick --files </dev/tty)
+            test $status -eq 10; or return
+            commandline -r -- "$before$picked$after"
+            commandline -C (math (string length -- $before) + (string length -- $picked))
         end
         commandline -f repaint
     end
@@ -942,5 +974,24 @@ mod tests {
         let off = SmcliConfig { left_key: Some(true), right_key: Some(false), ..Default::default() };
         let zsh = render_config("zsh", "smcli", &off).unwrap();
         assert!(zsh.contains("|| (( 0 )); then\n            _smcli_bind $_smcli_keymap '^[[C' _smcli_pick_right"));
+    }
+
+    #[test]
+    fn edit_paths_branch_runs_file_picker_on_first_placeholder() {
+        for shell in ["bash", "zsh", "fish"] {
+            let hooks = render_with_keys(shell, "smcli", true, false, false, false, false).unwrap();
+            assert!(hooks.contains("code == 11") || hooks.contains("$code -eq 11"), "{shell} missing exit-11 branch");
+            assert!(hooks.contains("pick --files"), "{shell} missing file picker call");
+        }
+        let bash = render_with_keys("bash", "smcli", true, false, false, false, false).unwrap();
+        assert!(bash.contains("READLINE_LINE=\"$before@$after\""));
+        assert!(bash.contains("SMCLI_LBUFFER=\"$before@\""));
+        assert!(bash.contains("READLINE_LINE=\"$before$picked$after\""));
+        let zsh = render_with_keys("zsh", "smcli", true, false, false, false, false).unwrap();
+        assert!(zsh.contains("BUFFER=\"$before@$after\""));
+        assert!(zsh.contains("BUFFER=\"$before$picked$after\""));
+        let fish = render_with_keys("fish", "smcli", true, false, false, false, false).unwrap();
+        assert!(fish.contains("commandline -r -- \"$before@$after\""));
+        assert!(fish.contains("commandline -r -- \"$before$picked$after\""));
     }
 }
