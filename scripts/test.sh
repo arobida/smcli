@@ -7,68 +7,30 @@ unset "${!SMCLI_@}" XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME
 cargo test --workspace
 cargo build --workspace
 bin_dir="$(cd "${CARGO_TARGET_DIR:-target}/debug" && pwd)"
-home="$(mktemp -d)"
-# The service is on by default; keep the one these checks start private, short-pathed and stopped on exit.
-runtime="$(mktemp -d /tmp/smcli-test.XXXXXX)"
-export SMCLI_DB="$home/captured.db" SMCLI_RUNTIME_DIR="$runtime"
-trap '"$bin_dir/smcli" service stop >/dev/null 2>&1 || true; rm -rf "$home" "$runtime"' EXIT
 
-output="$("$bin_dir/smcli")"
-[[ "$output" == 'Usage: smcli init'* ]]
-[[ "$(HOME="$home" HISTFILE='' "$bin_dir/smcli" history)" == 'No saved Bash or Zsh history found.' ]]
-printf '#1700000000\necho bash\n' > "$home/.bash_history"
-printf ': 1700000000:0;echo zsh\n' > "$home/.zsh_history"
-cp "$home/.bash_history" "$home/bash-history.before"
-cp "$home/.zsh_history" "$home/zsh-history.before"
-output="$(HOME="$home" HISTFILE='' "$bin_dir/smcli" history)"
-expected="$(printf '==> %s/.bash_history <==\necho bash\n==> %s/.zsh_history <==\necho zsh' "$home" "$home")"
-[[ "$output" == "$expected" ]]
+# Each black-box suite is isolated (its own HOME, database, runtime directory and Unix socket), so the
+# six run concurrently; a line-tagged prefix keeps the interleaved output readable.
+pids=()
+names=()
+run() {
+    local name="$1"; shift
+    ( "$@" 2>&1 | while IFS= read -r line || [[ -n "$line" ]]; do printf '[%-13s] %s\n' "$name" "$line"; done ) &
+    pids+=("$!")
+    names+=("$name")
+}
+run cli          bash scripts/test-cli.sh "$bin_dir/smcli"
+run shells       python3 scripts/test-shells.py "$bin_dir/smcli"
+run service      python3 scripts/test-service.py "$bin_dir/smcli"
+run file-picker  python3 scripts/test-file-picker.py "$bin_dir/smcli"
+run alias-picker python3 scripts/test-alias-picker.py "$bin_dir/smcli"
+run install      bash scripts/test-install.sh "$bin_dir"
 
-if HOME="$home" HISTFILE="$home/missing" "$bin_dir/smcli" history > "$home/output" 2> "$home/error"; then
-    printf 'Missing custom history should fail.\n' >&2
+failed=()
+for i in "${!pids[@]}"; do
+    wait "${pids[$i]}" || failed+=("${names[$i]}")
+done
+if (( ${#failed[@]} )); then
+    printf '\nsmcli test suite FAILED: %s\n' "${failed[*]}" >&2
     exit 1
 fi
-[[ ! -s "$home/output" && -s "$home/error" ]]
-if "$bin_dir/smcli" unknown > "$home/output" 2> "$home/error"; then
-    printf 'Unknown command should fail.\n' >&2
-    exit 1
-fi
-[[ "$(HOME="$home" HISTFILE='' "$bin_dir/smcli" search echo zsh -n 1)" == 'echo zsh'* ]]
-# init --keys sets the picker keys without asking, and shell-init follows them.
-cfg="$home/keys.json"
-SMCLI_CONFIG="$cfg" "$bin_dir/smcli" init --keys left > /dev/null
-grep -Eq '"ctrlRKey" ?: false' "$cfg" && grep -Eq '"leftKey" ?: true' "$cfg" && grep -Eq '"ctrlTKey" ?: false' "$cfg"
-init="$(SMCLI_CONFIG="$cfg" "$bin_dir/smcli" shell-init zsh)"
-[[ $init == *"(( 0 )) && _smcli_bind \$_smcli_keymap '^R'"* && $init == *"|| (( 1 )); then"* ]]
-[[ $init == *"(( 0 )) && _smcli_bind \$_smcli_keymap '^T'"* && $init == *"(( 0 )) && _smcli_bind \$_smcli_keymap '^G'"* ]]
-SMCLI_CONFIG="$cfg" "$bin_dir/smcli" init --keys ctrl-r,left > /dev/null
-grep -Eq '"ctrlRKey" ?: true' "$cfg"
-if SMCLI_CONFIG="$cfg" "$bin_dir/smcli" init --keys up > /dev/null 2>&1; then
-    printf 'An unknown key should fail.\n' >&2
-    exit 1
-fi
-# make clean keeps the latest CLI and service pair and both symlinks.
-dist="$home/dist"
-mkdir -p "$dist"
-touch "$dist"/smcli-1-a "$dist"/smcli-service-1-a "$dist"/smcli-2-b "$dist"/smcli-service-2-b
-ln -s smcli-2-b "$dist/smcli"
-ln -s smcli-service-2-b "$dist/smcli-service"
-bash scripts/clean-dist.sh "$dist"
-[[ "$(cd "$dist" && ls | tr '\n' ' ')" == 'smcli smcli-2-b smcli-service smcli-service-2-b ' ]]
-atdir="$(mktemp -d /tmp/smcli-at.XXXXXX)"
-touch "$atdir/smcli-at-probe42.txt"
-mkdir "$atdir/smcli-at-dir"
-[[ "$(cd "$atdir" && "$bin_dir/smcli" complete --word @probe42)" == smcli-at-probe42.txt ]]
-[[ "$(cd "$atdir" && "$bin_dir/smcli" complete --word @at-dir --command cd)" == smcli-at-dir/ ]]
-[[ -z "$(cd "$atdir" && "$bin_dir/smcli" complete --word @probe42 --command cd)" ]]
-rm -rf "$atdir"
-python3 scripts/test-shells.py "$bin_dir/smcli"
-python3 scripts/test-service.py "$bin_dir/smcli"
-python3 scripts/test-file-picker.py "$bin_dir/smcli"
-python3 scripts/test-alias-picker.py "$bin_dir/smcli"
-bash scripts/test-install.sh "$bin_dir"
-python3 scripts/bench-baseline.py --binary "$bin_dir/smcli" --rows 10 --samples 1 --output "$home/baseline.json"
-cmp "$home/bash-history.before" "$home/.bash_history"
-cmp "$home/zsh-history.before" "$home/.zsh_history"
-printf 'Native history byte-equality checks passed.\n'
-printf 'smcli history tests passed.\n'
+printf 'smcli test suite passed.\n'

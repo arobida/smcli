@@ -64,7 +64,7 @@ Use the Makefile for builds; don't hand-roll `cargo build` commands.
 - `make release` — same, without cleaning (faster). `make build` — debug build; `make run ARGS="..."` builds and runs the CLI.
 - `make test` — full test suite (`scripts/test.sh`): `cargo test --workspace`, then black-box CLI checks against a temp `HOME`, `SMCLI_DB` and `SMCLI_RUNTIME_DIR`.
 - Focused slices of the gate, each assuming `make build` output: `make test-rust` (`PKG=smcli-core FILTER=history`
-  narrows crate and test), `make test-shells` (honors `SMCLI_TEST_ONLY`), `make test-service`, `make test-install`.
+  narrows crate and test), `make test-cli` (CLI smoke), `make test-picker` (file + alias picker), `make test-shells` (honors `SMCLI_TEST_ONLY`), `make test-service`, `make test-install`. Match the slice to what changed: picker/menu -> `test-picker` + `test-rust PKG=smcli`, hooks -> `test-shells`, service -> `test-service`, install -> `test-install`.
 - `make ranking` — scores suggest/search ranking on the fixed query set (`crates/smcli-search/tests/ranking.rs`); run after ranking changes.
 - `make linux` — full test suite on Linux in Docker (needs a running daemon).
 - `make baseline` — black-box CLI/hook benchmark (`scripts/bench-baseline.py`, see `agents/reference/baseline.md`); never reads real history.

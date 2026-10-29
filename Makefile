@@ -2,7 +2,7 @@ PYTHON ?= python3
 DIST := dist
 STAMP := $(shell date +%Y%m%d-%H%M%S)-$(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)
 
-.PHONY: build release fresh install uninstall test test-rust test-shells test-service test-install clean run baseline ranking linux docs notices
+.PHONY: build release fresh install uninstall test test-rust test-cli test-picker test-shells test-service test-install clean run baseline ranking linux docs notices
 
 PKG ?=
 FILTER ?=
@@ -37,6 +37,15 @@ test:
 # One slice of the gate, for the edit/test loop. Each assumes `make build` output.
 test-rust:
 	cargo test $(if $(PKG),-p $(PKG),--workspace) $(FILTER)
+
+# Black-box CLI smoke: usage, history, search, init --keys, shell-init, clean-dist, @-completion.
+test-cli: build
+	bash scripts/test-cli.sh "$$(cd "$${CARGO_TARGET_DIR:-target}/debug" && pwd)/smcli"
+
+# The interactive pickers (files and aliases), for picker/menu/UI changes.
+test-picker: build
+	$(PYTHON) scripts/test-file-picker.py "$$(cd "$${CARGO_TARGET_DIR:-target}/debug" && pwd)/smcli"
+	$(PYTHON) scripts/test-alias-picker.py "$$(cd "$${CARGO_TARGET_DIR:-target}/debug" && pwd)/smcli"
 
 test-shells: build
 	$(PYTHON) scripts/test-shells.py "$$(cd "$${CARGO_TARGET_DIR:-target}/debug" && pwd)/smcli"
