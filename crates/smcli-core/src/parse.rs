@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn path_placeholders_replace_paths_and_preserve_non_paths() {
         let exists = |w: &str| w == "src";
-        let run = |cmd| path_placeholders(cmd, exists).map(|(s, _)| s);
+        let run = |cmd| path_placeholders(cmd, "bash", exists).map(|(s, _)| s);
         assert_eq!(run("cp notes/a.md backup/").as_deref(), Some("cp @ @"));
         assert_eq!(run(r#"rm -rf "old file.md""#).as_deref(), Some("rm -rf @"));
         assert_eq!(run("vim ~/x.toml").as_deref(), Some("vim @"));
@@ -278,8 +278,52 @@ mod tests {
         assert_eq!(run("echo hi > out.log").as_deref(), Some("echo hi > @"));
         assert_eq!(run("curl --url=https://x.com/a"), None);
         assert_eq!(run("find --name=*.rs"), None);
-        assert_eq!(path_placeholders("ls -a", |_| true), None);
+        assert_eq!(path_placeholders("ls -a", "bash", |_| true), None);
         assert_eq!(run("cmd --out=\"x/a\"").as_deref(), Some("cmd --out=@"));
+    }
+
+    #[test]
+    fn path_placeholders_mixed_word_substitution() {
+        let result = path_placeholders(r#"echo prefix"$(cat a.md)""#, "bash", |_| false);
+        assert_eq!(result.as_ref().map(|v| v.0.as_str()), Some(r#"echo prefix"$(cat @)""#));
+    }
+
+    #[test]
+    fn path_placeholders_restores_outer_redirection() {
+        let result = path_placeholders("echo > $(echo a.md) b.md", "bash", |_| false);
+        assert_eq!(result.as_ref().map(|v| v.0.as_str()), Some("echo > $(echo @) @"));
+    }
+
+    #[test]
+    fn path_placeholders_escaped_dollar_is_literal() {
+        let result = path_placeholders(r"cat \$HOME/x.md $HOME/y.md", "bash", |_| false);
+        assert_eq!(result.as_ref().map(|v| v.0.as_str()), Some("cat @ $HOME/y.md"));
+        let result = path_placeholders(r"cmd --out=\$HOME/x.md", "bash", |_| false);
+        assert_eq!(result.as_ref().map(|v| v.0.as_str()), Some("cmd --out=@"));
+    }
+
+    #[test]
+    fn path_placeholders_command_substitutions_and_groups() {
+        let exists = |w: &str| w == "src";
+        let run = |cmd, shell| path_placeholders(cmd, shell, exists).map(|(s, _)| s);
+        assert_eq!(run(r#"eval "$(/a/b/smcli shell-init zsh)""#, "bash").as_deref(), Some(r#"eval "$(@ shell-init zsh)""#));
+        assert_eq!(run(r#"cat "$(ls notes/)""#, "bash").as_deref(), Some(r#"cat "$(ls @)""#));
+        assert_eq!(run("cat `ls notes/`", "bash").as_deref(), Some("cat `ls @`"));
+        assert_eq!(run("diff <(sort a.txt) <(sort b.txt)", "bash").as_deref(), Some("diff <(sort @) <(sort @)"));
+        assert_eq!(run(r#"rm "old file.md""#, "bash").as_deref(), Some("rm @"));
+        assert_eq!(run("cp $HOME/x.md dir/", "bash").as_deref(), Some("cp $HOME/x.md @"));
+        assert_eq!(run("(cd src && make)", "bash").as_deref(), Some("(cd @ && make)"));
+        assert_eq!(run("./run.sh a.md", "bash").as_deref(), Some("@ @"));
+        assert_eq!(run("git log", "bash"), None);
+        assert_eq!(run(r#"echo "$(ls notes/""#, "bash"), None);
+        assert_eq!(run(r#"eval "$(/a/b/smcli shell-init zsh)""#, "zsh").as_deref(), Some(r#"eval "$(@ shell-init zsh)""#));
+        assert_eq!(run("cat (ls notes/)", "fish").as_deref(), Some("cat (ls @)"));
+        assert_eq!(run(r#"echo "a/b""#, "fish").as_deref(), Some("echo @"));
+        assert_eq!(run(r#"echo "(ls notes/)""#, "fish").as_deref(), Some(r#"echo "(ls @)""#));
+        assert_eq!(run("echo abc\"unfinished", "bash"), None);
+        assert_eq!(run("echo a.md )", "bash"), None);
+        assert_eq!(run(r#"echo "prefix/a $(cat b.md) suffix/c""#, "bash").as_deref(), Some(r#"echo "prefix/a $(cat @) suffix/c""#));
+        assert_eq!(run(r#"eval "$(/a/b/smcli shell-init zsh)""#, "fish").as_deref(), Some(r#"eval "$(@ shell-init zsh)""#));
     }
 }
 
@@ -373,40 +417,69 @@ fn glob_class_eat(pat: &str, c: char) -> Option<(bool, &str)> {
 /// Replace a command's path arguments with `@` placeholders so they can be re-filled in the shell.
 /// Returns `Some((rewritten_command, first_placeholder_byte_offset))` when at least one path was
 /// found; otherwise the command is returned unchanged as `None`.
-pub fn path_placeholders<F: FnMut(&str) -> bool>(command: &str, mut exists: F) -> Option<(String, usize)> {
-    let tokens = tokenize(command);
+pub fn path_placeholders<F: FnMut(&str) -> bool>(command: &str, shell: &str, mut exists: F) -> Option<(String, usize)> {
+    let tokens = tokenize(command, shell)?;
     let mut replacements: Vec<(std::ops::Range<usize>, String)> = Vec::new();
     let mut command_expected = true;
     let mut redirection_expected = false;
+    let mut frames = Vec::new();
 
     for token in tokens {
         match token {
+            Token::Open => {
+                frames.push((command_expected, redirection_expected));
+                command_expected = true;
+                redirection_expected = false;
+            }
+            Token::Close => {
+                (command_expected, redirection_expected) = frames.pop()?;
+                if redirection_expected { redirection_expected = false; } else { command_expected = false; }
+            }
+            Token::Opaque => { command_expected = false; redirection_expected = false; }
             Token::Op(range) => {
                 let op = &command[range.clone()];
-                command_expected = is_command_separator(op);
+                if op != "\"" && op != "'" {
+                    if is_command_separator(op) || is_command_frame_opener(op) {
+                        command_expected = true;
+                    } else {
+                        command_expected = false;
+                    }
+                }
                 redirection_expected = is_redirection(op);
             }
             Token::Whitespace => {}
             Token::Word { full, text } => {
+                let raw = &command[full.clone()];
+                let variable = |value: &str| {
+                    let raw_value = raw.split_once('=').map_or(raw, |(_, value)| value);
+                    value.starts_with('$') && !raw_value.starts_with('\\') && !raw_value.starts_with('\'') && !raw_value.starts_with("\"\\$")
+                };
                 let mut replacement = "@".to_string();
                 let candidate = if redirection_expected {
                     Some(full.clone())
                 } else if command_expected {
                     if is_assignment(&text) {
                         None
+                    } else if text.starts_with('-') || text.starts_with('@') || variable(&text) || is_url(&text) || is_remote(&text) || is_glob(&text) {
+                        command_expected = false;
+                        None
+                    } else if text.contains('/') && is_path(&text, &mut exists) {
+                        command_expected = false;
+                        replacement = "@".to_string();
+                        Some(full.clone())
                     } else {
                         command_expected = false;
                         None
                     }
                 } else if let Some((name_len, value)) = flag_value(&text) {
                     // Replace only the value part of `--flag=value`.
-                    if !value.starts_with('@') && !is_url(value) && !is_remote(value) && !is_glob(value) && is_path(value, &mut exists) {
+                    if !value.starts_with('@') && !variable(value) && !is_url(value) && !is_remote(value) && !is_glob(value) && is_path(value, &mut exists) {
                         replacement = format!("{}=@", &text[..name_len]);
                         Some(full.clone())
                     } else {
                         None
                     }
-                } else if text.starts_with('-') || text.starts_with('@') || is_url(&text) || is_remote(&text) || is_glob(&text) {
+                } else if text.starts_with('-') || text.starts_with('@') || variable(&text) || is_url(&text) || is_remote(&text) || is_glob(&text) {
                     None
                 } else if is_path(&text, &mut exists) {
                     Some(full.clone())
@@ -441,6 +514,9 @@ pub fn path_placeholders<F: FnMut(&str) -> bool>(command: &str, mut exists: F) -
 
 #[derive(Debug)]
 enum Token {
+    Open,
+    Close,
+    Opaque,
     Op(std::ops::Range<usize>),
     Whitespace,
     Word {
@@ -449,67 +525,142 @@ enum Token {
     },
 }
 
-fn tokenize(command: &str) -> Vec<Token> {
+fn tokenize(command: &str, shell: &str) -> Option<Vec<Token>> {
+    let mut i = 0;
+    tokenize_context(command, shell, &mut i, None)
+}
+
+fn tokenize_context(
+    command: &str,
+    shell: &str,
+    i: &mut usize,
+    stop: Option<char>,
+) -> Option<Vec<Token>> {
+    let stop_str = stop.map(|c| if c == ')' { ")" } else { "`" });
     let mut tokens = Vec::new();
-    let mut chars = command.char_indices().peekable();
-    while let Some(&(i, c)) = chars.peek() {
+    while *i < command.len() {
+        if let Some(s) = stop_str {
+            if command.get(*i..*i + 1) == Some(s) {
+                break;
+            }
+        }
+        let c = command[*i..].chars().next()?;
         if c.is_whitespace() {
-            chars.next();
-            while chars.peek().is_some_and(|(_, c)| c.is_whitespace()) {
-                chars.next();
+            *i += c.len_utf8();
+            while *i < command.len() && command[*i..].chars().next().unwrap().is_whitespace() {
+                *i += command[*i..].chars().next().unwrap().len_utf8();
             }
             tokens.push(Token::Whitespace);
-        } else if is_operator_char(c) {
-            let start = i;
-            chars.next();
-            if let Some(&(_, c2)) = chars.peek() {
+            continue;
+        }
+        if let Some(op_len) = command_opener_len(command, *i, shell) {
+            let op_end = *i + op_len;
+            tokens.push(Token::Open);
+            *i = op_end;
+            let inner_stop = if command.get(op_end - 1..op_end) == Some("`") {
+                '`'
+            } else {
+                ')'
+            };
+            let inner = tokenize_context(command, shell, i, Some(inner_stop))?;
+            tokens.extend(inner);
+            let inner_stop_str = if inner_stop == ')' { ")" } else { "`" };
+            if command.get(*i..*i + 1) != Some(inner_stop_str) {
+                return None;
+            }
+            tokens.push(Token::Close);
+            *i += 1;
+            continue;
+        }
+        if c == ')' && stop.is_none() {
+            return None;
+        }
+        if is_operator_char(c) {
+            let start = *i;
+            *i += c.len_utf8();
+            if *i < command.len() {
+                let c2 = command[*i..].chars().next().unwrap();
                 if (c == '&' && c2 == '&')
                     || (c == '|' && c2 == '|')
                     || (c == '>' && c2 == '>')
                     || (c == '<' && c2 == '<')
                 {
-                    chars.next();
+                    *i += c2.len_utf8();
                 }
             }
-            let end = chars.peek().map(|(i, _)| *i).unwrap_or(command.len());
-            tokens.push(Token::Op(start..end));
-        } else {
-            let (full, _, text) = read_word(command, &mut chars);
-            let guard = full.end;
-            tokens.push(Token::Word { full, text });
-            if guard <= i {
-                // Defensive: ensure progress on unexpected input.
-                chars.next();
+            tokens.push(Token::Op(start..*i));
+            continue;
+        }
+        if c == '"' {
+            if let Some((full, text, new_i)) = read_double_quoted_word(command, shell, *i) {
+                tokens.push(Token::Word { full, text });
+                *i = new_i;
+                continue;
+            } else {
+                tokens.push(Token::Op(*i..*i + 1));
+                *i += 1;
+                let inner = parse_double_quoted_inner(command, shell, i)?;
+                tokens.extend(inner);
+                if command.get(*i..*i + 1) != Some("\"") {
+                    return None;
+                }
+                tokens.push(Token::Op(*i..*i + 1));
+                *i += 1;
+                continue;
             }
         }
+        if c == '\'' {
+            let (full, text, new_i) = read_single_quoted_word(command, *i)?;
+            tokens.push(Token::Word { full, text });
+            *i = new_i;
+            continue;
+        }
+        let (full, text, new_i) = read_plain_word(command, *i, shell)?;
+        if command.get(new_i..new_i + 1) == Some("\"") {
+            tokens.push(Token::Opaque);
+        } else {
+            tokens.push(Token::Word { full, text });
+        }
+        *i = new_i;
     }
-    tokens
+    Some(tokens)
 }
 
-fn read_word(
+fn command_opener_len(command: &str, i: usize, _shell: &str) -> Option<usize> {
+    if command.get(i..i + 2) == Some("$(")
+        || command.get(i..i + 2) == Some("<(")
+        || command.get(i..i + 2) == Some(">(")
+    {
+        return Some(2);
+    }
+    if command.get(i..i + 1) == Some("(") || command.get(i..i + 1) == Some("`") {
+        return Some(1);
+    }
+    None
+}
+
+fn read_plain_word(
     command: &str,
-    chars: &mut std::iter::Peekable<impl Iterator<Item = (usize, char)>>,
-) -> (std::ops::Range<usize>, std::ops::Range<usize>, String) {
-    let start = chars.peek().map(|(i, _)| *i).unwrap_or(command.len());
+    start: usize,
+    shell: &str,
+) -> Option<(std::ops::Range<usize>, String, usize)> {
     let mut text = String::new();
-    let mut content_start: Option<usize> = None;
-    let mut content_end = start;
+    let mut i = start;
     let mut quote: Option<char> = None;
     let mut escaped = false;
-
-    while let Some(&(i, c)) = chars.peek() {
+    while i < command.len() {
+        let c = command[i..].chars().next().unwrap();
         if escaped {
             if quote != Some('\'') {
                 text.push(c);
-                content_end = i + c.len_utf8();
             }
             escaped = false;
-            chars.next();
+            i += c.len_utf8();
             continue;
         }
         if c == '\\' && quote != Some('\'') {
             escaped = true;
-            chars.next();
+            i += 1;
             continue;
         }
         if let Some(q) = quote {
@@ -517,46 +668,146 @@ fn read_word(
                 quote = None;
             } else {
                 text.push(c);
-                content_end = i + c.len_utf8();
             }
-            chars.next();
+            i += c.len_utf8();
             continue;
+        }
+        if c == '"' && read_double_quoted_word(command, shell, i).is_none() {
+            break;
         }
         if c == '\'' || c == '"' {
             quote = Some(c);
-            if content_start.is_none() {
-                content_start = Some(i + c.len_utf8());
-            }
-            chars.next();
+            i += c.len_utf8();
             continue;
         }
         if c.is_whitespace() || is_operator_char(c) {
             break;
         }
-        if content_start.is_none() {
-            content_start = Some(i);
+        if c == '$' && command.get(i + 1..i + 2) == Some("(") {
+            break;
         }
         text.push(c);
-        content_end = i + c.len_utf8();
-        chars.next();
+        i += c.len_utf8();
     }
+    if quote.is_some() || escaped { return None; }
+    Some((start..i, text, i))
+}
 
-    let end = chars.peek().map(|(i, _)| *i).unwrap_or(command.len());
-    let content_start = content_start.unwrap_or(start);
-    let content_end = content_end.min(end);
-    (start..end, content_start..content_end, text)
+fn read_single_quoted_word(
+    command: &str,
+    start: usize,
+) -> Option<(std::ops::Range<usize>, String, usize)> {
+    let mut i = start + 1;
+    let mut text = String::new();
+    while i < command.len() {
+        let c = command[i..].chars().next()?;
+        if c == '\'' {
+            return Some((start..i + 1, text, i + 1));
+        }
+        text.push(c);
+        i += c.len_utf8();
+    }
+    None
+}
+
+fn read_double_quoted_word(
+    command: &str,
+    shell: &str,
+    start: usize,
+) -> Option<(std::ops::Range<usize>, String, usize)> {
+    let mut i = start + 1;
+    let mut text = String::new();
+    let mut escaped = false;
+    while i < command.len() {
+        let c = command[i..].chars().next()?;
+        if escaped {
+            text.push(c);
+            escaped = false;
+            i += c.len_utf8();
+            continue;
+        }
+        if c == '\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if c == '$' && command.get(i + 1..i + 2) == Some("(") {
+            return None;
+        }
+        if c == '<' && command.get(i + 1..i + 2) == Some("(") {
+            return None;
+        }
+        if c == '>' && command.get(i + 1..i + 2) == Some("(") {
+            return None;
+        }
+        if c == '`' || (shell == "fish" && c == '(') {
+            return None;
+        }
+        if c == '"' {
+            return Some((start..i + 1, text, i + 1));
+        }
+        text.push(c);
+        i += c.len_utf8();
+    }
+    None
+}
+
+fn parse_double_quoted_inner(
+    command: &str,
+    shell: &str,
+    i: &mut usize,
+) -> Option<Vec<Token>> {
+    let mut tokens = Vec::new();
+    while *i < command.len() {
+        let c = command[*i..].chars().next()?;
+        if c == '"' {
+            break;
+        }
+        if command.get(*i..*i + 2) == Some("$(")
+            || command.get(*i..*i + 2) == Some("<(")
+            || command.get(*i..*i + 2) == Some(">(")
+            || c == '`'
+            || (shell == "fish" && c == '(')
+        {
+            let op_end = if c == '`' || c == '(' { *i + 1 } else { *i + 2 };
+            tokens.push(Token::Open);
+            *i = op_end;
+            let stop = if c == '`' { '`' } else { ')' };
+            let inner = tokenize_context(command, shell, i, Some(stop))?;
+            tokens.extend(inner);
+            let stop_str = if stop == ')' { ")" } else { "`" };
+            if command.get(*i..*i + 1) != Some(stop_str) {
+                return None;
+            }
+            tokens.push(Token::Close);
+            *i += 1;
+            continue;
+        }
+        if c == '\\' {
+            *i += 1;
+            let next = command[*i..].chars().next()?;
+            *i += next.len_utf8();
+            continue;
+        }
+        *i += c.len_utf8();
+    }
+    Some(tokens)
 }
 
 fn is_operator_char(c: char) -> bool {
-    matches!(c, '|' | '&' | ';' | '(' | ')' | '>' | '<')
+    matches!(c, '|' | '&' | ';' | '(' | ')' | '>' | '<' | '`')
 }
 
 fn is_command_separator(op: &str) -> bool {
-    matches!(op, "|" | "||" | "&&" | ";" | "&" | "(" | ")")
+    matches!(op, "|" | "||" | "&&" | ";" | "&")
+}
+
+fn is_command_frame_opener(op: &str) -> bool {
+    op == "$(" || op == "<(" || op == ">(" || op == "(" || op == "`"
 }
 
 fn is_redirection(op: &str) -> bool {
-    op.starts_with('>') || op.starts_with('<') || op == "&>" || op.ends_with('>')
+    op == ">" || op == ">>" || op == "<" || op == "<<" || op == "&>"
 }
 
 fn is_assignment(word: &str) -> bool {
@@ -587,8 +838,6 @@ fn looks_like_path(text: &str) -> bool {
         || text.starts_with('.')
         || text == "~"
         || text.starts_with("~/")
-        || text == "$HOME"
-        || text.starts_with("$HOME/")
         || has_extension(text)
 }
 

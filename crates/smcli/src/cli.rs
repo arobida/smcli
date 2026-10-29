@@ -1085,8 +1085,9 @@ fn pick(
                 }
                 let typed = crate::picker::history_insert(&command);
                 if edit_paths {
+                    let shell = env.get("SMCLI_SHELL").map(String::as_str).unwrap_or("bash");
                     let dir = command_directory(c, &user, &command).unwrap_or_else(|| d.clone());
-                    if let Some((rewritten, pos)) = smcli_core::parse::path_placeholders(&typed, |path| {
+                    if let Some((rewritten, pos)) = smcli_core::parse::path_placeholders(&typed, shell, |path| {
                         std::path::Path::new(&dir).join(path).exists()
                     }) {
                         print!("{}\x1f{}", &rewritten[..pos], &rewritten[pos + 1..]);

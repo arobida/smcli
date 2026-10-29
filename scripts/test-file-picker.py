@@ -75,6 +75,7 @@ def run(shell, path):
         Path(repo, name).write_text("x\n")
     Path(repo, "t00 decoy").write_text("x\n")
     Path(repo, INJECT).write_text("x\n")
+    Path(repo, "a b.md").write_text("x\n")
     for cmd in (["init", "-q"], ["add", "."], ["-c", "user.name=t", "-c", "user.email=t@e.x", "commit", "-q", "-m", "one"]):
         subprocess.run(["git", "-C", repo, *cmd], check=True, capture_output=True)
     args, extra = shell_setup(shell, home)
@@ -82,6 +83,7 @@ def run(shell, path):
                SMCLI_CONFIG=f"{home}/config.json", **extra)
     env.pop("SMCLI_SERVICE", None)
     subprocess.run([binary, "record", shell, repo, "0", "cp notes/a.md backup/", "test-session"], env=env, check=True)
+    subprocess.run([binary, "record", shell, repo, "0", f'eval "$({binary} shell-init zsh)"', "test-session"], env=env, check=True)
     pid, fd = pty.fork()
     if pid == 0:
         signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -181,6 +183,22 @@ def run(shell, path):
         line = CSI.sub(b"", buffer).decode(errors="replace")
         assert "cp '" + NAMES["t01"] + "' @" in line, f"{shell}: Ctrl-E did not leave cp <path> @: {line!r}"
         print(f"{shell}: Ctrl-E rewrites cp paths and opens the file picker.")
+
+        # Ctrl-E on eval "$(smcli shell-init zsh)" replaces the binary path inside command substitution.
+        settle()
+        buffer = b""
+        os.write(fd, b"\x01\x0b")  # Clear the previous Ctrl-E line.
+        os.write(fd, b"target/debug\x1b[A")
+        until(lambda t: "esc cancel" in t and "eval" in t and "target/debug" in t, "eval history picker", render=screen)
+        os.write(fd, b"\x05")
+        until(lambda t: "^F dirs/files" in t, "edit-path files picker", render=screen)
+        os.write(fd, b"ab.md\x01")
+        until(lambda t: "files results" in t, "edit-path file results", render=screen)
+        os.write(fd, b"\r")
+        settle()
+        line = CSI.sub(b"", buffer).decode(errors="replace")
+        assert "eval \"$('a b.md' shell-init zsh)\"" in line, f"{shell}: Ctrl-E did not rewrite eval substitution: {line!r}"
+        print(f"{shell}: Ctrl-E rewrites eval command substitution path.")
     finally:
         try:
             os.kill(pid, signal.SIGKILL)
