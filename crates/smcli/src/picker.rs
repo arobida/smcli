@@ -410,7 +410,9 @@ pub fn run(
                     match result {
                         Ok(result) => {
                             hits = if picker.mode == Mode::Files {
-                                filter_kind(result.hits, kind)
+                                let mut hits = filter_kind(result.hits, kind);
+                                suggested_first(&mut hits, &picker.query);
+                                hits
                             } else { result.hits };
                             status = if result.complete { String::new() } else {
                                 "partial grep results · type more to narrow".into()
@@ -844,6 +846,17 @@ fn filter_history(candidates: &[String], query: &str) -> Vec<String> {
         .collect()
 }
 
+/// Suggested (picked) rows that contain the query first; the stable sort keeps ranking within each group.
+/// A picked row that only fuzzy-matched (a typo away) keeps its rank, so it never jumps over real matches.
+fn suggested_first(hits: &mut [FileHit], query: &str) {
+    let pattern = Pattern::new(query, CaseMatching::Ignore, Normalization::Smart, nucleo_matcher::pattern::AtomKind::Substring);
+    let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
+    let mut buffer = Vec::new();
+    hits.sort_by_cached_key(|h| {
+        !(h.provenance.iter().any(|p| p == "picked") && pattern.score(Utf32Str::new(&h.path, &mut buffer), &mut matcher).is_some())
+    });
+}
+
 /// Narrows project hits to files (2) or folders (1); the index lists only files, so folders are their matches' parents.
 // shortcut: folders only appear if a file inside them matches; add directory entries to the service index if that's not enough.
 fn filter_kind(hits: Vec<FileHit>, kind: u8) -> Vec<FileHit> {
@@ -1011,6 +1024,21 @@ mod tests {
         assert_eq!(colors.style("main.rs"), Style::new().fg(Color::Rgb(1, 2, 3)));
         assert_eq!(colors.style("x.ok"), Style::new());
         assert_eq!(sgr("41;32"), Style::new().fg(Color::Indexed(2)), "backgrounds dropped");
+    }
+
+    #[test]
+    fn suggested_rows_lead_only_when_they_contain_the_query() {
+        let hit = |path: &str, picked: bool| FileHit {
+            insert: path.into(), path: path.into(), git: None, line: None, column: None, text: None, definition: None,
+            provenance: if picked { vec!["fff".into(), "picked".into()] } else { vec!["fff".into()] },
+        };
+        let mut hits = vec![hit("t02 a", false), hit("t01 b", true), hit("t02 c", true)];
+        suggested_first(&mut hits, "t02");
+        let order: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(order, ["t02 c", "t02 a", "t01 b"]);
+        suggested_first(&mut hits, "");
+        let order: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(order, ["t02 c", "t01 b", "t02 a"], "empty query: every suggestion leads");
     }
 
     #[test]
