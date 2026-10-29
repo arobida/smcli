@@ -11,6 +11,7 @@ By using the kero skill you are allowed to open new sessions with the list of ag
 ### Agents List:
 
 pisol=pi --model openai/gpt-6.1-sol --thinking low
+piterra=pi --model openai/gpt-6.1-terra --thinking low
 piluna=pi --model openai/gpt-6-luna --thinking low
 pikcode=pi --model opencode-go/kimi-k2.7-code --thinking high
 pidpro=pi --model opencode-go/deepseek-v4-pro --thinking high
@@ -23,13 +24,14 @@ pigrok45=pi --model xai/grok-4.5 --thinking medium
 
 > Some agents are better at certain tasks than others(try to use free models as much as possible)
 
+pisol: great for complicated reasoning tasks
+piterra: great for running test and code review
+piluna: great fast general purpose worker
 pikcode: great at writing code
-pisol: complicated reasoning tasks
-piluna: fast general purpose worker
 pidpro: good general purpose model, very token efficient with prompt caching
-pidflash: fast version pidpro with vision
-pigrok47: complicated reasoning tasks(not as good as pisol!)
-pigrok46: general purpose model faster than pigrok47
+pidflash: good fast general purpose model with vision
+pigrok47: complicated reasoning tasks
+pigrok46: general purpose model
 pigrok45: decent model should stick to using with commit messages
 
 <-- End of do not edit -->
