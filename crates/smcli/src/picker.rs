@@ -196,7 +196,7 @@ fn stripe_color(col: usize, width: usize) -> Color {
     }
 }
 
-fn stripe_line(width: u16, filled: u16, fade: Modifier) -> Line<'static> {
+fn stripe_line(width: u16, filled: u16, fade: Modifier, cell: &str) -> Line<'static> {
     let width = width as usize;
     let filled = (filled as usize).min(width);
     let mut spans = Vec::new();
@@ -209,12 +209,12 @@ fn stripe_line(width: u16, filled: u16, fade: Modifier) -> Line<'static> {
             col += 1;
         }
         spans.push(Span::styled(
-            "▀".repeat(col - start),
+            cell.repeat(col - start),
             Style::new().fg(color).add_modifier(fade),
         ));
     }
     if filled < width {
-        spans.push(Span::styled("▀".repeat(width - filled), MUTED));
+        spans.push(Span::styled(cell.repeat(width - filled), MUTED));
     }
     Line::from(spans)
 }
@@ -240,6 +240,14 @@ fn picker_layout(area: Rect) -> [Rect; 7] {
         y += height;
     }
     rows
+}
+
+/// Inline (`@`-Tab): header, search, sunset underline, list hints, 7 results, global hints.
+/// Slots match `picker_layout`; the sunset sits under the search and navigation is unused.
+fn inline_layout(area: Rect) -> [Rect; 7] {
+    let list = area.height.saturating_sub(5);
+    let row = |y: u16, height: u16| Rect::new(area.x, area.y + y, area.width, height);
+    [row(0, 1), row(3, 1), row(1, 1), row(4, 0), row(4, list), row(2, 1), row(4 + list, 1)]
 }
 
 fn hint_line(hints: &[(&str, &str)]) -> Line<'static> {
@@ -293,6 +301,7 @@ pub fn run(
     let rows = ratatui::crossterm::terminal::size().ok().filter(|&(_, rows)| rows > 0).map_or(24, |(_, rows)| rows);
     let inline_session = if inline { inline_height(rows).and_then(|height| TerminalSession::inline(height).ok()) } else { None };
     let mut terminal = match inline_session { Some(session) => session, None => TerminalSession::new()? };
+    let terminal_inline = terminal.inline.is_some();
     let mut saved = HashMap::new();
     let mut selected = 0usize;
     let mut semantic: Option<(String, Vec<String>)> = None;
@@ -412,7 +421,8 @@ pub fn run(
             cols = area.width;
             let history = picker.mode == Mode::History;
             let label = if picker.mode == Mode::Files { match kind { 1 => "folders", 2 => "files", _ => "files+dirs" } } else if history { picker.title.as_deref().unwrap_or("history") } else { picker.mode.as_str() };
-            let [header_area, filter_area, search_area, navigation_area, list_area, stripe_area, global_area] = picker_layout(area);
+            let compact = terminal_inline;
+            let [header_area, filter_area, search_area, navigation_area, list_area, stripe_area, global_area] = if compact { inline_layout(area) } else { picker_layout(area) };
             let boxed = search_area.height == 3;
             // Header shows cwd and current scope; single-file grep names the file as its scope.
             let scope_label = if history {
@@ -426,8 +436,8 @@ pub fn run(
                 };
                 format!("{}  →  {}", abbreviate(&cwd, &home), displayed)
             };
-            frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(format!(" {label} "), ACCENT), Span::styled(scope_label, ACCENT.add_modifier(Modifier::BOLD)), Span::styled(" ›", ACCENT.add_modifier(Modifier::BOLD))])), header_area);
-            let found = format!("{count} {} results", if picker.mode == Mode::Grep { "grep" } else { "files" });
+            let header = Line::from(vec![Span::styled(format!(" {label} "), ACCENT), Span::styled(scope_label, ACCENT.add_modifier(Modifier::BOLD)), Span::styled(" ›", ACCENT.add_modifier(Modifier::BOLD))]);
+            let found = if compact { format!("{count} Results") } else { format!("{count} {} results", if picker.mode == Mode::Grep { "grep" } else { "files" }) };
             let summary = if history {
                 visible(&status)
             } else if hits.is_empty() {
@@ -437,6 +447,7 @@ pub fn run(
             if busy {
                 summary.spans.insert(0, Span::styled(format!(" {}", ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][spinner]), ACCENT));
             }
+            frame.render_widget(Paragraph::new(header), header_area);
             let search_block = if boxed { Block::bordered().border_set(border::ROUNDED).border_style(MUTED) } else { Block::new() };
             let input = search_block.inner(search_area);
             let query = visible(&picker.query);
@@ -459,47 +470,61 @@ pub fn run(
                 Block::new()
             };
             page_size = list_block.inner(list_area).height.max(1) as usize;
+            // Inline marks the selection with a yellow cursor and nudges it right instead of a full-row highlight.
+            let cursor = |sel: bool| if !compact { None } else if sel { Some(Span::styled("▌  ", Style::new().fg(Color::Yellow))) } else { Some(Span::raw(" ")) };
             let items: Vec<ListItem> = if history {
                 // Rows past the selection plus one screen are never visible; skip building them.
                 commands.iter().enumerate().take(selected + area.height as usize).map(|(i, c)| {
                     let sel = i == selected;
                     let mark = if starred.contains(c) { "* " } else { "  " };
                     let spans = history_row(c, list_block.inner(list_area).width.saturating_sub(2) as usize);
-                    let mut line = vec![Span::styled(mark, if sel { Style::new() } else { MUTED })];
-                    line.extend(if sel { plain(spans) } else { spans });
+                    let mut line: Vec<Span> = cursor(sel).into_iter().collect();
+                    line.push(Span::styled(mark, if sel { Style::new() } else { MUTED }));
+                    line.extend(if sel && !compact { plain(spans) } else { spans });
                     ListItem::new(Line::from(line))
                 }).collect()
             } else {
-                hits.iter().map(|h| {
+                hits.iter().enumerate().map(|(i, h)| {
                     let name = &h.path;
                     let location = h.line.map(|n| format!(":{n}  {}", h.text.as_deref().unwrap_or(""))).unwrap_or_default();
-                    ListItem::new(Line::from(vec![
+                    ListItem::new(Line::from(cursor(i == selected).into_iter().chain([
                         Span::styled(format!("{} ", h.git.as_deref().unwrap_or("")), ACCENT),
                         Span::raw(visible(name)),
                         Span::styled(visible(&location), MUTED),
                         Span::styled(format!("  {}", h.provenance.join("+")), MUTED),
-                    ]))
+                    ]).collect::<Vec<_>>()))
                 }).collect()
             };
-            let list = List::new(items).block(list_block).highlight_style(SELECTED);
+            let list = List::new(items).block(list_block).highlight_style(if compact { Style::new().add_modifier(Modifier::BOLD) } else { SELECTED });
             let mut state = ListState::default().with_selected((count > 0).then_some(selected));
             frame.render_stateful_widget(list, list_area, &mut state);
             let filters = if history {
                 vec![("tab", "semantic")]
             } else if picker.mode == Mode::Files {
-                vec![("tab", "narrow"), ("⇧tab", "up"), ("^F", "dirs/files")]
+                vec![("tab", "into"), ("⇧tab", "out"), ("^F", "dirs/files")]
             } else if picker.mode == Mode::Grep {
-                vec![("⇧tab", "up")]
+                vec![("⇧tab", "out")]
             } else {
                 vec![]
             };
+            let mut filters = filters;
+            if compact { filters.extend([("⏎", "accept"), ("↑↓", "move")]); }
             frame.render_widget(Paragraph::new(hint_line(&filters)), filter_area);
             frame.render_widget(Paragraph::new(hint_line(&[("[ ⏎ ]", "accept"), ("↑↓", "move"), ("PgUp/PgDn", "page")])), navigation_area);
             let mut globals = vec![("esc", "cancel"), ("^T", if picker.mode == Mode::Files { "history" } else { "files" })];
             globals.push(("^G", if picker.mode == Mode::Grep { "history" } else { "grep" }));
             globals.push(("^U", "clear"));
             let fade = if tick < 3 { Modifier::DIM } else { Modifier::empty() };
-            frame.render_widget(Paragraph::new(stripe_line(area.width, shown, fade)), stripe_area);
+            if compact {
+                // The search underline is the sunset; the result count ends it.
+                let width = area.width.saturating_sub(summary.width() as u16);
+                cols = width;
+                let mut line = stripe_line(width, shown, fade, "─");
+                line.spans.extend(summary.spans);
+                frame.render_widget(Paragraph::new(line), stripe_area);
+            } else {
+                frame.render_widget(Paragraph::new(stripe_line(area.width, shown, fade, "▀")), stripe_area);
+            }
             frame.render_widget(Paragraph::new(hint_line(&globals)), global_area);
         })?; }
         // Soonest of bar ease (~20ms), fade-in (70ms), and spinner (80ms). A queued key
@@ -750,9 +775,9 @@ pub(crate) fn visible(text: &str) -> String {
         .collect()
 }
 
-/// Inline picker height: the full layout with 7 results, clamped under the prompt; `None` when too short to be useful.
+/// Inline picker height: the compact layout with 7 results, clamped under the prompt; `None` when too short to be useful.
 fn inline_height(rows: u16) -> Option<u16> {
-    Some(17.min(rows.saturating_sub(1))).filter(|&height| height >= 5)
+    Some(12.min(rows.saturating_sub(1))).filter(|&height| height >= 5)
 }
 
 pub(crate) struct TerminalSession {
@@ -859,17 +884,20 @@ mod tests {
 
     #[test]
     fn inline_viewport_sits_under_a_bottom_prompt() {
-        assert_eq!(inline_height(40), Some(17));
+        assert_eq!(inline_height(40), Some(12));
         assert_eq!(inline_height(10), Some(9));
         assert_eq!(inline_height(5), None);
         let mut backend = ratatui::backend::TestBackend::new(80, 24);
         // The cursor after `\r\n` from a prompt on the last row.
         ratatui::backend::Backend::set_cursor_position(&mut backend, (0, 23)).unwrap();
-        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport: Viewport::Inline(17) }).unwrap();
+        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport: Viewport::Inline(12) }).unwrap();
         let area = terminal.get_frame().area();
-        assert_eq!((area.y, area.height), (7, 17));
-        assert_eq!(area.y.saturating_sub(1), 6);
-        assert_eq!(picker_layout(area)[4].height, 9, "boxed list keeps 7 result rows");
+        assert_eq!((area.y, area.height), (12, 12));
+        assert_eq!(area.y.saturating_sub(1), 11);
+        let [header, filters, search, _, list, sunset, globals] = inline_layout(area);
+        let order: Vec<u16> = [header, search, sunset, filters, list, globals].iter().map(|r| r.y).collect();
+        assert_eq!(order, [12, 13, 14, 15, 16, 23], "search, underline, list hints, 7 results, global hints");
+        assert_eq!(list.height, 7);
     }
 
     #[test]
@@ -955,7 +983,7 @@ mod tests {
 
         let width = 12u16;
         let filled = 7u16;
-        let line = stripe_line(width, filled, Modifier::empty());
+        let line = stripe_line(width, filled, Modifier::empty(), "▀");
         let mut colors = Vec::new();
         for span in &line.spans {
             for _ in 0..span.content.chars().count() {
@@ -968,13 +996,13 @@ mod tests {
             assert!(!style.add_modifier.contains(Modifier::DIM));
         }
         assert!(colors[filled as usize..].iter().all(|style| *style == MUTED));
-        let dim = stripe_line(9, 9, Modifier::DIM);
+        let dim = stripe_line(9, 9, Modifier::DIM, "▀");
         assert!(dim.spans.iter().all(|span| span.style.add_modifier.contains(Modifier::DIM)));
         assert_eq!(
             dim.spans.iter().map(|span| span.content.chars().count()).sum::<usize>(),
             9
         );
-        assert!(stripe_line(8, 0, Modifier::empty()).spans.iter().all(|span| span.style == MUTED));
+        assert!(stripe_line(8, 0, Modifier::empty(), "▀").spans.iter().all(|span| span.style == MUTED));
     }
 }
 
