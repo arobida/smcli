@@ -80,8 +80,9 @@ impl Default for FileResults {
 }
 
 pub struct Picker {
-    pub candidates: Vec<String>,
-    pub suggestion_count: usize,
+    pub full: Vec<String>,
+    pub suggested: Vec<String>,
+    pub suggested_view: bool,
     pub query: String,
     pub mode: Mode,
     /// The current file/grep search scope (absolute directory). Set by the caller before `run`.
@@ -105,33 +106,23 @@ impl Picker {
         native: Vec<String>,
         query: String,
     ) -> Self {
-        let mut seen = HashSet::new();
-        let mut candidates = Vec::new();
-        let mut add = |command: String| {
-            let command = command.trim();
-            if !command.is_empty()
-                && !history_internal(command)
-                && seen.insert(command.to_owned())
-            {
-                candidates.push(command.to_owned());
+        let add = |commands: Vec<String>| {
+            let mut seen = HashSet::new();
+            let mut list = Vec::new();
+            for command in commands {
+                let command = command.trim();
+                if !command.is_empty() && !history_internal(command) && seen.insert(command.to_owned()) {
+                    list.push(command.to_owned());
+                }
             }
+            list
         };
-        for command in suggestions {
-            add(command);
-        }
-        let suggestion_count = seen.len();
-        for command in recent.into_iter().chain(native.into_iter().rev().map(|s| command_key(&s, None))) {
-            let command = command.trim();
-            if !command.is_empty()
-                && !history_internal(command)
-                && seen.insert(command.to_owned())
-            {
-                candidates.push(command.to_owned());
-            }
-        }
+        let suggested = add(suggestions);
+        let full = add(recent.into_iter().chain(native.into_iter().rev().map(|s| command_key(&s, None))).collect());
         Self {
-            candidates,
-            suggestion_count,
+            full,
+            suggested,
+            suggested_view: false,
             query,
             mode: Mode::History,
             scope: None,
@@ -357,13 +348,14 @@ pub fn run(
     files: Option<Box<dyn FnMut(Mode, &str, u8, &str, Option<&str>) -> Result<FileResults> + Send>>,
     inline: bool,
 ) -> Result<Option<Choice>> {
-    let search = search.map(|mut callback| worker(move |q: &String| callback(q)));
+    let search = search.map(|mut callback| worker(move |(q, _): &(String, u64)| callback(q)));
     let files = files.map(|mut callback| worker(move |(mode, q, kind, scope, path): &(Mode, String, u8, String, Option<String>)| {
         callback(*mode, q, *kind, scope, path.as_deref())
     }));
     let mut file_busy = false;
     let mut semantic_busy = false;
     let mut semantic_pending = None;
+    let mut semantic_generation = 0u64;
     let mut spinner = 0;
     let mut spun = Instant::now();
     let rows = ratatui::crossterm::terminal::size().ok().filter(|&(_, rows)| rows > 0).map_or(24, |(_, rows)| rows);
@@ -388,8 +380,8 @@ pub fn run(
     let mut page_size = 1usize;
     let mut hits = Vec::new();
     let mut status = String::new();
-    let mut filtered: Option<((String, bool), Vec<String>)> = None;
-    let starred: HashSet<String> = picker.candidates[..picker.suggestion_count].iter().cloned().collect();
+    let mut filtered: Option<((String, bool, bool), Vec<String>)> = None;
+    let starred: HashSet<String> = picker.suggested.iter().cloned().collect();
     let home = std::env::var("HOME").unwrap_or_default();
     let cwd = std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
     if picker.scope.is_none() {
@@ -424,9 +416,9 @@ pub fn run(
             }
         }
         if let Some((requests, replies)) = &search {
-            if let Ok((query, result)) = replies.try_recv() {
+            if let Ok(((query, generation), result)) = replies.try_recv() {
                 semantic_busy = false;
-                if picker.mode == Mode::History && query == picker.query && semantic_pending.is_none() {
+                if picker.mode == Mode::History && generation == semantic_generation && query == picker.query && semantic_pending.is_none() {
                     match result {
                         Ok(results) => {
                             semantic = Some((query, results));
@@ -440,7 +432,7 @@ pub fn run(
             if !semantic_busy {
                 if let Some(query) = semantic_pending.take() {
                     if picker.mode == Mode::History && query == picker.query {
-                        semantic_busy = requests.send(query).is_ok();
+                        semantic_busy = requests.send((query, semantic_generation)).is_ok();
                     }
                 }
             }
@@ -470,12 +462,12 @@ pub fn run(
             spun = Instant::now();
         }
         let semantic_active = semantic.as_ref().is_some_and(|(q, _)| q == &picker.query);
-        let key_now = (picker.query.clone(), semantic_active);
+        let key_now = (picker.query.clone(), semantic_active, picker.suggested_view);
         if filtered.as_ref().map(|(k, _)| k) != Some(&key_now) {
             let commands = if semantic_active {
                 semantic.as_ref().unwrap().1.clone()
             } else {
-                filter_history(&picker.candidates, &picker.query)
+                filter_history(if picker.suggested_view { &picker.suggested } else { &picker.full }, &picker.query)
             };
             filtered = Some((key_now, commands));
         }
@@ -491,7 +483,7 @@ pub fn run(
             let area = frame.area();
             cols = area.width;
             let history = picker.mode == Mode::History;
-            let label = if picker.mode == Mode::Files { match kind { 1 => "folders", 2 => "files", _ => "files+dirs" } } else if history { picker.title.as_deref().unwrap_or("history") } else { picker.mode.as_str() };
+            let label = if picker.mode == Mode::Files { match kind { 1 => "folders", 2 => "files", _ => "files+dirs" } } else if history { if picker.suggested_view { picker.title.as_deref().unwrap_or("history") } else { "history" } } else { picker.mode.as_str() };
             let compact = terminal_inline;
             let [header_area, filter_area, search_area, navigation_area, list_area, stripe_area, global_area] = if compact { inline_layout(area) } else { picker_layout(area) };
             let boxed = search_area.height == 3;
@@ -507,7 +499,7 @@ pub fn run(
                 };
                 format!("{}  →  {}", abbreviate(&cwd, &home), displayed)
             };
-            let header = if compact && (!history || picker.title.is_some()) {
+            let header = if compact && (!history || (picker.suggested_view && picker.title.is_some())) {
                 // Only the searched directory, which grows and shrinks as Tab moves in and out; suggestions name the cwd.
                 let (label, dir) = if history { ("suggested", &cwd) } else { (label, &scope) };
                 let mut path = abbreviate(dir, &home);
@@ -518,7 +510,9 @@ pub fn run(
             };
             let found = if compact { format!("{count} Results") } else { format!("{count} {} results", if picker.mode == Mode::Grep { "grep" } else { "files" }) };
             let summary = if history {
-                if compact && status.is_empty() { found } else { visible(&status) }
+                if status.is_empty() && picker.suggested_view && picker.suggested.is_empty() {
+                    "no suggestions for this directory".into()
+                } else if compact && status.is_empty() { found } else { visible(&status) }
             } else if hits.is_empty() {
                 if status.is_empty() { "no matches".into() } else { visible(&status) }
             } else if status.is_empty() { found } else { visible(&status) };
@@ -558,13 +552,13 @@ pub fn run(
                 // Rows past the selection plus one screen are never visible; skip building them.
                 commands.iter().enumerate().take(selected + area.height as usize).map(|(i, c)| {
                     let sel = i == selected;
-                    let mark = if starred.contains(c) { "* " } else { "  " };
+                    let mark = if picker.suggested_view && starred.contains(c) { "* " } else { "  " };
                     let spans = history_row(c, list_block.inner(list_area).width.saturating_sub(if compact { 5 } else { 2 }) as usize);
                     let mut line: Vec<Span> = cursor(sel).into_iter().collect();
                     // Inline matches the files rows: no leading mark, suggested rows end in ✨.
                     if !compact { line.push(Span::styled(mark, if sel { Style::new() } else { MUTED })); }
                     line.extend(if sel && !compact { plain(spans) } else { spans });
-                    if compact && starred.contains(c) { line.push(Span::raw(" ✨")); }
+                    if compact && picker.suggested_view && starred.contains(c) { line.push(Span::raw(" ✨")); }
                     ListItem::new(Line::from(line))
                 }).collect()
             } else {
@@ -587,11 +581,11 @@ pub fn run(
             let mut state = ListState::default().with_selected((count > 0).then_some(selected));
             frame.render_stateful_widget(list, list_area, &mut state);
             let filters = if history && compact {
-                vec![]
+                vec![("^R", "full/suggested")]
             } else if history {
-                vec![("tab", "semantic")]
+                vec![("^R", "full/suggested"), ("tab", "semantic")]
             } else if picker.mode == Mode::Files {
-                vec![("tab", "into"), ("⇧tab", "out"), ("^F", "dirs/files")]
+                vec![("tab", "into"), ("⇧tab", "out"), ("^T", "dirs/files")]
             } else if picker.mode == Mode::Grep {
                 vec![("⇧tab", "out")]
             } else {
@@ -601,11 +595,13 @@ pub fn run(
             if compact { filters.extend([("⏎", "accept"), ("↑↓", "move")]); }
             frame.render_widget(Paragraph::new(hint_line(&filters)), filter_area);
             frame.render_widget(Paragraph::new(hint_line(&[("[ ⏎ ]", "accept"), ("↑↓", "move"), ("PgUp/PgDn", "page")])), navigation_area);
-            let mut globals = vec![("esc", "cancel"), ("^T", if picker.mode == Mode::Files { "history" } else { "files" })];
+            let mut globals = vec![("esc", "cancel")];
+            if picker.mode != Mode::Files { globals.push(("^T", "files")); }
+            if picker.mode != Mode::History { globals.push(("^R", "history")); }
             if picker.mode == Mode::History {
                 globals.push(("^E", "edit paths"));
             }
-            globals.push(("^G", if picker.mode == Mode::Grep { "history" } else { "grep" }));
+            if picker.mode != Mode::Grep { globals.push(("^G", "grep")); }
             globals.push(("^U", "clear"));
             let fade = if tick < 3 { Modifier::DIM } else { Modifier::empty() };
             if compact {
@@ -684,11 +680,7 @@ pub fn run(
             KeyCode::PageUp => selected = selected.saturating_sub(page_size),
             KeyCode::PageDown => selected = selected.saturating_add(page_size).min(count.saturating_sub(1)),
             KeyCode::Up => selected = selected.saturating_sub(1),
-            KeyCode::Char('p' | 'r') if ctrl => selected = selected.saturating_sub(1),
             KeyCode::Down => selected = (selected + 1).min(count.saturating_sub(1)),
-            KeyCode::Char('n' | 's') if ctrl => {
-                selected = (selected + 1).min(count.saturating_sub(1))
-            }
             KeyCode::Enter => {
                 return Ok(if count == 0 {
                     None
@@ -708,22 +700,28 @@ pub fn run(
                     })
                 });
             }
-            KeyCode::Char('t' | 'g') if ctrl => {
-                saved.insert(picker.mode, picker.query);
-                if picker.mode == Mode::Grep {
-                    picker.single_file_path = None;
-                    picker.saved_file_scope = None;
+            KeyCode::Char('r') if ctrl => {
+                if picker.mode == Mode::History {
+                    picker.suggested_view = !picker.suggested_view;
+                    semantic = None;
+                    semantic_pending = None;
+                    semantic_generation += 1;
+                    selected = 0;
+                    status.clear();
+                } else {
+                    switch_mode(&mut picker, Mode::History, &mut saved, &mut selected, &mut status);
                 }
-                let target = if key.code == KeyCode::Char('t') { Mode::Files } else { Mode::Grep };
-                picker.mode = if picker.mode == target { Mode::History } else { target };
-                picker.query = saved.get(&picker.mode).cloned().unwrap_or_default();
-                selected = 0;
-                status.clear();
             }
-            KeyCode::Char('f') if ctrl && picker.mode == Mode::Files => {
-                kind = (kind + 1) % 3;
-                selected = 0;
+            KeyCode::Char('t') if ctrl => {
+                if picker.mode == Mode::Files {
+                    kind = (kind + 1) % 3;
+                    selected = 0;
+                } else {
+                    switch_mode(&mut picker, Mode::Files, &mut saved, &mut selected, &mut status);
+                    kind = picker.kind;
+                }
             }
+            KeyCode::Char('g') if ctrl && picker.mode != Mode::Grep => switch_mode(&mut picker, Mode::Grep, &mut saved, &mut selected, &mut status),
             KeyCode::Char('e') if ctrl && picker.mode == Mode::History && count > 0 => {
                 return Ok(Some(Choice::Command {
                     command: commands[selected].clone(),
@@ -804,6 +802,18 @@ pub fn run(
             _ => {}
         }
     }
+}
+
+fn switch_mode(picker: &mut Picker, target: Mode, saved: &mut HashMap<Mode, String>, selected: &mut usize, status: &mut String) {
+    saved.insert(picker.mode, std::mem::take(&mut picker.query));
+    if picker.mode == Mode::Grep {
+        picker.single_file_path = None;
+        picker.saved_file_scope = None;
+    }
+    picker.mode = target;
+    picker.query = saved.get(&picker.mode).cloned().unwrap_or_default();
+    *selected = 0;
+    status.clear();
 }
 
 fn history_internal(key: &str) -> bool {
@@ -1017,6 +1027,43 @@ impl Drop for TerminalSession {
 mod tests {
     use super::*;
     #[test]
+    fn picker_keeps_full_and_suggested_lists_separate() {
+        let p = Picker::new(vec!["suggested".into(), "shared".into()], vec!["shared".into(), "recent".into()], vec!["native".into()], String::new());
+        assert_eq!(p.full, ["shared", "recent", "native"]);
+        assert_eq!(p.suggested, ["suggested", "shared"]);
+    }
+
+    #[test]
+    fn switch_mode_saves_and_restores_query_and_clears_grep_scope() {
+        let mut p = Picker::new(vec![], vec![], vec![], String::new());
+        let mut saved = HashMap::new();
+        let mut selected = 4;
+        let mut status = "status".into();
+        p.query = "history".into();
+        switch_mode(&mut p, Mode::Files, &mut saved, &mut selected, &mut status);
+        assert_eq!((p.mode, p.query.as_str(), selected, status.as_str()), (Mode::Files, "", 0, ""));
+        p.query = "files".into();
+        switch_mode(&mut p, Mode::History, &mut saved, &mut selected, &mut status);
+        assert_eq!((p.mode, p.query.as_str()), (Mode::History, "history"));
+        p.mode = Mode::Grep;
+        p.single_file_path = Some("f".into());
+        p.saved_file_scope = Some("scope".into());
+        switch_mode(&mut p, Mode::History, &mut saved, &mut selected, &mut status);
+        assert_eq!((p.single_file_path, p.saved_file_scope), (None, None));
+    }
+
+    #[test]
+    fn file_kind_cycle_wraps_and_mode_entry_uses_picker_kind() {
+        let mut kind = 0;
+        let cycle = |kind: &mut u8| *kind = (*kind + 1) % 3;
+        let mut values = Vec::new();
+        for _ in 0..4 { values.push(kind); cycle(&mut kind); }
+        assert_eq!(values, [0, 1, 2, 0]);
+        let p = Picker { kind: 1, ..Picker::new(vec![], vec![], vec![], String::new()) };
+        assert_eq!(p.kind, 1);
+    }
+
+    #[test]
     fn fixed_viewport_can_shrink_and_grow() {
         let mut terminal = Terminal::with_options(
             ratatui::backend::TestBackend::new(100, 30),
@@ -1108,11 +1155,12 @@ mod tests {
         let first = command_key("gl", Some("git log"));
         let second = command_key("gl", Some("git ls-files"));
         let picker = Picker::new(vec![first.clone()], vec![second.clone()], vec!["gl".into()], String::new());
-        assert_eq!(picker.candidates.len(), 3);
+        assert_eq!(picker.full.len(), 2);
+        assert_eq!(picker.suggested, [first.clone()]);
         assert_eq!(history_label(&first), "gl  ↦ git log");
         assert_eq!(history_insert(&first), "gl");
         assert_eq!(history_insert("gl"), "gl");
-        assert_eq!(filter_history(&picker.candidates, "ls-files"), [second], "{:?}", picker.candidates.iter().map(|s| history_label(s)).collect::<Vec<_>>());
+        assert_eq!(filter_history(&picker.full, "ls-files"), [second], "{:?}", picker.full.iter().map(|s| history_label(s)).collect::<Vec<_>>());
         assert_eq!(history_label(&command_key("g\x1b[31m", Some("git status"))), "g^[[31m  ↦ git status");
     }
 
@@ -1140,11 +1188,12 @@ mod tests {
             vec!["old".into(), "new".into()],
             String::new(),
         );
-        assert_eq!(p.candidates, ["git status", "cargo test", "new", "old"]);
-        assert_eq!(filter_history(&p.candidates, "GIT STA"), ["git status"]);
-        assert_eq!(filter_history(&p.candidates, "status git"), ["git status"]);
+        assert_eq!(p.full, ["cargo test", "git status", "new", "old"]);
+        assert_eq!(p.suggested, ["git status"]);
+        assert_eq!(filter_history(&p.full, "GIT STA"), ["git status"]);
+        assert_eq!(filter_history(&p.full, "status git"), ["git status"]);
         assert_eq!(visible("a\x1b[2J\n\u{9b}"), "a^[[2J↵ <U+009B>");
-        assert!(filter_history(&p.candidates, "unmatched").is_empty());
+        assert!(filter_history(&p.full, "unmatched").is_empty());
         assert!(FileResults::default().complete);
     }
 

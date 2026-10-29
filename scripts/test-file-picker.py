@@ -113,7 +113,7 @@ def run(shell, path):
             os.write(fd, b"\x1b[A")  # Up opens the picker with the typed text as its history query
             until(lambda t: "esc cancel" in t, "picker")
             os.write(fd, b"\x14")  # Ctrl-T: files
-            until(lambda t: "files" in t and "^F dirs/files" in t, "files mode", render=screen)
+            until(lambda t: "files" in t and "^T dirs/files" in t, "files mode", render=screen)
             os.write(fd, token.lstrip("-").encode())
             os.write(fd, b"\x01")  # Ctrl-A: search the whole project instead of this directory's entries
             until(lambda t: "files results" in t, "results", render=screen)
@@ -134,7 +134,7 @@ def run(shell, path):
 
         def choose(token):
             os.write(fd, b"\x14")  # Ctrl-T at the prompt opens files mode directly
-            until(lambda t: "^F dirs/files" in t, "files mode", render=screen)
+            until(lambda t: "^T dirs/files" in t, "files mode", render=screen)
             os.write(fd, token.encode() + b"\x01")
             until(lambda t: "files results" in t, "results", render=screen)
             os.write(fd, b"\r")
@@ -175,7 +175,7 @@ def run(shell, path):
         os.write(fd, b"notes/a.md\x1b[A")  # Search for the recorded command, not the previous selection.
         until(lambda t: "esc cancel" in t and "cp notes/a.md backup/" in t, "history picker", render=screen)
         os.write(fd, b"\x05")  # Ctrl-E: edit path arguments.
-        until(lambda t: "^F dirs/files" in t, "edit-path files picker", render=screen)
+        until(lambda t: "^T dirs/files" in t, "edit-path files picker", render=screen)
         os.write(fd, b"t01\x01")
         until(lambda t: "files results" in t, "edit-path file results", render=screen)
         os.write(fd, b"\r")
@@ -191,7 +191,7 @@ def run(shell, path):
         os.write(fd, b"target/debug\x1b[A")
         until(lambda t: "esc cancel" in t and "eval" in t and "target/debug" in t, "eval history picker", render=screen)
         os.write(fd, b"\x05")
-        until(lambda t: "^F dirs/files" in t, "edit-path files picker", render=screen)
+        until(lambda t: "^T dirs/files" in t, "edit-path files picker", render=screen)
         os.write(fd, b"ab.md\x01")
         until(lambda t: "files results" in t, "edit-path file results", render=screen)
         os.write(fd, b"\r")

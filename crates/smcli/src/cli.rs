@@ -943,19 +943,15 @@ fn pick(
         .filter_map(|f| f.read().ok())
         .flat_map(|s| s.lines().map(String::from).collect::<Vec<_>>())
         .collect();
-    let mut picker = if suggest {
-        let mut p = Picker::new(suggestions, vec![], vec![], query);
-        p.title = Some(format!("Suggested for {d}"));
-        p
-    } else {
-        Picker::new(
-            vec![],
-            recent,
-            native,
-            // Ctrl-T's query is the whole command line, so files mode starts empty unless `@` completion names a word.
-            if files { env.get("SMCLI_FILES_QUERY").cloned().unwrap_or_default() } else if grep { String::new() } else { query },
-        )
-    };
+    let mut picker = Picker::new(
+        suggestions,
+        recent,
+        native,
+        // Ctrl-T's query is the whole command line, so files mode starts empty unless `@` completion names a word.
+        if files { env.get("SMCLI_FILES_QUERY").cloned().unwrap_or_default() } else if grep { String::new() } else { query },
+    );
+    picker.suggested_view = suggest;
+    picker.title = Some(format!("Suggested for {d}"));
     if files {
         picker.kind = if env.contains_key("SMCLI_FILES_DIRS") { 1 } else { 0 };
     }
