@@ -506,9 +506,10 @@ pub fn run(
                 };
                 format!("{}  →  {}", abbreviate(&cwd, &home), displayed)
             };
-            let header = if compact && !history {
-                // Only the searched directory, which grows and shrinks as Tab moves in and out.
-                let mut path = abbreviate(&scope, &home);
+            let header = if compact && (!history || picker.title.is_some()) {
+                // Only the searched directory, which grows and shrinks as Tab moves in and out; suggestions name the cwd.
+                let (label, dir) = if history { ("suggested", &cwd) } else { (label, &scope) };
+                let mut path = abbreviate(dir, &home);
                 if !path.ends_with('/') { path.push('/'); }
                 Line::from(vec![Span::styled(format!(" {label} @ "), ACCENT), Span::styled(visible(&path), ls_colors.dir)])
             } else {
@@ -516,7 +517,7 @@ pub fn run(
             };
             let found = if compact { format!("{count} Results") } else { format!("{count} {} results", if picker.mode == Mode::Grep { "grep" } else { "files" }) };
             let summary = if history {
-                visible(&status)
+                if compact && status.is_empty() { found } else { visible(&status) }
             } else if hits.is_empty() {
                 if status.is_empty() { "no matches".into() } else { visible(&status) }
             } else if status.is_empty() { found } else { visible(&status) };
@@ -535,6 +536,9 @@ pub fn run(
                 Span::raw(query.clone())
             };
             frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(prompt, ACCENT), text])).block(search_block), search_area);
+            if compact && history {
+                frame.render_widget(Paragraph::new(hint_line(&[("tab", "semantic ")]).right_aligned()), input);
+            }
             if input.width > 0 && input.height > 0 {
                 let offset = (Span::raw(prompt).width() + Span::raw(query.as_str()).width()).min(input.width.saturating_sub(1) as usize) as u16;
                 frame.set_cursor_position((input.x + offset, input.y));
@@ -554,10 +558,12 @@ pub fn run(
                 commands.iter().enumerate().take(selected + area.height as usize).map(|(i, c)| {
                     let sel = i == selected;
                     let mark = if starred.contains(c) { "* " } else { "  " };
-                    let spans = history_row(c, list_block.inner(list_area).width.saturating_sub(2) as usize);
+                    let spans = history_row(c, list_block.inner(list_area).width.saturating_sub(if compact { 5 } else { 2 }) as usize);
                     let mut line: Vec<Span> = cursor(sel).into_iter().collect();
-                    line.push(Span::styled(mark, if sel { Style::new() } else { MUTED }));
+                    // Inline matches the files rows: no leading mark, suggested rows end in ✨.
+                    if !compact { line.push(Span::styled(mark, if sel { Style::new() } else { MUTED })); }
                     line.extend(if sel && !compact { plain(spans) } else { spans });
+                    if compact && starred.contains(c) { line.push(Span::raw(" ✨")); }
                     ListItem::new(Line::from(line))
                 }).collect()
             } else {
@@ -579,7 +585,9 @@ pub fn run(
             let list = List::new(items).block(list_block).highlight_style(if compact { Style::new().add_modifier(Modifier::BOLD) } else { SELECTED });
             let mut state = ListState::default().with_selected((count > 0).then_some(selected));
             frame.render_stateful_widget(list, list_area, &mut state);
-            let filters = if history {
+            let filters = if history && compact {
+                vec![]
+            } else if history {
                 vec![("tab", "semantic")]
             } else if picker.mode == Mode::Files {
                 vec![("tab", "into"), ("⇧tab", "out"), ("^F", "dirs/files")]
