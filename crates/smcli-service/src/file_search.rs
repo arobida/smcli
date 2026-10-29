@@ -220,6 +220,32 @@ impl FileSearch {
                     let mut h = hit(&file.relative_path(picker), Some(file))?;
                     h.line = Some(m.line_number as i64); h.column = Some(m.col as i64 + 1); h.text = Some(m.line_content.clone()); h.definition = Some(m.is_definition); Some(h)
                 }).collect()
+            } else if query.trim().is_empty() {
+                // Blank: fff's own ranking of files and dirs together; its frecency/git picks are the suggestions.
+                let parsed = QueryParser::new(MixedSearchConfig).parse("");
+                let found = picker.fuzzy_search_mixed(&parsed, None, FuzzySearchOptions { pagination: PaginationArgs { offset: 0, limit: limit as usize }, ..Default::default() });
+                let mut seen = std::collections::HashSet::new();
+                let mut hits = Vec::new();
+                for (item, score) in found.items.iter().zip(found.scores.iter()) {
+                    let Some(mut h) = (match item {
+                        fff_search::MixedItemRef::File(f) => hit(&f.relative_path(picker), Some(f)),
+                        fff_search::MixedItemRef::Dir(d) => hit(&d.relative_path(picker), None),
+                    }) else { continue };
+                    h.provenance.retain(|p| p != "picked");
+                    if score.frecency_boost + score.git_status_boost + score.git_recency_boost > 0 {
+                        h.provenance.push("suggested".into());
+                        // fff ranks dirs last on a blank query: a suggested file's folder is suggested just above it.
+                        if let Some((dir, _)) = h.path.rsplit_once('/') {
+                            let dir = format!("{dir}/");
+                            if seen.insert(dir.clone()) {
+                                if let Some(mut d) = hit(&dir, None) { d.provenance.retain(|p| p != "picked"); d.provenance.push("suggested".into()); hits.push(d); }
+                            }
+                        }
+                    }
+                    if seen.insert(h.path.clone()) { hits.push(h); }
+                }
+                hits.truncate(limit as usize);
+                hits
             } else {
                 let parser = QueryParser::default();
                 let parsed = parser.parse(query);

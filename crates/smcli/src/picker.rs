@@ -573,7 +573,7 @@ pub fn run(
                         Span::styled(if !compact { format!("  {}", h.provenance.join("+")) } else {
                             h.git.as_deref().map(str::trim).filter(|g| !g.is_empty()).map(|g| format!("  {g}")).unwrap_or_default()
                         }, MUTED),
-                        Span::raw(if compact && h.provenance.iter().any(|p| p == "picked") { " ✨" } else { "" }),
+                        Span::raw(if compact && suggested(h) { " ✨" } else { "" }),
                     ]).collect::<Vec<_>>()))
                 }).collect()
             };
@@ -846,20 +846,29 @@ fn filter_history(candidates: &[String], query: &str) -> Vec<String> {
         .collect()
 }
 
-/// Suggested (picked) rows that contain the query first; the stable sort keeps ranking within each group.
+/// fff's blank-search suggestions, or files picked before.
+fn suggested(hit: &FileHit) -> bool {
+    hit.provenance.iter().any(|p| p == "picked" || p == "suggested")
+}
+
+/// Suggested rows that contain the query first; the stable sort keeps ranking within each group.
 /// A picked row that only fuzzy-matched (a typo away) keeps its rank, so it never jumps over real matches.
 fn suggested_first(hits: &mut [FileHit], query: &str) {
     let pattern = Pattern::new(query, CaseMatching::Ignore, Normalization::Smart, nucleo_matcher::pattern::AtomKind::Substring);
     let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
     let mut buffer = Vec::new();
     hits.sort_by_cached_key(|h| {
-        !(h.provenance.iter().any(|p| p == "picked") && pattern.score(Utf32Str::new(&h.path, &mut buffer), &mut matcher).is_some())
+        !(suggested(h) && pattern.score(Utf32Str::new(&h.path, &mut buffer), &mut matcher).is_some())
     });
 }
 
 /// Narrows project hits to files (2) or folders (1); the index lists only files, so folders are their matches' parents.
 // shortcut: folders only appear if a file inside them matches; add directory entries to the service index if that's not enough.
 fn filter_kind(hits: Vec<FileHit>, kind: u8) -> Vec<FileHit> {
+    // A blank search also returns dirs (trailing `/`): files mode drops them, folders mode keeps them as they are.
+    if kind == 2 {
+        return hits.into_iter().filter(|h| !h.path.ends_with('/')).collect();
+    }
     if kind != 1 {
         return hits;
     }
@@ -867,6 +876,7 @@ fn filter_kind(hits: Vec<FileHit>, kind: u8) -> Vec<FileHit> {
     let mut seen = HashSet::new();
     hits.into_iter()
         .filter_map(|h| {
+            if h.path.ends_with('/') { return seen.insert(h.path.clone()).then_some(h); }
             let path = parent(&h.path)?;
             seen.insert(path.clone()).then(|| FileHit { insert: parent(&h.insert).unwrap_or_else(|| "./".to_string()), path, git: None, line: None, column: None, text: None, ..h })
         })
