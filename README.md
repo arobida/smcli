@@ -175,7 +175,8 @@ Project-index ranking switches are controlled by `SMCLI_RANKING_OFF`: `index`, `
   matching regexes in the config file: `"historyFilter": ["^vault "]` for commands,
   `"cwdFilter": ["^/Users/me/secret"]` for directories. Set `"secretsFilter": false` to turn
   off the secret patterns. In zsh, `@`-Tab with several matches opens the files picker inline
-  under the prompt; set `"atCompletionInline": false` for the fullscreen picker. `prune` applies the current filters to already-stored history
+  under the prompt; set `"atCompletionInline": false` for the fullscreen picker. Its rows use the terminal
+  theme's colours; set `"atCompletionLsColors": true` to colour them from `LS_COLORS`. `prune` applies the current filters to already-stored history
   and compacts the database so deleted text is not left on disk.
 - `import --atuin` keeps Atuin's record UUIDs, so re-running it only adds new commands.
   It also carries over soft deletions (hidden from history, search, and suggestions) and

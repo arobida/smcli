@@ -47,6 +47,9 @@ pub struct SmcliConfig {
     /// `@`-Tab opens the files picker inline under the prompt; false uses the fullscreen picker. On unless false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at_completion_inline: Option<bool>,
+    /// Colour the `@`-Tab picker's rows from `LS_COLORS`; off unless true (the terminal theme is the default).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at_completion_ls_colors: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub left_key: Option<bool>,
     /// Right arrow on an empty line opens directory suggestions (Bash and Zsh; off unless true).
@@ -194,9 +197,9 @@ mod tests {
         assert_eq!(config.ctrl_r_key, Some(false));
         let saved = serde_json::to_string(&config).unwrap();
         assert_eq!(saved, r#"{"ctrlRKey":false,"historyFilter":["x"],"potionPath":"/m"}"#);
-        let inline: SmcliConfig = serde_json::from_str(r#"{"atCompletionInline":false}"#).unwrap();
-        assert_eq!(inline.at_completion_inline, Some(false));
-        assert_eq!(serde_json::to_string(&inline).unwrap(), r#"{"atCompletionInline":false}"#);
+        let inline: SmcliConfig = serde_json::from_str(r#"{"atCompletionInline":false,"atCompletionLsColors":true}"#).unwrap();
+        assert_eq!((inline.at_completion_inline, inline.at_completion_ls_colors), (Some(false), Some(true)));
+        assert_eq!(serde_json::to_string(&inline).unwrap(), r#"{"atCompletionInline":false,"atCompletionLsColors":true}"#);
         let arrows: SmcliConfig = serde_json::from_str(r#"{"leftKey":false,"rightKey":true}"#).unwrap();
         assert_eq!(arrows.left_key, Some(false));
         assert_eq!(arrows.right_key, Some(true));

@@ -1028,8 +1028,9 @@ fn pick(
         }
     };
     // Only the zsh `@`-Tab widget sets SMCLI_FILES_QUERY.
-    let inline = files && env.contains_key("SMCLI_FILES_QUERY")
-        && SmcliConfig::load(&SmcliConfig::location(home, env)).map_or(true, |c| c.at_completion_inline != Some(false));
+    let config = SmcliConfig::load(&SmcliConfig::location(home, env)).unwrap_or_default();
+    let inline = files && env.contains_key("SMCLI_FILES_QUERY") && config.at_completion_inline != Some(false);
+    picker.ls_colors = config.at_completion_ls_colors == Some(true);
     if let Some(choice) = crate::picker::run(picker, Some(Box::new(search)), Some(Box::new(file_search)), inline)? {
         match choice {
             Choice::Command {

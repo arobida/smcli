@@ -93,6 +93,8 @@ pub struct Picker {
     pub title: Option<String>,
     /// Files mode shows only folders (1) or files (2) when set.
     pub kind: u8,
+    /// Colour inline rows from `LS_COLORS` instead of only the terminal theme.
+    pub ls_colors: bool,
 }
 impl Picker {
     /// Native history is oldest first; captured history is newest first.
@@ -136,6 +138,7 @@ impl Picker {
             saved_file_scope: None,
             title: None,
             kind: 0,
+            ls_colors: false,
         }
     }
 }
@@ -366,7 +369,8 @@ pub fn run(
     let inline_session = if inline { inline_height(rows).and_then(|height| TerminalSession::inline(height).ok()) } else { None };
     let mut terminal = match inline_session { Some(session) => session, None => TerminalSession::new()? };
     let terminal_inline = terminal.inline.is_some();
-    let ls_colors = LsColors::parse(&std::env::var("LS_COLORS").unwrap_or_default());
+    // The terminal theme by default; LS_COLORS only when the user opts in.
+    let ls_colors = LsColors::parse(&if picker.ls_colors { std::env::var("LS_COLORS").unwrap_or_default() } else { String::new() });
     let mut saved = HashMap::new();
     let mut selected = 0usize;
     let mut semantic: Option<(String, Vec<String>)> = None;
@@ -563,11 +567,11 @@ pub fn run(
                         Span::styled(if compact { String::new() } else { format!("{} ", h.git.as_deref().unwrap_or("")) }, ACCENT),
                         Span::styled(visible(name), if compact { ls_colors.style(name) } else { Style::new() }),
                         Span::styled(visible(&location), MUTED),
-                        // Inline: colour already tells dirs from files; git status and picked stay.
+                        // Inline: colour already tells dirs from files; git status stays and suggested (picked) rows get ✨.
                         Span::styled(if !compact { format!("  {}", h.provenance.join("+")) } else {
-                            [h.git.clone().unwrap_or_default(), if h.provenance.iter().any(|p| p == "picked") { "picked".into() } else { String::new() }]
-                                .into_iter().filter(|s| !s.trim().is_empty()).map(|s| format!("  {}", s.trim())).collect()
+                            h.git.as_deref().map(str::trim).filter(|g| !g.is_empty()).map(|g| format!("  {g}")).unwrap_or_default()
                         }, MUTED),
+                        Span::raw(if compact && h.provenance.iter().any(|p| p == "picked") { " ✨" } else { "" }),
                     ]).collect::<Vec<_>>()))
                 }).collect()
             };
