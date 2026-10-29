@@ -95,6 +95,7 @@ pub struct Picker {
     pub title: Option<String>,
     /// Files mode shows only folders (1) or files (2) when set.
     pub kind: u8,
+    pub files_line: Option<String>,
     /// Colour inline rows from `LS_COLORS` instead of only the terminal theme.
     pub ls_colors: bool,
 }
@@ -130,6 +131,7 @@ impl Picker {
             saved_file_scope: None,
             title: None,
             kind: 0,
+            files_line: None,
             ls_colors: false,
         }
     }
@@ -499,7 +501,9 @@ pub fn run(
                 };
                 format!("{}  →  {}", abbreviate(&cwd, &home), displayed)
             };
-            let header = if compact && (!history || (picker.suggested_view && picker.title.is_some())) {
+            let header = if let Some(text) = edit_files_header(picker.mode, picker.files_line.as_deref()) {
+                Line::styled(format!(" {text}"), ACCENT)
+            } else if compact && (!history || (picker.suggested_view && picker.title.is_some())) {
                 // Only the searched directory, which grows and shrinks as Tab moves in and out; suggestions name the cwd.
                 let (label, dir) = if history { ("suggested", &cwd) } else { (label, &scope) };
                 let mut path = abbreviate(dir, &home);
@@ -1023,8 +1027,19 @@ impl Drop for TerminalSession {
     }
 }
 
+fn edit_files_header(mode: Mode, line: Option<&str>) -> Option<String> {
+    line.filter(|_| mode == Mode::Files).map(|line| format!("edit @ {}", visible(line)))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn files_edit_header() {
+        assert_eq!(super::edit_files_header(super::Mode::Files, Some("cat @")), Some("edit @ cat @".into()));
+        assert_eq!(super::edit_files_header(super::Mode::Files, None), None);
+        assert_eq!(super::edit_files_header(super::Mode::History, Some("cat @")), None);
+    }
+
     use super::*;
     #[test]
     fn picker_keeps_full_and_suggested_lists_separate() {

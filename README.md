@@ -69,7 +69,8 @@ showing 12 results:
   changes, and each one's folder. The rest of fff's ranking follows. Once you type, matching files you
   picked before are marked ✨ and lead.
 - Tab moves into the selected folder, or into a file's folder; Shift+Tab moves out. The header shows the
-  folder being searched, e.g. `files+dirs @ ~/project/src/`.
+  folder being searched, e.g. `files+dirs @ ~/project/src/`. While editing paths with ^E or @-Tab, it shows `edit @ <whole command line>` instead.
+- Both Ctrl-T at the prompt and @-Tab start with folders for `cd`, `pushd`, `popd`, `z`, `rmdir` and `mkdir`. Other commands use path arguments from their last 20 captured runs: a strict directory or file majority selects that filter; a tie or no evidence shows files+dirs. This works without the service.
 - ^T cycles files+dirs, folders and files; ^G searches file contents; ^R opens history; Enter
   inserts the path; Esc leaves the line as it was. Resizing the window re-lays out the picker.
 - In the history picker, ^R flips between full history and this directory's suggestions. Only ↑/↓

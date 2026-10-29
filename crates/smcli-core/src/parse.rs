@@ -218,6 +218,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn path_arguments_use_placeholder_detection() {
+        assert_eq!(path_arguments("/bin/tool --out=a.txt 'some dir' | cat b.md", "bash", |p| p == "some dir"), ["a.txt", "some dir", "b.md"]);
+    }
+
+    #[test]
+    fn last_command_segments() {
+        assert_eq!(last_command_word("echo 'a|b'; cd @", "bash").as_deref(), Some("cd"));
+        assert_eq!(last_command_word("cat \"a;b\"", "bash").as_deref(), Some("cat"));
+        assert_eq!(last_command_word("cat a && mkdir @", "bash").as_deref(), Some("mkdir"));
+        assert_eq!(last_command_word("cat a | ", "bash"), None);
+    }
+
+    #[test]
     fn parse_commands_and_flags() {
         let parsed = CommandBreakdown::parse("FOO=1 /usr/bin/git commit -m 'fix it' --amend file").unwrap();
         assert_eq!(parsed.main_command, "/usr/bin/git");
@@ -417,7 +430,17 @@ fn glob_class_eat(pat: &str, c: char) -> Option<(bool, &str)> {
 /// Replace a command's path arguments with `@` placeholders so they can be re-filled in the shell.
 /// Returns `Some((rewritten_command, first_placeholder_byte_offset))` when at least one path was
 /// found; otherwise the command is returned unchanged as `None`.
-pub fn path_placeholders<F: FnMut(&str) -> bool>(command: &str, shell: &str, mut exists: F) -> Option<(String, usize)> {
+pub fn path_placeholders<F: FnMut(&str) -> bool>(command: &str, shell: &str, exists: F) -> Option<(String, usize)> {
+    path_placeholders_with(command, shell, exists, |_| {})
+}
+
+pub fn path_arguments(command: &str, shell: &str, exists: impl FnMut(&str) -> bool) -> Vec<String> {
+    let mut paths = Vec::new();
+    path_placeholders_with(command, shell, exists, |path| paths.push(path.to_string()));
+    paths
+}
+
+fn path_placeholders_with(command: &str, shell: &str, mut exists: impl FnMut(&str) -> bool, mut argument: impl FnMut(&str)) -> Option<(String, usize)> {
     let tokens = tokenize(command, shell)?;
     let mut replacements: Vec<(std::ops::Range<usize>, String)> = Vec::new();
     let mut command_expected = true;
@@ -449,6 +472,7 @@ pub fn path_placeholders<F: FnMut(&str) -> bool>(command: &str, shell: &str, mut
             }
             Token::Whitespace => {}
             Token::Word { full, text } => {
+                let was_command = command_expected;
                 let raw = &command[full.clone()];
                 let variable = |value: &str| {
                     let raw_value = raw.split_once('=').map_or(raw, |(_, value)| value);
@@ -487,6 +511,9 @@ pub fn path_placeholders<F: FnMut(&str) -> bool>(command: &str, shell: &str, mut
                     None
                 };
                 if let Some(range) = candidate {
+                    if !was_command {
+                        argument(flag_value(&text).map_or(text.as_str(), |(_, value)| value));
+                    }
                     replacements.push((range, replacement));
                 }
                 redirection_expected = false;
@@ -510,6 +537,19 @@ pub fn path_placeholders<F: FnMut(&str) -> bool>(command: &str, shell: &str, mut
     }
     out.push_str(&command[last..]);
     Some((out, first_placeholder.unwrap()))
+}
+
+/// First word of the last command segment, ignoring separators inside quoted words.
+pub fn last_command_word(command: &str, shell: &str) -> Option<String> {
+    let mut first = None;
+    for token in tokenize(command, shell)? {
+        match token {
+            Token::Op(range) if is_command_separator(&command[range.clone()]) => first = None,
+            Token::Word { text, .. } if first.is_none() => first = Some(text),
+            _ => {}
+        }
+    }
+    first
 }
 
 #[derive(Debug)]

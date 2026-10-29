@@ -243,7 +243,7 @@ pub fn run() -> Result<()> {
         Command::Record { fields, expanded } => record(&fields, expanded.as_deref(), &captured, &service, &filter()?)?,
         Command::Complete { word, command, limit } => {
             let word = word.strip_prefix('@').unwrap_or(&word);
-            let dirs_only = matches!(command.as_deref(), Some("cd" | "pushd" | "z"));
+            let dirs_only = command.as_deref().is_some_and(is_directory_command);
             let cwd = working_directory(&env);
             let shell = env.get("SMCLI_SHELL").map(String::as_str).unwrap_or("bash");
             let mut request = ServiceRequest::new(Operation::Complete);
@@ -886,6 +886,39 @@ fn import(
     println!("Imported {count} records into {}.", c.path.display());
     Ok(())
 }
+const DIRECTORY_COMMANDS: &[&str] = &["cd", "pushd", "popd", "z", "rmdir", "mkdir"];
+
+fn is_directory_command(command: &str) -> bool {
+    DIRECTORY_COMMANDS.contains(&command)
+}
+
+fn files_kind(c: &CapturedHistory, env: &HashMap<String, String>) -> u8 {
+    let line = env.get("SMCLI_LBUFFER").map(String::as_str).unwrap_or("");
+    let Some(command) = smcli_core::parse::last_command_word(line, env.get("SMCLI_SHELL").map(String::as_str).unwrap_or("bash")) else { return 0 };
+    let command = command.rsplit('/').next().unwrap_or(&command).to_string();
+    if is_directory_command(&command) { return 1; }
+    let Some(db) = c.path.exists().then(|| c.open_connection().ok()).flatten() else { return 0 };
+    let Ok(mut stmt) = db.prepare("SELECT c.command, c.expanded_command, c.directory, s.shell FROM commands c JOIN sessions s ON s.id=c.session WHERE s.user=?1 ORDER BY c.started_at DESC,c.id DESC") else { return 0 };
+    let Ok(rows) = stmt.query_map(rusqlite::params![user_name()], |r| Ok((r.get::<_,String>(0)?, r.get::<_,Option<String>>(1)?, r.get::<_,String>(2)?, r.get::<_,String>(3)?))) else { return 0 };
+    files_majority(rows.flatten().filter(|(raw, _, _, _)| {
+        smcli_core::parse::program_of(raw, smcli_core::parse::CommandBreakdown::parse(raw).as_ref()).as_deref() == Some(&command)
+    }).map(|(raw, expanded, cwd, shell)| {
+        let (mut dirs, mut files) = (0, 0);
+        let command = expanded.as_deref().unwrap_or(&raw);
+        for path in smcli_core::parse::path_arguments(command, &shell, |p| Path::new(&cwd).join(p).exists()) {
+            let full = Path::new(&cwd).join(path);
+            dirs += usize::from(full.is_dir());
+            files += usize::from(full.is_file());
+        }
+        (dirs, files)
+    }))
+}
+
+fn files_majority(rows: impl IntoIterator<Item = (usize, usize)>) -> u8 {
+    let (dirs, files) = rows.into_iter().take(20).fold((0, 0), |(d, f), (dirs, files)| (d + dirs, f + files));
+    if dirs > files { 1 } else if files > dirs { 2 } else { 0 }
+}
+
 fn command_directory(c: &CapturedHistory, user: &str, command_key: &str) -> Option<String> {
     if !c.path.exists() {
         return None;
@@ -953,7 +986,8 @@ fn pick(
     picker.suggested_view = suggest;
     picker.title = Some(format!("Suggested for {d}"));
     if files {
-        picker.kind = if env.contains_key("SMCLI_FILES_DIRS") { 1 } else { 0 };
+        picker.kind = files_kind(c, env);
+        picker.files_line = env.get("SMCLI_FILES_LINE").cloned();
     }
     picker.mode = if files {
         Mode::Files
@@ -1420,6 +1454,38 @@ fn index_health(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn files_filter_uses_recent_captured_paths() {
+        let root = std::env::temp_dir().join(format!("smcli-files-kind-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        std::fs::write(root.join("file.txt"), "").unwrap();
+        let history = super::CapturedHistory::new(root.join("history.db"));
+        let env = std::collections::HashMap::from([("SMCLI_LBUFFER".into(), "echo hi; tool @".into())]);
+        assert_eq!(super::files_kind(&history, &env), 0);
+        let db = history.open_connection().unwrap();
+        for i in 0..21 {
+            let command = if i == 0 { "tool folder folder folder" } else { "tool file.txt" };
+            let mut run = smcli_core::history::NewRun::new(command, "bash", root.to_str().unwrap(), 0);
+            run.started_at = Some(1_700_000_000.0 + i as f64);
+            history.append(&run, "", Some(&db)).unwrap();
+        }
+        assert_eq!(super::files_kind(&history, &env), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn files_start_filter() {
+        for command in ["cd", "pushd", "popd", "z", "rmdir", "mkdir"] {
+            assert!(super::is_directory_command(command));
+        }
+        assert!(!super::is_directory_command("cat"));
+        assert_eq!(super::files_majority([]), 0);
+        assert_eq!(super::files_majority([(2, 2)]), 0);
+        assert_eq!(super::files_majority([(2, 1)]), 1);
+        assert_eq!(super::files_majority([(1, 2)]), 2);
+        assert_eq!(super::files_majority(std::iter::repeat_n((1, 0), 20).chain([(0, 100)])), 1);
+    }
+
     use super::*;
     #[test]
     fn parse_flags_and_times() {

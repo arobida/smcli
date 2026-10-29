@@ -301,7 +301,7 @@ elif [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
             _smcli_split "$before@"
             READLINE_LINE="$before@$after"
             READLINE_POINT=$_smcli_bytes
-            picked=$(SMCLI_SHELL=bash SMCLI_LBUFFER="$before@" "$_smcli_pick_bin" pick --files </dev/tty)
+            picked=$(SMCLI_SHELL=bash SMCLI_LBUFFER="$before@" SMCLI_FILES_LINE="$before@$after" "$_smcli_pick_bin" pick --files </dev/tty)
             (( $? == 10 )) || return
             READLINE_LINE="$before$picked$after"
             _smcli_split "$before$picked"
@@ -389,9 +389,7 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
                 hit=$hits
                 if [[ $hits == *$'\n'* ]]; then
                     # Several matches: pick one in the files picker, filtered by the word.
-                    local dirs=()
-                    case $cmd in cd|pushd|z) dirs=(SMCLI_FILES_DIRS=1) ;; esac
-                    hit=$(env SMCLI_SHELL=bash SMCLI_LBUFFER="${before%"$word"}" SMCLI_FILES_QUERY="${word#@}" SMCLI_FILES_COMMAND="$cmd" "${dirs[@]}" "$_smcli_complete_bin" pick --files </dev/tty)
+                    hit=$(env SMCLI_SHELL=bash SMCLI_LBUFFER="$before" SMCLI_FILES_QUERY="${word#@}" SMCLI_FILES_LINE="$READLINE_LINE" "$_smcli_complete_bin" pick --files </dev/tty)
                     (( $? == 10 )) || hit=
                 fi
                 if [[ -n $hit ]]; then
@@ -415,9 +413,8 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
             done < <(SMCLI_SHELL=bash "$_smcli_complete_bin" complete --word "$cur" --command "$cmd")
             if (( ${#COMPREPLY[@]} > 1 )); then
                 # Several matches: pick one in the files picker, filtered by the word.
-                local dirs=() line_before=${COMP_LINE:0:COMP_POINT}
-                case $cmd in cd|pushd|z) dirs=(SMCLI_FILES_DIRS=1) ;; esac
-                line=$(env SMCLI_SHELL=bash SMCLI_LBUFFER="${line_before%"$cur"}" SMCLI_FILES_QUERY="${cur#@}" SMCLI_FILES_COMMAND="$cmd" "${dirs[@]}" "$_smcli_complete_bin" pick --files </dev/tty)
+                local line_before=${COMP_LINE:0:COMP_POINT}
+                line=$(env SMCLI_SHELL=bash SMCLI_LBUFFER="$line_before" SMCLI_FILES_QUERY="${cur#@}" SMCLI_FILES_LINE="$COMP_LINE" "$_smcli_complete_bin" pick --files </dev/tty)
                 if (( $? == 10 )); then COMPREPLY=("$line"); else COMPREPLY=("$cur"); fi
             fi
         }
@@ -531,7 +528,7 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
             local before=${chosen%%$'\x1f'*} after=${chosen#*$'\x1f'} picked
             BUFFER="$before@$after"
             CURSOR=$((${#before} + 1))
-            picked=$(env SMCLI_SHELL=zsh SMCLI_LBUFFER="$before@" "$_smcli_pick_bin" pick --files </dev/tty)
+            picked=$(env SMCLI_SHELL=zsh SMCLI_LBUFFER="$before@" SMCLI_FILES_LINE="$before@$after" "$_smcli_pick_bin" pick --files </dev/tty)
             (( $? == 10 )) || return
             BUFFER="$before$picked$after"
             CURSOR=$((${#before} + ${#picked}))
@@ -625,7 +622,7 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
         elif (( $#hits > 1 )); then
             # Several matches: pick one in the files picker, filtered by the word.
             local chosen
-            chosen=$(env SMCLI_SHELL=zsh SMCLI_LBUFFER=${LBUFFER%$word} SMCLI_FILES_QUERY=${word#@} SMCLI_FILES_COMMAND=$cmd ${${(M)cmd:#(cd|pushd|z)}:+SMCLI_FILES_DIRS=1} "$_smcli_complete_bin" pick --files </dev/tty)
+            chosen=$(env SMCLI_SHELL=zsh SMCLI_LBUFFER=$LBUFFER SMCLI_FILES_QUERY=${word#@} SMCLI_FILES_LINE=$BUFFER "$_smcli_complete_bin" pick --files </dev/tty)
             (( $? == 10 )) && LBUFFER="${LBUFFER%$word}$chosen"
             zle reset-prompt
         fi
@@ -763,7 +760,7 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
             commandline -r -- "$before@$after"
             commandline -C (math (string length -- $before) + 1)
             set -lx SMCLI_LBUFFER "$before@"
-            set -l picked (SMCLI_SHELL=fish command $_smcli_bin pick --files </dev/tty)
+            set -l picked (SMCLI_SHELL=fish SMCLI_FILES_LINE="$before@$after" command $_smcli_bin pick --files </dev/tty)
             test $status -eq 10; or return
             commandline -r -- "$before$picked$after"
             commandline -C (math (string length -- $before) + (string length -- $picked))
@@ -835,10 +832,8 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
                 commandline -t -- $hits[1]
             else if test (count $hits) -gt 1
                 # Several matches: pick one in the files picker, filtered by the word.
-                set -l dirs
-                contains -- $cmd[1] cd pushd z; and set dirs SMCLI_FILES_DIRS=1
                 set -l before (commandline -c | string collect)
-                set -l chosen (env SMCLI_SHELL=fish SMCLI_LBUFFER=(string sub -e -(string length -- $token) -- $before | string collect) SMCLI_FILES_QUERY=(string sub -s 2 -- $token) SMCLI_FILES_COMMAND=$cmd[1] $dirs $_smcli_complete_bin pick --files </dev/tty)
+                set -l chosen (env SMCLI_SHELL=fish SMCLI_LBUFFER=$before SMCLI_FILES_QUERY=(string sub -s 2 -- $token) SMCLI_FILES_LINE=(commandline | string collect) $_smcli_complete_bin pick --files </dev/tty)
                 test $status -eq 10; and commandline -t -- (string join \n -- $chosen | string collect)
                 commandline -f repaint
             end
@@ -982,6 +977,8 @@ mod tests {
             let hooks = render_with_keys(shell, "smcli", true, false, false, false, false).unwrap();
             assert!(hooks.contains("code == 11") || hooks.contains("$code -eq 11"), "{shell} missing exit-11 branch");
             assert!(hooks.contains("pick --files"), "{shell} missing file picker call");
+            assert!(hooks.contains("SMCLI_FILES_LINE="), "{shell} missing edit header");
+            assert!(!hooks.contains("SMCLI_FILES_DIRS"), "{shell} duplicates the start filter decision");
         }
         let bash = render_with_keys("bash", "smcli", true, false, false, false, false).unwrap();
         assert!(bash.contains("READLINE_LINE=\"$before@$after\""));
