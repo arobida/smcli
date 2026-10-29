@@ -44,7 +44,7 @@ pub struct SmcliConfig {
     /// Regexes; commands matching any, or run in a directory matching any of `cwd_filter`, are not recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub history_filter: Option<Vec<String>>,
-    /// `@`-Tab opens the files picker inline under the prompt; false uses the fullscreen picker. On unless false.
+    /// Every picker and the menu open inline under the prompt; false uses fullscreen. On unless false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub at_completion_inline: Option<bool>,
     /// Colour the `@`-Tab picker's rows from `LS_COLORS`; off unless true (the terminal theme is the default).

@@ -71,8 +71,8 @@ showing 12 results:
 - ^F cycles files+dirs, folders and files; ^G searches file contents; ^T switches to history; Enter
   inserts the path; Esc leaves the line as it was. Resizing the window closes the picker.
 - Rows use your terminal theme's colours. Config options (in `~/.config/smcli/config.json`):
-  `"atCompletionLsColors": true` colours rows from `LS_COLORS`; `"atCompletionInline": false` uses the
-  fullscreen picker instead. Terminals that never report the cursor position also get the fullscreen
+  `"atCompletionLsColors": true` colours rows from `LS_COLORS`; `"atCompletionInline": false` makes every
+  picker (history, files, grep) and the `smcli` menu fullscreen instead; they all open inline by default. Terminals that never report the cursor position also get the fullscreen
   picker.
 
 ## Install

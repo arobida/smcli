@@ -366,8 +366,7 @@ pub fn run(
     let mut spinner = 0;
     let mut spun = Instant::now();
     let rows = ratatui::crossterm::terminal::size().ok().filter(|&(_, rows)| rows > 0).map_or(24, |(_, rows)| rows);
-    let inline_session = if inline { inline_height(rows).and_then(|height| TerminalSession::inline(height).ok()) } else { None };
-    let mut terminal = match inline_session { Some(session) => session, None => TerminalSession::new()? };
+    let mut terminal = TerminalSession::open(inline, 17, rows)?;
     let terminal_inline = terminal.inline.is_some();
     // The terminal theme by default; LS_COLORS only when the user opts in.
     let ls_colors = LsColors::parse(&if picker.ls_colors { std::env::var("LS_COLORS").unwrap_or_default() } else { String::new() });
@@ -897,9 +896,9 @@ pub(crate) fn visible(text: &str) -> String {
         .collect()
 }
 
-/// Inline picker height: the compact layout with 12 results, clamped under the prompt; `None` when too short to be useful.
-fn inline_height(rows: u16) -> Option<u16> {
-    Some(17.min(rows.saturating_sub(1))).filter(|&height| height >= 6)
+/// Inline height: `wanted` clamped under the prompt; `None` when too short to be useful.
+fn inline_height(wanted: u16, rows: u16) -> Option<u16> {
+    Some(wanted.min(rows.saturating_sub(1))).filter(|&height| height >= 6)
 }
 
 pub(crate) struct TerminalSession {
@@ -908,6 +907,14 @@ pub(crate) struct TerminalSession {
     inline: Option<(u16, std::os::fd::OwnedFd)>,
 }
 impl TerminalSession {
+    /// Inline under the prompt when asked and it fits, else (or if the terminal won't say where the cursor is) fullscreen.
+    // shortcut: a pty that never answers the cursor query waits crossterm's timeout on every open; cache the failure if one shows up.
+    pub fn open(inline: bool, wanted: u16, rows: u16) -> Result<Self> {
+        match inline.then(|| inline_height(wanted, rows)).flatten().and_then(|height| Self::inline(height).ok()) {
+            Some(session) => Ok(session),
+            None => Self::new(),
+        }
+    }
     /// A `height`-row viewport below the prompt line. Errors (e.g. a pty that never reports the cursor) leave the terminal as found.
     pub fn inline(height: u16) -> Result<Self> {
         let tty = OpenOptions::new().read(true).write(true).open("/dev/tty").context("pick needs a terminal")?;
@@ -1006,9 +1013,9 @@ mod tests {
 
     #[test]
     fn inline_viewport_sits_under_a_bottom_prompt() {
-        assert_eq!(inline_height(40), Some(17));
-        assert_eq!(inline_height(10), Some(9));
-        assert_eq!(inline_height(6), None);
+        assert_eq!(inline_height(17, 40), Some(17));
+        assert_eq!(inline_height(17, 10), Some(9));
+        assert_eq!(inline_height(17, 6), None);
         let mut backend = ratatui::backend::TestBackend::new(80, 24);
         // The cursor after `\r\n` from a prompt on the last row.
         ratatui::backend::Backend::set_cursor_position(&mut backend, (0, 23)).unwrap();

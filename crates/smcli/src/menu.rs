@@ -82,10 +82,10 @@ pub fn is_interactive() -> bool {
 }
 
 /// Returns command arguments (without argv[0]), or None on cancellation.
-pub fn run() -> Result<Option<Vec<String>>> {
+pub fn run(inline: bool) -> Result<Option<Vec<String>>> {
     let mut selected = 0;
     loop {
-        let Some(index) = choose(selected)? else {
+        let Some(index) = choose(selected, inline)? else {
             return Ok(None);
         };
         selected = index;
@@ -137,8 +137,10 @@ fn arguments(command: &str, input: &str, shell: &str) -> Vec<String> {
     args
 }
 
-fn choose(mut selected: usize) -> Result<Option<usize>> {
-    let mut terminal = TerminalSession::new()?;
+fn choose(mut selected: usize, inline: bool) -> Result<Option<usize>> {
+    let rows = ratatui::crossterm::terminal::size().ok().filter(|&(_, rows)| rows > 0).map_or(24, |(_, rows)| rows);
+    // Title, two rows per item, hints.
+    let mut terminal = TerminalSession::open(inline, ITEMS.len() as u16 * 2 + 2, rows)?;
     loop {
         terminal.terminal.draw(|frame| {
             let area = frame.area();

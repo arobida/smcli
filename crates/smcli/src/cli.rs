@@ -209,7 +209,7 @@ pub fn run() -> Result<()> {
     let filter = || CaptureFilter::new(&SmcliConfig::load(&config_path)?);
     let mut args: Vec<String> = std::env::args().collect();
     if args.len() == 1 && crate::menu::is_interactive() {
-        let Some(chosen) = crate::menu::run()? else {
+        let Some(chosen) = crate::menu::run(SmcliConfig::load(&config_path).unwrap_or_default().at_completion_inline != Some(false))? else {
             return Ok(());
         };
         args.extend(chosen);
@@ -1027,9 +1027,8 @@ fn pick(
         local.search(mode, q, kind, scope, path)
         }
     };
-    // Only the zsh `@`-Tab widget sets SMCLI_FILES_QUERY.
     let config = SmcliConfig::load(&SmcliConfig::location(home, env)).unwrap_or_default();
-    let inline = files && env.contains_key("SMCLI_FILES_QUERY") && config.at_completion_inline != Some(false);
+    let inline = config.at_completion_inline != Some(false);
     picker.ls_colors = config.at_completion_ls_colors == Some(true);
     if let Some(choice) = crate::picker::run(picker, Some(Box::new(search)), Some(Box::new(file_search)), inline)? {
         match choice {
