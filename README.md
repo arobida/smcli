@@ -69,7 +69,7 @@ showing 12 results:
 - Tab moves into the selected folder, or into a file's folder; Shift+Tab moves out. The header shows the
   folder being searched, e.g. `files+dirs @ ~/project/src/`.
 - ^F cycles files+dirs, folders and files; ^G searches file contents; ^T switches to history; Enter
-  inserts the path; Esc leaves the line as it was. Resizing the window closes the picker.
+  inserts the path; Esc leaves the line as it was. Resizing the window re-lays out the picker.
 - Rows use your terminal theme's colours. Config options (in `~/.config/smcli/config.json`):
   `"atCompletionLsColors": true` colours rows from `LS_COLORS`; `"atCompletionInline": false` makes every
   picker (history, files, grep) and the `smcli` menu fullscreen instead; they all open inline by default. Terminals that never report the cursor position also get the fullscreen

@@ -661,8 +661,8 @@ pub fn run(
         }
         tick = 3;
         let key = match event::read()? {
-            // Inline autoresize moves the viewport, losing the prompt row: cancel and let zle repaint.
-            Event::Resize(..) if terminal.inline.is_some() => return Ok(None),
+            // Inline: the next draw's autoresize re-anchors the viewport from the cursor; Drop still finds the prompt above it.
+            Event::Resize(..) if terminal.inline.is_some() => continue,
             Event::Resize(columns, rows) => {
                 terminal.terminal.resize(Rect::new(0, 0, columns, rows))?;
                 continue;
