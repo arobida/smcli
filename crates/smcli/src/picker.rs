@@ -279,6 +279,7 @@ pub fn run(
     mut picker: Picker,
     search: Option<Box<dyn FnMut(&str) -> Result<Vec<String>> + Send>>,
     files: Option<Box<dyn FnMut(Mode, &str, u8, &str, Option<&str>) -> Result<FileResults> + Send>>,
+    inline: bool,
 ) -> Result<Option<Choice>> {
     let search = search.map(|mut callback| worker(move |q: &String| callback(q)));
     let files = files.map(|mut callback| worker(move |(mode, q, kind, scope, path): &(Mode, String, u8, String, Option<String>)| {
@@ -289,7 +290,9 @@ pub fn run(
     let mut semantic_pending = None;
     let mut spinner = 0;
     let mut spun = Instant::now();
-    let mut terminal = TerminalSession::new()?;
+    let rows = ratatui::crossterm::terminal::size().ok().filter(|&(_, rows)| rows > 0).map_or(24, |(_, rows)| rows);
+    let inline_session = if inline { inline_height(rows).and_then(|height| TerminalSession::inline(height).ok()) } else { None };
+    let mut terminal = match inline_session { Some(session) => session, None => TerminalSession::new()? };
     let mut saved = HashMap::new();
     let mut selected = 0usize;
     let mut semantic: Option<(String, Vec<String>)> = None;
@@ -534,6 +537,8 @@ pub fn run(
         }
         tick = 3;
         let key = match event::read()? {
+            // Inline autoresize moves the viewport, losing the prompt row: cancel and let zle repaint.
+            Event::Resize(..) if terminal.inline.is_some() => return Ok(None),
             Event::Resize(columns, rows) => {
                 terminal.terminal.resize(Rect::new(0, 0, columns, rows))?;
                 continue;
@@ -745,10 +750,51 @@ pub(crate) fn visible(text: &str) -> String {
         .collect()
 }
 
+/// Inline picker height: the full layout with 7 results, clamped under the prompt; `None` when too short to be useful.
+fn inline_height(rows: u16) -> Option<u16> {
+    Some(17.min(rows.saturating_sub(1))).filter(|&height| height >= 5)
+}
+
 pub(crate) struct TerminalSession {
     pub terminal: Terminal<CrosstermBackend<File>>,
+    /// The prompt's cursor column and the caller's stdout when drawn inline under it (`@`-Tab).
+    inline: Option<(u16, std::os::fd::OwnedFd)>,
 }
 impl TerminalSession {
+    /// A `height`-row viewport below the prompt line. Errors (e.g. a pty that never reports the cursor) leave the terminal as found.
+    pub fn inline(height: u16) -> Result<Self> {
+        let tty = OpenOptions::new().read(true).write(true).open("/dev/tty").context("pick needs a terminal")?;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        // crossterm asks for the cursor on stdout, which the shell captures: point stdout at the tty until Drop.
+        let saved = unsafe { libc::dup(1) };
+        if saved < 0 { return Err(std::io::Error::last_os_error().into()); }
+        let stdout = unsafe { std::os::fd::OwnedFd::from_raw_fd(saved) };
+        let restore = |stdout: &std::os::fd::OwnedFd| unsafe { libc::dup2(stdout.as_raw_fd(), 1) };
+        if unsafe { libc::dup2(tty.as_raw_fd(), 1) } < 0 { return Err(std::io::Error::last_os_error().into()); }
+        if let Err(error) = enable_raw_mode() { restore(&stdout); return Err(error.into()); }
+        let column = match cursor::position() {
+            Ok((column, _)) => column,
+            Err(error) => {
+                let _ = disable_raw_mode();
+                restore(&stdout);
+                return Err(error.into());
+            }
+        };
+        let mut display = tty.try_clone().context("pick needs a terminal")?;
+        let terminal = std::io::Write::write_all(&mut display, b"\r\n").map_err(anyhow::Error::from).and_then(|_| {
+            Ok(Terminal::with_options(CrosstermBackend::new(display), TerminalOptions { viewport: Viewport::Inline(height) })?)
+        });
+        match terminal {
+            Ok(terminal) => Ok(Self { terminal, inline: Some((column, stdout)) }),
+            Err(error) => {
+                let _ = execute!(&tty, cursor::MoveUp(1), cursor::MoveToColumn(column));
+                let _ = disable_raw_mode();
+                restore(&stdout);
+                Err(error)
+            }
+        }
+    }
+
     pub fn new() -> Result<Self> {
         let mut tty = OpenOptions::new()
             .read(true)
@@ -767,7 +813,7 @@ impl TerminalSession {
                 Ok(Terminal::with_options(CrosstermBackend::new(display), TerminalOptions { viewport })?)
             });
         match terminal {
-            Ok(terminal) => Ok(Self { terminal }),
+            Ok(terminal) => Ok(Self { terminal, inline: None }),
             Err(error) => {
                 let _ = execute!(tty, ratatui::crossterm::terminal::LeaveAlternateScreen);
                 let _ = disable_raw_mode();
@@ -778,7 +824,16 @@ impl TerminalSession {
 }
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = execute!(self.terminal.backend_mut(), ratatui::crossterm::terminal::LeaveAlternateScreen, cursor::Show);
+        if let Some((column, stdout)) = &self.inline {
+            let column = *column;
+            // The viewport may have scrolled the screen; the prompt is the line just above it.
+            let row = self.terminal.get_frame().area().y.saturating_sub(1);
+            let _ = self.terminal.clear();
+            let _ = execute!(self.terminal.backend_mut(), cursor::MoveTo(column, row), cursor::Show);
+            unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(stdout), 1) };
+        } else {
+            let _ = execute!(self.terminal.backend_mut(), ratatui::crossterm::terminal::LeaveAlternateScreen, cursor::Show);
+        }
         let _ = disable_raw_mode();
     }
 }
@@ -800,6 +855,21 @@ mod tests {
                 assert_eq!(picker_layout(frame.area())[6].bottom(), rows);
             }).unwrap();
         }
+    }
+
+    #[test]
+    fn inline_viewport_sits_under_a_bottom_prompt() {
+        assert_eq!(inline_height(40), Some(17));
+        assert_eq!(inline_height(10), Some(9));
+        assert_eq!(inline_height(5), None);
+        let mut backend = ratatui::backend::TestBackend::new(80, 24);
+        // The cursor after `\r\n` from a prompt on the last row.
+        ratatui::backend::Backend::set_cursor_position(&mut backend, (0, 23)).unwrap();
+        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport: Viewport::Inline(17) }).unwrap();
+        let area = terminal.get_frame().area();
+        assert_eq!((area.y, area.height), (7, 17));
+        assert_eq!(area.y.saturating_sub(1), 6);
+        assert_eq!(picker_layout(area)[4].height, 9, "boxed list keeps 7 result rows");
     }
 
     #[test]

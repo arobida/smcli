@@ -174,7 +174,8 @@ Project-index ranking switches are controlled by `SMCLI_RANKING_OFF`: `index`, `
   secrets (AWS, GitHub, GitLab, Slack, Stripe, Google, npm, Anthropic/OpenAI keys), and any
   matching regexes in the config file: `"historyFilter": ["^vault "]` for commands,
   `"cwdFilter": ["^/Users/me/secret"]` for directories. Set `"secretsFilter": false` to turn
-  off the secret patterns. `prune` applies the current filters to already-stored history
+  off the secret patterns. In zsh, `@`-Tab with several matches opens the files picker inline
+  under the prompt; set `"atCompletionInline": false` for the fullscreen picker. `prune` applies the current filters to already-stored history
   and compacts the database so deleted text is not left on disk.
 - `import --atuin` keeps Atuin's record UUIDs, so re-running it only adds new commands.
   It also carries over soft deletions (hidden from history, search, and suggestions) and

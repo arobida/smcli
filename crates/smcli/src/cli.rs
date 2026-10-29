@@ -1027,7 +1027,10 @@ fn pick(
         local.search(mode, q, kind, scope, path)
         }
     };
-    if let Some(choice) = crate::picker::run(picker, Some(Box::new(search)), Some(Box::new(file_search)))? {
+    // Only the zsh `@`-Tab widget sets SMCLI_FILES_QUERY.
+    let inline = files && env.contains_key("SMCLI_FILES_QUERY")
+        && SmcliConfig::load(&SmcliConfig::location(home, env)).map_or(true, |c| c.at_completion_inline != Some(false));
+    if let Some(choice) = crate::picker::run(picker, Some(Box::new(search)), Some(Box::new(file_search)), inline)? {
         match choice {
             Choice::Command {
                 command,

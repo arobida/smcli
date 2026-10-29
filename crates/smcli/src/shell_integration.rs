@@ -372,9 +372,17 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
         _smcli_tab() {
             (( BASH_VERSINFO[0] >= 5 )) || local LC_ALL=C
             local before=${READLINE_LINE:0:READLINE_POINT} after=${READLINE_LINE:READLINE_POINT}
-            local word=${before##*[[:space:]]} cmd=${READLINE_LINE%%[[:space:]]*} hit
+            local word=${before##*[[:space:]]} cmd=${READLINE_LINE%%[[:space:]]*} hit hits
             if [[ $word == @* ]]; then
-                hit=$(SMCLI_SHELL=bash "$_smcli_complete_bin" complete --word "$word" --command "$cmd" --limit 1)
+                hits=$(SMCLI_SHELL=bash "$_smcli_complete_bin" complete --word "$word" --command "$cmd" --limit 2)
+                hit=$hits
+                if [[ $hits == *$'\n'* ]]; then
+                    # Several matches: pick one in the files picker, filtered by the word.
+                    local dirs=()
+                    case $cmd in cd|pushd|z) dirs=(SMCLI_FILES_DIRS=1) ;; esac
+                    hit=$(env SMCLI_SHELL=bash SMCLI_LBUFFER="${before%"$word"}" SMCLI_FILES_QUERY="${word#@}" SMCLI_FILES_COMMAND="$cmd" "${dirs[@]}" "$_smcli_complete_bin" pick --files </dev/tty)
+                    (( $? == 10 )) || hit=
+                fi
                 if [[ -n $hit ]]; then
                     READLINE_LINE=${before%"$word"}$hit$after
                     READLINE_POINT=$((${#before} - ${#word} + ${#hit}))
@@ -394,6 +402,13 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
             while IFS= read -r line; do
                 [[ -n $line ]] && COMPREPLY+=("$line")
             done < <(SMCLI_SHELL=bash "$_smcli_complete_bin" complete --word "$cur" --command "$cmd")
+            if (( ${#COMPREPLY[@]} > 1 )); then
+                # Several matches: pick one in the files picker, filtered by the word.
+                local dirs=() line_before=${COMP_LINE:0:COMP_POINT}
+                case $cmd in cd|pushd|z) dirs=(SMCLI_FILES_DIRS=1) ;; esac
+                line=$(env SMCLI_SHELL=bash SMCLI_LBUFFER="${line_before%"$cur"}" SMCLI_FILES_QUERY="${cur#@}" SMCLI_FILES_COMMAND="$cmd" "${dirs[@]}" "$_smcli_complete_bin" pick --files </dev/tty)
+                if (( $? == 10 )); then COMPREPLY=("$line"); else COMPREPLY=("$cur"); fi
+            fi
         }
         complete -o bashdefault -o default -o nospace -F _smcli_complete printf echo cd pushd z cat npm true 2>/dev/null || true
     fi
@@ -784,7 +799,17 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
         if string match -q -- '@*' -- $token
             set -l cmd (commandline -op)
             set -l hits (SMCLI_SHELL=fish command $_smcli_complete_bin complete --word "$token" --command $cmd[1])
-            test (count $hits) -eq 1; and commandline -t -- $hits[1]
+            if test (count $hits) -eq 1
+                commandline -t -- $hits[1]
+            else if test (count $hits) -gt 1
+                # Several matches: pick one in the files picker, filtered by the word.
+                set -l dirs
+                contains -- $cmd[1] cd pushd z; and set dirs SMCLI_FILES_DIRS=1
+                set -l before (commandline -c | string collect)
+                set -l chosen (env SMCLI_SHELL=fish SMCLI_LBUFFER=(string sub -e -(string length -- $token) -- $before | string collect) SMCLI_FILES_QUERY=(string sub -s 2 -- $token) SMCLI_FILES_COMMAND=$cmd[1] $dirs $_smcli_complete_bin pick --files </dev/tty)
+                test $status -eq 10; and commandline -t -- (string join \n -- $chosen | string collect)
+                commandline -f repaint
+            end
         else
             commandline -f complete
         end

@@ -1022,6 +1022,8 @@ def run_at_completion(variant):
         (home / "smcli-at-probe42.txt").write_text("ok\n")
         (home / "my notes.txt").write_text("x\n")
         (home / "zz space.txt").write_text("ok\n")
+        (home / "twin-a.txt").write_text("a\n")
+        (home / "twin-b.txt").write_text("b\n")
         t = Terminal(variant.path, variant.args, env, str(home))
         try:
             t.drain()
@@ -1040,6 +1042,14 @@ def run_at_completion(variant):
             t.type("\n")
             out = t.until_prompt()
             assert "smcli-at-probe42.txt" in out, (variant.label, out)
+            # Several matches open the files picker; Enter inserts the selection without running it.
+            t.type("printf %s @twin")
+            t.type("\t")
+            t.until_text("twin-b.txt")
+            t.type("\r")
+            t.type("\n")
+            out = t.until_prompt()
+            assert "twin-" in out, (variant.label, out)
             t.type("printf '%s\\n' @zz")
             t.type("\t")
             t.until_text("zz space.txt")
