@@ -187,21 +187,34 @@ pub fn safe_expansion(text: &str) -> bool {
 
 /// True when a command line runs smcli itself (`smcli …`, `/path/to/smcli …`, `swift run smcli …`),
 /// so searches and suggestions are not about the tool. Leading `VAR=value` assignments are skipped.
+/// Any segment of a compound line counts, as does `$VAR` set to an smcli path earlier in the line.
 pub fn is_smcli_command(command: &str) -> bool {
-    let mut words: Vec<&str> = command.split_whitespace().map(|w| w.trim_matches(|c| c == '\'' || c == '"')).collect();
-    while let Some(first) = words.first() {
-        match first.find('=') {
-            Some(equals) if equals != 0 && !first[..equals].contains('/') => {
-                words.remove(0);
+    const SUBCOMMANDS: [&str; 7] = ["search", "suggest", "pick", "history", "reindex", "indexes", "shell-init"];
+    let mut smcli_vars: Vec<&str> = Vec::new();
+    command.split(['\n', ';', '&', '|']).any(|segment| {
+        let mut words: Vec<&str> = segment.split_whitespace().map(|w| w.trim_matches(|c| c == '\'' || c == '"')).collect();
+        while let Some(first) = words.first() {
+            match first.find('=') {
+                Some(equals) if equals != 0 && !first[..equals].contains('/') => {
+                    if base_name(&first[equals + 1..]) == "smcli" {
+                        smcli_vars.push(&first[..equals]);
+                    }
+                    words.remove(0);
+                }
+                _ => break,
             }
-            _ => break,
         }
-    }
-    // `swift run` options may take values (`-c release`), so look for the product among the next few words.
-    if words.first() == Some(&"swift") && words.get(1) == Some(&"run") {
-        return words.iter().skip(2).take(5).any(|w| *w == "smcli");
-    }
-    words.first().is_some_and(|w| base_name(w) == "smcli")
+        // `swift run` options may take values (`-c release`), so look for the product among the next few words.
+        if words.first() == Some(&"swift") && words.get(1) == Some(&"run") {
+            return words.iter().skip(2).take(5).any(|w| *w == "smcli");
+        }
+        let Some(first) = words.first() else { return false };
+        // shortcut: a `$VAR` set in an earlier line is unknown, so `$VAR search` counts by its subcommand alone.
+        if let Some(var) = first.strip_prefix('$').map(|v| v.trim_matches(['{', '}'])) {
+            return smcli_vars.contains(&var) || words.get(1).is_some_and(|w| SUBCOMMANDS.contains(w));
+        }
+        base_name(first) == "smcli"
+    })
 }
 
 /// The executable's name without its path (`git` for `/usr/bin/git git status`); for compound
@@ -272,6 +285,11 @@ mod tests {
         assert!(is_smcli_command("A=1 /opt/bin/smcli"));
         assert!(is_smcli_command("swift run -c release smcli history"));
         assert!(!is_smcli_command("git status"));
+        assert!(is_smcli_command("make fresh && dist/smcli search x"));
+        assert!(is_smcli_command("B=/repo/.build/release/smcli\n$B init --potion\n${B} history"));
+        assert!(is_smcli_command("$B search \"undo the last commit\""));
+        assert!(!is_smcli_command("$EDITOR notes.md"));
+        assert!(!is_smcli_command("echo a | grep smcli"));
         assert_eq!(program_of("/usr/bin/git status", CommandBreakdown::parse("/usr/bin/git status").as_ref()).as_deref(), Some("git"));
     }
 
