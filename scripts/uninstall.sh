@@ -91,13 +91,44 @@ validate_block() {  # $1: file
     [[ $state == closed ]]
 }
 
+# Resolve symlinks so rename replaces the target, not the link itself.
+resolve_rc() {
+    local path=$1 link count=0
+    while [[ -L $path ]]; do
+        (( count += 1 ))
+        (( count <= 40 )) || return 1
+        link=$(readlink "$path") || return 1
+        if [[ $link == /* ]]; then path=$link; else path="$(dirname "$path")/$link"; fi
+    done
+    printf '%s\n' "$path"
+}
+remove_hook() (
+    local target tmp
+    target=$(resolve_rc "$1") || exit 1
+    if [[ -f $target ]]; then
+        local links
+        if [[ $(uname) == Darwin ]]; then
+            links=$(stat -f %l "$target") || exit 1
+        else
+            links=$(stat -c %h "$target") || exit 1
+        fi
+        if [[ $links != 1 ]]; then
+            printf 'refusing to replace hard-linked startup file %s\n' "$target" >&2
+            exit 1
+        fi
+    fi
+    tmp=$(mktemp "$target.smcli.XXXXXX") || exit 1
+    trap 'rm -f "$tmp"' EXIT
+    cp -p "$target" "$tmp" || exit 1
+    awk -v b="$begin" -v e="$end" '$0 == b {skip = 1; next} skip && $0 == e {skip = 0; next} !skip' "$target" > "$tmp" || exit 1
+    mv -f "$tmp" "$target"
+)
+
 # 3. Shell hooks: only the marked block install.sh wrote; the rest of each file is kept as is.
 for file in "${rc_files[@]}"; do
     [[ -f $file ]] && grep -qxF "$begin" "$file" || continue
     validate_block "$file" || die "malformed smcli block in $file; not modifying"
-    tmp=$(mktemp "$file.smcli.XXXXXX")
-    awk -v b="$begin" -v e="$end" '$0 == b {skip = 1; next} skip && $0 == e {skip = 0; next} !skip' "$file" > "$tmp"
-    cat "$tmp" > "$file" && rm -f "$tmp"
+    remove_hook "$file" || die "could not update $file; not modifying"
     rm -f "$file.smcli-backup"
     say "Removed the smcli hooks from $file"
 done

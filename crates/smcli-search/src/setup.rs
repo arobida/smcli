@@ -52,6 +52,13 @@ pub fn working_directory(environment: &HashMap<String, String>) -> String {
         .unwrap_or_else(|| std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_else(|_| "/".into()))
 }
 
+/// The shared index directory next to the history database.
+pub fn index_directory(captured: &CapturedHistory) -> std::path::PathBuf {
+    let mut directory = captured.path.clone().into_os_string();
+    directory.push(".search");
+    directory.into()
+}
+
 /// The search index next to the history database: `potionPath` from `smcli init`, otherwise the built-in model.
 // shortcut: Ollama and Apple (`builtin`) configs fall back to the built-in Potion; port an embedder when someone asks.
 pub fn search_engine(captured: &CapturedHistory, home: &Path, environment: &HashMap<String, String>) -> Result<HistorySearch> {
@@ -60,7 +67,5 @@ pub fn search_engine(captured: &CapturedHistory, home: &Path, environment: &Hash
         Some(path) => Potion::from_dir(Path::new(path))?,
         None => Potion::bundled()?,
     };
-    let mut directory = captured.path.clone().into_os_string();
-    directory.push(".search");
-    Ok(HistorySearch::new(directory, potion))
+    Ok(HistorySearch::new(index_directory(captured), potion))
 }

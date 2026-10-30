@@ -13,11 +13,70 @@ unset "${!SMCLI_@}" XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME ZDOTDIR
 export HOME=$home SMCLI_RUNTIME_DIR=$runtime SHELL=/bin/zsh
 fail() { printf 'test-install: %s\n' "$*" >&2; exit 1; }
 
-printf 'alias ll="ls -l"\n' > "$home/.zshrc"
+printf 'alias ll="ls -l"\n' > "$home/zshrc-target"
+chmod 640 "$home/zshrc-target"
+ln -s zshrc-target "$home/.zshrc"
 for _ in 1 2; do  # twice: a rerun replaces the block rather than adding another
     bash scripts/install.sh --from "$from" --prefix "$home/bin" --shells zsh,bash,fish --keys left --yes > "$home/out" 2>&1 \
         || { cat "$home/out"; fail "install failed"; }
 done
+[[ -L $home/.zshrc ]] || fail "install replaced startup symlink"
+[[ $(stat -f %Lp "$home/zshrc-target") == 640 ]] || fail "install changed startup permissions"
+# An incomplete model is rejected before either existing executable is replaced.
+mkdir -p "$home/incomplete/potion-shell-16m"
+cp "$from/smcli" "$home/incomplete/smcli"
+cp "$from/smcli-service" "$home/incomplete/smcli-service"
+printf x > "$home/incomplete/potion-shell-16m/model.safetensors"
+cp "$home/bin/smcli" "$home/old-smcli"
+cp "$home/bin/smcli-service" "$home/old-service"
+bash scripts/install.sh --from "$home/incomplete" --prefix "$home/bin" --shells none --yes > "$home/out" 2>&1 \
+    && fail "install should reject incomplete model"
+cmp "$home/old-smcli" "$home/bin/smcli" || fail "invalid model replaced smcli"
+cmp "$home/old-service" "$home/bin/smcli-service" || fail "invalid model replaced service"
+# A failed model copy must leave both old executables and the old model untouched.
+mkdir "$home/fail-tools"
+real_cp=$(command -v cp)
+cat > "$home/fail-tools/cp" <<EOF
+#!/bin/bash
+case "\$*" in *potion-shell-16m*) exit 1 ;; esac
+exec "$real_cp" "\$@"
+EOF
+chmod +x "$home/fail-tools/cp"
+cp "$home/bin/smcli" "$home/old-smcli"
+cp "$home/bin/smcli-service" "$home/old-service"
+PATH="$home/fail-tools:$PATH" bash scripts/install.sh --from "$from" --prefix "$home/bin" --shells none --yes > "$home/out" 2>&1 \
+    && fail "install should fail when staging model fails"
+cmp "$home/old-smcli" "$home/bin/smcli" || fail "failed staging replaced smcli"
+cmp "$home/old-service" "$home/bin/smcli-service" || fail "failed staging replaced service"
+[[ -f $home/bin/potion-shell-16m/model.safetensors ]] || fail "failed staging removed model"
+rm "$home/fail-tools/cp"
+# A failed filter must not truncate the symlink target on either install or uninstall.
+printf '#!/bin/bash\nexit 1\n' > "$home/fail-tools/awk"
+chmod +x "$home/fail-tools/awk"
+cp "$home/zshrc-target" "$home/old-rc"
+PATH="$home/fail-tools:$PATH" bash scripts/install.sh --from "$from" --prefix "$home/bin" --shells zsh --yes > "$home/out" 2>&1 \
+    && fail "install should fail when filtering fails"
+cmp "$home/old-rc" "$home/zshrc-target" || fail "failed install damaged startup file"
+PATH="$home/fail-tools:$PATH" bash "$home/bin/smcli-uninstall" --keep-data --yes > "$home/out" 2>&1 \
+    && fail "uninstall should fail when filtering fails"
+cmp "$home/old-rc" "$home/zshrc-target" || fail "failed uninstall damaged startup file"
+rm "$home/fail-tools/awk"
+# Refuse hard-linked startup files, including through a symlink, without detaching either name.
+ln "$home/zshrc-target" "$home/zshrc-hardlink"
+cp "$home/zshrc-target" "$home/old-rc"
+for operation in install uninstall; do
+    if [[ $operation == install ]]; then
+        bash scripts/install.sh --from "$from" --prefix "$home/bin" --shells zsh --yes > "$home/out" 2>&1 \
+            && fail "install should refuse hard-linked startup file"
+    else
+        bash "$home/bin/smcli-uninstall" --keep-data --yes > "$home/out" 2>&1 \
+            && fail "uninstall should refuse hard-linked startup file"
+    fi
+    grep -q 'hard-linked startup file' "$home/out" || fail "$operation missing hard-link diagnostic"
+    [[ -L $home/.zshrc && $home/zshrc-target -ef $home/zshrc-hardlink ]] || fail "$operation detached hard links"
+    cmp "$home/old-rc" "$home/zshrc-target" || fail "$operation modified hard-linked startup file"
+done
+rm "$home/zshrc-hardlink"
 # --atuin yes imports a found Atuin database; the import itself is covered by the Rust tests.
 mkdir -p "$home/.local/share/atuin"
 sqlite3 "$home/.local/share/atuin/history.db" "CREATE TABLE history (id TEXT PRIMARY KEY, timestamp INTEGER NOT NULL, duration INTEGER NOT NULL, exit INTEGER NOT NULL, command TEXT NOT NULL, cwd TEXT NOT NULL, session TEXT NOT NULL, hostname TEXT NOT NULL, deleted_at INTEGER); INSERT INTO history VALUES ('a1', 1700000000000000000, 5000000, 0, 'echo from-atuin', '/tmp', 'sess', 'host:user', NULL);"
@@ -143,5 +202,6 @@ for f in .zshrc .bashrc .config/fish/config.fish; do
     ! grep -q smcli "$home/$f" || fail "$f still mentions smcli"
 done
 grep -q '^alias ll="ls -l"$' "$home/.zshrc" || fail "uninstall lost the user's own .zshrc lines"
+[[ -L $home/.zshrc && $(stat -f %Lp "$home/zshrc-target") == 640 ]] || fail "uninstall changed startup symlink or permissions"
 [[ ! -d $runtime || -z $(ls -A "$runtime") ]] || fail "service socket left behind: $(ls -A "$runtime")"
 printf 'Install and uninstall (with export) passed.\n'

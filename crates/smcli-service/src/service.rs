@@ -2,6 +2,7 @@
 //! answers smcli clients over a private Unix-domain socket. Started on demand by clients; exits when idle.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -135,6 +136,14 @@ impl Service {
         self.lock().last_activity = Instant::now();
     }
 
+    fn claim_idle_shutdown(&self) -> bool {
+        let state = self.lock();
+        if state.last_activity.elapsed() <= self.idle {
+            return false;
+        }
+        self.active.compare_exchange(0, MAX_CONNECTIONS, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+    }
+
     pub fn run(self: &Arc<Self>) -> Result<()> {
         let listener = listen_unix(&self.location.socket)?;
         let socket_inode = inode(&self.location.socket);
@@ -144,8 +153,7 @@ impl Service {
             std::thread::sleep(Duration::from_secs(15));
             // Idle too long, or our socket was removed or replaced: let a fresh service take over.
             watcher.file_search.evict_idle();
-            let idle = watcher.lock().last_activity.elapsed() > watcher.idle;
-            if idle || inode(&watcher.location.socket) != socket_inode {
+            if watcher.claim_idle_shutdown() || inode(&watcher.location.socket) != socket_inode {
                 watcher.stop(socket_inode);
             }
         });
@@ -153,8 +161,17 @@ impl Service {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    let service = Arc::clone(self);
-                    std::thread::spawn(move || service.serve(stream, socket_inode));
+                    if let Some(guard) = Leave::admit(Arc::clone(self)) {
+                        let service = Arc::clone(self);
+                        if let Err(e) = std::thread::Builder::new().spawn(move || {
+                            let _guard = guard;
+                            service.serve(stream, socket_inode);
+                        }) {
+                            eprintln!("smcli-service: could not spawn connection thread: {e}");
+                        }
+                    } else {
+                        self.reject_busy(stream);
+                    }
                 }
                 // Out of descriptors: back off instead of spinning until one frees up.
                 Err(e) if matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) => std::thread::sleep(Duration::from_millis(10)),
@@ -162,6 +179,17 @@ impl Service {
             }
         }
         Ok(())
+    }
+
+    fn reject_busy(&self, mut stream: UnixStream) {
+        // Never let a rejected client block the accept loop.
+        if stream.set_nonblocking(true).is_ok() {
+            let mut response = ServiceResponse::failure("busy", "Too many connections.");
+            response.build = self.build.clone();
+            if let Ok(data) = encode_line(&response) {
+                let _ = stream.write_all(&data);
+            }
+        }
     }
 
     /// Removes the socket only while it is still ours, then exits without running libc exit handlers.
@@ -179,14 +207,9 @@ impl Service {
         if connection.peer_uid() != Some(unsafe { libc::getuid() }) {
             return;
         }
-        let admitted = self.active.fetch_add(1, Ordering::SeqCst) < MAX_CONNECTIONS;
-        let _guard = Leave(&self.active);
         let timeout = Duration::from_secs_f64(IO_TIMEOUT);
         let mut shutdown = false;
-        let mut response = if !admitted {
-            ServiceResponse::failure("busy", "Too many connections.")
-        } else {
-            match connection.read_line(MAX_MESSAGE_BYTES, timeout) {
+        let mut response = match connection.read_line(MAX_MESSAGE_BYTES, timeout) {
                 Ok(None) => return,
                 Ok(Some(line)) => match decode_line::<ServiceRequest>(&line) {
                     Ok(request) => {
@@ -198,8 +221,7 @@ impl Service {
                 Err(SocketError::TooLarge) => ServiceResponse::failure("too_large", format!("Request exceeds {MAX_MESSAGE_BYTES} bytes.")),
                 Err(SocketError::Timeout) => ServiceResponse::failure("timeout", format!("Request not received within {IO_TIMEOUT} s.")),
                 Err(_) => return,
-            }
-        };
+            };
         response.build = self.build.clone();
         if let Ok(data) = encode_line(&response) {
             let _ = connection.write(&data, timeout);
@@ -486,13 +508,15 @@ impl Service {
                 signals.context = Some(context.clone());
                 signals
             };
+            // Lock before reading the corpus so prune cannot leave a stale snapshot in the index.
+            let lock = engine.lock_index(20)?;
             // Read native history files and stats outside `state` so records don't wait on I/O.
             let (entries, programs) = self.current_corpus(request, directory, project.as_deref())?;
             let filter = request.filter.clone().unwrap_or_default();
             let evidence = FileSearch::root(directory).and_then(|root| self.file_search.ready(&root))
                 .map(crate::file_search::evidence::IndexEvidence);
-            let hits = engine.search_with_evidence(query, &entries, limit as usize, &filter, Some(&programs), &signals, now(),
-                evidence.as_ref().map(|e| e as &dyn smcli_search::ProjectEvidence))?;
+            let hits = engine.search_with_evidence_using_lock(query, &entries, limit as usize, &filter, Some(&programs), &signals, now(),
+                evidence.as_ref().map(|e| e as &dyn smcli_search::ProjectEvidence), lock.as_ref())?;
             let mut response = ServiceResponse::new(true);
             response.hits = Some(hits);
             Ok(response)
@@ -557,13 +581,14 @@ mod tests {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     struct Fixture { service: Arc<Service>, home: PathBuf }
     impl Fixture {
-        fn new() -> Self {
+        fn new() -> Self { Self::with_idle(Duration::from_secs(600)) }
+        fn with_idle(idle: Duration) -> Self {
             let home = std::env::temp_dir().join(format!("smcli-service-c-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
             std::fs::create_dir_all(&home).unwrap();
             let history = CapturedHistory::new(home.join("history.db"));
             let environment = HashMap::from([("HOME".into(), home.to_string_lossy().into_owned()), ("SMCLI_CONFIG".into(), home.join("config.toml").to_string_lossy().into_owned())]);
             let location = ServiceLocation::new(&history.path, &environment);
-            let service = Service::new(history, location, Duration::from_secs(600), environment).unwrap();
+            let service = Service::new(history, location, idle, environment).unwrap();
             Self { service, home }
         }
         fn request(&self, op: Operation) -> ServiceRequest {
@@ -583,6 +608,52 @@ mod tests {
         }
     }
     impl Drop for Fixture { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.home); } }
+
+    #[test]
+    fn busy_response_includes_service_build() {
+        use std::io::BufRead;
+        let f = Fixture::new();
+        assert!(f.service.build.is_some());
+        let (server, client) = UnixStream::pair().unwrap();
+        f.service.reject_busy(server);
+        let mut line = String::new();
+        std::io::BufReader::new(client).read_line(&mut line).unwrap();
+        let response: ServiceResponse = decode_line(line.as_bytes()).unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.build, f.service.build);
+        assert!(line.contains("busy"));
+    }
+
+    #[test]
+    fn idle_shutdown_waits_for_admitted_work() {
+        let f = Fixture::with_idle(Duration::from_millis(30));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let service = Arc::clone(&f.service);
+        let work = std::thread::spawn(move || {
+            let _guard = Leave::admit(service).unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        ready_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!f.service.claim_idle_shutdown());
+        release_tx.send(()).unwrap();
+        work.join().unwrap();
+        assert!(f.service.claim_idle_shutdown());
+        assert!(Leave::admit(Arc::clone(&f.service)).is_none());
+    }
+
+    #[test]
+    fn admission_is_bounded_and_released_on_drop() {
+        let f = Fixture::new();
+        let mut guards: Vec<_> = (0..MAX_CONNECTIONS).map(|_| Leave::admit(Arc::clone(&f.service)).unwrap()).collect();
+        assert!(Leave::admit(Arc::clone(&f.service)).is_none());
+        drop(guards.pop());
+        assert!(Leave::admit(Arc::clone(&f.service)).is_some());
+        drop(guards);
+        assert_eq!(f.service.active.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn file_selection_filters_query_and_actual_directory() {
@@ -715,11 +786,18 @@ mod tests {
     }
 }
 
-struct Leave<'a>(&'a AtomicUsize);
+struct Leave(Arc<Service>);
 
-impl Drop for Leave<'_> {
+impl Leave {
+    fn admit(service: Arc<Service>) -> Option<Self> {
+        service.active.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_CONNECTIONS).then_some(n + 1)).ok()?;
+        Some(Self(service))
+    }
+}
+
+impl Drop for Leave {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.0.active.fetch_sub(1, Ordering::SeqCst);
     }
 }
 

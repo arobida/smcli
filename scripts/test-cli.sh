@@ -62,6 +62,18 @@ mkdir "$atdir/smcli-at-dir"
 [[ "$(cd "$atdir" && "$bin" complete --word @at-dir --command cd)" == smcli-at-dir/ ]]
 [[ -z "$(cd "$atdir" && "$bin" complete --word @probe42 --command cd)" ]]
 rm -rf "$atdir"
+# A selection rejected by both command and query is counted only once.
+prunedb="$home/prune.db"
+prunecfg="$home/prune.json"
+printf '%s\n' '{"historyFilter":["^secret"]}' > "$prunecfg"
+HOME="$home" SMCLI_DB="$prunedb" SMCLI_SERVICE=0 "$bin" record bash session /tmp 0 1700000000 '' '' 'secret-command'
+python3 - "$prunedb" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as db:
+    db.execute("INSERT INTO command_selections(query,command,kind,directory,selected_at) VALUES('secret-query','secret-command','search','/tmp',1)")
+PY
+[[ "$(HOME="$home" SMCLI_DB="$prunedb" SMCLI_CONFIG="$prunecfg" SMCLI_SERVICE=0 "$bin" prune --dry-run)" == *'1 commands and 1 selections would be removed.' ]]
+[[ "$(HOME="$home" SMCLI_DB="$prunedb" SMCLI_CONFIG="$prunecfg" SMCLI_SERVICE=0 "$bin" prune)" == *'Removed 1 commands and 1 selections.' ]]
 cmp "$home/bash-history.before" "$home/.bash_history"
 cmp "$home/zsh-history.before" "$home/.zsh_history"
 printf 'smcli CLI smoke tests passed.\n'

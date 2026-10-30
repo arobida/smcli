@@ -43,7 +43,7 @@ impl IndexedCommand {
         let program = program_of(entry.primary(), parsed.as_ref());
         let subcommand = parsed.and_then(|p| p.subcommand);
         let mut dirs = vec![];
-        let mut path = entry.last_directory.clone().unwrap_or_default();
+        let mut path = trim_slash(entry.last_directory.as_deref().unwrap_or_default()).to_string();
         while !path.is_empty() {
             dirs.push(path.clone());
             if path == "/" {
@@ -118,6 +118,14 @@ impl HistorySearch {
     pub fn search_with_evidence(&self, query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter,
                   programs: Option<&HashMap<String, HashSet<String>>>, signals: &SearchSignals, now: f64,
                   evidence: Option<&dyn crate::ProjectEvidence>) -> Result<Vec<SearchEntry>> {
+        let lock = self.lock_index(20)?;
+        self.search_with_evidence_using_lock(query, corpus, limit, filter, programs, signals, now, evidence, lock.as_ref())
+    }
+
+    /// `lock` must be acquired before reading the corpus; without it only the text fallback is used.
+    pub fn search_with_evidence_using_lock(&self, query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter,
+                  programs: Option<&HashMap<String, HashSet<String>>>, signals: &SearchSignals, now: f64,
+                  evidence: Option<&dyn crate::ProjectEvidence>, lock: Option<&File>) -> Result<Vec<SearchEntry>> {
         let alias_off = !uses(signals.context.as_ref(), Signal::Alias);
         let typed_only = alias_off.then(|| corpus.iter().map(|(key, entry)| {
             let mut entry = entry.clone();
@@ -166,7 +174,7 @@ impl HistorySearch {
             let hits = signals.additions(&stripped, corpus, &HashSet::new(), active, now);
             return Ok(crate::corpus::rerank_with_evidence(hits, literal, &stripped, now, signals, evidence).into_iter().take(limit).collect());
         }
-        let Some(_lock) = self.lock_index(20)? else {
+        if lock.is_none() {
             // The service (or a reindex) holds the index; TalaDB refuses a second process, so no semantic leg.
             return Ok(text_fallback_with_evidence(&stripped, corpus, limit, filter, literal, signals, now, &parsed_filter, has_markers, evidence));
         };
@@ -269,7 +277,12 @@ impl HistorySearch {
 
     /// Discards the index and embeds every command again. Returns the number embedded.
     pub fn reindex(&self, corpus: &HashMap<String, SearchEntry>) -> Result<usize> {
-        let Some(_lock) = self.lock_index(u32::MAX)? else { bail!("Another smcli is updating the index.") };
+        let Some(lock) = self.lock_index(u32::MAX)? else { bail!("Another smcli is updating the index.") };
+        self.reindex_using_lock(corpus, &lock)
+    }
+
+    /// `lock` must be acquired before reading the corpus.
+    pub fn reindex_using_lock(&self, corpus: &HashMap<String, SearchEntry>, _lock: &File) -> Result<usize> {
         let name = self.index_name();
         self.remove_files(&name);
         let db = self.open_index(&name)?;
@@ -403,39 +416,44 @@ impl HistorySearch {
 
     /// Serializes index writers with the same `lock` file (flock) the Swift build uses. Tries `attempts` times,
     /// 50 ms apart; `None` when another process still holds it.
-    fn lock_index(&self, attempts: u32) -> Result<Option<File>> {
-        self.prepare_directory()?;
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(self.directory.join("lock"))?;
-        for attempt in 0..attempts {
-            match lock.try_lock() {
-                Ok(()) => return Ok(Some(lock)),
-                Err(std::fs::TryLockError::WouldBlock) if attempt + 1 < attempts => {
-                    std::thread::sleep(std::time::Duration::from_millis(50))
-                }
-                Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
-                Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
-            }
-        }
-        Ok(None)
+    pub fn lock_index(&self, attempts: u32) -> Result<Option<File>> {
+        lock_index_directory(&self.directory, attempts)
     }
+}
 
-    /// The index holds command text, so it gets the same privacy as the history database.
-    fn prepare_directory(&self) -> Result<()> {
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&self.directory)?;
-        let info = std::fs::symlink_metadata(&self.directory)?;
-        // SAFETY: getuid has no preconditions.
-        if !info.is_dir() || info.uid() != unsafe { libc::getuid() } || info.mode() & 0o077 != 0 {
-            bail!("Search index must be a private directory owned by you (chmod 700): {}", self.directory.display());
+/// Locks the shared index directory without loading an embedding model.
+pub fn lock_index_directory(directory: &Path, attempts: u32) -> Result<Option<File>> {
+    prepare_directory(directory)?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(directory.join("lock"))?;
+    for attempt in 0..attempts {
+        match lock.try_lock() {
+            Ok(()) => return Ok(Some(lock)),
+            Err(std::fs::TryLockError::WouldBlock) if attempt + 1 < attempts => {
+                std::thread::sleep(std::time::Duration::from_millis(50))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
-        Ok(())
     }
+    Ok(None)
+}
+
+/// The index holds command text, so it gets the same privacy as the history database.
+fn prepare_directory(directory: &Path) -> Result<()> {
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(directory)?;
+    let info = std::fs::symlink_metadata(directory)?;
+    // SAFETY: getuid has no preconditions.
+    if !info.is_dir() || info.uid() != unsafe { libc::getuid() } || info.mode() & 0o077 != 0 {
+        bail!("Search index must be a private directory owned by you (chmod 700): {}", directory.display());
+    }
+    Ok(())
 }
 
 /// Each indexed command's document identity and metadata fingerprint. Projected, since decoding every embedding is slow.
@@ -647,6 +665,8 @@ mod tests {
         assert_eq!(index_filter(&range), Some(json!({"lastRun": {"$gte": 10.0, "$lt": 20.0}})));
         let entry = SearchEntry { last_directory: Some("/repo/app".into()), ..SearchEntry::new("git status", 1, "captured") };
         assert_eq!(IndexedCommand::new(&entry, "git status".into()).dirs, ["/repo/app", "/repo", "/"]);
+        let entry = SearchEntry { last_directory: Some("/repo/".into()), ..entry };
+        assert_eq!(IndexedCommand::new(&entry, "git status".into()).dirs, ["/repo", "/"]);
     }
 
     #[test]
@@ -740,6 +760,22 @@ mod tests {
         // "ps docker" is not a literal command, so this exercises the HybridQuery path.
         let hits = engine.search("ps docker", &corpus, 3, &SearchFilter::default(), None, &SearchSignals::default(), 0.0).unwrap();
         assert!(hits.iter().any(|e| e.command == "docker ps"), "hybrid query missed docker ps: {:?}", hits);
+    }
+
+    #[test]
+    fn trailing_slash_directory_matches_index_and_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = HistorySearch::new(dir.path().join("index"), Potion::bundled().unwrap());
+        let entry = SearchEntry { last_directory: Some("/repo/".into()), ..SearchEntry::new("git status", 1, "captured") };
+        let corpus = HashMap::from([(entry.command.clone(), entry)]);
+        let filter = SearchFilter { directory: Some("/repo".into()), ..Default::default() };
+        let signals = SearchSignals::default();
+        let indexed = engine.search("status", &corpus, 3, &filter, None, &signals, 0.0).unwrap();
+        assert_eq!(indexed.iter().map(|e| e.command.as_str()).collect::<Vec<_>>(), ["git status"]);
+        let lock = engine.lock_index(1).unwrap().unwrap();
+        let fallback = engine.search("status", &corpus, 3, &filter, None, &signals, 0.0).unwrap();
+        assert_eq!(fallback.iter().map(|e| e.command.as_str()).collect::<Vec<_>>(), ["git status"]);
+        drop(lock);
     }
 
     #[test]

@@ -168,8 +168,8 @@ if [[ ${_smcli_installed-} != 1 ]]; then
                 if [[ $entry =~ ^[[:space:]]*([0-9]+)[[:space:]]+(.*)$ ]]; then
                     if [[ ${BASH_REMATCH[1]} != "$_smcli_history_number" ]]; then
                         _smcli_command=${BASH_REMATCH[2]}
-                    elif [[ -n ${HISTIGNORE-} ]] && _smcli_histignore "$1"; then
-                        # HISTIGNORE kept the command out of history; a leading space makes smcli skip it too.
+                    elif [[ -n ${HISTIGNORE-} ]]; then
+                        # A duplicate and an excluded compound line can have the same first BASH_COMMAND; prefer privacy.
                         _smcli_command=" $1"
                     elif [[ ${BASH_REMATCH[2]} == *"$1"* ]]; then
                         # A duplicate bash left out of history (ignoredups): the full line is the previous entry.
@@ -373,10 +373,13 @@ fi
 if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
     _smcli_complete_bin=\#(binary)
     if (( BASH_VERSINFO[0] >= 4 )); then
+        # Macros and bind -x commands cannot be chained through a Readline function.
+        _smcli_tab_custom=$(bind -s 2>/dev/null; bind -X 2>/dev/null)
+        if [[ $_smcli_tab_custom != *'"\C-i"'* && $_smcli_tab_custom != *'"\t"'* ]]; then
         _smcli_tab_orig=complete
         while IFS= read -r _smcli_bind_line; do
-            [[ $_smcli_bind_line == '"\t": '* ]] || continue
-            _smcli_tab_orig=${_smcli_bind_line#'"\t": '}
+            [[ $_smcli_bind_line == '"\t": '* || $_smcli_bind_line == '"\C-i": '* ]] || continue
+            _smcli_tab_orig=${_smcli_bind_line#*: }
             _smcli_tab_orig=${_smcli_tab_orig%.}
             break
         done < <(bind -p 2>/dev/null)
@@ -403,6 +406,8 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
         }
         bind -x '"\C-x@": _smcli_tab'
         bind '"\t": "\C-x@\e[0n"'
+        fi
+        unset _smcli_tab_custom
     else
         _smcli_complete() {
             local cur=${COMP_WORDS[COMP_CWORD]} cmd=${COMP_WORDS[0]} line
@@ -841,7 +846,9 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
             commandline -f complete
         end
     end
-    bind \t _smcli_complete_widget
+    if not bind --user \t >/dev/null 2>&1
+        bind \t _smcli_complete_widget
+    end
 end"###
         }
         _ => bail!("shell-init requires bash, zsh or fish."),

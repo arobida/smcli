@@ -347,7 +347,7 @@ impl FileSearch {
         result.unwrap_or_else(|e| ServiceResponse::failure("failed", e.to_string()))
     }
 
-    /// Records an explicit choice. The path must stay inside the root; fff and the picker only ever send relative ones.
+    /// Records an explicit choice after lexical path validation; symlink containment is not checked.
     pub fn select(&self, request: &ServiceRequest) -> ServiceResponse {
         let (Some(directory), Some(path), Some(mode)) = (request.directory.as_deref().filter(|d| d.starts_with('/')), request.path.as_deref(), request.mode.as_deref().filter(|m| matches!(*m, "files" | "grep"))) else {
             return ServiceResponse::failure("bad_request", "select needs a directory, a path and a mode of files or grep.");

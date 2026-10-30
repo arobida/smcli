@@ -205,8 +205,8 @@ def variants():
     if os.path.exists(system):
         found.append(Variant(f"bash {'.'.join(map(str, bash_version(system) or ()))} (DEBUG trap)", "bash", system, bash_args,
                              env={"SMCLI_BASH_HOOK": "debug"}))
-    modern = next((p for p in (shutil.which("bash"), "/opt/homebrew/bin/bash", "/usr/local/bin/bash")
-                   if p and (bash_version(p) or (0, 0)) >= (4, 4) and p != system), None)
+    modern = next((p for p in (shutil.which("bash"), "/opt/homebrew/bin/bash", "/usr/local/bin/bash", system)
+                   if p and (bash_version(p) or (0, 0)) >= (4, 4)), None)
     if modern:
         version = ".".join(map(str, bash_version(modern)))
         found.append(Variant(f"bash {version} (PS0)", "bash", modern, bash_args))
@@ -451,6 +451,14 @@ def exclusions(t, variant, env):
         t.send("HISTIGNORE='printf ignored*:printf bare&'")
         t.send("printf ignored1")
         t.send("printf bare&")
+        t.send("HISTIGNORE='*secretcompound*'")
+        t.send("printf visiblecompound; printf secretcompound")
+        if variant.extra_env.get("SMCLI_BASH_HOOK") == "debug":
+            # DEBUG sees the same first BASH_COMMAND for an ignored compound and an allowed duplicate.
+            t.send("printf safedup")
+            t.send("printf safedup")
+            t.send("printf safedup; printf secretcompound")
+            assert commands(env).count("printf safedup") == 1, (variant.label, commands(env)[-8:])
         t.send("HISTIGNORE=; HISTCONTROL=")
     elif kind == "zsh":
         t.send("setopt HIST_IGNORE_SPACE HIST_IGNORE_DUPS")
@@ -476,7 +484,7 @@ def exclusions(t, variant, env):
     t.send("printf visible-after")
     seen = commands(env)
     assert seen[-1] == "printf visible-after", seen[-4:]
-    assert not any(word in c for c in seen for word in ("hidden", "AKIA", "ignored1", "private1")), seen[-8:]
+    assert not any(word in c for c in seen for word in ("hidden", "AKIA", "ignored1", "private1", "visiblecompound")), seen[-8:]
     if kind == "bash":
         # Bare & in HISTIGNORE means previous-command duplicate to Bash, not a glob to smcli.
         assert "printf bare&" in seen, seen[-8:]
@@ -1091,6 +1099,33 @@ def run_at_completion(variant):
             shutil.rmtree(runtime, ignore_errors=True)
 
 
+def run_custom_tab(variant):
+    if variant.kind not in ("bash", "fish") or not variant.keys:
+        return
+    bindings = ([('bind \'"\\t": "TABMACRO"\'', 'bind -s', 'TABMACRO'),
+                 ('bind -x \'"\\t": "echo TABCOMMAND"\'', 'bind -X', 'TABCOMMAND')]
+                if variant.kind == "bash" else
+                [('bind \\t "echo TABFISH"', 'bind --user \\t', 'TABFISH')])
+    for install, query, marker in bindings:
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = tempfile.mkdtemp(prefix="smcli-sh.", dir="/tmp")
+            env = new_environment(Path(directory).resolve(), runtime, variant)
+            t = Terminal(variant.path, variant.args, env, directory)
+            try:
+                t.drain()
+                setup_prompt(t, variant.kind)
+                t.send(install)
+                t.send(init_line(variant.kind))
+                t.send(init_line(variant.kind))
+                bound = t.send(query)
+                assert marker in bound and '_smcli_complete_widget' not in bound, (variant.label, bound)
+            finally:
+                t.close()
+                stop_services(env)
+                shutil.rmtree(runtime, ignore_errors=True)
+    print(f"{variant.label}: custom Tab bindings preserved on re-source.")
+
+
 found, skipped = variants()
 # SMCLI_TEST_ONLY=<substring of a variant label> narrows a run while debugging.
 only = os.environ.get("SMCLI_TEST_ONLY", "")
@@ -1099,6 +1134,7 @@ for variant in found:
     run_variant(variant)
     run_alias_capture(variant)
     run_at_completion(variant)
+    run_custom_tab(variant)
 by_label = {v.label: v for v in found}
 zsh_variant = next((v for v in found if v.kind == "zsh"), None)
 if zsh_variant:
@@ -1158,6 +1194,22 @@ with tempfile.TemporaryDirectory() as directory:
     finally:
         stop_services(env)
         shutil.rmtree(runtime, ignore_errors=True)
+
+# Import must never initialize SQLite over a native history file, including a hard link.
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    native = root / "native-history"
+    native.touch(mode=0o600)
+    linked = root / "linked-history"
+    os.link(native, linked)
+    source = root / "source.json"
+    source.write_text("[]")
+    for destination in (native, linked):
+        env = dict(os.environ, HOME=directory, HISTFILE=str(native), SMCLI_DB=str(destination), SMCLI_SERVICE="0")
+        result = subprocess.run([binary, "import", str(source)], env=env, capture_output=True, text=True)
+        assert result.returncode != 0 and "HISTFILE" in result.stderr, result
+        assert native.read_bytes() == b"", destination
+    print("Import refuses native HISTFILE and hard-linked destinations.")
 
 # fish and bash both parse what shell-init prints.
 with tempfile.TemporaryDirectory() as directory:

@@ -92,14 +92,8 @@ pub fn answers_with_exit_code(command: &str) -> bool {
 
 /// The user smcli records runs under, like Foundation's `NSUserName()`.
 pub fn user_name() -> String {
-    // SAFETY: getpwuid returns a pointer into static storage or null; it is read before any other call.
-    unsafe {
-        let entry = libc::getpwuid(libc::getuid());
-        if !entry.is_null() && !(*entry).pw_name.is_null() {
-            return std::ffi::CStr::from_ptr((*entry).pw_name).to_string_lossy().into_owned();
-        }
-    }
-    std::env::var("USER").unwrap_or_else(|_| "unknown".into())
+    crate::passwd::current_user().map(|(name, _)| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "unknown".into()))
 }
 
 fn host_name() -> String {
@@ -546,34 +540,41 @@ impl CapturedHistory {
         let mut name = self.path.as_os_str().to_owned();
         name.push(".v7.bak");
         let path = PathBuf::from(name);
-        let created = match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(&path) {
-            Ok(file) => Some(file),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => None,
-            Err(e) => return Err(e.into()),
-        };
-        if created.is_none() {
-            let info = std::fs::symlink_metadata(&path)?;
-            if !info.is_file() || info.uid() != unsafe { libc::getuid() } || info.mode() & 0o077 != 0 || info.len() == 0 {
-                bail!("Migration backup must be a nonempty private file owned by you.");
+        let validate = |path: &Path| -> Result<()> {
+            let info = std::fs::symlink_metadata(path)?;
+            if !info.is_file() || info.uid() != unsafe { libc::getuid() } || info.mode() & 0o077 != 0 {
+                bail!("Migration backup must be a private regular file owned by you.");
             }
-            return Ok(());
+            let parent = std::fs::canonicalize(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
+            let resolved = parent.join(path.file_name().ok_or_else(|| anyhow!("Invalid migration backup path"))?);
+            let backup = Connection::open_with_flags(resolved, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+            let check: String = backup.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+            let version: i64 = backup.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if check != "ok" || !(0..=7).contains(&version) || backup.prepare("SELECT command FROM commands LIMIT 0").is_err() {
+                bail!("Migration backup is not a valid pre-v8 history database.");
+            }
+            Ok(())
+        };
+        if path.exists() {
+            return validate(&path).with_context(|| format!("Invalid migration backup {}; preserve or move it before retrying", path.display()));
         }
-        let resolved = std::fs::canonicalize(path.parent().unwrap_or(Path::new(".")))?
-            .join(path.file_name().ok_or_else(|| anyhow!("Invalid migration backup path"))?);
-        let destination = resolved.to_str().ok_or_else(|| anyhow!("Invalid migration backup path"))?;
-        if let Err(error) = db.execute("VACUUM INTO ?", [destination]) {
-            let _ = std::fs::remove_file(&path);
-            return Err(error.into());
-        }
-        created.unwrap().sync_all()?;
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let parent = std::fs::canonicalize(parent)?;
+        let temporary = tempfile::NamedTempFile::new_in(&parent)?;
+        let destination = temporary.path().to_str().ok_or_else(|| anyhow!("Invalid migration backup path"))?;
+        db.execute("VACUUM INTO ?", [destination])?;
+        validate(temporary.path())?;
+        temporary.as_file().sync_all()?;
+        temporary.persist_noclobber(&path)?;
+        std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     }
 
     fn connect(&self, write: bool) -> Result<Connection> {
         let path = &self.path;
         if write {
-            if let Some(parent) = path.parent() {
+            self.check_separate(&std::env::var("HISTFILE").unwrap_or_default())?;
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
             }
             // Create the file ourselves so it is private from the start; SQLite gives its WAL files the same mode.
@@ -596,7 +597,7 @@ impl CapturedHistory {
         }
         // SQLite's NOFOLLOW refuses symlinks anywhere in the path (e.g. macOS /var), so resolve parent directories;
         // the file itself must still not be a symlink.
-        let parent = std::fs::canonicalize(path.parent().unwrap_or(Path::new(".")))?;
+        let parent = std::fs::canonicalize(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
         let resolved = parent.join(path.file_name().ok_or_else(|| anyhow!("Invalid history path"))?);
         let flags = if write { OpenFlags::SQLITE_OPEN_READ_WRITE } else { OpenFlags::SQLITE_OPEN_READ_ONLY }
             | OpenFlags::SQLITE_OPEN_NOFOLLOW
@@ -898,6 +899,36 @@ mod tests {
         assert_eq!(runs[0].expanded_command.as_deref(), Some("git log"));
         drop(log.open_connection().unwrap());
         assert_eq!(std::fs::read(backup_path).unwrap(), backup_bytes, "the first backup is never overwritten");
+    }
+
+    #[test]
+    fn migration_rejects_partial_backup_without_overwriting_it() {
+        let (_dir, log) = temp_db();
+        std::fs::create_dir_all(log.path.parent().unwrap()).unwrap();
+        let old = Connection::open(&log.path).unwrap();
+        old.execute_batch(SCHEMA_V1).unwrap();
+        old.execute_batch("PRAGMA user_version=1;").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&log.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let backup = PathBuf::from(format!("{}.v7.bak", log.path.display()));
+        std::fs::write(&backup, b"partial").unwrap();
+        std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(log.open_connection().is_err());
+        assert_eq!(std::fs::read(&backup).unwrap(), b"partial");
+        assert_eq!(old.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        std::fs::remove_file(&backup).unwrap();
+        assert!(log.open_connection().is_ok());
+        assert_eq!(Connection::open(&backup).unwrap().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn bare_relative_database_path_opens() {
+        let name = format!("smcli-relative-{}-{}.db", std::process::id(), new_event_id().unwrap());
+        let log = CapturedHistory::new(&name);
+        drop(log.open_connection().unwrap());
+        for suffix in ["", "-wal", "-shm", ".migration.lock"] {
+            let _ = std::fs::remove_file(format!("{name}{suffix}"));
+        }
     }
 
     #[test]

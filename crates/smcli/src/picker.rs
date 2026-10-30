@@ -510,7 +510,7 @@ pub fn run(
                 if !path.ends_with('/') { path.push('/'); }
                 Line::from(vec![Span::styled(format!(" {label} @ "), ACCENT), Span::styled(visible(&path), ls_colors.dir)])
             } else {
-                Line::from(vec![Span::styled(format!(" {label} "), ACCENT), Span::styled(scope_label, ACCENT.add_modifier(Modifier::BOLD)), Span::styled(" ›", ACCENT.add_modifier(Modifier::BOLD))])
+                Line::from(vec![Span::styled(format!(" {label} "), ACCENT), Span::styled(scope_label, ACCENT.add_modifier(Modifier::BOLD)), Span::styled(if history { "" } else { " ›" }, ACCENT.add_modifier(Modifier::BOLD))])
             };
             let found = if compact { format!("{count} Results") } else { format!("{count} {} results", if picker.mode == Mode::Grep { "grep" } else { "files" }) };
             let summary = if history {

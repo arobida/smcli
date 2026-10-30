@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-use std::ffi::{CStr, OsStr};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
@@ -13,14 +11,7 @@ pub fn home_dir(environment: &HashMap<String, String>) -> PathBuf {
         .get("HOME")
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| unsafe {
-            let user = libc::getpwuid(libc::getuid());
-            if user.is_null() {
-                PathBuf::from("/")
-            } else {
-                PathBuf::from(OsStr::from_bytes(CStr::from_ptr((*user).pw_dir).to_bytes()))
-            }
-        })
+        .unwrap_or_else(|| crate::passwd::current_user().map(|(_, home)| PathBuf::from(home)).unwrap_or_else(|| PathBuf::from("/")))
 }
 
 /// User settings written by `smcli init`.

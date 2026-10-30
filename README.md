@@ -1,10 +1,10 @@
 # `smcli`
 
-Read your saved Bash and Zsh commands, and — with an opt-in shell hook — record
+Read your saved Bash, Zsh and Fish commands, and — with an opt-in shell hook — record
 metadata native history doesn't reliably keep: the working directory, exit code,
 start time, duration, user, host, and terminal session. Search commands with keyword
 and semantic matching, or rank captured commands for your current directory.
-Search uses potion-shell-16m (potion-code-16M-v2 fine-tuned on shell commands), a static model built into the binary (about 33 MB, MIT licensed,
+Search uses potion-shell-16m (potion-code-16M-v2 fine-tuned on shell commands), a static model shipped beside the binaries (about 33 MB, MIT licensed,
 see `Models/`). Search works on macOS and Linux.
 
 > [!NOTE]
@@ -123,11 +123,11 @@ $ smcli --help
 ## How it works
 
 - Native history is read from `~/.bash_history`, `~/.zsh_history`, and the
-  `.history`/`.historynew` files in `~/.bash_sessions`/`~/.zsh_sessions`, plus an
+  `.history`/`.historynew` files in `~/.bash_sessions`/`~/.zsh_sessions`, `~/.local/share/fish/fish_history`, plus an
   exported `HISTFILE`. It's grouped by file, not merged chronologically — most native
   files carry no timestamps.
 - Native history is decoded for display: Bash timestamp lines and Zsh extended-history
-  prefixes are removed, and Zsh escaped bytes are decoded. The source files aren't changed.
+  prefixes are removed, Zsh escaped bytes are decoded, and Fish `- cmd:` records are decoded. The source files aren't changed.
 - Search combines captured commands and native history, treating each native line as an
   entry (not reconstructing multiline commands). It ranks distinct commands by fusing
   BM25 keywords (whole words like `--soft` and their pieces) with potion-shell-16m
@@ -141,18 +141,14 @@ $ smcli --help
   without surfacing weak ones; failed commands are demoted, not hidden. Text
   results show why a command ranked (`exact words`, `used here`, `recent`, …).
 - potion-shell-16m runs natively (WordPiece tokens, mean of float16 rows, normalize;
-  no network pass). It is embedded in the binary,
+  no network pass). It is shipped in a model folder beside the binaries,
   so there is nothing to download; `init --potion DIR` points at another copy. Being a static model, it embeds only the command and its intent,
   not the labels below; word order is lost (`cp a b` equals `cp b a`), so keywords matter.
   For commands with captured metadata, run counts come only from captured records;
   otherwise they count occurrences across native files. Native lines have no times, so
   their usage decays by position (halving every 1,000 lines from the end); a captured
   command keeps its native usage when that is the stronger evidence.
-- Each command is embedded with labels — `command:`, `subcommand:`, `flags:`,
-  `author:` and `intent:` (from the last captured run) — so queries naming a
-  tool or option rank closer. Directories are not embedded: use `--dir PATH`, and
-  commands run in the current directory get a "used here" boost. Time and frequency are filters, not labels.
-  Captured commands store their option names in a `flags` column (filled in for existing rows on upgrade).
+- Search document identity preserves the full command and intent; embedding input is capped at 1,500 characters and lexical input at 8,192 (`crates/smcli-search/src/corpus.rs:search_document`, `embedding_text`, `lexical_text`). Keyword input contains executable text, the typed alias when present, and intent, without generated contextual labels. Directories are not embedded: use `--dir PATH`. Captured commands store option names in a `flags` column, filled in for existing rows on upgrade.
 - Hard filters drop non-matching results: `--command git`, `--subcommand commit`,
   `--since 7d`, `--before 2026-10-01`, `--min-runs 5`, `--author NAME`, `--dir PATH`
   (last run in PATH or below), `--flag NAME` (exact option name, e.g. `--flag --amend`). Times are `30m`/`12h`/`7d`/`2w`,
@@ -188,8 +184,7 @@ Project-index ranking switches are controlled by `SMCLI_RANKING_OFF`: `index`, `
   `~/.config/smcli/config.json` (or `$XDG_CONFIG_HOME/smcli/config.json`);
   `SMCLI_CONFIG` overrides that file's path. `init` configures search, not capture,
   and is not required for the built-in model.
-- `import` of legacy JSONL is transactional but does not deduplicate: importing the same
-  file again adds duplicate records. Run each migration only once.
+- `import` of legacy JSONL is transactional and deduplicates matching imported records; repeated imports preserve existing rows (`crates/smcli/src/cli.rs:import`).
 - Like Atuin, capture skips commands typed with a leading space, commands containing likely
   secrets (AWS, GitHub, GitLab, Slack, Stripe, Google, npm, Anthropic/OpenAI keys), and any
   matching regexes in the config file: `"historyFilter": ["^vault "]` for commands,
@@ -213,10 +208,40 @@ Before changing shell transports or search ownership:
 
 ``` sh
 make baseline       # release CLI; synthetic 1k/10k/100k histories, raw JSON in dist/baseline.json
-make fff-smoke      # pinned fff-search crate smoke test
+make test-service   # service and file-search black-box checks
 ```
 
 Normal builds link the pinned `fff-search` crate into `smcli-service` only;
 `smcli` does not link fff. Builds require Cargo and a C toolchain. See
 [the baseline report](agents/reference/baseline.md) for the capture-to-picker trace,
 measurements, dependency/API verification, limitations, and the next gate.
+
+## Architecture Blueprint
+
+### System Overview
+
+The two executables share `smcli-core` for captured history/protocol types and `smcli-search` for local hybrid search. `smcli-service` keeps history/search state open and alone links fff-search; the CLI retains local history/search and picker fallbacks without fff-specific evidence. See the crate manifests and child contracts for ownership.
+
+### Interface
+
+- [Rust workspace](crates/README.md) — CLI, shared history/protocol, search library and service boundaries.
+- [Scripts](scripts/README.md) — install/uninstall, benchmarking, build cleanup and notices.
+- The workspace manifest selects `crates/*` (`Cargo.toml:workspace.members`); `Makefile` exposes build/test/formatting entry points. Source-free docs, model assets and test-only directories are not component contracts.
+
+### Invariants
+
+- Native shell history is read-only; captured history cannot alias `HISTFILE` (`crates/smcli-search/src/native.rs:HistoryFile::read`, `crates/smcli-core/src/history.rs:CapturedHistory::check_separate`).
+- History and runtime paths require current-user ownership and private permissions (`crates/smcli-core/src/history.rs:CapturedHistory::connect`, `service_location.rs:ServiceLocation::prepare`). Search caches contain command text and also require a private directory (`crates/smcli-search/src/index.rs:HistorySearch::prepare_directory`).
+- Protocol JSON is one request/response per connection; version mismatches are rejected in dispatch, while clients handle unavailable/stale services (`crates/smcli-service/src/service.rs:Service::serve`, `Service::dispatch`; `crates/smcli-core/src/service_client.rs:ServiceClient`).
+- Embeddings run locally from the shipped model folder, with checkout fallback for development; model-specific index names prevent vector reuse across identities (`crates/smcli-search/src/potion.rs:Potion::bundled`, `index.rs:HistorySearch::index_name`).
+- Initialization attempts to stop the service when changing models but can proceed if shutdown fails; service reload drops its old engine before loading another (`crates/smcli/src/initialize.rs:run`, `cli.rs:run`; `crates/smcli-service/src/service.rs:Service::load_engine`).
+
+### Side Effects
+
+- Persistent captured-history SQLite rows, selection records, migrations and config writes (`crates/smcli-core/src/history.rs:CapturedHistory`, `config.rs:SmcliConfig::save`); rebuildable TalaDB search caches (`crates/smcli-search/src/index.rs:HistorySearch`).
+- Service process/socket lifecycle, local filesystem watchers and Git-status subprocesses (`crates/smcli-core/src/service_client.rs:ServiceClient`, `context_cache.rs:GitStatus::read`; `crates/smcli-service/src/file_search.rs:FileSearch`).
+- Interactive terminal modes and user-opted shell hooks (`crates/smcli/src/picker.rs:TerminalSession`, `shell_integration.rs:render_config`). Install/uninstall can change shell startup files and remove smcli data; see the scripts contract.
+
+### Verification
+
+Run `make test` from the repository root. `make ranking` checks ranking changes; focused gates are listed in child contracts. Run `make docs` after handwritten Markdown changes; generated `THIRD_PARTY_NOTICES.md` is excluded by the Makefile.

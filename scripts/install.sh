@@ -53,25 +53,32 @@ if [[ -z $from ]]; then
 fi
 [[ -x $from/smcli && -x $from/smcli-service ]] || die "$from must hold executable smcli and smcli-service"
 
-say "Installing smcli and smcli-service to $prefix"
-mkdir -p "$prefix"
-# A running service is from the old build: stop it first (the next command would replace it anyway).
-[[ -x $prefix/smcli ]] && "$prefix/smcli" service stop > /dev/null 2>&1 || true
-# Copy then rename, so a shell running the old binary never sees a half-written file.
-for name in smcli smcli-service; do
-    cp -L "$from/$name" "$prefix/.$name.new"  # -L: dist/ holds symlinks to the timestamped build
-    chmod 755 "$prefix/.$name.new"
-    xattr -d com.apple.quarantine "$prefix/.$name.new" 2>/dev/null || true
-    mv -f "$prefix/.$name.new" "$prefix/$name"
-done
-# Both executables load the default model from this folder beside them.
+# Validate and stage every required artifact before touching the existing installation.
 model="$from/potion-shell-16m"
 [[ -d $model ]] || model="$here/../Models/potion-shell-16m"
-[[ -f $model/model.safetensors ]] || die "no potion-shell-16m model beside $from/smcli"
-rm -rf "$prefix/.potion-shell-16m.new"
-cp -RL "$model" "$prefix/.potion-shell-16m.new"
+for file in model.safetensors tokenizer.json config.json; do
+    [[ -s $model/$file ]] || die "missing or empty potion-shell-16m/$file beside $from/smcli"
+done
+say "Installing smcli and smcli-service to $prefix"
+mkdir -p "$prefix"
+stage=$(mktemp -d "$prefix/.smcli-install.XXXXXX")
+trap 'rm -rf "$stage"' EXIT
+for name in smcli smcli-service; do
+    cp -L "$from/$name" "$stage/$name"
+    chmod 755 "$stage/$name"
+    xattr -d com.apple.quarantine "$stage/$name" 2>/dev/null || true
+done
+cp -RL "$model" "$stage/potion-shell-16m"
+"$stage/smcli" --help > /dev/null || die "the staged smcli does not run"
+"$stage/smcli-service" --help > "$stage/service-help" 2>&1 && service_status=0 || service_status=$?
+[[ $service_status == 2 ]] && grep -q '^Usage: smcli-service ' "$stage/service-help" || die "the staged smcli-service does not run"
+# A running service is from the old build: stop it only after staging succeeded.
+[[ -x $prefix/smcli ]] && "$prefix/smcli" service stop > /dev/null 2>&1 || true
+for name in smcli smcli-service; do
+    mv -f "$stage/$name" "$prefix/$name"
+done
 rm -rf "$prefix/potion-shell-16m"
-mv "$prefix/.potion-shell-16m.new" "$prefix/potion-shell-16m"
+mv "$stage/potion-shell-16m" "$prefix/potion-shell-16m"
 # The uninstaller ships with the install, so it works without the release archive or checkout.
 uninstaller="$here/uninstall.sh"
 [[ -f $uninstaller ]] && install -m 755 "$uninstaller" "$prefix/smcli-uninstall"
@@ -110,14 +117,42 @@ validate_block() {  # $1: file
     [[ $state == closed ]]
 }
 
-remove_block() {  # $1: file
-    [[ -f $1 ]] && grep -qxF "$begin" "$1" || return 0
-    validate_block "$1" || return 1
-    local tmp
-    tmp=$(mktemp "$1.smcli.XXXXXX")
-    awk -v b="$begin" -v e="$end" '$0 == b {skip = 1; next} skip && $0 == e {skip = 0; next} !skip' "$1" > "$tmp"
-    cat "$tmp" > "$1" && rm -f "$tmp"  # rewrite in place: keeps the file's permissions and any symlink
+# Resolve symlinks so rename replaces the target, not the link itself.
+resolve_rc() {
+    local path=$1 link count=0
+    while [[ -L $path ]]; do
+        (( count += 1 ))
+        (( count <= 40 )) || return 1
+        link=$(readlink "$path") || return 1
+        if [[ $link == /* ]]; then path=$link; else path="$(dirname "$path")/$link"; fi
+    done
+    printf '%s\n' "$path"
 }
+write_hook() (  # $1: startup file, $2: shell
+    local target tmp
+    target=$(resolve_rc "$1") || exit 1
+    if [[ -f $target ]]; then
+        local links
+        if [[ $(uname) == Darwin ]]; then
+            links=$(stat -f %l "$target") || exit 1
+        else
+            links=$(stat -c %h "$target") || exit 1
+        fi
+        if [[ $links != 1 ]]; then
+            printf 'refusing to replace hard-linked startup file %s\n' "$target" >&2
+            exit 1
+        fi
+    fi
+    tmp=$(mktemp "$target.smcli.XXXXXX") || exit 1
+    trap 'rm -f "$tmp"' EXIT
+    if [[ -f $target ]]; then
+        cp -p "$target" "$tmp" || exit 1
+        awk -v b="$begin" -v e="$end" '$0 == b {skip = 1; next} skip && $0 == e {skip = 0; next} !skip' "$target" > "$tmp" || exit 1
+    fi
+    printf '\n%s\n# Added by smcli install.sh; remove with smcli-uninstall. Keep it below other tools that bind keys.\n%s\n%s\n' \
+        "$begin" "$(hook_line "$2")" "$end" >> "$tmp" || exit 1
+    mv -f "$tmp" "$target"
+)
 
 # Without --shells, a terminal user is asked per startup file; declining prints the line to add by hand.
 ask_hooks=""
@@ -142,9 +177,7 @@ for shell in ${shells//,/ }; do
     fi
     [[ -f $file ]] && { validate_block "$file" || die "malformed smcli block in $file; not modifying"; }
     [[ -f $file ]] && cp -p "$file" "$file.smcli-backup"
-    remove_block "$file" || die "malformed smcli block in $file; not modifying"
-    printf '\n%s\n# Added by smcli install.sh; remove with smcli-uninstall. Keep it below other tools that bind keys.\n%s\n%s\n' \
-        "$begin" "$(hook_line "$shell")" "$end" >> "$file"
+    write_hook "$file" "$shell" || die "could not update $file; not modifying"
     hooked+=("$shell ($file)")
     if [[ $shell == bash && -f $HOME/.bash_profile ]] && ! grep -q bashrc "$HOME/.bash_profile"; then
         printf 'note: ~/.bash_profile does not read ~/.bashrc, so login shells (the macOS default) skip the hooks;\n' >&2
