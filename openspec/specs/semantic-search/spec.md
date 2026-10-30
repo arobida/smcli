@@ -85,6 +85,25 @@ A process SHALL NOT hold two embedding models at once. Model changes through `sm
 - **WHEN** the service sees the configured model change
 - **THEN** it releases the old model before loading the new one
 
+### Requirement: smcli's own commands are excluded
+
+Search, suggestions and capture SHALL skip any command line that runs smcli itself, so past searches never answer a new one. A line runs smcli when any segment split on newlines, `;`, `&` or `|` runs `smcli` by name or path, runs `swift run … smcli`, or runs `$VAR` where `VAR` was set to an smcli path earlier in the line. A `$VAR` with no assignment in the line SHALL count only when its next word is an smcli subcommand (`search`, `suggest`, `pick`, `history`, `reindex`, `indexes`, `shell-init`).
+
+#### Scenario: Earlier search for the same query
+
+- **WHEN** history has `$B search "undo the last commit"` and the user searches `undo the last commit`
+- **THEN** that line is not returned
+
+#### Scenario: smcli in a later segment
+
+- **WHEN** a line is `make fresh && dist/smcli search x`
+- **THEN** it is neither captured nor returned
+
+#### Scenario: Unrelated variable
+
+- **WHEN** a line is `$EDITOR notes.md` or `echo a | grep smcli`
+- **THEN** it is kept
+
 ### Requirement: Private index
 
 The index directory SHALL be owned by the current user with mode `0700`, because it stores command text.
