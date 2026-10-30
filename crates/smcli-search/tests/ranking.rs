@@ -104,7 +104,7 @@ const ORIGINAL_CASES: [Case; 34] = [
     case(Original, "git state", Search, "merging", "continue", "git merge --continue"),
 ];
 
-const ADVERSARIAL_CASES: [Case; 8] = [
+const ADVERSARIAL_CASES: [Case; 16] = [
     // Exact literal distinctions: a rare flag variant must beat a frequent near-match.
     case(Adversarial, "flag-variant", Search, "flags", "git reset --soft", "git reset --soft HEAD"),
     case(Adversarial, "revision", Search, "revisions", "HEAD~1", "git reset HEAD~1"),
@@ -116,6 +116,14 @@ const ADVERSARIAL_CASES: [Case; 8] = [
     case(Adversarial, "camelcase", Search, "camel", "FooBar", "run FooBar"),
     // Intent paraphrase without command tokens, and a never-run project script.
     case(Adversarial, "intent", Search, "intent", "undo the last commit but keep changes", "git reset --soft HEAD~1"),
+    case(Adversarial, "intent", Search, "intent", "show recent commits", "git log --oneline -20"),
+    case(Adversarial, "intent", Search, "intent", "what is using port 3000", "lsof -i :3000"),
+    case(Adversarial, "intent", Search, "intent", "find the biggest files here", "du -sh * | sort -h"),
+    case(Adversarial, "intent", Search, "intent", "delete branches that were merged", "git branch --merged | xargs git branch -d"),
+    case(Adversarial, "intent", Search, "intent", "see what changed", "git diff"),
+    case(Adversarial, "intent", Search, "intent", "download a file", "curl -O https://example.com/file.tgz"),
+    case(Adversarial, "intent", Search, "intent", "unpack a tarball", "tar -xzf archive.tgz"),
+    case(Adversarial, "intent", Search, "intent", "check github login", "gh auth status"),
     case(Adversarial, "cold-start", Suggest, "coldstart", "npm run sto", "npm run storybook"),
 ];
 
@@ -140,8 +148,8 @@ const HELD_OUT_CASES: [Case; 3] = [
     with_forbidden(case(HeldOut, "whole-token", Search, "heldout", "$make $release", "make release"), "make lint"),
 ];
 
-const CASES: [Case; 45] = {
-    let mut all: [Case; 45] = [ORIGINAL_CASES[0]; 45];
+const CASES: [Case; 53] = {
+    let mut all: [Case; 53] = [ORIGINAL_CASES[0]; 53];
     let mut i = 0;
     while i < ORIGINAL_CASES.len() {
         all[i] = ORIGINAL_CASES[i];
@@ -341,6 +349,17 @@ impl World {
 
         self.habit_with("git commit --amend", "intent", 10, 0.5, 10.0);
         self.run("git reset --soft HEAD~1", "intent", NOW - 1.0, "intent1", 0);
+        // Intent distractors share words with the queries (`find`, `branch`), not meaning.
+        self.run("git log --oneline -20", "intent", NOW - 2.0, "intent2", 0);
+        self.run("lsof -i :3000", "intent", NOW - 5.0, "intent5", 0);
+        self.run("du -sh * | sort -h", "intent", NOW - 6.0, "intent6", 0);
+        self.run("git branch --merged | xargs git branch -d", "intent", NOW - 7.0, "intent7", 0);
+        self.run("git diff", "intent", NOW - 8.0, "intent8", 0);
+        self.run("curl -O https://example.com/file.tgz", "intent", NOW - 9.0, "intent9", 0);
+        self.run("tar -xzf archive.tgz", "intent", NOW - 10.0, "intent10", 0);
+        self.run("gh auth status", "intent", NOW - 11.0, "intent11", 0);
+        self.run("find . -name '*.md'", "intent", NOW - 14.0, "intent14", 0);
+        self.run("git branch", "intent", NOW - 15.0, "intent15", 0);
 
         // Held-out history (kept small and using commands that do not move original cohort scores).
         self.run("git status", "heldout", NOW - 1.0, "held1", 0);
