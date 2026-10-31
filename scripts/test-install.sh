@@ -163,11 +163,41 @@ grep -q 'sqlite3 is needed to export history' "$home/out" || fail "missing sqlit
 [[ -x $home/bin/smcli && -f $home/.local/share/smcli/history.db && ! -e $home/export ]] || fail "refused uninstall changed files"
 grep -q '^# >>> smcli >>>$' "$home/.zshrc" || fail "refused uninstall removed hooks"
 
+# Uninstalling database A must leave database B's runtime files alone (finding #8).
+db_a=$home/.local/share/smcli/history.db
+db_b=$home/other-history.db
+fnv_fp() { # bytes via LC_ALL=C, same as uninstall.sh / service_location.rs
+    local text=$1 h=$((0xcbf29ce484222325)) i c
+    local LC_ALL=C
+    for ((i = 0; i < ${#text}; i++)); do
+        printf -v c '%d' "'${text:i:1}"
+        h=$(( (h ^ c) * 0x100000001b3 ))
+    done
+    printf '%016x' "$h"
+}
+fp_a=$(fnv_fp "$db_a")
+fp_b=$(fnv_fp "$db_b")
+[[ $fp_a != "$fp_b" ]] || fail "test databases collided on fingerprint"
+touch "$runtime/service-${fp_a}.sock" "$runtime/service-${fp_a}.lock"
+touch "$runtime/service-${fp_b}.sock" "$runtime/service-${fp_b}.lock"
+# Sanity: fingerprint of a known path matches service_location.rs.
+[[ $(fnv_fp /tmp/history.db) == e325ec6f80fdf18c ]] || fail "FNV fingerprint drift vs service_location.rs"
+# UTF-8 path: bash LC_ALL=C bytes must match independent FNV-1a over UTF-8.
+utf_db=$home/café-history.db
+fp_utf=$(fnv_fp "$utf_db")
+fp_utf_py=$(python3 -c 'import sys; t=sys.argv[1].encode(); h=0xcbf29ce484222325
+for b in t: h=((h^b)*0x100000001b3)&0xffffffffffffffff
+print(f"{h:016x}")' "$utf_db")
+[[ $fp_utf == "$fp_utf_py" ]] || fail "UTF-8 fingerprint bash=$fp_utf python=$fp_utf_py"
+
 # Existing, permissive destinations must also become private.
 mkdir "$home/export"
 chmod 755 "$home/export"
 for f in history.db history.json config.json; do touch "$home/export/$f"; chmod 644 "$home/export/$f"; done
 (umask 022; "$home/bin/smcli-uninstall" --yes --export "$home/export") > "$home/out" 2>&1 || { cat "$home/out"; fail "uninstall failed"; }
+[[ ! -e $runtime/service-${fp_a}.sock && ! -e $runtime/service-${fp_a}.lock ]] || fail "uninstall left database A's service files"
+[[ -e $runtime/service-${fp_b}.sock && -e $runtime/service-${fp_b}.lock ]] || fail "uninstall removed database B's service files"
+rm -f "$runtime/service-${fp_b}.sock" "$runtime/service-${fp_b}.lock"
 python3 - "$home/export" <<'PY'
 import stat
 import sys

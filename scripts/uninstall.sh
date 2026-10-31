@@ -37,7 +37,8 @@ if [[ -z $prefix ]]; then
     if [[ -x $here/smcli ]]; then prefix=$here; else prefix="$HOME/.local/bin"; fi
 fi
 smcli="$prefix/smcli"
-db="${SMCLI_DB:-$HOME/.local/share/smcli/history.db}"
+# Explicit SMCLI_DB is used as given (no canonicalize). Default matches Path::join (no // if HOME ends in /).
+if [[ -n ${SMCLI_DB:-} ]]; then db=$SMCLI_DB; else db="${HOME%/}/.local/share/smcli/history.db"; fi
 config="${SMCLI_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/smcli/config.json}"
 begin='# >>> smcli >>>'
 end='# <<< smcli <<<'
@@ -143,8 +144,24 @@ if [[ -z $keep_data ]]; then
     rmdir "$(dirname "$db")" 2>/dev/null || true
     rm -f "$config"
     rmdir "$(dirname "$config")" 2>/dev/null || true
-    for runtime in "${SMCLI_RUNTIME_DIR:-}" "${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/smcli}" "${TMPDIR:-/tmp}/smcli-$(id -u)"; do
-        [[ -n $runtime && -d $runtime ]] && rm -f "$runtime"/service-* && rmdir "$runtime" 2>/dev/null || true
+    # Same FNV-1a name as service_location.rs (bytes, LC_ALL=C): only this database's socket/lock.
+    service_fp=$(export LC_ALL=C; h=$((0xcbf29ce484222325)); t=$db
+        for ((i = 0; i < ${#t}; i++)); do printf -v c '%d' "'${t:i:1}"; h=$(( (h ^ c) * 0x100000001b3 )); done
+        printf '%016x' "$h")
+    # Absolute dirs only, same precedence filters as ServiceLocation::new.
+    runtime_dirs=()
+    if [[ ${SMCLI_RUNTIME_DIR:-} == /* ]]; then runtime_dirs+=("$SMCLI_RUNTIME_DIR")
+    elif [[ ${XDG_RUNTIME_DIR:-} == /* ]]; then runtime_dirs+=("$XDG_RUNTIME_DIR/smcli")
+    else
+        if [[ ${TMPDIR:-} == /* ]]; then runtime_dirs+=("$TMPDIR/smcli-$(id -u)")
+        else runtime_dirs+=("/tmp/smcli-$(id -u)")
+        fi
+    fi
+    for runtime in "${runtime_dirs[@]}"; do
+        if [[ -d $runtime ]]; then
+            rm -f "$runtime/service-${service_fp}.sock" "$runtime/service-${service_fp}.lock"
+            rmdir "$runtime" 2>/dev/null || true
+        fi
     done
     say "Deleted smcli's history, search index and settings"
 fi
