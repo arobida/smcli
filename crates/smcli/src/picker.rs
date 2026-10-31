@@ -892,7 +892,9 @@ fn suggested_first(hits: &mut [FileHit], query: &str) {
     let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
     let mut buffer = Vec::new();
     hits.sort_by_cached_key(|h| {
-        !(suggested(h) && pattern.score(Utf32Str::new(&h.path, &mut buffer), &mut matcher).is_some())
+        let exact = h.path.rsplit('/').next() == Some(query);
+        let suggested_match = suggested(h) && pattern.score(Utf32Str::new(&h.path, &mut buffer), &mut matcher).is_some();
+        (!exact, !suggested_match)
     });
 }
 
@@ -1032,14 +1034,14 @@ fn edit_files_header(mode: Mode, line: Option<&str>, ok: bool) -> Option<Line<'s
     let line = visible(line.filter(|_| mode == Mode::Files)?);
     let status = Style::new().fg(if ok { Color::Green } else { Color::Red }).add_modifier(Modifier::BOLD);
     // A placeholder is a bare @, not the start of a word like npm's @scope/pkg.
-    let is_placeholder = |s: &str, i: usize| s[i..].starts_with('@') && !s[i + 1..].starts_with(|c: char| c.is_alphanumeric() || "_./-".contains(c));
-    let total = (0..line.len()).filter(|&i| is_placeholder(&line, i)).count();
+    let is_placeholder = |s: &str, i: usize| s[i + 1..].starts_with(|c: char| c.is_alphanumeric() || "_./-".contains(c)) == false;
+    let total = line.match_indices('@').filter(|(i, _)| is_placeholder(&line, *i)).count();
     let mut spans = vec![Span::styled(" editing ", ACCENT), Span::styled("→ ", status)];
     let mut n = 0;
     for span in highlight(&line) {
         let text = span.content.into_owned();
         let mut start = 0;
-        for i in (0..text.len()).filter(|&i| is_placeholder(&text, i)) {
+        for (i, _) in text.match_indices('@').filter(|(i, _)| is_placeholder(&text, *i)) {
             spans.push(Span::styled(text[start..i].to_string(), span.style));
             n += 1;
             // The number is display only; the accepted line keeps the bare @.
@@ -1058,6 +1060,8 @@ mod tests {
         let text = |line| super::edit_files_header(super::Mode::Files, Some(line), true).map(|l| l.to_string());
         assert_eq!(text("cat @").as_deref(), Some(" editing → cat @"));
         assert_eq!(text("mv @ @").as_deref(), Some(" editing → mv @1 @2"));
+        assert_eq!(text("echo café @").as_deref(), Some(" editing → echo café @"));
+        assert_eq!(text("mv é @ @").as_deref(), Some(" editing → mv é @1 @2"));
         assert_eq!(text("npm i @scope/pkg --out=@").as_deref(), Some(" editing → npm i @scope/pkg --out=@"));
         assert_eq!(super::edit_files_header(super::Mode::Files, None, true), None);
         assert_eq!(super::edit_files_header(super::Mode::History, Some("cat @"), true), None);
@@ -1162,6 +1166,17 @@ mod tests {
         suggested_first(&mut hits, "");
         let order: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
         assert_eq!(order, ["t02 c", "t01 b", "t02 a"], "empty query: every suggestion leads");
+    }
+
+    #[test]
+    fn exact_filename_stays_ahead_of_picked_fuzzy_match() {
+        let hit = |path: &str, picked: bool| FileHit {
+            insert: path.into(), path: path.into(), git: None, line: None, column: None, text: None, definition: None,
+            provenance: if picked { vec!["fff".into(), "picked".into()] } else { vec!["fff".into()] },
+        };
+        let mut hits = vec![hit("xneedle.rs", true), hit("needle.rs", false)];
+        suggested_first(&mut hits, "needle.rs");
+        assert_eq!(hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(), ["needle.rs", "xneedle.rs"]);
     }
 
     #[test]
