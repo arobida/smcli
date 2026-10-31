@@ -106,14 +106,22 @@ impl ServiceClient {
     /// Requests the old service's answer can be replaced by the new one's without a second effect.
     fn repeatable(op: Operation) -> bool { !matches!(op, Operation::Select | Operation::Shutdown) }
 
-    fn exchange(&self, request: &ServiceRequest, spawn: bool, timeout: Duration) -> Result<ServiceResponse, ExchangeError> {
+    /// Fills fields the service reads from this caller's environment (ranking switches, search PATH).
+    fn prepare_request(&self, request: &ServiceRequest) -> ServiceRequest {
         let mut request = request.clone();
         if request.config.is_none() { request.config = Some(self.config.clone()); }
         if request.op == Operation::Search {
             request.shell_path = service_protocol::shell_path_snapshot(self.environment.get("PATH").map(String::as_str));
+        }
+        if matches!(request.op, Operation::Search | Operation::Suggest | Operation::Pick) {
             request.ranking_off = Some(self.environment.get("SMCLI_RANKING_OFF")
                 .filter(|s| s.len() <= 256).cloned().unwrap_or_default());
         }
+        request
+    }
+
+    fn exchange(&self, request: &ServiceRequest, spawn: bool, timeout: Duration) -> Result<ServiceResponse, ExchangeError> {
+        let request = self.prepare_request(request);
         let Some(mut connection) = self.connect(spawn) else { return Err(ExchangeError::Unavailable); };
         // The private directory already keeps others out; also refuse a socket another user planted.
         if connection.peer_uid() != Some(unsafe { libc::getuid() }) { return Err(ExchangeError::Unavailable); }
@@ -231,6 +239,18 @@ mod tests {
         assert!(fds.contains(&file.as_file().as_raw_fd()));
         assert!(fds.iter().all(|&fd| fd >= 3));
     }
+    #[test]
+    fn ranking_off_forwarded_for_suggest_and_pick() {
+        let environment = HashMap::from([("SMCLI_SERVICE".into(), "0".into()), ("SMCLI_RANKING_OFF".into(), "script".into())]);
+        let client = ServiceClient::new(Path::new("/missing/db"), &environment, Path::new("/missing/smcli"));
+        for op in [Operation::Suggest, Operation::Pick, Operation::Search] {
+            assert_eq!(client.prepare_request(&ServiceRequest::new(op)).ranking_off.as_deref(), Some("script"), "{op:?}");
+        }
+        assert!(client.prepare_request(&ServiceRequest::new(Operation::Ping)).ranking_off.is_none());
+        let bare = ServiceClient::new(Path::new("/missing/db"), &HashMap::from([("SMCLI_SERVICE".into(), "0".into())]), Path::new("/missing/smcli"));
+        assert_eq!(bare.prepare_request(&ServiceRequest::new(Operation::Suggest)).ranking_off.as_deref(), Some(""));
+    }
+
     #[test]
     fn modes_and_repeatable_operations() {
         for value in ["0", "OFF", "false", "no", "connect", "on"] {
