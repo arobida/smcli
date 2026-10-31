@@ -13,12 +13,11 @@ By using the kero skill you are allowed to open new sessions with the list of ag
 pisol=pi --model openai/gpt-6.1-sol --thinking low
 piterra=pi --model openai/gpt-6.1-terra --thinking low
 piluna=pi --model openai/gpt-6-luna --thinking low
-pikcode=pi --model opencode-go/kimi-k2.7-code --thinking high
-pidpro=pi --model opencode-go/deepseek-v4-pro --thinking high
+pikcode=pi --model opencode-go/kimi-k2.7-code --thinking low
 pidflash=pi --model opencode-go/deepseek-v4.1-flash --thinking high
 pigrok47=pi --model xai/grok-4.7 --thinking high
 pigrok46=pi --model xai/grok-4.6 --thinking high
-pigrok45=pi --model xai/grok-4.5 --thinking medium
+pigrok45=pi --model xai/grok-4.5 --thinking low
 
 #### Agent Affinities
 
@@ -28,21 +27,12 @@ pisol: great for complicated reasoning tasks
 piterra: great for running test and code review
 piluna: great fast general purpose worker
 pikcode: great at writing code
-pidpro: good general purpose model, very token efficient with prompt caching
 pidflash: good fast general purpose model with vision
 pigrok47: complicated reasoning tasks
 pigrok46: general purpose model
 pigrok45: decent model should stick to using with commit messages
 
 <-- End of do not edit -->
-
-### Dispatching to the team
-
-Delegate through `scripts/ateam.sh` instead of hand-rolled `kero new` loops: `bash scripts/ateam.sh <brief> <alias=command>...` (bash only; run it, don't source it from zsh), passing the `alias=command` lines above verbatim.
-
-- Starts every agent in parallel in the repo dir (each in its own kero session), waits for each prompt, then briefs it.
-- `<brief>` is one of: empty (start only), inline text (sent to every agent), a task file path, or a task directory; with a directory it briefs each agent from `<dir>/<alias>.task` — write one `.task` file per agent and pass the dir, so each gets `Read <dir>/<alias>.task and do exactly what it says.`
-- Prints `<alias>\t<session-id>` per agent; monitor with `kero wait` / `kero read`, `kero close` when done. `ATEAM_SHELL` (default zsh) and `ATEAM_DIR` (default `$PWD`) override.
 
 ## Git
 
