@@ -108,7 +108,7 @@ pub fn test_candidates(search: &FileSearch, root: &str) -> Vec<Candidate> {
     let mut found = vec![];
     for pattern in ["#[test]", "#[tokio::test]", "def test_", "it('", "test('"] {
         let query = parse_grep_query(pattern);
-        let page = picker.grep(&query, &GrepSearchOptions { page_limit: 200, max_matches_per_file: 0, time_budget_ms: 100, enforce_time_budget: true, ..Default::default() });
+        let page = picker.grep(&query, &GrepSearchOptions { page_limit: 200, max_matches_per_file: 1, time_budget_ms: 100, enforce_time_budget: true, ..Default::default() });
         for hit in page.matches {
             let file = page.files[hit.file_index];
             let path = file.relative_path(picker);

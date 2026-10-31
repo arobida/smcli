@@ -145,7 +145,7 @@ impl ProjectEvidence for IndexEvidence {
         let patterns: Vec<&str> = names.iter().map(String::as_str).collect();
         let page = picker.multi_grep(&patterns, &[], &fff_search::GrepSearchOptions {
             page_limit: 256,
-            max_matches_per_file: 0,
+            max_matches_per_file: 32,
             time_budget_ms: ms,
             enforce_time_budget: true,
             classify_definitions: true,
