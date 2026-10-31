@@ -689,6 +689,16 @@ fn prune(c: &CapturedHistory, filter: &CaptureFilter, dry: bool) -> Result<()> {
             }
         }
     }
+    let mut file_picks = vec![];
+    {
+        let mut s = tx.prepare("SELECT id,query,root FROM file_selections")?;
+        for row in s.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
+            let (id, query, root) = row?;
+            if !query.is_empty() && !filter.allows(&query, &root) {
+                file_picks.push(id);
+            }
+        }
+    }
     let mut picks = vec![];
     {
         let mut s = tx.prepare(
@@ -710,7 +720,7 @@ fn prune(c: &CapturedHistory, filter: &CaptureFilter, dry: bool) -> Result<()> {
             }
         }
     }
-    let selection_removed = picks.len();
+    let selection_removed = picks.len() + file_picks.len();
     if dry {
         for command in &commands {
             println!("{}", smcli_core::entry::command_parts(command).0);
@@ -724,6 +734,9 @@ fn prune(c: &CapturedHistory, filter: &CaptureFilter, dry: bool) -> Result<()> {
         }
         for id in picks {
             tx.execute("DELETE FROM command_selections WHERE id=?", [id])?;
+        }
+        for id in file_picks {
+            tx.execute("DELETE FROM file_selections WHERE id=?", [id])?;
         }
         for command in &commands {
             tx.execute("DELETE FROM command_selections WHERE command=?", [command])?;
@@ -852,7 +865,7 @@ fn import(
             let command: String = r.get(4)?;
             let flags = smcli_core::parse::command_flags(&command).join(" ");
             let duration: i64 = r.get(2)?;
-            count+=tx.execute("INSERT OR IGNORE INTO commands(session,started_at,duration_ms,directory,command,exit_code,uuid,deleted_at,author,intent,flags) VALUES(?,?,?,?,?,?,?,?,?,?,?)",rusqlite::params![session,r.get::<_,i64>(1)? as f64/1e9,if duration<0{None}else{Some(duration/1_000_000)},r.get::<_,String>(5)?,command,r.get::<_,i64>(3)?,r.get::<_,String>(0)?,r.get::<_,Option<i64>>(8)?.map(|n|n as f64/1e9),r.get::<_,Option<String>>(10)?,r.get::<_,Option<String>>(11)?,flags])?;
+            count+=tx.execute("INSERT INTO commands(session,started_at,duration_ms,directory,command,exit_code,uuid,deleted_at,author,intent,flags) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(uuid) DO UPDATE SET deleted_at=excluded.deleted_at",rusqlite::params![session,r.get::<_,i64>(1)? as f64/1e9,if duration<0{None}else{Some(duration/1_000_000)},r.get::<_,String>(5)?,command,r.get::<_,i64>(3)?,r.get::<_,String>(0)?,r.get::<_,Option<i64>>(8)?.map(|n|n as f64/1e9),r.get::<_,Option<String>>(10)?,r.get::<_,Option<String>>(11)?,flags])?;
         }
     } else {
         for line in std::fs::read_to_string(&source)?
@@ -952,6 +965,16 @@ fn command_directory(c: &CapturedHistory, user: &str, command_key: &str) -> Opti
         .ok()
 }
 
+fn fallback_picker_recents(c: &CapturedHistory, user: &str) -> Result<Vec<String>> {
+    let db = c.open_connection()?;
+    let mut statement = db.prepare(
+        "SELECT DISTINCT smcli_key(c.command,c.expanded_command) FROM commands c JOIN sessions s ON s.id = c.session
+         WHERE s.user = ? AND c.deleted_at IS NULL AND NOT smcli_internal(COALESCE(c.expanded_command,c.command))
+         ORDER BY c.started_at DESC, c.id DESC",
+    )?;
+    Ok(statement.query_map([user], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 fn pick(
     c: &CapturedHistory,
     service: &ServiceClient,
@@ -986,7 +1009,7 @@ fn pick(
     let user = user_name();
     let recent = match served.and_then(|r| r.recent_entries) {
         Some(r) => r.into_iter().map(|entry| entry.key()).collect(),
-        None => c.picker_recents(&user, 50)?,
+        None => fallback_picker_recents(c, &user)?,
     };
     let native = smcli_search::native::history_files(home, env)?
         .iter()
@@ -1144,11 +1167,7 @@ fn pick(
             }
             Choice::File { hit, mode, query, scope } => {
                 if hit.provenance != ["*"] {
-                    let mut r = ServiceRequest::new(Operation::Select);
-                    r.directory = Some(scope);
-                    r.path = Some(hit.path.clone());
-                    r.mode = Some(mode.as_str().into());
-                    r.query = Some(query);
+                    let r = file_selection_request(scope, hit.path.clone(), mode, query);
                     let _ = service.send(&r, None, Duration::from_secs(2));
                 }
                 let shell = env.get("SMCLI_SHELL").map(String::as_str).unwrap_or("bash");
@@ -1170,6 +1189,16 @@ fn pick(
     Ok(())
 }
 
+fn file_selection_request(scope: String, path: String, mode: Mode, query: String) -> ServiceRequest {
+    let mut request = ServiceRequest::new(Operation::Select);
+    request.directory = Some(scope);
+    request.path = Some(path);
+    request.mode = Some(mode.as_str().into());
+    request.query = Some(query);
+    request.scope = Some(true);
+    request
+}
+
 struct LocalFileSearch {
     cwd: PathBuf,
     home: PathBuf,
@@ -1184,30 +1213,21 @@ impl LocalFileSearch {
         let mut hits = Vec::new();
         match mode {
             Mode::Files => {
-                let mut files = Vec::new();
-                self.walk(&scope, &mut |p| {
+                let mut entries = Vec::new();
+                let mut budget = 10_000;
+                self.walk(&scope, 0, &mut budget, &mut |p, is_dir| {
                     let rel = p.strip_prefix(&scope).unwrap().to_string_lossy().into_owned();
-                    if query.is_empty() || rel.to_lowercase().contains(&query.to_lowercase()) {
-                        files.push(rel);
+                    if (query.is_empty() || rel.to_lowercase().contains(&query.to_lowercase()))
+                        && (kind == 0 || is_dir == (kind == 1))
+                    {
+                        entries.push((rel, is_dir));
                     }
                 });
-                files.sort();
-                files.truncate(100);
-                if kind == 1 {
-                    let mut seen = std::collections::HashSet::new();
-                    for rel in files {
-                        if let Some(parent) = Path::new(&rel).parent() {
-                            let dir = parent.to_string_lossy().into_owned();
-                            if !dir.is_empty() && seen.insert(dir.clone()) {
-                                let path = format!("{dir}/");
-                                hits.push(self.file_hit(&path, &scope_str, &cwd_str, &home_str, "files"));
-                            }
-                        }
-                    }
-                } else {
-                    for rel in files {
-                        hits.push(self.file_hit(&rel, &scope_str, &cwd_str, &home_str, "files"));
-                    }
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                entries.truncate(100);
+                for (rel, is_dir) in entries {
+                    let rel = if is_dir { format!("{rel}/") } else { rel };
+                    hits.push(self.file_hit(&rel, &scope_str, &cwd_str, &home_str, "files"));
                 }
             }
             Mode::Grep => {
@@ -1216,7 +1236,10 @@ impl LocalFileSearch {
                     vec![target]
                 } else {
                     let mut files = Vec::new();
-                    self.walk(&scope, &mut |p| files.push(p.to_path_buf()));
+                    let mut budget = 10_000;
+                    self.walk(&scope, 0, &mut budget, &mut |p, is_dir| {
+                        if !is_dir { files.push(p.to_path_buf()); }
+                    });
                     files
                 };
                 for file in sources {
@@ -1243,15 +1266,21 @@ impl LocalFileSearch {
         Ok(FileResults { hits, complete: true })
     }
 
-    fn walk(&self, dir: &Path, on_file: &mut dyn FnMut(&Path)) {
+    fn walk(&self, dir: &Path, depth: usize, budget: &mut usize, on_entry: &mut dyn FnMut(&Path, bool)) {
+        if depth >= 32 || *budget == 0 { return; }
         let Ok(entries) = std::fs::read_dir(dir) else { return };
-        for e in entries.flatten() {
+        for entry in entries {
+            if *budget == 0 { break; }
+            *budget -= 1;
+            let Ok(e) = entry else { continue };
             let path = e.path();
             if path.file_name().is_some_and(|n| n == ".git") { continue; }
-            if path.is_dir() {
-                self.walk(&path, on_file);
-            } else if path.is_file() {
-                on_file(&path);
+            let Ok(file_type) = e.file_type() else { continue };
+            if file_type.is_dir() {
+                on_entry(&path, true);
+                self.walk(&path, depth + 1, budget, on_entry);
+            } else if file_type.is_file() {
+                on_entry(&path, false);
             }
         }
     }
@@ -1505,6 +1534,78 @@ mod tests {
 
     use super::*;
     #[test]
+    fn fallback_walker_skips_directory_symlink_cycles_within_budget() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("smcli-walk-cycle-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("nested"))?;
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&root, root.join("nested/back-one"))?;
+            std::os::unix::fs::symlink(&root, root.join("nested/back-two"))?;
+        }
+        let search = LocalFileSearch { cwd: root.clone(), home: root.clone() };
+        let result = search.search(Mode::Files, "", 0, root.to_str().unwrap(), None)?;
+        assert!(result.hits.iter().any(|hit| hit.path == "nested/"));
+        assert!(!result.hits.iter().any(|hit| hit.path.contains("back-one") || hit.path.contains("back-two")));
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_walker_obeys_entry_budget() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("smcli-walk-budget-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root)?;
+        for name in ["one", "two", "three"] { std::fs::write(root.join(name), "")?; }
+        let search = LocalFileSearch { cwd: root.clone(), home: root.clone() };
+        let mut budget = 1;
+        let mut seen = Vec::new();
+        search.walk(&root, 0, &mut budget, &mut |path, _| seen.push(path.to_path_buf()));
+        assert_eq!(seen.len(), 1);
+        assert_eq!(budget, 0);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_walker_obeys_depth_limit() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("smcli-walk-depth-{}", uuid::Uuid::new_v4()));
+        let mut leaf = root.clone();
+        for _ in 0..33 { leaf.push("d"); }
+        std::fs::create_dir_all(&leaf)?;
+        let search = LocalFileSearch { cwd: root.clone(), home: root.clone() };
+        let mut budget = 10_000;
+        let mut deepest = 0;
+        search.walk(&root, 0, &mut budget, &mut |path, _| {
+            deepest = deepest.max(path.strip_prefix(&root).unwrap().components().count());
+        });
+        assert_eq!(deepest, 32);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_folder_picker_lists_empty_directories() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("smcli-walk-empty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("empty"))?;
+        let search = LocalFileSearch { cwd: root.clone(), home: root.clone() };
+        std::fs::write(root.join("visible.txt"), "file")?;
+        let result = search.search(Mode::Files, "", 1, root.to_str().unwrap(), None)?;
+        assert!(result.hits.iter().any(|hit| hit.path == "empty/"));
+        let mixed = search.search(Mode::Files, "", 0, root.to_str().unwrap(), None)?;
+        assert!(mixed.hits.iter().any(|hit| hit.path == "visible.txt"));
+        assert!(mixed.hits.iter().any(|hit| hit.path == "empty/"));
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_file_selection_request_sets_scope() {
+        let request = file_selection_request("/repo/sub".into(), "needle.rs".into(), Mode::Files, "needle".into());
+        assert_eq!(request.scope, Some(true));
+        assert_eq!(request.directory.as_deref(), Some("/repo/sub"));
+        assert_eq!(request.path.as_deref(), Some("needle.rs"));
+    }
+
+    #[test]
     fn parse_flags_and_times() {
         assert!(Cli::try_parse_from(["smcli", "search", "git", "--flag", "--all"]).is_ok());
         assert!(Cli::try_parse_from(["smcli", "complete", "--word", "@foo", "--command", "cd", "--limit", "5"]).is_ok());
@@ -1520,12 +1621,29 @@ mod tests {
     }
 
     #[test]
+    fn fallback_history_picker_includes_oldest_distinct_capture() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("smcli-fallback-history-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let c = CapturedHistory::new(dir.join("history.db"));
+        for n in 0..52 {
+            let command = format!("command-{n:02}");
+            let mut run = NewRun::new(&command, "zsh", "/tmp", 0);
+            run.started_at = Some(1_700_000_000.0 + n as f64);
+            c.append(&run, "", None)?;
+        }
+        let recent = fallback_picker_recents(&c, &user_name())?;
+        assert!(recent.iter().any(|key| smcli_core::entry::command_parts(key).0 == "command-00"));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn atuin_import_deduplicates_and_replace_is_atomic() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("smcli-atuin-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir)?;
         let source = dir.join("atuin.db");
         let db = rusqlite::Connection::open(&source)?;
-        db.execute_batch("CREATE TABLE history(id TEXT,timestamp INTEGER,duration INTEGER,exit INTEGER,command TEXT,cwd TEXT,session TEXT,hostname TEXT); INSERT INTO history VALUES('atuin-id',1700000000000000000,1000000000,0,'git status','/tmp','session','host:user');")?;
+        db.execute_batch("CREATE TABLE history(id TEXT,timestamp INTEGER,duration INTEGER,exit INTEGER,command TEXT,cwd TEXT,session TEXT,hostname TEXT,deleted_at INTEGER); INSERT INTO history VALUES('atuin-id',1700000000000000000,1000000000,0,'git status','/tmp','session','host:user',NULL);")?;
         let c = CapturedHistory::new(dir.join("history.db"));
         for _ in 0..2 {
             import(&c, &dir, &HashMap::new(), true, false, Some(source.clone()))?;
@@ -1534,6 +1652,12 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["durationMs"], 1000);
         assert_eq!(rows[0]["user"], "user");
+        db.execute("UPDATE history SET deleted_at=1700000001 WHERE id='atuin-id'", [])?;
+        import(&c, &dir, &HashMap::new(), true, false, Some(source.clone()))?;
+        assert!(records(&c)?.is_empty());
+        db.execute("UPDATE history SET deleted_at=NULL WHERE id='atuin-id'", [])?;
+        import(&c, &dir, &HashMap::new(), true, false, Some(source.clone()))?;
+        assert_eq!(records(&c)?.len(), 1);
         import(&c, &dir, &HashMap::new(), true, true, Some(source))?;
         assert_eq!(records(&c)?.len(), 1);
         drop(db);
@@ -1698,6 +1822,7 @@ mod tests {
              INSERT INTO commands(session,started_at,directory,command,exit_code) VALUES
                ('s',1700000000.0,'/tmp','git push',0),
                ('s',1700000001.0,'/tmp','secret-cmd',0);
+             INSERT INTO file_selections(root,path,mode,query,selected_at) VALUES('/tmp','secret.txt','files','secret query',1700000005.0);
              INSERT INTO command_selections(query,command,kind,directory,selected_at) VALUES
                ('AKIAABCDEFGHIJKLMNOP','git push','search','/tmp',1700000002.0),
                ('push','git push','search','/tmp',1700000003.0),
@@ -1720,6 +1845,7 @@ mod tests {
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         assert_eq!(selections, ["push"]);
+        assert_eq!(db.query_row("SELECT count(*) FROM file_selections", [], |r| r.get::<_, i64>(0))?, 0);
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
