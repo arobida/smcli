@@ -33,11 +33,12 @@ pub fn run(args: Init, path: &Path, service: &ServiceClient) -> Result<()> {
                 .collect();
             if names
                 .iter()
-                .any(|s| !["ctrl-r", "left", "right", "ctrl-t", "ctrl-g", "none"].contains(&s.as_str()))
+                .any(|s| !["up", "ctrl-r", "left", "right", "ctrl-t", "ctrl-g", "none"].contains(&s.as_str()))
                 || (names.iter().any(|s| s == "none") && names.len() > 1)
             {
-                bail!("--keys takes ctrl-r,left,right,ctrl-t,ctrl-g or none.");
+                bail!("--keys takes up,ctrl-r,left,right,ctrl-t,ctrl-g or none.");
             }
+            config.up_key = Some(names.iter().any(|s| s == "up"));
             config.ctrl_r_key = Some(names.iter().any(|s| s == "ctrl-r"));
             config.left_key = Some(names.iter().any(|s| s == "left"));
             config.right_key = Some(names.iter().any(|s| s == "right"));
@@ -45,7 +46,7 @@ pub fn run(args: Init, path: &Path, service: &ServiceClient) -> Result<()> {
             config.ctrl_g_key = Some(names.iter().any(|s| s == "ctrl-g"));
         } else {
             if !io::stdin().is_terminal() {
-                bail!("smcli init --keys needs a terminal; pass --keys ctrl-r,left,right,ctrl-t,ctrl-g.");
+                bail!("smcli init --keys needs a terminal; pass --keys up,ctrl-r,left,right,ctrl-t,ctrl-g.");
             }
             choose(&mut config)?;
         }
@@ -104,6 +105,7 @@ fn persisted_potion(value: &str) -> std::io::Result<String> {
 }
 
 fn choose(c: &mut SmcliConfig) -> Result<()> {
+    let up = ask("Open history with Up?", c.up_key.unwrap_or(true))?;
     let r = ask("Open history with Ctrl-R?", c.ctrl_r_key.unwrap_or(true))?;
     let l = ask(
         "Open history with Left on an empty line?",
@@ -115,6 +117,7 @@ fn choose(c: &mut SmcliConfig) -> Result<()> {
     )?;
     let t = ask("Open files with Ctrl-T?", c.ctrl_t_key.unwrap_or(true))?;
     let g = ask("Open grep with Ctrl-G?", c.ctrl_g_key.unwrap_or(true))?;
+    c.up_key = Some(up);
     c.ctrl_r_key = Some(r);
     c.left_key = Some(l);
     c.right_key = Some(right);

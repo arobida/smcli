@@ -42,8 +42,9 @@ init="$(SMCLI_CONFIG="$cfg" "$bin" shell-init zsh)"
 [[ $init == *"(( 0 )) && _smcli_bind \$_smcli_keymap '^R'"* && $init == *"|| (( 1 )); then"* ]]
 [[ $init == *"(( 0 )) && _smcli_bind \$_smcli_keymap '^T'"* && $init == *"(( 0 )) && _smcli_bind \$_smcli_keymap '^G'"* ]]
 SMCLI_CONFIG="$cfg" "$bin" init --keys ctrl-r,left > /dev/null
-grep -Eq '"ctrlRKey" ?: true' "$cfg"
-if SMCLI_CONFIG="$cfg" "$bin" init --keys up > /dev/null 2>&1; then
+grep -Eq '"ctrlRKey" ?: true' "$cfg" && grep -Eq '"upKey" ?: false' "$cfg"
+[[ $(SMCLI_CONFIG="$cfg" "$bin" shell-init zsh) == *"(( 0 )) && _smcli_bind \$_smcli_keymap '^[[A'"* ]]
+if SMCLI_CONFIG="$cfg" "$bin" init --keys down > /dev/null 2>&1; then
     printf 'An unknown key should fail.\n' >&2
     exit 1
 fi

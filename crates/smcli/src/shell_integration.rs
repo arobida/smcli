@@ -13,6 +13,7 @@ pub fn render_config(shell: &str, binary_path: &str, config: &SmcliConfig) -> Re
         config.right_key.or(config.left_key).unwrap_or(false),
         config.ctrl_t_key.unwrap_or(true),
         config.ctrl_g_key.unwrap_or(true),
+        config.up_key.unwrap_or(true),
     )
 }
 
@@ -24,6 +25,7 @@ pub fn render_with_keys(
     right: bool,
     ctrl_t: bool,
     ctrl_g: bool,
+    up: bool,
 ) -> Result<String> {
     let binary = if shell == "fish" {
         format!(
@@ -339,7 +341,7 @@ elif [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
     _smcli_kept=
     # From `smcli init`: Ctrl-R, and Left and Right on an empty line.
     (( \#(keyR) )) && _smcli_bind '\C-r' _smcli_pick 'reverse-search-history history-search-backward'
-    _smcli_bind '\e[A' _smcli_pick 'previous-history history-search-backward'
+    (( \#(keyUp) )) && _smcli_bind '\e[A' _smcli_pick 'previous-history history-search-backward'
     _smcli_bind '\eOA' _smcli_pick 'previous-history history-search-backward'
     if (( \#(keyT) )); then
         _smcli_bind '\C-t' _smcli_pick_files transpose-chars
@@ -575,8 +577,8 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
     for _smcli_keymap in emacs viins; do
         # From `smcli init`: Ctrl-R, and Left and Right on an empty line.
         (( \#(keyR) )) && _smcli_bind $_smcli_keymap '^R' _smcli_pick 'redisplay|history-incremental-(pattern-|)search-backward|history-search-backward'
-        _smcli_bind $_smcli_keymap '^[[A' _smcli_pick_up 'up-line-or-(history|beginning-search)'
-        _smcli_bind $_smcli_keymap '^[OA' _smcli_pick_up 'up-line-or-(history|beginning-search)'
+        (( \#(keyUp) )) && _smcli_bind $_smcli_keymap '^[[A' _smcli_pick_up 'up-line-or-(history|beginning-search)'
+        (( \#(keyUp) )) && _smcli_bind $_smcli_keymap '^[OA' _smcli_pick_up 'up-line-or-(history|beginning-search)'
         (( \#(keyT) )) && _smcli_bind $_smcli_keymap '^T' _smcli_pick_files 'transpose-chars|self-insert'
         (( \#(keyG) )) && _smcli_bind $_smcli_keymap '^G' _smcli_pick_grep 'send-break|list-expand|self-insert'
         if [[ -n ${SMCLI_EXTRA_KEYS-} ]] || (( \#(keyLeft) )); then
@@ -810,8 +812,8 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
     test \#(keyR) = 1; and _smcli_bind \cr _smcli_pick
     test \#(keyT) = 1; and _smcli_bind \ct _smcli_pick_files
     test \#(keyG) = 1; and _smcli_bind \cg _smcli_pick_grep
-    _smcli_bind \e\[A _smcli_pick_up
-    _smcli_bind \eOA _smcli_pick_up
+    test \#(keyUp) = 1; and _smcli_bind \e\[A _smcli_pick_up
+    test \#(keyUp) = 1; and _smcli_bind \eOA _smcli_pick_up
     if test \#(keyLeft) = 1
         _smcli_bind \e\[D _smcli_pick_left
         _smcli_bind \eOD _smcli_pick_left
@@ -861,6 +863,7 @@ end"###
         .replace(r"\#(keyLeft)", if left { "1" } else { "0" })
         .replace(r"\#(keyT)", if ctrl_t { "1" } else { "0" })
         .replace(r"\#(keyG)", if ctrl_g { "1" } else { "0" })
+        .replace(r"\#(keyUp)", if up { "1" } else { "0" })
         .replace(
             if shell == "fish" {
                 r"\#(fishBinary)"
@@ -878,7 +881,7 @@ mod tests {
     #[test]
     fn at_completion_hooks_call_smcli_complete() {
         for shell in ["bash", "zsh", "fish"] {
-            let hooks = render_with_keys(shell, "smcli", true, false, false, false, false).unwrap();
+            let hooks = render_with_keys(shell, "smcli", true, false, false, false, false, true).unwrap();
             assert!(hooks.contains("complete --word"), "{shell}");
             assert!(hooks.contains("_smcli_complete"), "{shell}");
             assert!(hooks.contains("SMCLI_NO_KEYS"), "{shell}");
@@ -888,15 +891,15 @@ mod tests {
     #[test]
     fn record_hooks_pass_optional_expanded_flag() {
         for shell in ["bash", "zsh", "fish"] {
-            let hooks = render_with_keys(shell, "smcli", true, false, false, false, false).unwrap();
+            let hooks = render_with_keys(shell, "smcli", true, false, false, false, false, true).unwrap();
             assert!(hooks.contains("--expanded"), "{shell} missing --expanded");
             assert!(hooks.contains("8192"), "{shell} missing the 8192-byte gate");
         }
-        let bash = render_with_keys("bash", "smcli", true, false, false, false, false).unwrap();
+        let bash = render_with_keys("bash", "smcli", true, false, false, false, false, true).unwrap();
         assert!(bash.contains("BASH_ALIASES") && bash.contains("alias --"));
-        let zsh = render_with_keys("zsh", "smcli", true, false, false, false, false).unwrap();
+        let zsh = render_with_keys("zsh", "smcli", true, false, false, false, false, true).unwrap();
         assert!(zsh.contains("_smcli_executed=$3") && zsh.contains("_smcli_alias \"$1\" \"$3\""));
-        let fish = render_with_keys("fish", "smcli", true, false, false, false, false).unwrap();
+        let fish = render_with_keys("fish", "smcli", true, false, false, false, false, true).unwrap();
         assert!(fish.contains("[$]argv") && !fish.contains("abbr -"));
     }
 
@@ -913,7 +916,7 @@ mod tests {
                 .unwrap()
                 .contains("set -g _smcli_bin 'a\\'\\\\b\\\\#(keyR)'")
         );
-        let hooks = render_with_keys("zsh", "smcli", false, true, false, false, false).unwrap();
+        let hooks = render_with_keys("zsh", "smcli", false, true, false, false, false, true).unwrap();
         assert!(hooks.contains("(( 0 )) && _smcli_bind $_smcli_keymap '^R'"));
         assert!(hooks.contains("|| (( 1 )); then"));
         assert!(render_config("unknown", path, &SmcliConfig::default()).is_err());
@@ -921,7 +924,7 @@ mod tests {
 
     #[test]
     fn empty_prompt_arrows_open_history_and_suggestions() {
-        let bash = render_with_keys("bash", "smcli", true, true, true, true, true).unwrap();
+        let bash = render_with_keys("bash", "smcli", true, true, true, true, true, true).unwrap();
         assert!(bash.contains("(( 1 )) && _smcli_bind '\\C-r' _smcli_pick "));
         assert!(bash.contains("if (( 1 )); then\n        _smcli_bind '\\C-t' _smcli_pick_files"));
         assert!(bash.contains("if [[ -z $READLINE_LINE ]]; then _smcli_pick\n"));
@@ -933,7 +936,7 @@ mod tests {
         assert!(!bash.contains("#(key"));
         assert!(!bash.contains("ight)"));
 
-        let zsh = render_with_keys("zsh", "smcli", true, true, true, true, true).unwrap();
+        let zsh = render_with_keys("zsh", "smcli", true, true, true, true, true, true).unwrap();
         assert!(zsh.contains("(( 1 )) && _smcli_bind $_smcli_keymap '^R' _smcli_pick "));
         assert!(zsh.contains("(( 1 )) && _smcli_bind $_smcli_keymap '^T' _smcli_pick_files"));
         assert!(zsh.contains("if [[ -z $BUFFER ]]; then _smcli_pick; else zle backward-char; fi"));
@@ -943,19 +946,19 @@ mod tests {
         assert!(zsh.contains("'backward-char|vi-backward-char'"));
         assert!(zsh.contains("'forward-char|vi-forward-char'"));
 
-        let off = render_with_keys("zsh", "smcli", true, false, false, true, true).unwrap();
+        let off = render_with_keys("zsh", "smcli", true, false, false, true, true, true).unwrap();
         assert!(off.contains("(( 1 )) && _smcli_bind $_smcli_keymap '^R'"));
         assert!(off.contains("(( 1 )) && _smcli_bind $_smcli_keymap '^T'"));
         assert!(off.contains("|| (( 0 )); then\n            _smcli_bind $_smcli_keymap '^[[D'"));
         assert!(off.contains("|| (( 0 )); then\n            _smcli_bind $_smcli_keymap '^[[C'"));
 
-        let right_only = render_with_keys("bash", "smcli", false, false, true, false, false).unwrap();
+        let right_only = render_with_keys("bash", "smcli", false, false, true, false, false, true).unwrap();
         assert!(right_only.contains("(( 0 )) && _smcli_bind '\\C-r'"));
         assert!(right_only.contains("if (( 0 )); then\n        _smcli_bind '\\C-t' _smcli_pick_files"));
         assert!(right_only.contains("|| (( 0 )); then\n        _smcli_bind '\\e[D'"));
         assert!(right_only.contains("|| (( 1 )); then\n        _smcli_bind '\\e[C'"));
 
-        let fish = render_with_keys("fish", "smcli", true, true, true, true, true).unwrap();
+        let fish = render_with_keys("fish", "smcli", true, true, true, true, true, true).unwrap();
         assert!(fish.contains("test 1 = 1; and _smcli_bind \\cr _smcli_pick"));
         assert!(fish.contains("test 1 = 1; and _smcli_bind \\ct _smcli_pick_files"));
         assert!(!fish.contains("_smcli_pick_right"));
@@ -981,20 +984,20 @@ mod tests {
     #[test]
     fn edit_paths_branch_runs_file_picker_on_first_placeholder() {
         for shell in ["bash", "zsh", "fish"] {
-            let hooks = render_with_keys(shell, "smcli", true, false, false, false, false).unwrap();
+            let hooks = render_with_keys(shell, "smcli", true, false, false, false, false, true).unwrap();
             assert!(hooks.contains("code == 11") || hooks.contains("$code -eq 11"), "{shell} missing exit-11 branch");
             assert!(hooks.contains("pick --files"), "{shell} missing file picker call");
             assert!(hooks.contains("SMCLI_FILES_LINE="), "{shell} missing edit header");
             assert!(!hooks.contains("SMCLI_FILES_DIRS"), "{shell} duplicates the start filter decision");
         }
-        let bash = render_with_keys("bash", "smcli", true, false, false, false, false).unwrap();
+        let bash = render_with_keys("bash", "smcli", true, false, false, false, false, true).unwrap();
         assert!(bash.contains("READLINE_LINE=\"$before@$after\""));
         assert!(bash.contains("SMCLI_LBUFFER=\"$before@\""));
         assert!(bash.contains("READLINE_LINE=\"$before$picked$after\""));
-        let zsh = render_with_keys("zsh", "smcli", true, false, false, false, false).unwrap();
+        let zsh = render_with_keys("zsh", "smcli", true, false, false, false, false, true).unwrap();
         assert!(zsh.contains("BUFFER=\"$before@$after\""));
         assert!(zsh.contains("BUFFER=\"$before$picked$after\""));
-        let fish = render_with_keys("fish", "smcli", true, false, false, false, false).unwrap();
+        let fish = render_with_keys("fish", "smcli", true, false, false, false, false, true).unwrap();
         assert!(fish.contains("commandline -r -- \"$before@$after\""));
         assert!(fish.contains("commandline -r -- \"$before$picked$after\""));
     }

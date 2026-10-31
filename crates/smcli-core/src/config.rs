@@ -25,7 +25,7 @@ pub struct SmcliConfig {
     pub ctrl_g_key: Option<bool>,
     /// Picker keys bound by shell-init, chosen in `smcli init`: Ctrl-R and Ctrl-T file search (on unless false).
     /// On an empty line, Left opens that same history search and Right opens directory suggestions (Bash and Zsh;
-    /// each off unless true). Up is always bound; SMCLI_NO_KEYS=1 still skips them all.
+    /// each off unless true). Up opens history too (on unless false); SMCLI_NO_KEYS=1 still skips them all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ctrl_r_key: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,6 +46,8 @@ pub struct SmcliConfig {
     /// Right arrow on an empty line opens directory suggestions (Bash and Zsh; off unless true).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub right_key: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub up_key: Option<bool>,
     /// The model's vector size, recorded at init so the index can be opened without a network call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ollama_dimension: Option<i64>,

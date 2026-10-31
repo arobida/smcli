@@ -7,7 +7,7 @@
 #   --prefix DIR    where the executables go (default ~/.local/bin)
 #   --from DIR      a directory holding smcli and smcli-service (default: beside this script, else build)
 #   --shells LIST   zsh,bash,fish to hook (default: your login shell, asking first in a terminal; `all`: every one installed; `none`)
-#   --keys LIST     picker keys: any of ctrl-r,left,right,ctrl-t,ctrl-g, or none (default: ask in a terminal, else ctrl-r,ctrl-t,ctrl-g)
+#   --keys LIST     picker keys: any of up,ctrl-r,left,right,ctrl-t,ctrl-g, or none (default: ask in a terminal, else up,ctrl-r,ctrl-t,ctrl-g)
 #   --atuin yes|no  import Atuin's history if found (default: ask in a terminal, else no); safe to rerun, duplicates are skipped
 #   --yes           don't ask anything; with no --keys, keeps the default keys (Up, Ctrl-R, Ctrl-T and Ctrl-G)
 set -euo pipefail
