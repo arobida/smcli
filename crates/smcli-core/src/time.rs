@@ -37,21 +37,41 @@ pub fn format_iso8601(epoch: f64, fractional: bool) -> String {
     if fractional { format!("{base}.{:03}Z", millis.rem_euclid(1000)) } else { format!("{base}Z") }
 }
 
+fn days_in_month(y: i64, mo: i64) -> i64 {
+    match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
 /// `YYYY-MM-DDTHH:MM:SS[.fff](Z|±HH:MM)`.
 pub fn parse_iso8601(text: &str) -> Option<f64> {
+    if !text.is_ascii() {
+        return None;
+    }
     let b = text.as_bytes();
-    let num = |r: std::ops::Range<usize>| -> Option<i64> { text.get(r)?.parse().ok() };
+    // ASCII digits only — `str::parse` would accept a leading sign (`+-1:00`).
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let s = text.get(r)?;
+        if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        s.parse().ok()
+    };
     if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
         return None;
     }
     let (y, mo, d, h, mi, s) = (num(0..4)?, num(5..7)?, num(8..10)?, num(11..13)?, num(14..16)?, num(17..19)?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
+    if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || s > 60 {
         return None;
     }
     let mut rest = &text[19..];
     let mut fraction = 0.0;
     if let Some(after) = rest.strip_prefix('.') {
-        let digits = after.chars().take_while(char::is_ascii_digit).count();
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
         if digits == 0 {
             return None;
         }
@@ -60,9 +80,16 @@ pub fn parse_iso8601(text: &str) -> Option<f64> {
     }
     let offset = match rest {
         "Z" => 0,
-        _ if rest.len() == 6 && (rest.starts_with('+') || rest.starts_with('-')) && &rest[3..4] == ":" => {
+        _ if rest.len() == 6 && (rest.starts_with('+') || rest.starts_with('-')) && rest.as_bytes()[3] == b':' => {
+            let digits2 = |s: &str| -> Option<i64> {
+                if s.len() == 2 && s.bytes().all(|c| c.is_ascii_digit()) { s.parse().ok() } else { None }
+            };
+            let (oh, om) = (digits2(&rest[1..3])?, digits2(&rest[4..6])?);
+            if oh > 23 || om > 59 {
+                return None;
+            }
             let sign = if rest.starts_with('-') { -1 } else { 1 };
-            sign * (rest[1..3].parse::<i64>().ok()? * 3600 + rest[4..6].parse::<i64>().ok()? * 60)
+            sign * (oh * 3600 + om * 60)
         }
         _ => return None,
     };
@@ -82,5 +109,13 @@ mod tests {
         assert_eq!(parse_iso8601("2023-11-14T23:13:20.5+01:00"), Some(1_700_000_000.5));
         assert_eq!(parse_iso8601("2024-02-29T00:00:00Z"), Some(1_709_164_800.0));
         assert_eq!(parse_iso8601("2023-11-14"), None);
+    }
+
+    #[test]
+    fn parse_iso8601_rejects_impossible_values() {
+        assert_eq!(parse_iso8601("2023-02-31T00:00:00Z"), None);
+        assert_eq!(parse_iso8601("2023-11-14T22:13:20+99:99"), None);
+        assert_eq!(parse_iso8601("2026-01-01T00:00:00+1é00"), None);
+        assert_eq!(parse_iso8601("2023-11-14T22:13:20+-1:00"), None);
     }
 }
