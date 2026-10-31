@@ -392,7 +392,7 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
                 hit=$hits
                 if [[ $hits == *$'\n'* ]]; then
                     # Several matches: pick one in the files picker, filtered by the word.
-                    hit=$(env SMCLI_SHELL=bash SMCLI_LBUFFER="$before" SMCLI_FILES_QUERY="${word#@}" SMCLI_FILES_LINE="$READLINE_LINE" "$_smcli_complete_bin" pick --files </dev/tty)
+                    hit=$(env SMCLI_SHELL=bash SMCLI_LBUFFER="$before" SMCLI_FILES_QUERY="${word#@}" "$_smcli_complete_bin" pick --files </dev/tty)
                     (( $? == 10 )) || hit=
                 fi
                 if [[ -n $hit ]]; then
@@ -419,7 +419,7 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
             if (( ${#COMPREPLY[@]} > 1 )); then
                 # Several matches: pick one in the files picker, filtered by the word.
                 local line_before=${COMP_LINE:0:COMP_POINT}
-                line=$(env SMCLI_SHELL=bash SMCLI_LBUFFER="$line_before" SMCLI_FILES_QUERY="${cur#@}" SMCLI_FILES_LINE="$COMP_LINE" "$_smcli_complete_bin" pick --files </dev/tty)
+                line=$(env SMCLI_SHELL=bash SMCLI_LBUFFER="$line_before" SMCLI_FILES_QUERY="${cur#@}" "$_smcli_complete_bin" pick --files </dev/tty)
                 if (( $? == 10 )); then COMPREPLY=("$line"); else COMPREPLY=("$cur"); fi
             fi
         }
@@ -627,7 +627,7 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
         elif (( $#hits > 1 )); then
             # Several matches: pick one in the files picker, filtered by the word.
             local chosen
-            chosen=$(env SMCLI_SHELL=zsh SMCLI_LBUFFER=$LBUFFER SMCLI_FILES_QUERY=${word#@} SMCLI_FILES_LINE=$BUFFER "$_smcli_complete_bin" pick --files </dev/tty)
+            chosen=$(env SMCLI_SHELL=zsh SMCLI_LBUFFER=$LBUFFER SMCLI_FILES_QUERY=${word#@} "$_smcli_complete_bin" pick --files </dev/tty)
             (( $? == 10 )) && LBUFFER="${LBUFFER%$word}$chosen"
             zle reset-prompt
         fi
@@ -838,7 +838,7 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
             else if test (count $hits) -gt 1
                 # Several matches: pick one in the files picker, filtered by the word.
                 set -l before (commandline -c | string collect)
-                set -l chosen (env SMCLI_SHELL=fish SMCLI_LBUFFER=$before SMCLI_FILES_QUERY=(string sub -s 2 -- $token) SMCLI_FILES_LINE=(commandline | string collect) $_smcli_complete_bin pick --files </dev/tty)
+                set -l chosen (env SMCLI_SHELL=fish SMCLI_LBUFFER=$before SMCLI_FILES_QUERY=(string sub -s 2 -- $token) $_smcli_complete_bin pick --files </dev/tty)
                 test $status -eq 10; and commandline -t -- (string join \n -- $chosen | string collect)
                 commandline -f repaint
             end

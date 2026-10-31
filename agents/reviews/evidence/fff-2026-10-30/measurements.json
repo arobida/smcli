@@ -1,0 +1,1341 @@
+{
+  "homogeneous": {
+    "machine": {
+      "platform": "macOS-27.0.1-arm64-arm-64bit-Mach-O",
+      "logical_cpus": 8
+    },
+    "binary": "/private/tmp/smcli-fff-audit-6hk7c8zy/dist/smcli-service-20261030-113631-90f13a2",
+    "root": "/tmp/fff-audit-i27jp158",
+    "measurements": {
+      "10000": {
+        "root": "/tmp/fff-audit-i27jp158/tree10000",
+        "cold_files_ms": 161.1399159883149,
+        "index_cpu_s": 0.5769685416666667,
+        "settled": {
+          "cpu_s": 0.6494858333333333,
+          "rss_mib": 95.078125,
+          "footprint_mib": 75.85987854003906,
+          "read_bytes": 33701888,
+          "written_bytes": 77824
+        },
+        "files": {
+          "median_ms": 3.743250505067408,
+          "p95_ms": 9.344541991595179,
+          "cpu_s": 0.11365937499999999,
+          "wall_s": 0.09297654099646024,
+          "hits": 100,
+          "partial": false,
+          "rss_mib": 95.40625,
+          "footprint_mib": 75.85987854003906
+        },
+        "blank": {
+          "median_ms": 2.395041999989189,
+          "p95_ms": 2.7824580029118806,
+          "cpu_s": 0.0781128333333333,
+          "wall_s": 0.048004041018430144,
+          "hits": 100,
+          "partial": false,
+          "rss_mib": 98.109375,
+          "footprint_mib": 75.98487854003906
+        },
+        "grep_rareuniqueneedle": {
+          "median_ms": 74.770333521883,
+          "p95_ms": 78.57008301652968,
+          "cpu_s": 4.267681166666667,
+          "wall_s": 0.7561575830040965,
+          "hits": 1,
+          "partial": false,
+          "rss_mib": 98.5,
+          "footprint_mib": 76.25052642822266
+        },
+        "grep_absentuniqueneedle": {
+          "median_ms": 76.5027294983156,
+          "p95_ms": 77.27129201521166,
+          "cpu_s": 4.270819583333334,
+          "wall_s": 0.7614187909930479,
+          "hits": 0,
+          "partial": false,
+          "rss_mib": 98.53125,
+          "footprint_mib": 76.29742431640625
+        },
+        "grep_commonneedle": {
+          "median_ms": 2.0794584997929633,
+          "p95_ms": 2.1684170060325414,
+          "cpu_s": 0.030474499999999977,
+          "wall_s": 0.021274707978591323,
+          "hits": 104,
+          "partial": true,
+          "rss_mib": 98.59375,
+          "footprint_mib": 76.29742431640625
+        },
+        "grep_abcdefghijklmnopqrstuvxyz": {
+          "median_ms": 75.13881199702155,
+          "p95_ms": 80.36016701953486,
+          "cpu_s": 4.269779666666666,
+          "wall_s": 0.7643590000225231,
+          "hits": 0,
+          "partial": false,
+          "rss_mib": 98.59375,
+          "footprint_mib": 76.29742431640625
+        },
+        "idle_cpu_s_per_3s": 0.003856374999999801,
+        "concurrent_8_grep": {
+          "wall_s": 0.6090105420153122,
+          "cpu_s": 3.3269418750000006,
+          "max_latency_ms": 594.941084011225
+        },
+        "service": {
+          "baseline": {
+            "cpu_s": 0.07251729166666666,
+            "rss_mib": 87.703125,
+            "footprint_mib": 75.09423065185547,
+            "read_bytes": 33701888,
+            "written_bytes": 77824
+          },
+          "end": {
+            "cpu_s": 17.011453083333333,
+            "rss_mib": 98.765625,
+            "footprint_mib": 76.34429931640625,
+            "read_bytes": 33701888,
+            "written_bytes": 77824
+          },
+          "peak_sampled_rss_mib": 99.390625,
+          "peak_sampled_footprint_mib": 77.18798065185547,
+          "storage_before": {
+            "h.db-shm": {
+              "bytes": 32768,
+              "allocated": 32768
+            },
+            "h.db-wal": {
+              "bytes": 0,
+              "allocated": 0
+            },
+            "stderr": {
+              "bytes": 0,
+              "allocated": 0
+            },
+            "h.db": {
+              "bytes": 36864,
+              "allocated": 36864
+            },
+            "h.db.migration.lock": {
+              "bytes": 0,
+              "allocated": 0
+            },
+            "run/service-97ea78d48190c6ab.lock": {
+              "bytes": 0,
+              "allocated": 0
+            }
+          },
+          "storage_after": {
+            "h.db-shm": {
+              "bytes": 32768,
+              "allocated": 32768
+            },
+            "h.db-wal": {
+              "bytes": 0,
+              "allocated": 0
+            },
+            "stderr": {
+              "bytes": 0,
+              "allocated": 0
+            },
+            "h.db": {
+              "bytes": 36864,
+              "allocated": 36864
+            },
+            "h.db.migration.lock": {
+              "bytes": 0,
+              "allocated": 0
+            },
+            "run/service-97ea78d48190c6ab.lock": {
+              "bytes": 0,
+              "allocated": 0
+            }
+          }
+        }
+      },
+      "50000": {
+        "root": "/tmp/fff-audit-i27jp158/tree50000",
+        "cold_files_ms": 750.2447500010021,
+        "index_cpu_s": 3.1100963333333334,
+        "settled": {
+          "cpu_s": 3.1666630000000002,
+          "rss_mib": 110.328125,
+          "footprint_mib": 79.75050354003906,
+          "read_bytes": 33525760,
+          "written_bytes": 77824
+        },
+        "files": {
+          "median_ms": 5.117917011375539,
+          "p95_ms": 7.332250010222197,
+          "cpu_s": 0.2482265416666665,
+          "wall_s": 0.1196932909952011,
+          "hits": 100,
+          "partial": false,
+          "rss_mib": 110.8125,
+          "footprint_mib": 79.79737854003906
+        },
+        "blank": {
+          "median_ms": 3.4698749950621277,
+          "p95_ms": 3.664249990833923,
+          "cpu_s": 0.1380689583333333,
+          "wall_s": 0.0713370839948766,
+          "hits": 100,
+          "partial": false,
+          "rss_mib": 117.359375,
+          "footprint_mib": 79.95365142822266
+        },
+        "grep_rareuniqueneedle": {
+          "median_ms": 778.7446250003995,
+          "p95_ms": 821.3831250031944,
+          "cpu_s": 44.62240270833333,
+          "wall_s": 7.782408333994681,
+          "hits": 1,
+          "partial": false,
+          "rss_mib": 117.8125,
+          "footprint_mib": 80.26619720458984
+        },
+        "grep_absentuniqueneedle": {
+          "median_ms": 775.858438006253,
+          "p95_ms": 780.2491250040475,
+          "cpu_s": 44.24548475,
+          "wall_s": 7.7670254159893375,
+          "hits": 0,
+          "partial": false,
+          "rss_mib": 117.859375,
+          "footprint_mib": 80.31307220458984
+        },
+        "grep_commonneedle": {
+          "median_ms": 2.5742289872141555,
+          "p95_ms": 2.701416000491008,
+          "cpu_s": 0.03667179166666479,
+          "wall_s": 0.02671362500404939,
+          "hits": 104,
+          "partial": true,
+          "rss_mib": 117.9375,
+          "footprint_mib": 80.31307220458984
+        },
+        "grep_abcdefghijklmnopqrstuvxyz": {
+          "median_ms": 779.4029164942913,
+          "p95_ms": 783.8509580178652,
+          "cpu_s": 43.452368041666666,
+          "wall_s": 7.712769208999816,
+          "hits": 0,
+          "partial": false,
+          "rss_mib": 117.953125,
+          "footprint_mib": 80.32869720458984
+        },
+        "idle_cpu_s_per_3s": 0.004383833333343468,
+        "concurrent_8_grep": {
+          "wall_s": 1.0239250409940723,
+          "cpu_s": 5.741592666666666,
+          "max_latency_ms": 1021.4214590087067
+        },
+        "service": {
+          "baseline": {
+            "cpu_s": 0.056566666666666675,
+            "rss_mib": 87.703125,
+            "footprint_mib": 75.10985565185547,
+            "read_bytes": 33525760,
+            "written_bytes": 77824
+          },
+          "end": {
+            "cpu_s": 141.656393125,
+            "rss_mib": 119.9375,
+            "footprint_mib": 80.35994720458984,
+            "read_bytes": 33525760,
+            "written_bytes": 77824
+          },
+          "peak_sampled_rss_mib": 120.5625,
+          "peak_sampled_footprint_mib": 94.28175354003906,
+          "storage_before": {
+            "h.db-shm": {
+              "bytes": 32768,
+              "allocated": 32768
+            },
+            "h.db-wal": {
+              "bytes": 0,
+              "allocated": 0
+            },
+            "stderr": {
+              "bytes": 0,
+              "allocated": 0
+            },
+            "h.db": {
+              "bytes": 36864,
+              "allocated": 36864
+            },
+            "h.db.migration.lock": {
+              "bytes": 0,
+              "allocated": 0
+            },
+            "run/service-2de41d6902383047.lock": {
+              "bytes": 0,
+              "allocated": 0
+            }
+          },
+          "storage_after": {
+            "h.db-shm": {
+              "bytes": 32768,
+              "allocated": 32768
+            },
+            "h.db-wal": {
+              "bytes": 0,
+              "allocated": 0
+            },
+            "stderr": {
+              "bytes": 0,
+              "allocated": 0
+            },
+            "h.db": {
+              "bytes": 36864,
+              "allocated": 36864
+            },
+            "h.db.migration.lock": {
+              "bytes": 0,
+              "allocated": 0
+            },
+            "run/service-2de41d6902383047.lock": {
+              "bytes": 0,
+              "allocated": 0
+            }
+          }
+        }
+      }
+    },
+    "cpu_clock": "proc_pid_rusage Mach ticks converted with mach_timebase_info=125/3; calibrated against ps with a busy-loop subprocess"
+  },
+  "diverse_and_checkout": {
+    "diverse50000": {
+      "root": "/tmp/fff-audit-hexe7jwv/diverse50000",
+      "cold_files_ms": 1482.7490840107203,
+      "index_cpu_s": 3.0285537916666665,
+      "settled": {
+        "cpu_s": 3.074121208333333,
+        "rss_mib": 165.515625,
+        "footprint_mib": 155.93809509277344,
+        "read_bytes": 238333952,
+        "written_bytes": 77824
+      },
+      "files": {
+        "median_ms": 5.514645992661826,
+        "p95_ms": 6.909916992299259,
+        "cpu_s": 0.2466081666666664,
+        "wall_s": 0.11930337498779409,
+        "hits": 100,
+        "partial": false,
+        "rss_mib": 166.625,
+        "footprint_mib": 157.04747009277344
+      },
+      "blank": {
+        "median_ms": 2.6150835037697107,
+        "p95_ms": 2.8517080063465983,
+        "cpu_s": 0.08716054166666698,
+        "wall_s": 0.052576999994926155,
+        "hits": 100,
+        "partial": false,
+        "rss_mib": 173.015625,
+        "footprint_mib": 163.40684509277344
+      },
+      "grep_rareuniqueneedle": {
+        "median_ms": 23.986770989722572,
+        "p95_ms": 24.312624998856336,
+        "cpu_s": 1.1548698333333332,
+        "wall_s": 0.24675454100361094,
+        "hits": 1,
+        "partial": false,
+        "rss_mib": 173.34375,
+        "footprint_mib": 163.67251586914062
+      },
+      "grep_absentuniqueneedle": {
+        "median_ms": 9.287750013754703,
+        "p95_ms": 10.087916976772249,
+        "cpu_s": 0.4407509583333331,
+        "wall_s": 0.09559437501593493,
+        "hits": 0,
+        "partial": false,
+        "rss_mib": 173.375,
+        "footprint_mib": 163.70376586914062
+      },
+      "grep_commonneedle": {
+        "median_ms": 2.4901254946598783,
+        "p95_ms": 2.5798340211622417,
+        "cpu_s": 0.03363854166666691,
+        "wall_s": 0.0250897090008948,
+        "hits": 105,
+        "partial": true,
+        "rss_mib": 173.5,
+        "footprint_mib": 163.82876586914062
+      },
+      "grep_abcdefghijklmnopqrstuvxyz": {
+        "median_ms": 0.132478991872631,
+        "p95_ms": 0.2176669950131327,
+        "cpu_s": 0.002151583333333207,
+        "wall_s": 0.0017582079744897783,
+        "hits": 0,
+        "partial": false,
+        "rss_mib": 173.5,
+        "footprint_mib": 163.82876586914062
+      },
+      "idle_cpu_s_per_3s": 0.004409875000000341,
+      "concurrent_8_grep": {
+        "wall_s": 0.025895792001392692,
+        "cpu_s": 0.005208833333332663,
+        "max_latency_ms": 5.832709022797644
+      },
+      "service": {
+        "baseline": {
+          "cpu_s": 0.04556741666666666,
+          "rss_mib": 142.53125,
+          "footprint_mib": 135.12554931640625,
+          "read_bytes": 33525760,
+          "written_bytes": 77824
+        },
+        "end": {
+          "cpu_s": 5.0496129583333325,
+          "rss_mib": 173.5,
+          "footprint_mib": 163.82876586914062,
+          "read_bytes": 238333952,
+          "written_bytes": 77824
+        },
+        "peak_sampled_rss_mib": 173.5625,
+        "peak_sampled_footprint_mib": 163.89126586914062,
+        "storage_before": {
+          "h.db-shm": {
+            "bytes": 32768,
+            "allocated": 32768
+          },
+          "h.db-wal": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "stderr": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "h.db": {
+            "bytes": 36864,
+            "allocated": 36864
+          },
+          "h.db.migration.lock": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "run/service-5342bdded8382420.lock": {
+            "bytes": 0,
+            "allocated": 0
+          }
+        },
+        "storage_after": {
+          "h.db-shm": {
+            "bytes": 32768,
+            "allocated": 32768
+          },
+          "h.db-wal": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "stderr": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "h.db": {
+            "bytes": 36864,
+            "allocated": 36864
+          },
+          "h.db.migration.lock": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "run/service-5342bdded8382420.lock": {
+            "bytes": 0,
+            "allocated": 0
+          }
+        }
+      }
+    },
+    "checkout": {
+      "cold_files_ms": 71.59920799313113,
+      "settled": {
+        "cpu_s": 0.14103658333333333,
+        "rss_mib": 146.65625,
+        "footprint_mib": 136.23494720458984,
+        "read_bytes": 5468160,
+        "written_bytes": 77824
+      },
+      "files": {
+        "median_ms": 1.4069375029066578,
+        "p95_ms": 6.481749995145947,
+        "cpu_s": 0.038321458333333336,
+        "wall_s": 0.055113709007855505,
+        "hits": 50,
+        "partial": false,
+        "rss_mib": 146.75,
+        "footprint_mib": 136.32869720458984
+      },
+      "grep": {
+        "median_ms": 2.010771000641398,
+        "p95_ms": 2.721791999647394,
+        "cpu_s": 0.11458512499999998,
+        "wall_s": 0.042553040984785184,
+        "hits": 40,
+        "partial": false,
+        "rss_mib": 150.078125,
+        "footprint_mib": 136.64122009277344
+      },
+      "missing": {
+        "median_ms": 0.22581248776987195,
+        "p95_ms": 0.32254098914563656,
+        "cpu_s": 0.012598999999999971,
+        "wall_s": 0.005317750008543953,
+        "hits": 1,
+        "partial": false,
+        "rss_mib": 150.078125,
+        "footprint_mib": 136.64122009277344
+      },
+      "service": {
+        "baseline": {
+          "cpu_s": 0.06521004166666666,
+          "rss_mib": 141.3125,
+          "footprint_mib": 133.90679931640625,
+          "read_bytes": 0,
+          "written_bytes": 77824
+        },
+        "end": {
+          "cpu_s": 0.3065421666666666,
+          "rss_mib": 150.078125,
+          "footprint_mib": 136.64122009277344,
+          "read_bytes": 5500928,
+          "written_bytes": 77824
+        },
+        "peak_sampled_rss_mib": 150.15625,
+        "peak_sampled_footprint_mib": 136.71934509277344,
+        "storage_before": {
+          "h.db-shm": {
+            "bytes": 32768,
+            "allocated": 32768
+          },
+          "h.db-wal": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "stderr": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "h.db": {
+            "bytes": 36864,
+            "allocated": 36864
+          },
+          "h.db.migration.lock": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "run/service-7c9b24d000f7cb1b.lock": {
+            "bytes": 0,
+            "allocated": 0
+          }
+        },
+        "storage_after": {
+          "h.db-shm": {
+            "bytes": 32768,
+            "allocated": 32768
+          },
+          "h.db-wal": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "stderr": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "h.db": {
+            "bytes": 36864,
+            "allocated": 36864
+          },
+          "h.db.migration.lock": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "run/service-7c9b24d000f7cb1b.lock": {
+            "bytes": 0,
+            "allocated": 0
+          }
+        }
+      }
+    },
+    "root": "/tmp/fff-audit-hexe7jwv"
+  },
+  "pool": {
+    "base": {
+      "cpu_s": 0.06804404166666667,
+      "rss_mib": 141.375,
+      "footprint_mib": 133.95365142822266,
+      "read_bytes": 0,
+      "written_bytes": 77824
+    },
+    "steps": [
+      {
+        "root": "/tmp/fff-audit-i27jp158/tree10000",
+        "ms": 335.169500001939,
+        "usage": {
+          "cpu_s": 0.7047237916666665,
+          "rss_mib": 150.734375,
+          "footprint_mib": 141.06307220458984,
+          "read_bytes": 45064192,
+          "written_bytes": 77824
+        },
+        "instances": [
+          {
+            "id": 1,
+            "root": "/private/tmp/fff-audit-i27jp158/tree10000"
+          }
+        ]
+      },
+      {
+        "root": "/tmp/fff-audit-i27jp158/tree50000",
+        "ms": 1366.3683330232743,
+        "usage": {
+          "cpu_s": 3.485488416666666,
+          "rss_mib": 164.8125,
+          "footprint_mib": 155.12557220458984,
+          "read_bytes": 249876480,
+          "written_bytes": 77824
+        },
+        "instances": [
+          {
+            "id": 1,
+            "root": "/private/tmp/fff-audit-i27jp158/tree10000"
+          },
+          {
+            "id": 2,
+            "root": "/private/tmp/fff-audit-i27jp158/tree50000"
+          }
+        ]
+      },
+      {
+        "root": "/tmp/fff-audit-hexe7jwv/diverse50000",
+        "ms": 1521.0012909956276,
+        "usage": {
+          "cpu_s": 6.538070208333333,
+          "rss_mib": 55.421875,
+          "footprint_mib": 158.95372009277344,
+          "read_bytes": 454688768,
+          "written_bytes": 77824
+        },
+        "instances": [
+          {
+            "id": 1,
+            "root": "/private/tmp/fff-audit-i27jp158/tree10000"
+          },
+          {
+            "id": 2,
+            "root": "/private/tmp/fff-audit-i27jp158/tree50000"
+          },
+          {
+            "id": 3,
+            "root": "/private/tmp/fff-audit-hexe7jwv/diverse50000"
+          }
+        ]
+      },
+      {
+        "root": "/tmp/smcli-fff-audit-6hk7c8zy",
+        "ms": 77.26666700909846,
+        "usage": {
+          "cpu_s": 6.651996791666666,
+          "rss_mib": 58.46875,
+          "footprint_mib": 159.48497009277344,
+          "read_bytes": 458784768,
+          "written_bytes": 77824
+        },
+        "instances": [
+          {
+            "id": 1,
+            "root": "/private/tmp/fff-audit-i27jp158/tree10000"
+          },
+          {
+            "id": 2,
+            "root": "/private/tmp/fff-audit-i27jp158/tree50000"
+          },
+          {
+            "id": 3,
+            "root": "/private/tmp/fff-audit-hexe7jwv/diverse50000"
+          },
+          {
+            "id": 4,
+            "root": "/private/tmp/smcli-fff-audit-6hk7c8zy"
+          }
+        ]
+      }
+    ],
+    "fifth_instances": [
+      {
+        "id": 2,
+        "root": "/private/tmp/fff-audit-i27jp158/tree50000"
+      },
+      {
+        "id": 3,
+        "root": "/private/tmp/fff-audit-hexe7jwv/diverse50000"
+      },
+      {
+        "id": 4,
+        "root": "/private/tmp/smcli-fff-audit-6hk7c8zy"
+      },
+      {
+        "id": 5,
+        "root": "/private/tmp/fff-audit-qsafgq7i/fifth"
+      }
+    ],
+    "after_fifth": {
+      "cpu_s": 6.6576224999999996,
+      "rss_mib": 59.25,
+      "footprint_mib": 159.57874298095703,
+      "read_bytes": 458805248,
+      "written_bytes": 77824
+    },
+    "capacity_service": {
+      "baseline": {
+        "cpu_s": 0.06804404166666667,
+        "rss_mib": 141.375,
+        "footprint_mib": 133.95365142822266,
+        "read_bytes": 0,
+        "written_bytes": 77824
+      },
+      "end": {
+        "cpu_s": 6.657650541666666,
+        "rss_mib": 59.25,
+        "footprint_mib": 159.57874298095703,
+        "read_bytes": 458805248,
+        "written_bytes": 77824
+      },
+      "peak_sampled_rss_mib": 169.375,
+      "peak_sampled_footprint_mib": 159.73497009277344,
+      "storage_before": {
+        "h.db-shm": {
+          "bytes": 32768,
+          "allocated": 32768
+        },
+        "h.db-wal": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "stderr": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "h.db": {
+          "bytes": 36864,
+          "allocated": 36864
+        },
+        "h.db.migration.lock": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "run/service-b1ec4d9500248ea2.lock": {
+          "bytes": 0,
+          "allocated": 0
+        }
+      },
+      "storage_after": {
+        "h.db-shm": {
+          "bytes": 32768,
+          "allocated": 32768
+        },
+        "h.db-wal": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "stderr": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "h.db": {
+          "bytes": 36864,
+          "allocated": 36864
+        },
+        "h.db.migration.lock": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "run/service-b1ec4d9500248ea2.lock": {
+          "bytes": 0,
+          "allocated": 0
+        }
+      }
+    },
+    "idle_after_index": {
+      "cpu_s": 0.8338365416666665,
+      "rss_mib": 151.1875,
+      "footprint_mib": 141.51619720458984,
+      "read_bytes": 16384,
+      "written_bytes": 77824
+    },
+    "idle_cpu_16s": 0.024728375000000025,
+    "after_idle": {
+      "cpu_s": 0.8585649166666666,
+      "rss_mib": 151.15625,
+      "footprint_mib": 141.46932220458984,
+      "read_bytes": 16384,
+      "written_bytes": 77824
+    },
+    "idle_instances": [],
+    "idle_service": {
+      "baseline": {
+        "cpu_s": 0.07217279166666667,
+        "rss_mib": 142.734375,
+        "footprint_mib": 135.32867431640625,
+        "read_bytes": 16384,
+        "written_bytes": 77824
+      },
+      "end": {
+        "cpu_s": 0.8589732916666666,
+        "rss_mib": 151.171875,
+        "footprint_mib": 141.48494720458984,
+        "read_bytes": 16384,
+        "written_bytes": 77824
+      },
+      "peak_sampled_rss_mib": 151.203125,
+      "peak_sampled_footprint_mib": 141.53182220458984,
+      "storage_before": {
+        "h.db-shm": {
+          "bytes": 32768,
+          "allocated": 32768
+        },
+        "h.db-wal": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "stderr": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "h.db": {
+          "bytes": 36864,
+          "allocated": 36864
+        },
+        "h.db.migration.lock": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "run/service-fc9ac9cbeeef8f4c.lock": {
+          "bytes": 0,
+          "allocated": 0
+        }
+      },
+      "storage_after": {
+        "h.db-shm": {
+          "bytes": 32768,
+          "allocated": 32768
+        },
+        "h.db-wal": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "stderr": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "h.db": {
+          "bytes": 36864,
+          "allocated": 36864
+        },
+        "h.db.migration.lock": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "run/service-fc9ac9cbeeef8f4c.lock": {
+          "bytes": 0,
+          "allocated": 0
+        }
+      }
+    }
+  },
+  "dense_and_ranking": {
+    "dense": {
+      "hits": 100000,
+      "response_mib": 14.390103340148926,
+      "ms": 1419.8760830040555,
+      "before": {
+        "cpu_s": 0.05718808333333333,
+        "rss_mib": 146.53125,
+        "footprint_mib": 136.92242431640625,
+        "read_bytes": 0,
+        "written_bytes": 77824
+      },
+      "after": {
+        "cpu_s": 1.3393381249999998,
+        "rss_mib": 202.015625,
+        "footprint_mib": 191.06316375732422,
+        "read_bytes": 0,
+        "written_bytes": 77824
+      },
+      "service": {
+        "baseline": {
+          "cpu_s": 0.042459166666666666,
+          "rss_mib": 142.703125,
+          "footprint_mib": 135.29742431640625,
+          "read_bytes": 0,
+          "written_bytes": 77824
+        },
+        "end": {
+          "cpu_s": 1.3393992916666666,
+          "rss_mib": 202.015625,
+          "footprint_mib": 191.06316375732422,
+          "read_bytes": 0,
+          "written_bytes": 77824
+        },
+        "peak_sampled_rss_mib": 202.015625,
+        "peak_sampled_footprint_mib": 191.06316375732422,
+        "storage_before": {
+          "h.db-shm": {
+            "bytes": 32768,
+            "allocated": 32768
+          },
+          "h.db-wal": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "stderr": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "h.db": {
+            "bytes": 36864,
+            "allocated": 36864
+          },
+          "h.db.migration.lock": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "run/service-bd6a3569d0e462a8.lock": {
+            "bytes": 0,
+            "allocated": 0
+          }
+        },
+        "storage_after": {
+          "h.db-shm": {
+            "bytes": 32768,
+            "allocated": 32768
+          },
+          "h.db-wal": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "stderr": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "h.db": {
+            "bytes": 36864,
+            "allocated": 36864
+          },
+          "h.db.migration.lock": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "run/service-bd6a3569d0e462a8.lock": {
+            "bytes": 0,
+            "allocated": 0
+          }
+        }
+      }
+    },
+    "a.*b": [
+      [
+        "needle.rs",
+        "literal a.*b"
+      ],
+      [
+        "xneedle.rs",
+        "literal a.*b"
+      ],
+      [
+        "sub/needle.rs",
+        "literal a.*b"
+      ]
+    ],
+    "axxxb": [
+      [
+        "needle.rs",
+        "literal axxxb"
+      ],
+      [
+        "xneedle.rs",
+        "literal axxxb"
+      ],
+      [
+        "sub/needle.rs",
+        "literal axxxb"
+      ]
+    ],
+    "mixed": [
+      [
+        "needle.rs",
+        "MiXeD"
+      ],
+      [
+        "xneedle.rs",
+        "MiXeD"
+      ],
+      [
+        "sub/needle.rs",
+        "MiXeD"
+      ]
+    ],
+    "MiXeD": [
+      [
+        "needle.rs",
+        "MiXeD"
+      ],
+      [
+        "xneedle.rs",
+        "MiXeD"
+      ],
+      [
+        "sub/needle.rs",
+        "MiXeD"
+      ]
+    ],
+    "MIXED": [],
+    "ranking": {
+      "exact": {
+        "v": 3,
+        "ok": true,
+        "files": [
+          {
+            "path": "needle.rs",
+            "insert": "needle.rs",
+            "provenance": [
+              "files"
+            ],
+            "git": "??"
+          },
+          {
+            "path": "sub/needle.rs",
+            "insert": "sub/needle.rs",
+            "provenance": [
+              "files"
+            ],
+            "git": "??"
+          },
+          {
+            "path": "xneedle.rs",
+            "insert": "xneedle.rs",
+            "provenance": [
+              "files",
+              "picked"
+            ],
+            "git": "??"
+          }
+        ],
+        "root": "/private/tmp/fff-audit-lwahac1i/ranking",
+        "instance": 1,
+        "build": "/private/tmp/smcli-fff-audit-6hk7c8zy/dist/smcli-service-20261030-113631-90f13a2|1793352991.916366992|18851632"
+      },
+      "blank": {
+        "v": 3,
+        "ok": true,
+        "files": [
+          {
+            "path": "needle.rs",
+            "insert": "needle.rs",
+            "provenance": [
+              "files"
+            ],
+            "git": "??"
+          },
+          {
+            "path": "xneedle.rs",
+            "insert": "xneedle.rs",
+            "provenance": [
+              "files"
+            ],
+            "git": "??"
+          },
+          {
+            "path": "sub/needle.rs",
+            "insert": "sub/needle.rs",
+            "provenance": [
+              "files"
+            ],
+            "git": "??"
+          },
+          {
+            "path": "",
+            "insert": "",
+            "provenance": [
+              "files"
+            ]
+          },
+          {
+            "path": "sub/",
+            "insert": "sub/",
+            "provenance": [
+              "files"
+            ]
+          }
+        ],
+        "root": "/private/tmp/fff-audit-lwahac1i/ranking",
+        "instance": 1,
+        "build": "/private/tmp/smcli-fff-audit-6hk7c8zy/dist/smcli-service-20261030-113631-90f13a2|1793352991.916366992|18851632"
+      },
+      "baseline_blank": {
+        "v": 3,
+        "ok": true,
+        "files": [
+          {
+            "path": "needle.rs",
+            "insert": "needle.rs",
+            "provenance": [
+              "files"
+            ],
+            "git": "??"
+          },
+          {
+            "path": "xneedle.rs",
+            "insert": "xneedle.rs",
+            "provenance": [
+              "files"
+            ],
+            "git": "??"
+          },
+          {
+            "path": "sub/needle.rs",
+            "insert": "sub/needle.rs",
+            "provenance": [
+              "files"
+            ],
+            "git": "??"
+          },
+          {
+            "path": "",
+            "insert": "",
+            "provenance": [
+              "files"
+            ]
+          },
+          {
+            "path": "sub/",
+            "insert": "sub/",
+            "provenance": [
+              "files"
+            ]
+          }
+        ],
+        "root": "/private/tmp/fff-audit-lwahac1i/ranking",
+        "instance": 1,
+        "build": "/private/tmp/smcli-fff-audit-6hk7c8zy/dist/smcli-service-20261030-113631-90f13a2|1793352991.916366992|18851632"
+      },
+      "service": {
+        "baseline": {
+          "cpu_s": 0.03978883333333333,
+          "rss_mib": 141.34375,
+          "footprint_mib": 133.93804931640625,
+          "read_bytes": 0,
+          "written_bytes": 77824
+        },
+        "end": {
+          "cpu_s": 0.067359375,
+          "rss_mib": 146.328125,
+          "footprint_mib": 136.09434509277344,
+          "read_bytes": 49152,
+          "written_bytes": 81920
+        },
+        "peak_sampled_rss_mib": 146.0625,
+        "peak_sampled_footprint_mib": 135.85994720458984,
+        "storage_before": {
+          "h.db-shm": {
+            "bytes": 32768,
+            "allocated": 32768
+          },
+          "h.db-wal": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "stderr": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "h.db": {
+            "bytes": 36864,
+            "allocated": 36864
+          },
+          "h.db.migration.lock": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "run/service-000181ab6a77c033.lock": {
+            "bytes": 0,
+            "allocated": 0
+          }
+        },
+        "storage_after": {
+          "h.db-shm": {
+            "bytes": 32768,
+            "allocated": 32768
+          },
+          "h.db-wal": {
+            "bytes": 41232,
+            "allocated": 45056
+          },
+          "stderr": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "h.db": {
+            "bytes": 36864,
+            "allocated": 36864
+          },
+          "h.db.migration.lock": {
+            "bytes": 0,
+            "allocated": 0
+          },
+          "run/service-000181ab6a77c033.lock": {
+            "bytes": 0,
+            "allocated": 0
+          }
+        }
+      }
+    }
+  },
+  "medium_files": {
+    "source_bytes": 52428800,
+    "files": 200,
+    "cold_files_ms": 89.22029100358486,
+    "baseline": {
+      "cpu_s": 0.044579125,
+      "rss_mib": 142.53125,
+      "footprint_mib": 135.12554931640625,
+      "read_bytes": 0,
+      "written_bytes": 77824
+    },
+    "after_index": {
+      "cpu_s": 0.12846233333333332,
+      "rss_mib": 146.015625,
+      "footprint_mib": 136.51617431640625,
+      "read_bytes": 0,
+      "written_bytes": 77824
+    },
+    "grep_missing": {
+      "median_ms": 1.6069580160547048,
+      "p95_ms": 1.97275000391528,
+      "cpu_s": 0.07714254166666668,
+      "wall_s": 0.02567516700946726,
+      "hits": 0,
+      "partial": false,
+      "rss_mib": 196.328125,
+      "footprint_mib": 136.81314086914062
+    },
+    "service": {
+      "baseline": {
+        "cpu_s": 0.044579125,
+        "rss_mib": 142.53125,
+        "footprint_mib": 135.12554931640625,
+        "read_bytes": 0,
+        "written_bytes": 77824
+      },
+      "end": {
+        "cpu_s": 0.2063975833333333,
+        "rss_mib": 196.328125,
+        "footprint_mib": 136.81314086914062,
+        "read_bytes": 0,
+        "written_bytes": 77824
+      },
+      "peak_sampled_rss_mib": 196.328125,
+      "peak_sampled_footprint_mib": 136.84434509277344,
+      "storage_before": {
+        "h.db-shm": {
+          "bytes": 32768,
+          "allocated": 32768
+        },
+        "h.db-wal": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "stderr": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "h.db": {
+          "bytes": 36864,
+          "allocated": 36864
+        },
+        "h.db.migration.lock": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "run/service-8abfc8f5fa37b9de.lock": {
+          "bytes": 0,
+          "allocated": 0
+        }
+      },
+      "storage_after": {
+        "h.db-shm": {
+          "bytes": 32768,
+          "allocated": 32768
+        },
+        "h.db-wal": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "stderr": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "h.db": {
+          "bytes": 36864,
+          "allocated": 36864
+        },
+        "h.db.migration.lock": {
+          "bytes": 0,
+          "allocated": 0
+        },
+        "run/service-8abfc8f5fa37b9de.lock": {
+          "bytes": 0,
+          "allocated": 0
+        }
+      }
+    }
+  },
+  "installed_storage": {
+    "/Users/arobida/.local/share/smcli/history.db": {
+      "logical_bytes": 7577600,
+      "allocated_bytes": 8425472,
+      "files": 1
+    },
+    "/Users/arobida/.local/share/smcli/history.db.search": {
+      "logical_bytes": 71782400,
+      "allocated_bytes": 50548736,
+      "files": 2
+    },
+    "/Users/arobida/.local/bin/smcli-service": {
+      "logical_bytes": 18851632,
+      "allocated_bytes": 18853888,
+      "files": 1
+    },
+    "/Users/arobida/.local/bin/potion-shell-16m": {
+      "logical_bytes": 33514821,
+      "allocated_bytes": 33529856,
+      "files": 4
+    }
+  },
+  "metadata": {
+    "commit": "90f13a21fe59c7df5ef81e3627ec762764b778e1",
+    "fff_commit": "95fd777c2529fc7b4d7572dabff64cc07268f2c5",
+    "binary_sha256": "476b16388145e65f346cce919c385ccb7b64c0da1ba69ed3ce7957d8c120e9da",
+    "machine": "MacBookPro18,3, 16 GiB, 8 logical CPUs / 6 performance cores, macOS 27.0.1",
+    "build": "make release in isolated snapshot, no application fixes",
+    "cpu_calibration": "proc_pid_rusage values are Mach ticks, scaled by mach_timebase_info 125/3; busy-loop subprocess raw 0.041400086*125/3=1.725s, ps TIME=1.73s",
+    "scope_reproduction": {
+      "fixture": "30 older inside/moduleinside*.rs; 80 newer outside/module*.rs; each contains scopecommon; limit=3",
+      "cold_child_files": 3,
+      "cold_child_grep": 3,
+      "parent_first_child_files": 0,
+      "parent_first_child_grep": 0,
+      "single_file_grep": 0
+    },
+    "picker_sort_probe": "Actual suggested_first function in isolated snapshot moved picked xneedle.rs above exact needle.rs; temporary unit test passed. Live picker end-to-end attempt did not establish this case.",
+    "diverse_fixture_note": "57.077 MiB, 100 varied deterministic identifier templates; rare marker prepended to the final file and its one-hit result asserted. This replaces an initial fixture whose appended marker was truncated."
+  }
+}

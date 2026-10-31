@@ -501,8 +501,8 @@ pub fn run(
                 };
                 format!("{}  →  {}", abbreviate(&cwd, &home), displayed)
             };
-            let header = if let Some(text) = edit_files_header(picker.mode, picker.files_line.as_deref()) {
-                Line::styled(format!(" {text}"), ACCENT)
+            let header = if let Some(line) = edit_files_header(picker.mode, picker.files_line.as_deref(), true) {
+                line
             } else if compact && (!history || (picker.suggested_view && picker.title.is_some())) {
                 // Only the searched directory, which grows and shrinks as Tab moves in and out; suggestions name the cwd.
                 let (label, dir) = if history { ("suggested", &cwd) } else { (label, &scope) };
@@ -1027,17 +1027,40 @@ impl Drop for TerminalSession {
     }
 }
 
-fn edit_files_header(mode: Mode, line: Option<&str>) -> Option<String> {
-    line.filter(|_| mode == Mode::Files).map(|line| format!("edit @ {}", visible(line)))
+/// `ok` picks the arrow and placeholder color: green now, red once edits can fail.
+fn edit_files_header(mode: Mode, line: Option<&str>, ok: bool) -> Option<Line<'static>> {
+    let line = visible(line.filter(|_| mode == Mode::Files)?);
+    let status = Style::new().fg(if ok { Color::Green } else { Color::Red }).add_modifier(Modifier::BOLD);
+    // A placeholder is a bare @, not the start of a word like npm's @scope/pkg.
+    let is_placeholder = |s: &str, i: usize| s[i..].starts_with('@') && !s[i + 1..].starts_with(|c: char| c.is_alphanumeric() || "_./-".contains(c));
+    let total = (0..line.len()).filter(|&i| is_placeholder(&line, i)).count();
+    let mut spans = vec![Span::styled(" editing ", ACCENT), Span::styled("→ ", status)];
+    let mut n = 0;
+    for span in highlight(&line) {
+        let text = span.content.into_owned();
+        let mut start = 0;
+        for i in (0..text.len()).filter(|&i| is_placeholder(&text, i)) {
+            spans.push(Span::styled(text[start..i].to_string(), span.style));
+            n += 1;
+            // The number is display only; the accepted line keeps the bare @.
+            spans.push(Span::styled(if total > 1 { format!("@{n}") } else { "@".into() }, status));
+            start = i + 1;
+        }
+        spans.push(Span::styled(text[start..].to_string(), span.style));
+    }
+    Some(Line::from(spans))
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn files_edit_header() {
-        assert_eq!(super::edit_files_header(super::Mode::Files, Some("cat @")), Some("edit @ cat @".into()));
-        assert_eq!(super::edit_files_header(super::Mode::Files, None), None);
-        assert_eq!(super::edit_files_header(super::Mode::History, Some("cat @")), None);
+        let text = |line| super::edit_files_header(super::Mode::Files, Some(line), true).map(|l| l.to_string());
+        assert_eq!(text("cat @").as_deref(), Some(" editing → cat @"));
+        assert_eq!(text("mv @ @").as_deref(), Some(" editing → mv @1 @2"));
+        assert_eq!(text("npm i @scope/pkg --out=@").as_deref(), Some(" editing → npm i @scope/pkg --out=@"));
+        assert_eq!(super::edit_files_header(super::Mode::Files, None, true), None);
+        assert_eq!(super::edit_files_header(super::Mode::History, Some("cat @"), true), None);
     }
 
     use super::*;
