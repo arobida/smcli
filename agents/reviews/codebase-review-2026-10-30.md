@@ -16,6 +16,7 @@ These findings were reproduced in the preceding audit in this conversation. They
 
 #### 1. **Prune leaves rejected file-search queries in SQLite** (`crates/smcli/src/cli.rs:692`).
 
+- **Status:** fixed 2026-10-31.
 - **What this is:** File/grep selections store the typed query.
 - **Problem:** Prune handles commands and command selections but ignores `file_selections`; a newly rejected `secret query` remained after pruning.
 - **Fix:** Filter file selections in the same transaction before compaction.
@@ -23,6 +24,7 @@ These findings were reproduced in the preceding audit in this conversation. They
 
 #### 2. **Atuin re-import misses later deletions** (`crates/smcli/src/cli.rs:855`).
 
+- **Status:** fixed 2026-10-31.
 - **What this is:** UUIDs deduplicate imported records.
 - **Problem:** `INSERT OR IGNORE` leaves a previously imported command visible after it is deleted in Atuin and re-imported.
 - **Fix:** Update deletion state on UUID conflict.
@@ -30,6 +32,7 @@ These findings were reproduced in the preceding audit in this conversation. They
 
 #### 3. **Unicode crashes the new edit-path header** (`crates/smcli/src/picker.rs:1035`).
 
+- **Status:** fixed 2026-10-31.
 - **What this is:** The uncommitted header numbers path placeholders.
 - **Problem:** Iterating byte offsets and slicing at each offset panics for `echo café @` (exit 101).
 - **Fix:** Use character boundaries in both loops and add a Unicode regression case.
@@ -37,6 +40,7 @@ These findings were reproduced in the preceding audit in this conversation. They
 
 #### 4. **Home-abbreviated insertion paths do not expand** (`crates/smcli/src/shell_quoting.rs:17`; `crates/smcli-core/src/service_location.rs:102`).
 
+- **Status:** fixed 2026-10-31.
 - **What this is:** Results outside the current directory may use `~/repo/file`.
 - **Problem:** Quoting produces `'~/repo/file'`; a real sibling completion then fails `test -f`.
 - **Fix:** Use absolute paths for insertion and abbreviate only display text.
@@ -44,6 +48,7 @@ These findings were reproduced in the preceding audit in this conversation. They
 
 #### 5. **Local file fallback follows directory cycles without a work budget** (`crates/smcli/src/cli.rs:1246`).
 
+- **Status:** fixed 2026-10-31.
 - **What this is:** A separate recursive walker handles service failure.
 - **Problem:** Two directory links back to the current folder prevented the synthetic scan from returning within two seconds. No depth/entry budget or cycle detection exists.
 - **Fix:** Reuse bounded traversal rules and avoid following directory symlinks.
@@ -51,6 +56,7 @@ These findings were reproduced in the preceding audit in this conversation. They
 
 #### 6. **Fallback history picker loses older captures** (`crates/smcli/src/cli.rs:989`).
 
+- **Status:** fixed 2026-10-31.
 - **What this is:** Typing filters the captured-command picker.
 - **Problem:** Fallback loads 50 rows; service mode returns all distinct commands. With 52 captures and no native history, the oldest selection succeeded with the service and failed without it.
 - **Fix:** Supply the same distinct-command set in both paths.
@@ -58,6 +64,7 @@ These findings were reproduced in the preceding audit in this conversation. They
 
 #### 7. **Timestamp parser accepts impossible values and can panic** (`crates/smcli-core/src/time.rs:41`).
 
+- **Status:** fixed 2026-10-31.
 - **What this is:** Imported timestamps and time filters use this parser.
 - **Problem:** February 31 and `+99:99` are accepted. Importing `2026-01-01T00:00:00+1é00` panics at a string boundary.
 - **Fix:** Validate ASCII, dates, and timezone ranges before conversion.
@@ -65,6 +72,7 @@ These findings were reproduced in the preceding audit in this conversation. They
 
 #### 8. **Uninstall removes other databases' service sockets** (`scripts/uninstall.sh:146`).
 
+- **Status:** fixed 2026-10-31.
 - **What this is:** Each database has separate runtime files.
 - **Problem:** Cleanup deletes every `service-*` file. Uninstalling database A removed running database B's socket in an isolated reproduction.
 - **Fix:** Delete only the selected database's runtime files.
@@ -72,6 +80,7 @@ These findings were reproduced in the preceding audit in this conversation. They
 
 #### 9. **Fallback folder picker cannot find empty directories** (`crates/smcli/src/cli.rs:1186`).
 
+- **Status:** fixed 2026-10-31.
 - **What this is:** Folder-only mode supports `cd` and similar commands.
 - **Problem:** Fallback derives directories from files, after truncating files to 100. Empty folders never appear.
 - **Fix:** Collect directory entries directly before limiting results.
@@ -81,6 +90,7 @@ These findings were reproduced in the preceding audit in this conversation. They
 
 #### 10. **Directory selections are rejected instead of remembered** (`crates/smcli-service/src/file_search.rs:355`).
 
+- **Status:** fixed 2026-10-31.
 - **What this is:** Picks affect later file ranking.
 - **Problem:** Normal directory hits end in `/`; validation rejects their empty final component. `folder/` returned `bad_request`.
 - **Fix:** Normalize the trailing slash before validation/storage.
@@ -88,6 +98,7 @@ These findings were reproduced in the preceding audit in this conversation. They
 
 #### 11. **Service suggestions ignore the caller's ranking switches** (`crates/smcli-core/src/service_client.rs:112`).
 
+- **Status:** fixed 2026-10-31.
 - **What this is:** `SMCLI_RANKING_OFF` disables signals.
 - **Problem:** Only search forwards it. An existing service still suggested a project script with `SMCLI_RANKING_OFF=script`; fallback excluded it.
 - **Fix:** Forward the setting for suggest/pick requests too.
@@ -180,6 +191,7 @@ CPU values use `proc_pid_rusage` with Mach clock conversion `125/3`, calibrated 
 
 #### 12. **Scope constraints are applied after the result limit — confirmed defect** (`crates/smcli-service/src/file_search.rs:196-221,259-267`).
 
+- **Status:** fixed 2026-10-31.
 - **What this is:** A ready parent index is reused for a subfolder, and grep can request one specific file.
 - **Problem:** fff searches/limits the broader set before smcli removes other paths. A fixture with thirty older inside matches and eighty newer outside matches returned three hits from a child-only index, but zero after warming the parent, for both files and grep. Single-file grep also returned zero while its target contained the text.
 - **Fix:** Apply the scope/file constraint inside fff before ranking/pagination, or use a scope-specific index. Do not fix this by increasing an arbitrary overfetch multiplier.
@@ -187,6 +199,7 @@ CPU values use `proc_pid_rusage` with Mach clock conversion `125/3`, calibrated 
 
 #### 13. **Grep result limits do not bound output or memory — confirmed defect** (`crates/smcli-service/src/file_search.rs:213-222,379-381`).
 
+- **Status:** fixed 2026-10-31.
 - **What this is:** Interactive requests normally ask for 100 matches.
 - **Problem:** The wrapper uses unlimited matches per file, while fff's page limit finishes the current file. One 1.3 MB source file returned **100,000 matches for limit=100**, about **14.39 MiB JSON**, taking **1.42 seconds**. Service RSS rose from **146.5 to 202.0 MiB**. Bigger allowed files can exceed the client's 64 MiB response allowance.
 - **Fix:** Set a finite per-file bound, enforce a hard response-count bound, and mark truncation clearly. Apply equivalent bounds to identifier/test-discovery probes using unlimited per-file matches.
@@ -194,6 +207,7 @@ CPU values use `proc_pid_rusage` with Mach clock conversion `125/3`, calibrated 
 
 #### 14. **Scoped picks are stored under the wrong root — confirmed defect** (`crates/smcli/src/cli.rs:1145-1152`; `file_search.rs:358-365`).
 
+- **Status:** fixed 2026-10-31.
 - **What this is:** Scoped hits are relative to the searched subfolder.
 - **Problem:** The picker omits `scope=true` when saving its choice. A `needle.rs` choice from `repo/sub` was stored as `(repo, needle.rs)`, the identity of the top-level file, instead of `(repo/sub, needle.rs)`.
 - **Fix:** Preserve the scope flag/identity from search through selection.
@@ -201,6 +215,7 @@ CPU values use `proc_pid_rusage` with Mach clock conversion `125/3`, calibrated 
 
 #### 15. **Blank file ranking ignores recorded pick frequency — confirmed integration gap** (`crates/smcli-service/src/file_search.rs:223-252,94`; `service.rs:96-100`).
 
+- **Status:** fixed 2026-10-31.
 - **What this is:** The initial file list is presented as frequently/recently useful files.
 - **Problem:** The blank branch neither applies SQLite selection scores nor retains `picked` provenance; the fff access tracker is absent. Four repeated choices changed neither blank ordering nor its picked markers in the fixture. External editor file-open history is not collected here.
 - **Fix:** Use the existing SQLite pick scores for blank ranking and describe its actual signals. No second LMDB history store is needed.
@@ -208,6 +223,7 @@ CPU values use `proc_pid_rusage` with Mach clock conversion `125/3`, calibrated 
 
 #### 16. **Picker sorting can undo exact-first file ranking — confirmed function-level defect** (`crates/smcli/src/picker.rs:890-896`).
 
+- **Status:** fixed 2026-10-31.
 - **What this is:** The service protects exact matches, then the picker performs another sort.
 - **Problem:** Service output placed exact `needle.rs` before picked `xneedle.rs`; calling the actual `suggested_first` function reversed them for query `needle.rs`. A temporary test in the isolated snapshot passed with that reversal. The live-picker attempt did not establish this case end-to-end, so the claim is limited to the connected sorting function.
 - **Fix:** Preserve service order or carry enough score information to keep exact matches first in the UI sort.
