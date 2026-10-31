@@ -342,7 +342,8 @@ try:
     top = answers[0]["files"][0]
     assert top["path"] == "src/main.swift" and top["insert"] == "main.swift" and "files" in top["provenance"], top
     assert ask("files", repo_a, "main")["files"][0]["insert"] == "src/main.swift"
-    assert ask("files", repo_a + "/awk", "main")["files"][0]["insert"] == "~/fffrepo/src/main.swift"
+    home_insert = ask("files", repo_a + "/awk", "main")["files"][0]["insert"]
+    assert home_insert == os.path.realpath(f"{repo_a}/src/main.swift") and os.path.isfile(home_insert), home_insert
     util = answers[-1]["files"][0]
     assert top.get("git") is None, top
     assert util["path"] == "src/util.swift" and util["git"] == " M", util

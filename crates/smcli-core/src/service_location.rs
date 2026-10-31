@@ -81,8 +81,8 @@ pub fn build(executable: &Path) -> Option<String> {
     ))
 }
 
-/// `path` (under `root`) as seen from `cwd`: `a.swift` from its own folder, otherwise `~/…` or absolute.
-pub fn relative_insert(path: &str, root: &str, cwd: &str, home: Option<&str>) -> String {
+/// `path` (under `root`) as seen from `cwd`; insertion paths stay absolute outside `cwd`.
+pub fn relative_insert(path: &str, root: &str, cwd: &str, _home: Option<&str>) -> String {
     if path.is_empty() {
         return String::new();
     }
@@ -98,13 +98,6 @@ pub fn relative_insert(path: &str, root: &str, cwd: &str, home: Option<&str>) ->
             ".".into()
         } else {
             rel.to_string_lossy().into_owned()
-        }
-    } else if let Some(home) = home {
-        let home = fs::canonicalize(home).unwrap_or_else(|_| PathBuf::from(home));
-        if !is_root(&home) && let Ok(rel) = target.strip_prefix(&home) {
-            format!("~/ {}", rel.to_string_lossy()).replace("/ ", "/")
-        } else {
-            target.to_string_lossy().into_owned()
         }
     } else {
         target.to_string_lossy().into_owned()
@@ -211,9 +204,13 @@ mod tests {
         let home = home.to_str().unwrap();
         // Inside cwd -> relative.
         assert_eq!(relative_insert("file.rs", root, root, Some(home)), "file.rs");
-        // Outside cwd but under home -> ~/…
-        assert_eq!(relative_insert("file.rs", root, &format!("{home}/Dev/other"), Some(home)), "~/Dev/project/file.rs");
-        assert_eq!(relative_insert("../../elsewhere/out.rs", root, root, Some(home)), "~/elsewhere/out.rs");
+        // Outside cwd but under home -> absolute insertion path.
+        let project_file = fs::canonicalize(Path::new(root).join("file.rs")).unwrap();
+        let insert = relative_insert("file.rs", root, &format!("{home}/Dev/other"), Some(home));
+        assert_eq!(insert, project_file.to_string_lossy());
+        assert!(Path::new(&insert).is_file());
+        let elsewhere = fs::canonicalize(Path::new(home).join("elsewhere/out.rs")).unwrap();
+        assert_eq!(relative_insert("../../elsewhere/out.rs", root, root, Some(home)), elsewhere.to_string_lossy());
         // Outside home -> absolute.
         fs::write(temporary.path().join("outside.rs"), "").unwrap();
         let outside = fs::canonicalize(temporary.path().join("outside.rs")).unwrap();
