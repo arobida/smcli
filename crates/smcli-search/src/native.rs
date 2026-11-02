@@ -65,26 +65,20 @@ impl HistoryFile {
     }
 }
 
-/// Fish history stores YAML-like records; accept only simple single-line `- cmd:` scalars.
+/// Fish history writes `- cmd: ` then the typed command, escaping only `\\` and `\n`.
+/// Surrounding quotes are part of the command, not storage syntax.
 fn unquote_fish(command: &str) -> String {
     let command = command.trim();
-    if let Some(value) = command.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
-        value.replace("''", "'")
-    } else if let Some(value) = command.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-        value.replace("\\\\", "\\").replace("\\\"", "\"")
-    } else {
-        // Fish writes `\\` for a backslash and `\n` for a newline in a multi-line command.
-        let mut out = String::with_capacity(command.len());
-        let mut chars = command.chars();
-        while let Some(c) = chars.next() {
-            match (c, chars.clone().next()) {
-                ('\\', Some('\\')) => { out.push('\\'); chars.next(); }
-                ('\\', Some('n')) => { out.push('\n'); chars.next(); }
-                _ => out.push(c),
-            }
+    let mut out = String::with_capacity(command.len());
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match (c, chars.clone().next()) {
+            ('\\', Some('\\')) => { out.push('\\'); chars.next(); }
+            ('\\', Some('n')) => { out.push('\n'); chars.next(); }
+            _ => out.push(c),
         }
-        out
     }
+    out
 }
 
 /// Removes zsh's `: <start>:<elapsed>;` extended-history prefix.
@@ -160,13 +154,17 @@ mod tests {
         let fish_dir = dir.path().join(".local/share/fish");
         std::fs::create_dir_all(&fish_dir).unwrap();
         let fish = fish_dir.join("fish_history");
-        let source = "- cmd: echo plain\n  when: 1700000000\n- cmd: 'echo it''s quoted'\n  when: 1700000001\n\
-                      - cmd: printf a\\\\tb\\nls\n  when: 1700000002\n";
+        // Fixture matches `history append` / `history save` output from Fish 4.x.
+        let source = "- cmd: echo plain\n  when: 1700000000\n- cmd: \"/tmp/a b\"\n  when: 1700000001\n\
+                      - cmd: echo it's quoted\n  when: 1700000002\n- cmd: printf a\\\\tb\\nls\n  when: 1700000003\n";
         std::fs::write(&fish, source).unwrap();
         let files = history_files(dir.path(), &HashMap::new()).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].shell, Shell::Fish);
-        assert_eq!(files[0].read().unwrap(), "echo plain\necho it's quoted\nprintf a\\tb\nls");
+        assert_eq!(
+            files[0].read().unwrap(),
+            "echo plain\n\"/tmp/a b\"\necho it's quoted\nprintf a\\tb\nls"
+        );
         assert_eq!(std::fs::read_to_string(fish).unwrap(), source);
     }
 

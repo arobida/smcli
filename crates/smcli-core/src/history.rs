@@ -211,7 +211,15 @@ impl CapturedHistory {
 
     pub fn location(home: &Path, environment: &HashMap<String, String>) -> PathBuf {
         match environment.get("SMCLI_DB").filter(|p| !p.is_empty()) {
-            Some(path) => PathBuf::from(path),
+            Some(path) => {
+                let path = PathBuf::from(path);
+                // Service launch requires an absolute --db; resolve relative overrides against cwd.
+                if path.is_absolute() {
+                    path
+                } else {
+                    std::env::current_dir().map(|cwd| cwd.join(&path)).unwrap_or(path)
+                }
+            }
             None => home.join(".local/share/smcli/history.db"),
         }
     }
@@ -748,6 +756,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let history = CapturedHistory::new(dir.path().join("sub/history.db"));
         (dir, history)
+    }
+
+    #[test]
+    fn relative_smcli_db_resolves_against_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let environment = HashMap::from([("SMCLI_DB".into(), "relative.db".into())]);
+        assert_eq!(
+            CapturedHistory::location(Path::new("/home"), &environment),
+            cwd.join("relative.db")
+        );
+        let absolute = HashMap::from([("SMCLI_DB".into(), "/tmp/absolute.db".into())]);
+        assert_eq!(
+            CapturedHistory::location(Path::new("/home"), &absolute),
+            PathBuf::from("/tmp/absolute.db")
+        );
     }
 
     #[test]

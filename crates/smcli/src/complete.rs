@@ -51,7 +51,7 @@ fn walk(cwd: &Path, dir: &Path, depth: usize, dirs_only: bool, n: &mut usize, ou
             && let Some(rel) = rel.to_str()
             && (is_dir || !dirs_only)
         {
-            out.push(rel.replace('\\', "/"));
+            out.push(rel.to_string());
         }
         if is_dir {
             walk(cwd, &path, depth + 1, dirs_only, n, out);
@@ -158,6 +158,15 @@ mod tests {
         touch(&dir, "src/main.rs");
         let hits = complete_local(&dir, "src/**/serv*", true, 8);
         assert_eq!(hits, ["src/foo/bar/service/"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn keeps_literal_backslash_in_filename() {
+        let dir = tmp();
+        touch(&dir, r"back\slash.unique");
+        let hits = complete_local(&dir, "unique", false, 8);
+        assert_eq!(hits, [r"back\slash.unique"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

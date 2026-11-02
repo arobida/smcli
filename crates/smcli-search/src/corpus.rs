@@ -597,8 +597,17 @@ pub(crate) fn rerank_intent(hits: Vec<Hit>, query: &PreparedQuery, signals: &Sea
         if present { boost += INTENT_FILE_WEIGHT; why.push("input file exists".into()); }
         let config_boost = INTENT_CONFIG_WEIGHT * config.get(&entry.command).copied().unwrap_or(0.0).clamp(0.0, 1.0);
         if config_boost > 0.0 { why.push("project config match".into()); }
+        let mut score = cosine + boost.min(INTENT_BOOST_CAP) + config_boost;
+        // Same failure handling as hybrid rerank: demote without dropping.
+        if entry.source == "captured" && entry.runs > 0 {
+            let success_rate = entry.successes as f64 / entry.runs as f64;
+            score *= 0.75 + 0.25 * success_rate;
+            if entry.successes == 0 {
+                why.push("always failed".into());
+            }
+        }
         entry.why = Some(why);
-        (offset, entry, cosine + boost.min(INTENT_BOOST_CAP) + config_boost)
+        (offset, entry, score)
     }).collect::<Vec<_>>();
     ranked.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
     ranked.into_iter().map(|(_, entry, _)| entry).collect()
@@ -822,6 +831,17 @@ mod tests {
         let vocabulary = ["install".into()].into_iter().collect();
         assert_eq!(prepare_intent_query("build and insall locally", &vocabulary, None).embedding_query(), "build and install locally");
         assert_eq!(prepare_intent_query("build and install locally", &vocabulary, None).embedding_query(), "build and install locally");
+    }
+
+    #[test]
+    fn intent_rerank_penalizes_always_failed_commands() {
+        let query = prepare_intent_query("copy files", &HashSet::new(), None);
+        let ok = entry("cp b a", 10, 10.0, Some(10), 10);
+        let failed = entry("cp a b", 10, 10.0, Some(0), 10);
+        let hits = rerank_intent(vec![(failed.clone(), 0.9), (ok.clone(), 0.9)], &query, &SearchSignals::default());
+        assert_eq!(hits[0].command, "cp b a");
+        assert_eq!(hits[1].command, "cp a b");
+        assert!(hits[1].why.as_ref().unwrap().contains(&"always failed".to_string()));
     }
 
     #[test]

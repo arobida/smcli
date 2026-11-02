@@ -86,12 +86,17 @@ impl SmcliConfig {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         use std::os::unix::fs::DirBuilderExt;
-        if let Some(parent) = path.parent() {
-            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
-        }
-        let temporary = path.with_extension("json.tmp");
-        std::fs::write(&temporary, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&temporary, path)?;
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        // Unique tempfile beside the destination: a planted `config.json.tmp` symlink must not be followed.
+        let temporary = tempfile::NamedTempFile::new_in(parent)
+            .with_context(|| format!("Failed to create temporary config beside {}", path.display()))?;
+        serde_json::to_writer_pretty(temporary.as_file(), self)
+            .with_context(|| format!("Failed to write config {}", path.display()))?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(path)
+            .map_err(|e| anyhow!("Failed to save config {}: {}", path.display(), e.error))?;
         Ok(())
     }
 }
@@ -203,5 +208,20 @@ mod tests {
         let environment = HashMap::from([("XDG_CONFIG_HOME".to_string(), "/x".to_string())]);
         assert_eq!(SmcliConfig::location(Path::new("/h"), &environment), PathBuf::from("/x/smcli/config.json"));
         assert_eq!(SmcliConfig::location(Path::new("/h"), &HashMap::new()), PathBuf::from("/h/.config/smcli/config.json"));
+    }
+
+    #[test]
+    fn save_does_not_follow_planted_temp_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "DO NOT OVERWRITE").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("config.json.tmp")).unwrap();
+        SmcliConfig { ctrl_r_key: Some(true), ..Default::default() }
+            .save(&config_path)
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "DO NOT OVERWRITE");
+        let loaded = SmcliConfig::load(&config_path).unwrap();
+        assert_eq!(loaded.ctrl_r_key, Some(true));
     }
 }

@@ -156,7 +156,16 @@ mod tests {
 
         let abs_cfg = home.join("abs.json");
         run(init(Some(&abs)), &abs_cfg, &service).unwrap();
-        run(init(None), &abs_cfg, &service).unwrap();
+        // Re-init without a model flag must keep the custom path; pass --keys so a TTY cannot enter the questionnaire.
+        run(
+            Init {
+                keys: Some("up,ctrl-r,ctrl-t,ctrl-g".into()),
+                ..init(None)
+            },
+            &abs_cfg,
+            &service,
+        )
+        .unwrap();
         assert_eq!(SmcliConfig::load(&abs_cfg).unwrap().potion_path.as_deref(), Some(abs.as_str()));
 
         let rel = relative_from_cwd(&model);

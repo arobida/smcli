@@ -12,7 +12,7 @@ use smcli_core::{
 };
 use smcli_search::setup::{corpus, index_directory, search_engine, search_signals, working_directory};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -665,8 +665,13 @@ fn prune(c: &CapturedHistory, filter: &CaptureFilter, dry: bool) -> Result<()> {
             .ok_or_else(|| anyhow::anyhow!("Another smcli is updating the index."))?)
     };
     let mut db = c.open_connection()?;
-    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let mut commands = vec![];
+    // Dry-run is read-only: Deferred avoids taking the write lock that blocks concurrent capture.
+    let tx = db.transaction_with_behavior(if dry {
+        rusqlite::TransactionBehavior::Deferred
+    } else {
+        rusqlite::TransactionBehavior::Immediate
+    })?;
+    let mut commands = HashSet::new();
     let mut ids = vec![];
     {
         let mut s =
@@ -682,10 +687,7 @@ fn prune(c: &CapturedHistory, filter: &CaptureFilter, dry: bool) -> Result<()> {
             let (id, command, d, expanded) = row?;
             if !filter.allows(&command, &d) || expanded.as_deref().is_some_and(|e| !filter.allows(e, &d)) {
                 ids.push(id);
-                let key = smcli_core::entry::command_key(&command, expanded.as_deref());
-                if !commands.contains(&key) {
-                    commands.push(key);
-                }
+                commands.insert(smcli_core::entry::command_key(&command, expanded.as_deref()));
             }
         }
     }
@@ -694,7 +696,8 @@ fn prune(c: &CapturedHistory, filter: &CaptureFilter, dry: bool) -> Result<()> {
         let mut s = tx.prepare("SELECT id,query,root FROM file_selections")?;
         for row in s.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
             let (id, query, root) = row?;
-            if !query.is_empty() && !filter.allows(&query, &root) {
+            // Blank-query picks still carry a root; cwd filters must remove them too.
+            if !filter.allows(&query, &root) {
                 file_picks.push(id);
             }
         }
@@ -892,7 +895,7 @@ fn import(
                 .ok_or_else(|| anyhow::anyhow!("Invalid timestamp"))?;
             let directory = text("directory")?;
             let exit_code = r["exitCode"].as_i64().ok_or_else(|| anyhow::anyhow!("Missing exitCode"))?;
-            if expanded.is_some() && !capture_filter.allows_run(command, expanded, directory) { continue; }
+            if !capture_filter.allows_run(command, expanded, directory) { continue; }
             tx.execute(
                 "INSERT OR IGNORE INTO sessions(id,user,host,shell) VALUES(?,?,'unknown',?)",
                 rusqlite::params![session, user, shell],
@@ -1846,6 +1849,49 @@ mod tests {
             .collect::<rusqlite::Result<_>>()?;
         assert_eq!(selections, ["push"]);
         assert_eq!(db.query_row("SELECT count(*) FROM file_selections", [], |r| r.get::<_, i64>(0))?, 0);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prune_removes_blank_query_file_selections_in_excluded_directories() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("smcli-prune-blank-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let c = CapturedHistory::new(dir.join("history.db"));
+        let db = c.open_connection()?;
+        db.execute_batch(
+            "INSERT INTO file_selections(root,path,mode,query,selected_at) VALUES('/private','private.txt','files','',1700000005.0)",
+        )?;
+        drop(db);
+        let filter = CaptureFilter::new(&SmcliConfig {
+            cwd_filter: Some(vec!["/private".into()]),
+            ..Default::default()
+        })?;
+        prune(&c, &filter, false)?;
+        let db = c.open_connection()?;
+        assert_eq!(db.query_row("SELECT count(*) FROM file_selections", [], |r| r.get::<_, i64>(0))?, 0);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_import_applies_filters_without_expanded_command() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("smcli-legacy-filter-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".config/smcli"))?;
+        std::fs::write(
+            dir.join(".config/smcli/config.json"),
+            r#"{"historyFilter":["^secret"]}"#,
+        )?;
+        let c = CapturedHistory::new(dir.join("history.db"));
+        let source = dir.join("legacy.jsonl");
+        let plain = serde_json::json!({"timestamp":"2024-01-01T00:00:00Z","user":"test","shell":"zsh","command":"secret data","directory":"/tmp","exitCode":0});
+        let expanded = serde_json::json!({"timestamp":"2024-01-01T00:00:01Z","user":"test","shell":"zsh","command":"sd","expandedCommand":"secret data","directory":"/tmp","exitCode":0});
+        let allowed = serde_json::json!({"timestamp":"2024-01-01T00:00:02Z","user":"test","shell":"zsh","command":"git status","directory":"/tmp","exitCode":0});
+        std::fs::write(&source, format!("{plain}\n{expanded}\n{allowed}\n"))?;
+        import(&c, &dir, &HashMap::new(), false, false, Some(source))?;
+        let rows = records(&c)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["command"], "git status");
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

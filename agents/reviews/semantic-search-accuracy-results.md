@@ -232,21 +232,25 @@ No commit or push. Owner-history validation and latency instrumentation remain o
 
 ## Config boost tuning (real history)
 
-Selected **0.18 (1.5× the previous 0.12)** after six sequential isolated-service runs from the repository root. The owner database was opened read-only solely for SQLite `.backup`; all searches used the private bench5 copy, its own index and newly created private runtime directories. Only benchmark-owned services were started/stopped. The final release was rebuilt without the temporary environment override and exactly reproduced all 14 NL query ranks and all six ordered literal-control top-threes.
+### Bench measurement (0.18 under a no-loss rule)
 
-| Weight      | NL wanted in top 3 | MRR   | NL rank losses vs 1× | Changed literal controls | Eligible     |
-| ----------- | ------------------ | ----- | -------------------- | ------------------------ | ------------ |
-| 0.12 (1×)   | 5/13               | 0.394 | 0                    | 0                        | yes          |
-| 0.18 (1.5×) | 6/13               | 0.406 | 0                    | 0                        | **selected** |
-| 0.24 (2×)   | 6/13               | 0.396 | 1                    | 0                        | no           |
-| 0.36 (3×)   | 8/13               | 0.468 | 1                    | 0                        | no           |
-| 0.48 (4×)   | 8/13               | 0.558 | 1                    | 0                        | no           |
-| 0.72 (6×)   | 8/13               | 0.558 | 1                    | 1                        | no           |
+An earlier owner-history sweep selected **0.18 (1.5× the previous 0.12)** under a strict no-loss criterion. That measurement is retained below as historical evidence; it is **not** the shipped constant.
 
-The 14 queries/wanted predicates are frozen from results3; the docker label retains its n/a convention, so 13 labels contribute to metrics. Missing top-ten results contribute zero MRR. This is a fresh 1× baseline on the copied snapshot, not the older results3 ranks. At 0.18, `format the docs` → `make docs` improves **4→3** and `rebuild a clean release` → `make fresh` improves **8→5**; all other NL ranks are unchanged. Values 2× and above make `run the tests` worse (1→2); 6× also changes the `cargo test` control top-three. Larger aggregate gains were rejected under the strict no-loss criterion.
+| Weight      | NL wanted in top 3 | MRR   | NL rank losses vs 1× | Changed literal controls | Eligible under no-loss |
+| ----------- | ------------------ | ----- | -------------------- | ------------------------ | ---------------------- |
+| 0.12 (1×)   | 5/13               | 0.394 | 0                    | 0                        | yes                    |
+| 0.18 (1.5×) | 6/13               | 0.406 | 0                    | 0                        | measured selection     |
+| 0.24 (2×)   | 6/13               | 0.396 | 1                    | 0                        | no                     |
+| 0.36 (3×)   | 8/13               | 0.468 | 1                    | 0                        | no                     |
+| 0.48 (4×)   | 8/13               | 0.558 | 1                    | 0                        | no                     |
+| 0.72 (6×)   | 8/13               | 0.558 | 1                    | 1                        | no                     |
 
-Synthetic validation also passes: none of the 32 NL labels worsens versus the previous 0.12 default; the added install-description query improves 2→1. Existing fixed-search checks pass. No synthetic fallback to a smaller value was needed. The separate config cap is now 0.18 and the combined positive context/config bound is 0.28.
+At 0.18, `format the docs` → `make docs` improves **4→3** and `rebuild a clean release` → `make fresh` improves **8→5**. Values 2× and above make `run the tests` worse (1→2); 6× also changes the `cargo test` control top-three.
 
-`make release`, `make test-rust PKG=smcli-search` and `make ranking` passed on the final override-free build. `make test` passed in the background (exit status 0). No commit or push. No latency claims.
+### Shipped value (0.48)
+
+Current main ships `INTENT_CONFIG_WEIGHT = 0.48` (`crates/smcli-search/src/corpus.rs`, documented in `crates/smcli-search/README.md`), for a separate config cap of 0.48 and a combined positive context/config bound of 0.58. That choice accepts the measured regression of `run the tests` (1→2) from the table above in exchange for higher aggregate NL hit rate and MRR. Do not treat the 0.18 no-loss validation claims as evidence for 0.48 behavior; the private owner-history benchmark was not rerun for this documentation correction.
+
+`make release`, `make test-rust PKG=smcli-search` and `make ranking` passed on the final override-free build that first measured 0.18. `make test` passed in the background (exit status 0). No latency claims.
 
 The full value-by-query rank table and private literal-control arrays are in the scratch report `scratchpad/bench/results5.md` and `scratchpad/bench5/`; no private retrieved command text is copied here. Gate logs: `/tmp/config5-release-final.log`, `/tmp/config5-search-final.log`, `/tmp/config5-ranking-final.log`, `/tmp/config5-full-final.log`.
