@@ -45,7 +45,7 @@ pub fn real_path(path: &str) -> Option<String> {
     std::fs::canonicalize(path).ok().map(|p| p.to_string_lossy().into_owned())
 }
 
-fn read_small_file(path: &str, limit: u64) -> Option<String> {
+pub(crate) fn read_small_file(path: &str, limit: u64) -> Option<String> {
     if !regular_file(path) { return None; }
     let mut data = Vec::new();
     std::fs::File::open(path).ok()?.take(limit).read_to_end(&mut data).ok()?;

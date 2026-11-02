@@ -1,11 +1,12 @@
-use std::{hash::{Hash, Hasher}, path::{Path, PathBuf}};
+use std::{collections::HashSet, hash::{Hash, Hasher}, path::{Path, PathBuf}};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use model2vec_rs::model::StaticModel;
 
 /// potion-shell-16m (fine-tuned potion-code-16M-v2), shipped as a folder beside the binaries or loaded from a directory. Load once per process; embed in batches.
 pub struct Potion {
     model: StaticModel,
+    pub(crate) vocabulary: HashSet<String>,
     /// Names the model in the index file name, so another model never reuses these vectors.
     pub identity: String,
     dimension: usize,
@@ -20,8 +21,7 @@ impl Potion {
         let directory = Self::bundled_dir().ok_or_else(|| {
             anyhow::anyhow!("{} model not found beside the smcli executable; reinstall, or point `smcli init --potion DIR` at a model", Self::NAME)
         })?;
-        let model = StaticModel::from_pretrained(&directory, None, None, None)?;
-        Ok(Self::with(model, "bundled".into()))
+        Self::load(&directory, "bundled".into())
     }
 
     fn bundled_dir() -> Option<PathBuf> {
@@ -39,14 +39,33 @@ impl Potion {
 
     /// A model directory (`potionPath` in the config).
     pub fn from_dir(directory: &Path) -> Result<Self> {
-        let model = StaticModel::from_pretrained(directory, None, None, None)?;
         let canonical = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
-        Ok(Self::with(model, model_identity(&canonical)))
+        Self::load(directory, model_identity(&canonical))
     }
 
-    fn with(model: StaticModel, identity: String) -> Self {
+    fn load(directory: &Path, identity: String) -> Result<Self> {
+        // Preserve the local layouts accepted by StaticModel::from_pretrained.
+        let nested = directory.join("0_StaticEmbedding");
+        let (config, model_dir) = [
+            (directory.join("config.json"), directory),
+            (directory.join("config_sentence_transformers.json"), directory),
+            (directory.join("config_sentence_transformers.json"), nested.as_path()),
+            (directory.parent().unwrap_or(directory).join("config_sentence_transformers.json"), directory),
+        ].into_iter().find(|(config, dir)| config.is_file() && dir.join("tokenizer.json").is_file()
+            && dir.join("model.safetensors").is_file())
+            .ok_or_else(|| anyhow::anyhow!("no valid model layout found in '{}'", directory.display()))?;
+        let tokenizer = std::fs::read(model_dir.join("tokenizer.json")).context("failed to read tokenizer.json")?;
+        let json: serde_json::Value = serde_json::from_slice(&tokenizer)?;
+        let vocabulary = match &json["model"]["vocab"] {
+            serde_json::Value::Object(words) => words.keys().cloned().collect(),
+            serde_json::Value::Array(words) => words.iter().filter_map(|word| word[0].as_str().map(str::to_owned)).collect(),
+            _ => HashSet::new(),
+        };
+        let model = StaticModel::from_bytes(tokenizer,
+            std::fs::read(model_dir.join("model.safetensors")).context("failed to read model.safetensors")?,
+            std::fs::read(config).context("failed to read model config")?, None)?;
         let dimension = model.encode_single("smcli").len();
-        Self { model, identity, dimension }
+        Ok(Self { model, vocabulary, identity, dimension })
     }
 
     pub fn dimension(&self) -> usize {
@@ -78,6 +97,18 @@ fn model_identity(canonical: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokenizer_words_are_protected_from_typo_correction() {
+        let potion = Potion::bundled().unwrap();
+        let history = ["site", "install"].map(str::to_owned).into_iter().collect();
+        let prepare = |query| crate::corpus::prepare_intent_query(query, &history, Some(&potion.vocabulary));
+        assert!(potion.vocabulary.contains("suite"));
+        assert!(!potion.vocabulary.contains("insall"));
+        assert_eq!(prepare("run the project test suite").embedding_query(), "run the project test suite");
+        assert_eq!(prepare("build and insall locally").embedding_query(), "build and install locally");
+        assert_eq!(crate::corpus::prepare_intent_query("suite", &history, None).embedding_query(), "site");
+    }
 
     #[test]
     fn identity_stays_short_for_a_long_model_path() {

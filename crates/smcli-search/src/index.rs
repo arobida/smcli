@@ -97,6 +97,15 @@ pub struct HistorySearch {
 /// Swift's `commands-v*` files live in the same directory; this prefix keeps the two from deleting each other's index.
 const VERSION: &str = "rs-commands-v3";
 
+#[cfg(test)]
+thread_local! { pub(crate) static VECTOR_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) }; }
+fn vector_first() -> bool {
+    #[cfg(test)]
+    { VECTOR_FIRST.with(|v| v.get()) }
+    #[cfg(not(test))]
+    { true }
+}
+
 impl HistorySearch {
     pub fn new(directory: impl Into<PathBuf>, potion: Potion) -> Self {
         Self { directory: directory.into(), potion }
@@ -109,7 +118,7 @@ impl HistorySearch {
 
     /// Brings the index up to date with `corpus`, then returns the best `limit` matches that pass `filter`.
     /// An empty query is allowed with a filter and lists matches by most recent run.
-    /// When another process holds the index, search falls back to word matching over the corpus.
+    /// Under index contention, literals use word matching; intent embeds the in-memory corpus.
     pub fn search(&self, query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter,
                   programs: Option<&HashMap<String, HashSet<String>>>, signals: &SearchSignals, now: f64) -> Result<Vec<SearchEntry>> {
         self.search_with_evidence(query, corpus, limit, filter, programs, signals, now, None)
@@ -160,13 +169,18 @@ impl HistorySearch {
         let directories: HashSet<String> = corpus.values().filter_map(|e| e.last_directory.clone()).collect();
         let (stripped, marked_filter, has_markers) = parse_markers(query, programs, &directories);
         let parsed_filter = if has_markers { marked_filter } else { query_filter(query, programs, &directories) };
-        // Literal queries lean on keywords; intent queries weigh both legs equally. Both see the
-        // stripped query so `$word` markers do not accidentally make a query literal.
+        // Interpret stripped text so `$word` markers do not accidentally make intent literal.
         let literal = is_literal_query(&stripped, programs);
+        // An exact typed alias is an explicit spelling, even when only its expansion is a known program.
+        let alias_query = corpus.values().any(|e| e.secondary().is_some_and(|s| s.eq_ignore_ascii_case(stripped.trim())));
         let parsed_any = has_constraint(&parsed_filter);
         let mut merged_filter = filter.clone();
         if parsed_any {
             merged_filter.merge_parsed(&parsed_filter);
+        }
+        if vector_first() && !literal && !alias_query && (corpus.is_empty() || lock.is_none()) {
+            let active = if has_markers && parsed_any { &merged_filter } else { filter };
+            return Ok(self.intent_search(&stripped, corpus, limit, active, signals, None));
         }
         // No history yet: nothing to embed, but project commands can still answer.
         if corpus.is_empty() {
@@ -182,6 +196,19 @@ impl HistorySearch {
         let db = self.open_index(&name)?;
         let commands = db.typed::<IndexedCommand>("commands")?;
         self.sync(&commands, corpus)?;
+        if vector_first() && !literal && !alias_query {
+            let active = if has_markers && parsed_any { &merged_filter } else { filter };
+            let vocabulary = crate::corpus::query_vocabulary(corpus, signals);
+            let prepared = crate::corpus::prepare_intent_query(&stripped, &vocabulary, Some(&self.potion.vocabulary));
+            let vector = self.potion.embed(&[prepared.embedding_query()]).remove(0);
+            let hits = commands.raw().find_nearest("embedding", &vector, (limit * 4).max(40),
+                index_filter(active).map(|f| filter_from_json(&f)).transpose()?)?
+                .into_iter().filter_map(|hit| {
+                    let Some(Value::Str(key)) = hit.document.get("command") else { return None; };
+                    Some((corpus.get(key).filter(|e| active.allows(e))?.clone(), f64::from(hit.score)))
+                }).collect();
+            return Ok(self.intent_search(&stripped, corpus, limit, active, signals, Some((prepared, vector, hits))));
+        }
         // Filters narrow candidates in the index, so a bounded pool is enough to rerank with usage.
         let text = ShellTokenizer::encoded(&stripped);
         let vector = self.potion.embed(&[stripped.clone()]).remove(0);
@@ -273,6 +300,41 @@ impl HistorySearch {
         let existing: HashSet<String> = hits.iter().map(|h| h.0.key()).collect();
         hits.extend(signals.additions(&stripped, corpus, &existing, final_filter, now));
         Ok(crate::corpus::rerank_with_evidence(hits, literal, &stripped, now, signals, evidence).into_iter().take(limit).collect())
+    }
+
+    /// Index contention uses the same cosine semantics, but must embed the in-memory corpus.
+    fn intent_search(&self, query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter,
+                     signals: &SearchSignals, indexed: Option<(crate::corpus::PreparedQuery, Vec<f32>, Vec<Hit>)>) -> Vec<SearchEntry> {
+        let fallback = indexed.is_none();
+        let (prepared, vector, mut hits) = indexed.unwrap_or_else(|| {
+            let prepared = crate::corpus::prepare_intent_query(query, &crate::corpus::query_vocabulary(corpus, signals), Some(&self.potion.vocabulary));
+            let vector = self.potion.embed(&[prepared.embedding_query()]).remove(0);
+            (prepared, vector, vec![])
+        });
+        let mut seen = hits.iter().map(|(e, _)| e.key()).collect::<HashSet<_>>();
+        let mut pending = Vec::new();
+        // A missing indexed pool means empty history or a held lock, not a BM25 fallback.
+        if fallback {
+            let mut entries = corpus.values().filter(|e| filter.allows(e)).cloned().collect::<Vec<_>>();
+            entries.sort_by_key(|e| e.key());
+            for entry in entries { if seen.insert(entry.key()) { pending.push(entry); } }
+        }
+        if let Some(context) = &signals.context {
+            for kind in [smcli_core::ranking::CandidateKind::Hint, smcli_core::ranking::CandidateKind::Script, smcli_core::ranking::CandidateKind::Test] {
+                for candidate in context.candidates_of(kind) {
+                    let entry = corpus.get(&candidate.command).cloned().unwrap_or_else(|| SearchEntry {
+                        flags: smcli_core::parse::command_flags(&candidate.command),
+                        ..SearchEntry::new(&candidate.command, 0, "project")
+                    });
+                    if filter.allows(&entry) && seen.insert(entry.key()) { pending.push(entry); }
+                }
+            }
+        }
+        if !pending.is_empty() {
+            let vectors = self.potion.embed(&pending.iter().map(embedding_text).collect::<Vec<_>>());
+            hits.extend(pending.into_iter().zip(vectors).map(|(entry, v)| (entry, cosine(&vector, &v))));
+        }
+        crate::corpus::rerank_intent(hits, &prepared, signals).into_iter().take(limit).collect()
     }
 
     /// Discards the index and embeds every command again. Returns the number embedded.
@@ -581,6 +643,13 @@ fn expansion_terms(hits: &[Hit], query: &str, signals: &SearchSignals,
         .filter(|t| !terms.contains(t) && seen.insert(t.clone())).take(16).collect()
 }
 
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    let dot = a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum::<f64>();
+    let norm = |v: &[f32]| v.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let denominator = norm(a) * norm(b);
+    if denominator > 0.0 { (dot / denominator).clamp(-1.0, 1.0) } else { 0.0 }
+}
+
 fn merge_expansion(hits: &mut Vec<Hit>, entry: &SearchEntry, score: f64) {
     let bonus = 0.15 * score.clamp(0.0, 1.0);
     if bonus == 0.0 { return; }
@@ -596,7 +665,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vector_intent_uses_no_grep_expansion_and_keeps_absolute_cosine() {
+        struct NoExpansion;
+        impl crate::ProjectEvidence for NoExpansion {
+            fn exists(&self, _: &[PathBuf]) -> Vec<bool> { panic!("intent must not consult indexed file evidence"); }
+            fn grep_terms(&self, _: &[String], _: std::time::Duration) -> Vec<String> { panic!("intent must not expand with BM25"); }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let engine = HistorySearch::new(root.path().join("index"), Potion::bundled().unwrap());
+        let corpus = ["make test", "bun run"].into_iter().map(|c| (c.into(), SearchEntry::new(c, 0, "native"))).collect();
+        let indexed = engine.search_with_evidence("run the tests", &corpus, 2, &SearchFilter::default(), None, &SearchSignals::default(), 0.0, Some(&NoExpansion)).unwrap();
+        assert_eq!(indexed[0].command, "make test");
+        let locked = engine.search_with_evidence_using_lock("run the tests", &corpus, 2, &SearchFilter::default(), None, &SearchSignals::default(), 0.0, Some(&NoExpansion), None).unwrap();
+        assert_eq!(indexed.iter().map(|e| &e.command).collect::<Vec<_>>(), locked.iter().map(|e| &e.command).collect::<Vec<_>>());
+        assert_eq!(cosine(&[2.0, 0.0], &[3.0, 0.0]), 1.0);
+        assert_eq!(cosine(&[1.0, 0.0], &[0.0, 1.0]), 0.0);
+    }
+
+    #[test]
+    fn typo_recovery_works_with_existing_index_lock_and_empty_history() {
+        use smcli_core::ranking::{Candidate, CandidateKind, RankingContext};
+        let root = tempfile::tempdir().unwrap();
+        let engine = HistorySearch::new(root.path().join("index"), Potion::bundled().unwrap());
+        let entry = SearchEntry::new("make install", 1, "native");
+        let corpus = HashMap::from([(entry.key(), entry)]);
+        let signals = SearchSignals::default();
+        engine.search("install", &corpus, 10, &SearchFilter::default(), None, &signals, 0.0).unwrap();
+        assert_eq!(engine.search("insall", &corpus, 10, &SearchFilter::default(), None, &signals, 0.0).unwrap()[0].command, "make install");
+        let lock = engine.lock_index(20).unwrap().unwrap();
+        let hits = engine.search_with_evidence_using_lock("insall", &corpus, 10, &SearchFilter::default(), None, &signals, 0.0, None, None).unwrap();
+        assert_eq!(hits[0].command, "make install");
+        drop(lock);
+        let strict = SearchFilter { program: Some("git".into()), ..Default::default() };
+        assert!(engine.search("insall", &corpus, 10, &strict, None, &signals, 0.0).unwrap().is_empty());
+        let mut context = RankingContext::default();
+        context.candidates.push(Candidate { command: "make install".into(), kind: CandidateKind::Script, reason: "Makefile target".into(), detail: None });
+        let signals = SearchSignals { context: Some(context), ..Default::default() };
+        assert_eq!(engine.search("insall", &HashMap::new(), 10, &SearchFilter::default(), None, &signals, 0.0).unwrap()[0].command, "make install");
+    }
+
+    #[test]
     fn expansion_finds_code_concepts_but_skips_strong_history_hits() {
+        VECTOR_FIRST.with(|v| v.set(false));
         struct Evidence(std::cell::Cell<usize>);
         impl crate::ProjectEvidence for Evidence {
             fn exists(&self, _: &[std::path::PathBuf]) -> Vec<bool> { vec![] }

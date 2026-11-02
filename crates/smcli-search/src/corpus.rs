@@ -205,6 +205,7 @@ pub fn is_literal_query(query: &str, programs: &HashMap<String, HashSet<String>>
             || word.contains(|c| "~^@|*{}".contains(c)) || *word == "HEAD"
             || (word.starts_with('$') && chars.len() > 1) || inner.contains(&':')
             || (word.contains('.') && !word.ends_with('.'))
+            || (words.len() == 1 && word.len() > 1 && word.bytes().all(|b| b.is_ascii_uppercase()))
     };
     if words.iter().any(literal_word) || (words.len() == 1 && first.contains('-')) {
         return true;
@@ -426,6 +427,183 @@ pub fn coverage(command: &str, terms: &[String]) -> f64 {
     matched as f64 / terms.len() as f64
 }
 
+pub const CORRECTION_WEIGHT: f64 = 0.75;
+
+pub(crate) struct PreparedQuery {
+    pub original: String,
+    terms: Vec<(String, Option<String>)>,
+}
+impl PreparedQuery {
+    pub fn embedding_query(&self) -> String {
+        self.original.split_whitespace().map(|word| {
+            self.terms.iter().find(|(t, _)| t.eq_ignore_ascii_case(word))
+                .and_then(|(_, c)| c.as_deref()).unwrap_or(word)
+        }).collect::<Vec<_>>().join(" ")
+    }
+
+}
+fn prefix_matches(term: &str, token: &str) -> bool {
+    token == term || (term.chars().count() >= 2 && token.starts_with(term))
+}
+pub(crate) fn query_vocabulary(corpus: &HashMap<String, SearchEntry>, signals: &SearchSignals) -> HashSet<String> {
+    let mut vocabulary = HashSet::new();
+    for entry in corpus.values() { vocabulary.extend(crate::ShellTokenizer::tokenize(&lexical_text(entry))); }
+    if let Some(context) = &signals.context {
+        for kind in [CandidateKind::Hint, CandidateKind::Script, CandidateKind::Test] {
+            for candidate in context.candidates_of(kind) {
+                vocabulary.extend(crate::ShellTokenizer::tokenize(&candidate.command));
+            }
+        }
+    }
+    vocabulary
+}
+pub(crate) fn prepare_intent_query(query: &str, vocabulary: &HashSet<String>, model_vocabulary: Option<&HashSet<String>>) -> PreparedQuery {
+    let terms = query.to_lowercase().split_whitespace()
+        .map(|term| {
+            let eligible = term.len() >= 4 && term.bytes().all(|b| b.is_ascii_alphabetic())
+                && !model_vocabulary.is_some_and(|words| words.contains(term))
+                && !vocabulary.iter().any(|v| prefix_matches(term, v));
+            let mut neighbors = vocabulary.iter().filter(|v| eligible && v.bytes().all(|b| b.is_ascii_alphabetic())
+                && edit_distance_at_most_one(term, v));
+            let correction = neighbors.next().cloned().filter(|_| neighbors.next().is_none());
+            (term.to_string(), correction)
+        }).collect();
+    PreparedQuery { original: query.into(), terms }
+}
+pub(crate) fn edit_distance_at_most_one(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len().abs_diff(b.len()) > 1 { return false; }
+    let (mut i, mut j, mut edits) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] { i += 1; j += 1; continue; }
+        edits += 1;
+        if edits > 1 { return false; }
+        if a.len() >= b.len() { i += 1; }
+        if b.len() >= a.len() { j += 1; }
+    }
+    edits + usize::from(i < a.len() || j < b.len()) <= 1
+}
+pub(crate) fn coverage_prepared(command: &str, query: &PreparedQuery) -> f64 {
+    if query.terms.is_empty() { return 0.0; }
+    let tokens = crate::ShellTokenizer::tokenize(command);
+    query.terms.iter().map(|(term, correction)| {
+        if tokens.iter().any(|t| prefix_matches(term, t)) { 1.0 }
+        else if correction.as_ref().is_some_and(|c| tokens.contains(c)) { CORRECTION_WEIGHT }
+        else { 0.0 }
+    }).sum::<f64>() / query.terms.len() as f64
+}
+pub(crate) fn entry_coverage_prepared(entry: &SearchEntry, query: &PreparedQuery) -> f64 {
+    coverage_prepared(entry.primary(), query).max(entry.secondary().map_or(0.0, |s| coverage_prepared(s, query)))
+}
+
+/// Only supported wrappers are unwrapped; ambiguous shell syntax supplies no identity signal.
+pub(crate) fn head_command(command: &str) -> Option<String> {
+    if command.contains(['|', '&', ';', '<', '>', '$', '`', '\n']) { return None; }
+    let words = smcli_core::parse::shell_words(command)?;
+    let assignment = |w: &str| w.split_once('=').is_some_and(|(name, _)| !name.is_empty()
+        && name.bytes().enumerate().all(|(i, b)| b == b'_' || b.is_ascii_alphabetic() || (i > 0 && b.is_ascii_digit())));
+    let mut i = 0;
+    loop {
+        while words.get(i).is_some_and(|w| assignment(w)) { i += 1; }
+        let word = words.get(i)?;
+        let name = std::path::Path::new(word).file_name()?.to_str()?;
+        if name != "sudo" && name != "env" { return (!word.starts_with('-')).then(|| name.to_lowercase()); }
+        i += 1;
+        if words.get(i).is_some_and(|w| w == "--") { i += 1; }
+        else if words.get(i).is_some_and(|w| w.starts_with('-')) { return None; }
+    }
+}
+fn head_match(entry: &SearchEntry, query: &PreparedQuery) -> bool {
+    [Some(entry.primary()), entry.secondary()].into_iter().flatten().any(|s|
+        head_command(s).is_some_and(|head| query.terms.iter().any(|(term, _)| *term == head)))
+}
+pub(crate) const INTENT_HERE_WEIGHT: f64 = 0.01;
+pub(crate) const INTENT_HERE_CAP: f64 = 0.04;
+pub(crate) const INTENT_PROJECT_WEIGHT: f64 = 0.01;
+pub(crate) const INTENT_PROJECT_CAP: f64 = 0.02;
+pub(crate) const INTENT_FRECENCY_WEIGHT: f64 = 0.005;
+pub(crate) const INTENT_FRECENCY_CAP: f64 = 0.03;
+pub(crate) const INTENT_HEAD_WEIGHT: f64 = 0.02;
+pub(crate) const INTENT_COVERAGE_WEIGHT: f64 = 0.005;
+pub(crate) const INTENT_BOOST_CAP: f64 = 0.10;
+pub(crate) const INTENT_TASK_WEIGHT: f64 = 0.03;
+pub(crate) const INTENT_PATH_WEIGHT: f64 = 0.03;
+pub(crate) const INTENT_FILE_WEIGHT: f64 = 0.01;
+
+pub(crate) const INTENT_CONFIG_WEIGHT: f64 = 0.48;
+
+#[cfg(test)]
+thread_local! { pub(crate) static PROJECT_CONFIG_MODE: std::cell::Cell<u8> = const { std::cell::Cell::new(1) }; }
+fn project_config_enabled() -> bool {
+    #[cfg(test)] { PROJECT_CONFIG_MODE.with(|m| m.get() != 0) }
+    #[cfg(not(test))] { true }
+}
+fn project_config_scores(query: &PreparedQuery, signals: &SearchSignals) -> HashMap<String, f64> {
+    let mut scores = HashMap::new();
+    if !project_config_enabled() { return scores; }
+    let Some(context) = &signals.context else { return scores; };
+    // Discovery emits one manifest per kind; its reason identifies the source file.
+    let mut files = HashMap::new();
+    for candidate in context.candidates_of(CandidateKind::Script) {
+        if let Some(detail) = &candidate.detail {
+            files.entry(candidate.reason.as_str()).or_insert_with(Vec::new)
+                .push((candidate, crate::ShellTokenizer::tokenize(detail)));
+        }
+    }
+    let terms = crate::ShellTokenizer::tokenize(&query.embedding_query()).into_iter()
+        .filter(|term| !is_stopword(term)).collect::<HashSet<_>>();
+    if terms.is_empty() { return scores; }
+    let matches = |term: &str, tokens: &[String]| tokens.iter().any(|token|
+        token == term || (term.chars().count() >= 4 && token.starts_with(term)));
+    for candidates in files.values() {
+        for term in &terms {
+            let matched = candidates.iter().filter(|(_, tokens)| matches(term, tokens)).collect::<Vec<_>>();
+            let rarity = 1.0 - matched.len() as f64 / candidates.len() as f64;
+            if rarity > 0.0 {
+                for (candidate, _) in matched {
+                    *scores.entry(candidate.command.clone()).or_insert(0.0) += rarity / terms.len() as f64;
+                }
+            }
+        }
+    }
+    scores
+}
+
+/// Absolute cosine is retained; context and config matches each have their own bounded boost.
+pub(crate) fn rerank_intent(hits: Vec<Hit>, query: &PreparedQuery, signals: &SearchSignals) -> Vec<SearchEntry> {
+    let meaningful = PreparedQuery { original: query.original.clone(),
+        terms: query.terms.iter().filter(|(t, _)| !is_stopword(t)).cloned().collect() };
+    let project_commands = signals.context.as_ref().map(|context| {
+        [CandidateKind::Hint, CandidateKind::Script, CandidateKind::Test].into_iter()
+            .flat_map(|kind| context.candidates_of(kind)).map(|c| c.command.as_str()).collect::<HashSet<_>>()
+    }).unwrap_or_default();
+    let config = project_config_scores(query, signals);
+    let filesystem = crate::filesystem::evidence_with_index(&hits, signals,
+        uses(signals.context.as_ref(), Signal::Path) && signals.shell_path.is_some(),
+        uses(signals.context.as_ref(), Signal::Files) && signals.directory.is_some(), None);
+    let mut ranked = hits.into_iter().enumerate().map(|(offset, (mut entry, cosine))| {
+        let mut why = vec!["semantic match".into()];
+        let mut boost = (INTENT_HERE_WEIGHT * (entry.runs_here.max(0) as f64).ln_1p()).min(INTENT_HERE_CAP);
+        if entry.runs_here > 0 { why.push("used here".into()); }
+        if uses(signals.context.as_ref(), Signal::Project) {
+            boost += (INTENT_PROJECT_WEIGHT * (entry.runs_project.max(0) as f64).ln_1p()).min(INTENT_PROJECT_CAP);
+        }
+        boost += (INTENT_FRECENCY_WEIGHT * entry.frecency.max(0.0).ln_1p()).min(INTENT_FRECENCY_CAP);
+        if head_match(&entry, query) { boost += INTENT_HEAD_WEIGHT; }
+        boost += INTENT_COVERAGE_WEIGHT * entry_coverage_prepared(&entry, &meaningful);
+        if project_commands.contains(entry.command.as_str()) { boost += INTENT_TASK_WEIGHT; }
+        let (available, present, _) = filesystem.get(offset).copied().unwrap_or_default();
+        if available { boost += INTENT_PATH_WEIGHT; why.push("program found in PATH".into()); }
+        if present { boost += INTENT_FILE_WEIGHT; why.push("input file exists".into()); }
+        let config_boost = INTENT_CONFIG_WEIGHT * config.get(&entry.command).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+        if config_boost > 0.0 { why.push("project config match".into()); }
+        entry.why = Some(why);
+        (offset, entry, cosine + boost.min(INTENT_BOOST_CAP) + config_boost)
+    }).collect::<Vec<_>>();
+    ranked.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
+    ranked.into_iter().map(|(_, entry, _)| entry).collect()
+}
+
 /// Reorders hybrid hits with usage evidence. `relevance` is each hit's fused score scaled so the best is 1.
 /// Usage multiplies it as `boost ^ relevance`, so a habit lifts a strong match nearly fully but barely moves a
 /// weak one: rank fusion leaves even distant dense neighbours a third of the best score, and a plain product
@@ -583,6 +761,81 @@ mod tests {
             runs_here,
             ..SearchEntry::new(command, runs, "captured")
         }
+    }
+
+    #[test]
+    fn correction_is_global_weighted_unambiguous_and_protects_shell_tokens() {
+        let vocab = ["make", "install", "test", "toast", "storybook"].map(String::from).into_iter().collect();
+        let query = prepare_intent_query("build and insall locally", &vocab, None);
+        assert_eq!(coverage_prepared("make install", &query), CORRECTION_WEIGHT / 4.0);
+        assert_eq!(query.embedding_query(), "build and install locally");
+        assert_eq!(prepare_intent_query("tost", &vocab, None).embedding_query(), "tost");
+        for term in ["--insall", "a/insall", "X=insall", "$insall", "gpt-6", "pi"] {
+            assert_eq!(prepare_intent_query(term, &vocab, None).embedding_query(), term);
+        }
+        let mut exact = vocab.clone();
+        exact.insert("insall".into());
+        assert_eq!(prepare_intent_query("insall", &exact, None).embedding_query(), "insall");
+        assert_eq!(coverage("make install", &["the".into(), "and".into()]), 0.0);
+        assert_eq!(coverage("gpt-6", &["6".into()]), 1.0);
+        assert!(edit_distance_at_most_one("insall", "install"));
+        assert!(edit_distance_at_most_one("installl", "install"));
+        assert!(edit_distance_at_most_one("instell", "install"));
+        assert!(!edit_distance_at_most_one("isntall", "install"));
+    }
+
+    #[test]
+    fn config_overlap_uses_corrected_terms_rarity_and_signal_switch() {
+        let mut context = RankingContext::default();
+        for (command, detail) in [("make docs", "Project common Formats markdown"), ("make fresh", "Project common Clean rebuild"), ("make decoy", "Project common")] {
+            let mut candidate = smcli_core::ranking::Candidate::new(command.into(), CandidateKind::Script, "Makefile target");
+            candidate.detail = Some(detail.into());
+            context.candidates.push(candidate);
+        }
+        let mut signals = SearchSignals { context: Some(context), ..Default::default() };
+        let vocabulary = ["format".into()].into_iter().collect();
+        let query = prepare_intent_query("formt common project", &vocabulary, None);
+        let scores = project_config_scores(&query, &signals);
+        assert!(scores["make docs"] > 0.0 && scores["make docs"] <= 1.0);
+        assert!(!scores.contains_key("make decoy"));
+        assert!(!scores.contains_key("make fresh"));
+        let mut other_file = smcli_core::ranking::Candidate::new("npm run docs".into(), CandidateKind::Script, "package.json script");
+        other_file.detail = Some("Formats markdown".into());
+        signals.context.as_mut().unwrap().candidates.push(other_file);
+        assert_eq!(scores["make docs"], project_config_scores(&query, &signals)["make docs"]);
+        assert!(project_config_scores(&prepare_intent_query("for", &HashSet::new(), None), &signals).is_empty());
+        assert!(project_config_scores(&prepare_intent_query("the and with", &HashSet::new(), None), &signals).is_empty());
+        signals.context.as_mut().unwrap().off.insert(Signal::Script);
+        assert!(project_config_scores(&query, &signals).is_empty());
+    }
+
+    #[test]
+    fn vector_context_cannot_bridge_more_than_the_cap_and_ties_are_stable() {
+        let query = prepare_intent_query("pi", &HashSet::new(), None);
+        let weak = SearchEntry { runs_here: 1_000_000, runs_project: 1_000_000, frecency: 1_000_000.0,
+            ..SearchEntry::new("pi", 1_000_000, "captured") };
+        let strong = SearchEntry::new("other", 0, "native");
+        let hits = rerank_intent(vec![(weak, 0.4), (strong, 0.4 + INTENT_BOOST_CAP + 0.001)], &query, &SearchSignals::default());
+        assert_eq!(hits[0].command, "other");
+        let hits = rerank_intent(vec![(SearchEntry::new("first", 0, "native"), 0.5), (SearchEntry::new("second", 0, "native"), 0.5)], &query, &SearchSignals::default());
+        assert_eq!(hits[0].command, "first");
+        let vocabulary = ["install".into()].into_iter().collect();
+        assert_eq!(prepare_intent_query("build and insall locally", &vocabulary, None).embedding_query(), "build and install locally");
+        assert_eq!(prepare_intent_query("build and install locally", &vocabulary, None).embedding_query(), "build and install locally");
+    }
+
+    #[test]
+    fn parsed_head_identity() {
+        for command in ["pi --model sol", "X=1 sudo -- env Y=2 /bin/pi 'an argument'", "sudo env sudo /bin/pi"] {
+            assert_eq!(head_command(command).as_deref(), Some("pi"), "{command}");
+        }
+        for command in ["sudo -u root pi", "env -u X pi", "pi | cat", "echo $(pi)", "pi 'unterminated"] {
+            assert!(head_command(command).is_none(), "{command}");
+        }
+        let prepared = prepare_intent_query("open pi with sol", &HashSet::new(), None);
+        assert!(head_match(&SearchEntry::new("pi --model sol", 0, "native"), &prepared));
+        assert!(!head_match(&SearchEntry::new("pip sol", 0, "native"), &prepared));
+        assert!(!head_match(&SearchEntry::new("oc pi sol", 0, "native"), &prepared));
     }
 
     #[test]

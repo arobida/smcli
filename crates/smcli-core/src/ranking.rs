@@ -56,11 +56,13 @@ pub struct Candidate {
     pub kind: CandidateKind,
     /// Shown in `why`: `npm script`, `rebase in progress`.
     pub reason: String,
+    /// Bounded manifest text, never shell input or executed.
+    pub detail: Option<String>,
 }
 
 impl Candidate {
     pub fn new(command: String, kind: CandidateKind, reason: &str) -> Self {
-        Self { command, kind, reason: reason.into() }
+        Self { command, kind, reason: reason.into(), detail: None }
     }
 }
 
@@ -142,7 +144,12 @@ pub fn candidates(context: &ProjectContext) -> Vec<Candidate> {
     let manager = project.package_manager.as_deref().unwrap_or("");
     for (file, names) in &project.scripts {
         let lower = file.to_lowercase();
+        let details = if matches!(lower.as_str(), "makefile" | "gnumakefile" | "justfile" | ".justfile" | "package.json" | "package.swift") {
+            crate::context::read_small_file(&format!("{}/{file}", project.root), 1 << 20)
+                .map(|text| script_details(&lower, &text)).unwrap_or_default()
+        } else { HashMap::new() };
         for name in names.iter().filter(|n| valid(n)) {
+            let start = found.len();
             match lower.as_str() {
                 "package.json" => {
                     // Checked again here: a cached or hand-built context may carry any text.
@@ -175,6 +182,7 @@ pub fn candidates(context: &ProjectContext) -> Vec<Candidate> {
                 }
                 _ => {}
             }
+            for candidate in &mut found[start..] { candidate.detail = details.get(name).cloned(); }
         }
     }
     for file in &project.manifests {
@@ -183,6 +191,36 @@ pub fn candidates(context: &ProjectContext) -> Vec<Candidate> {
         }
     }
     found
+}
+
+fn script_details(file: &str, text: &str) -> HashMap<String, String> {
+    let bounded = |s: &str| s.chars().take(400).collect::<String>();
+    let mut details = HashMap::new();
+    if file == "package.json" {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(text)
+            && let Some(scripts) = json.get("scripts").and_then(|v| v.as_object()) {
+            for (name, value) in scripts { if let Some(command) = value.as_str() { details.insert(name.clone(), bounded(command)); } }
+        }
+    } else if file == "package.swift" {
+        let pattern = regex::Regex::new(r#"\.(executableTarget|target|testTarget|plugin|macro|library|executable)\(\s*name:\s*"([^"]+)""#).unwrap();
+        for capture in pattern.captures_iter(text) {
+            let detail = details.entry(capture[2].to_string()).or_insert_with(String::new);
+            *detail = bounded(&format!("{detail} {} {}", &capture[1], &capture[2]));
+        }
+    } else {
+        let lines = text.lines().collect::<Vec<_>>();
+        for (i, line) in lines.iter().enumerate() {
+            if line.starts_with(char::is_whitespace) || line.starts_with('#') { continue; }
+            let Some((names, rest)) = line.split_once(':') else { continue };
+            let mut start = i;
+            while start > 0 && lines[start - 1].trim_start().starts_with('#') { start -= 1; }
+            let comments = lines[start..i].iter().map(|l| l.trim().trim_start_matches('#').trim());
+            let recipes = lines[i + 1..].iter().take_while(|l| l.trim().is_empty() || l.starts_with(char::is_whitespace)).map(|l| l.trim());
+            let detail = bounded(&comments.chain(std::iter::once(rest.trim())).chain(recipes).collect::<Vec<_>>().join(" "));
+            for name in names.split_whitespace() { details.insert(name.into(), detail.clone()); }
+        }
+    }
+    details
 }
 
 /// The usual commands for a manifest, whatever it declares. Fixed text: only the tool varies, and only
@@ -373,6 +411,26 @@ pub fn suggestion_why(runs_here: i64, project_runs: i64, extra: Option<&Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_details_are_bounded_text_not_commands() {
+        for file in ["makefile", "gnumakefile", "justfile", ".justfile"] {
+            let details = script_details(file, "# unrelated\n\n# Formats markdown\n# safely\ndocs:\n\techo $(touch NEVER)\n\n# Next target\nnext:\n\ttrue\n");
+            assert!(details["docs"].contains("Formats markdown safely"));
+            assert!(details["docs"].contains("$(touch NEVER)"));
+            assert!(!details["docs"].contains("unrelated"));
+            assert!(!details["docs"].contains("Next target"));
+            assert_eq!(details["next"], "Next target  true");
+            let long = format!("# {}\ndocs:\n", "é".repeat(500));
+            assert_eq!(script_details(file, &long)["docs"].chars().count(), 400);
+        }
+        assert_eq!(script_details("package.json", r#"{"scripts":{"docs":"formatter --markdown", "bad":false}}"#)["docs"], "formatter --markdown");
+        assert!(script_details("package.json", "broken").is_empty());
+        let swift = script_details("package.swift", r#".library(name: "Lib"), .target(name: "Lib"), .executableTarget(name: "App")"#);
+        assert!(swift["Lib"].contains("library Lib"));
+        assert!(swift["Lib"].contains("target Lib"));
+        assert!(swift["App"].contains("executableTarget App"));
+    }
 
     #[test]
     fn score_pick_similarity() {

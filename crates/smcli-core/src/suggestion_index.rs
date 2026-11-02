@@ -426,6 +426,7 @@ mod tests {
                 command: "cargo check".into(),
                 kind: CandidateKind::Script,
                 reason: "Cargo.toml project".into(),
+                detail: None,
             }],
             ..Default::default()
         };
@@ -596,6 +597,7 @@ mod tests {
                 command: "cargo test my_test".into(),
                 kind: CandidateKind::Test,
                 reason: "project test".into(),
+                detail: None,
             }],
             ..Default::default()
         };

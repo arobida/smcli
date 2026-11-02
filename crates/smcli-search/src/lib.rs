@@ -23,3 +23,21 @@ mod tokenizer;
 pub use index::HistorySearch;
 pub use potion::Potion;
 pub use tokenizer::ShellTokenizer;
+
+#[cfg(test)]
+extern crate self as smcli_search;
+#[cfg(test)]
+#[path = "../tests/ranking.rs"]
+mod ranking;
+
+#[cfg(test)]
+#[test]
+fn project_config_comparison() {
+    ranking::compare_project_config(|mode| corpus::PROJECT_CONFIG_MODE.with(|m| m.set(mode)));
+}
+
+#[cfg(test)]
+#[test]
+fn vector_first_comparison() {
+    ranking::compare_vector_first(|enabled| index::VECTOR_FIRST.with(|v| v.set(enabled)));
+}

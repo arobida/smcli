@@ -28,3 +28,17 @@ Hybrid search over one user's shell history: captured SQLite statistics and raw 
 
 - Run: `make test-rust PKG=smcli-search`
 - Run: `make ranking` (scored, floor-checked query set)
+
+## Ranking
+
+Natural-language intent uses vector-only top-k retrieval. Unambiguous query-side spelling corrections are applied before embedding only to words absent from the loaded model’s whole-word tokenizer vocabulary (paths without a loaded model retain their existing behavior); the original corpus/model/index format is unchanged. Current project Hint/Script/Test candidates are batch-embedded at query time and join with the same cosine. BM25 fusion, grep expansion and the old usage exponent are not used for intent. Only explicit filters and resolved markers constrain this pool.
+
+Intent score is cosine plus bounded additive context: runs here (0.01 × log1p, cap 0.04), project runs (0.01 × log1p, cap 0.02), frecency (0.005 × log1p, cap 0.03), exact parsed executable (0.02), lexical coverage (0.005), project candidate membership (0.03), PATH (0.03) and existing input files (0.01). The combined context cap is 0.10. Project-config keyword evidence adds a separate boost capped at 0.48, so the combined positive contributions cannot reverse a cosine gap greater than 0.58. Signal-disable behavior is preserved. With a held index lock, intent embeds the filtered in-memory corpus instead of using text-only coverage; this may cost more than indexed retrieval.
+
+Literal queries retain the existing hybrid/usage pipeline, including strict filters, alias behavior and fallback. Exact typed alias invocations retain their alias-aware legacy path; standalone uppercase identifier queries remain lexical. Native history and stored index documents are unchanged.
+
+`make ranking` prints the fixed natural-language cohorts and legacy cases. `make test-rust PKG=smcli-search FILTER="--release vector_first_comparison -- --nocapture"` prints the synthetic old/new comparison and asserts no literal-rank regressions. Natural-language trade-offs are reported separately; the existing suggestion and literal-search floors remain enforced. Timing and pool-tracing instrumentation are not part of this harness.
+
+Project Script candidates also carry up to 400 characters of local config description text: contiguous Make/just comments and recipes, package.json command strings, or Swift target/product names and kinds. Nothing is executed. Corrected query tokens match these descriptions case-insensitively (prefixes need four characters), with stopwords removed and each match weighted by rarity across that file's candidates. Shared boilerplate contributes zero. Candidates already enter independently of the stored-vector pool cutoff, so the keyword signal needs no BM25 retrieval or unbounded relevance promotion.
+
+`make test-rust PKG=smcli-search FILTER="--release project_config_comparison -- --nocapture"` compares this bounded keyword signal with vector-first alone and asserts no worsened fixed-search or NL ranks. Embedding command+detail was tested and rejected after a held-out regression; stored vectors and query-time command embeddings are unchanged.
