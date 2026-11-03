@@ -34,7 +34,7 @@ done
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
-[[ $(uname) == Darwin ]] || die "the installer is macOS-only; on Linux, copy smcli, smcli-service, and the potion-shell-16m/ folder into the same directory manually."
+[[ $(uname) == Darwin ]] || die "the installer is macOS-only; on Linux, copy smcli, smcli-service, the potion-shell-16m/ folder and the tldr/ folder into the same directory manually."
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ $prefix == /* ]] || prefix="$PWD/$prefix"
 
@@ -59,6 +59,9 @@ model="$from/potion-shell-16m"
 for file in model.safetensors tokenizer.json config.json; do
     [[ -s $model/$file ]] || die "missing or empty potion-shell-16m/$file beside $from/smcli"
 done
+tldr="$from/tldr"
+[[ -d $tldr ]] || tldr="$here/../Data/tldr"
+[[ -s $tldr/tldr.jsonl ]] || die "missing or empty tldr/tldr.jsonl beside $from/smcli"
 say "Installing smcli and smcli-service to $prefix"
 mkdir -p "$prefix"
 stage=$(mktemp -d "$prefix/.smcli-install.XXXXXX")
@@ -69,6 +72,7 @@ for name in smcli smcli-service; do
     xattr -d com.apple.quarantine "$stage/$name" 2>/dev/null || true
 done
 cp -RL "$model" "$stage/potion-shell-16m"
+cp -RL "$tldr" "$stage/tldr"
 "$stage/smcli" --help > /dev/null || die "the staged smcli does not run"
 "$stage/smcli-service" --help > "$stage/service-help" 2>&1 && service_status=0 || service_status=$?
 [[ $service_status == 2 ]] && grep -q '^Usage: smcli-service ' "$stage/service-help" || die "the staged smcli-service does not run"
@@ -79,6 +83,8 @@ for name in smcli smcli-service; do
 done
 rm -rf "$prefix/potion-shell-16m"
 mv "$stage/potion-shell-16m" "$prefix/potion-shell-16m"
+rm -rf "$prefix/tldr"
+mv "$stage/tldr" "$prefix/tldr"
 # The uninstaller ships with the install, so it works without the release archive or checkout.
 uninstaller="$here/uninstall.sh"
 [[ -f $uninstaller ]] && install -m 755 "$uninstaller" "$prefix/smcli-uninstall"

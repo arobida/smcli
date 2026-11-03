@@ -2,7 +2,7 @@ PYTHON ?= python3
 DIST := dist
 STAMP := $(shell date +%Y%m%d-%H%M%S)-$(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)
 
-.PHONY: build release fresh install uninstall test test-rust test-cli test-picker test-shells test-service test-install clean run baseline ranking linux docs notices
+.PHONY: build release fresh install uninstall tldr test test-rust test-cli test-picker test-shells test-service test-install clean run baseline ranking tldr-ranking linux docs notices
 
 PKG ?=
 FILTER ?=
@@ -20,6 +20,7 @@ release:
 	ln -sf smcli-$(STAMP) $(DIST)/smcli
 	ln -sf smcli-service-$(STAMP) $(DIST)/smcli-service
 	rm -rf $(DIST)/potion-shell-16m && cp -R Models/potion-shell-16m $(DIST)/potion-shell-16m
+	rm -rf $(DIST)/tldr && cp -R Data/tldr $(DIST)/tldr
 	@echo "Built $(DIST)/smcli-$(STAMP) (latest: $(DIST)/smcli)"
 	@echo ""
 	@echo "Try it in this shell (loads the zsh hooks from the new build):"
@@ -30,6 +31,10 @@ release:
 fresh:
 	$(MAKE) clean
 	$(MAKE) release
+
+# Regenerates Data/tldr from a local tldr-pages checkout at its current commit: make tldr TLDR=<checkout>.
+tldr:
+	$(PYTHON) scripts/gen-tldr.py TLDR=$(TLDR)
 
 test:
 	bash scripts/test.sh
@@ -69,6 +74,9 @@ test-install: build
 # Scores suggest and search ranking on the fixed query set (MRR, top-1, top-3) and lists the misses.
 ranking:
 	cargo test --release -p smcli-search --test ranking -- --nocapture
+
+tldr-ranking:
+	cargo test --release -p smcli-search --test tldr tldr_ranking_evaluation -- --nocapture
 
 # Black-box baseline of the current CLI and generated hooks; never reads real history.
 baseline:

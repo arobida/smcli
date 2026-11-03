@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 manifest = f"{root}/Cargo.toml"
@@ -122,6 +123,23 @@ lmdb_license = glob.glob(f"{os.path.dirname(lmdb['manifest_path'])}/lmdb/librari
 w("### LMDB (OpenLDAP Public License)\n")
 w(f"From `lmdb-master-sys {lmdb['version']}`.\n")
 w("```text\n" + (read(lmdb_license[0]) if lmdb_license else "LICENSE file not found in the crate; see lmdb-master-sys.") + "\n```\n")
+
+w("## Bundled data\n")
+w("Converted offline at build time by `scripts/gen-tldr.py` from a pinned tldr-pages commit.\n")
+for folder in sorted(glob.glob(f"{root}/Data/*/")):
+    name = os.path.basename(folder.rstrip("/"))
+    license_path = os.path.join(folder, "LICENSE.md")
+    if not os.path.isfile(license_path):
+        sys.exit(f"Data/{name} has no LICENSE.md; bundled data needs its attribution")
+    jsonl = os.path.join(folder, "tldr.jsonl")
+    with open(jsonl) as handle:
+        header = json.loads(handle.readline())
+        entries = sum(1 for _ in handle)
+    w(f"### {name} (tldr-pages, {header['license']})\n")
+    w(f"From https://github.com/tldr-pages/tldr, commit `{header['tldr_commit']}`. "
+      f"{header['version']} header, {entries} example entries in `tldr.jsonl`. "
+      f"The pages' CC-BY attribution follows (full license text in `Data/tldr/LICENSE.md`).\n")
+    w("```text\n" + read(license_path) + "\n```\n")
 
 w("## Rust crates linked by smcli and smcli-service\n")
 w(f"{len(third_party)} third-party crates across {', '.join(targets)} (normal dependencies only; Cargo feature unification and proc-macros may overstate the linked set), with the license expression each declares.\n")

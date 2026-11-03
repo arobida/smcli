@@ -1,0 +1,51 @@
+program	query	expected
+bun	how do I install a package globally	bun add --global {{package}}
+bun	install all dependencies from package.json	bun install
+bun	add a package as a development dependency	bun add --dev {{package}}
+bun	remove a dependency from my project	bun remove {{package}}
+bun	run a script defined in package.json	bun run {{script}}
+bun	run the project test suite	bun test
+bun	create a new application from a template	bun create {{template}} {{directory}}
+bun	update all dependencies to newer versions	bun update
+bun	execute a binary provided by a package	bun x {{command}}
+bun	list the packages installed in this project	bun pm ls
+git	show the working tree status	git status
+git	commit staged changes with a message	git commit -m {{message}}
+git	change the most recent commit	git commit --amend
+git	continue rebasing after resolving conflicts	git rebase --continue
+git	interactive rebase of recent commits	git rebase -i {{commit}}
+git	temporarily save uncommitted work	git stash
+git	restore the most recently stashed changes	git stash pop
+git	show a compact commit history	git log --oneline
+git	delete a local branch	git branch -d {{branch}}
+git	undo the last commit but keep its changes	git reset --soft HEAD~1
+tar	extract an archive in the current directory	tar -xf {{archive}}
+tar	extract a compressed gzip tarball	tar -xzf {{archive.tar.gz}}
+tar	create a gzip compressed archive	tar -czf {{archive.tar.gz}} {{files}}
+tar	list the files inside an archive	tar -tf {{archive}}
+tar	extract an archive into another directory	tar -xf {{archive}} -C {{directory}}
+tar	create an archive from files	tar -cf {{archive.tar}} {{files}}
+tar	extract a bzip2 compressed archive	tar -xjf {{archive.tar.bz2}}
+tar	add a file to an existing archive	tar -rf {{archive.tar}} {{file}}
+tar	extract while excluding a pattern	tar -xf {{archive}} --exclude={{pattern}}
+tar	verbosely extract an archive	tar -xvf {{archive}}
+docker	list containers that are running	docker ps
+docker	list every container including stopped ones	docker ps -a
+docker	start compose services in the background	docker compose up -d
+docker	stop a running container	docker stop {{container}}
+docker	follow logs from a container	docker logs -f {{container}}
+docker	build an image from a Dockerfile	docker build -t {{image}} .
+docker	remove an image from the machine	docker rmi {{image}}
+docker	run a container interactively	docker run -it {{image}}
+docker	delete unused containers networks and images	docker system prune
+docker	open a shell inside a running container	docker exec -it {{container}} sh
+find	find files by exact name	find {{directory}} -name {{filename}}
+find	search for names without matching case	find {{directory}} -iname {{filename}}
+find	find only regular files	find {{directory}} -type f
+find	list directories below a path	find {{directory}} -type d
+find	find files modified in the last day	find {{directory}} -mtime -1
+find	delete files matching a name	find {{directory}} -name {{filename}} -delete
+find	run a command for every matching file	find {{directory}} -name {{filename}} -exec {{command}} {} \;
+find	find files larger than 100 megabytes	find {{directory}} -size +100M
+find	locate empty files	find {{directory}} -empty
+find	search while skipping a directory	find {{directory}} -path {{exclude}} -prune -o -print

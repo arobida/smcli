@@ -18,10 +18,12 @@ pub mod index;
 pub mod native;
 mod potion;
 pub mod setup;
+pub mod tldr;
 mod tokenizer;
 
 pub use index::HistorySearch;
 pub use potion::Potion;
+pub use tldr::{Corpus, Entry, corpus_vectors, rank};
 pub use tokenizer::ShellTokenizer;
 
 #[cfg(test)]

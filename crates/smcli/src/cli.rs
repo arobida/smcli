@@ -60,6 +60,8 @@ enum Command {
         files: bool,
         #[arg(long)]
         grep: bool,
+        #[arg(long, conflicts_with_all=["suggest","files","grep"])]
+        tldr: bool,
         query: Vec<String>,
     },
     Context {
@@ -473,8 +475,13 @@ pub fn run() -> Result<()> {
             suggest,
             files,
             grep,
+            tldr,
             query,
         } => {
+            if tldr {
+                pick_tldr(&captured, &home, &env)?;
+                return Ok(());
+            }
             pick(
                 &captured,
                 &service,
@@ -978,6 +985,97 @@ fn fallback_picker_recents(c: &CapturedHistory, user: &str) -> Result<Vec<String
     Ok(statement.query_map([user], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct TldrContext {
+    leading: String,
+    program: Option<String>,
+    prefix_words: Vec<String>,
+}
+
+fn tldr_context(line: &str) -> TldrContext {
+    let words = line.split_whitespace().collect::<Vec<_>>();
+    let mut program_index = 0;
+    while words.get(program_index).is_some_and(|word| matches!(*word, "sudo" | "env" | "command")) {
+        program_index += 1;
+    }
+    let program = words.get(program_index).map(|word| word.rsplit('/').next().unwrap_or(word).to_owned());
+    let mut leading = words[..program_index].join(" ");
+    if !leading.is_empty() {
+        leading.push(' ');
+    }
+    let mut prefix_words = words.get(program_index..).unwrap_or_default().iter().map(|word| (*word).to_owned()).collect::<Vec<_>>();
+    if let Some(program) = &program {
+        prefix_words[0] = program.clone();
+    }
+    TldrContext { leading, program, prefix_words }
+}
+
+fn current_tldr_platform() -> &'static str {
+    if cfg!(target_os = "macos") { "osx" } else { std::env::consts::OS }
+}
+
+fn pick_tldr(c: &CapturedHistory, home: &Path, env: &HashMap<String, String>) -> Result<()> {
+    use crate::picker::{Choice, Mode, Picker};
+    use smcli_search::tldr;
+
+    let directory = tldr::bundled_dir().ok_or_else(|| anyhow::anyhow!("tldr data not found beside the smcli executable or in Data/tldr"))?;
+    let corpus = tldr::load(&directory, current_tldr_platform())?;
+    let context = tldr_context(env.get("SMCLI_LBUFFER").map(String::as_str).unwrap_or(""));
+    let programs = corpus.entries.iter().map(|entry| entry.program.clone()).collect::<HashSet<_>>();
+    let path = smcli_core::service_protocol::shell_path_snapshot(env.get("PATH").map(String::as_str)).unwrap_or_default();
+    let installed = tldr::installed(&programs, &path);
+    let engine = search_engine(c, home, env)?;
+    let index_dir = engine.directory.clone();
+    let potion = engine.potion;
+    let program = context.program.clone();
+    let prefix = context.prefix_words.clone();
+    let picker_entries = corpus.entries.clone();
+    let tldr_status = context.program.as_ref().filter(|program| !corpus.entries.iter().any(|entry| &entry.program == *program))
+        .map(|program| format!("no tldr page for {program}; Ctrl-A searches all installed"));
+    let mut page_data = None;
+    let mut all_data = None;
+    let search = move |query: &str, all: bool| -> Result<Vec<String>> {
+        type Data = (Vec<usize>, Vec<smcli_search::Entry>, Vec<Vec<f32>>);
+        let data: &mut Data = if all {
+            if all_data.is_none() {
+                let indices = corpus.entries.iter().enumerate().filter(|(_, entry)| installed.contains(&entry.program)).map(|(index, _)| index).collect::<Vec<_>>();
+                let entries = indices.iter().map(|index| corpus.entries[*index].clone()).collect::<Vec<_>>();
+                let vectors = tldr::corpus_vectors(&potion, &corpus, &installed, &index_dir)?;
+                all_data = Some((indices, entries, vectors));
+            }
+            all_data.as_mut().unwrap()
+        } else {
+            if page_data.is_none() {
+                let indices = corpus.entries.iter().enumerate().filter(|(_, entry)| Some(&entry.program) == program.as_ref()).map(|(index, _)| index).collect::<Vec<_>>();
+                let entries = indices.iter().map(|index| corpus.entries[*index].clone()).collect::<Vec<_>>();
+                let vectors = potion.embed(&entries.iter().map(|entry| entry.description.clone()).collect::<Vec<_>>());
+                page_data = Some((indices, entries, vectors));
+            }
+            page_data.as_mut().unwrap()
+        };
+        let query = potion.embed(&[query.to_owned()]).remove(0);
+        let empty = Vec::new();
+        let prefix = if all { &empty } else { &prefix };
+        Ok(tldr::rank_with_vectors(&query, &data.1, &data.2, prefix)
+            .into_iter()
+            .map(|(index, _)| data.0[index].to_string())
+            .collect())
+    };
+    let query = env.get("SMCLI_TLDR_QUERY").map(|query| query.trim_start().to_owned()).unwrap_or_default();
+    let mut picker = Picker::new(Vec::new(), Vec::new(), Vec::new(), query);
+    picker.mode = Mode::Tldr;
+    picker.tldr_all = context.program.is_none();
+    picker.tldr_program = context.program.clone();
+    picker.tldr_entries = picker_entries;
+    picker.title = Some(if picker.tldr_all { "all installed".into() } else { context.program.clone().unwrap_or_default() });
+    picker.tldr_status = tldr_status;
+    let config = SmcliConfig::load(&SmcliConfig::location(home, env)).unwrap_or_default();
+    if let Some(Choice::Command { command, .. }) = crate::picker::run(picker, Some(Box::new(search)), None, config.at_completion_inline != Some(false))? {
+        println!("{}{}", context.leading, command);
+    }
+    Ok(())
+}
+
 fn pick(
     c: &CapturedHistory,
     service: &ServiceClient,
@@ -1055,7 +1153,7 @@ fn pick(
         let service = ServiceClient::new(&c.path, &env, &std::env::current_exe()?);
         // The model is reused, but each fallback reads history while holding the index lock.
         let fallback = std::cell::OnceCell::new();
-        move |q: &str| -> Result<Vec<String>> {
+        move |q: &str, _: bool| -> Result<Vec<String>> {
         let mut r = ServiceRequest::new(Operation::Search);
         r.query = Some(q.into());
         r.directory = Some(d.clone());
@@ -1338,6 +1436,9 @@ struct IndexInfo {
 fn indexes(captured: &CapturedHistory, home: &Path, env: &HashMap<String, String>, prune: bool, json: bool) -> Result<()> {
     let engine = search_engine(captured, home, env)?;
     let current = engine.index_name();
+    let tldr_current = smcli_search::tldr::bundled_dir()
+        .and_then(|dir| smcli_search::tldr::load(&dir, current_tldr_platform()).ok())
+        .map(|corpus| smcli_search::tldr::cache_name(&engine.potion, &corpus.commit));
     let _lock = if prune { Some(engine.lock_index(20)?.ok_or_else(|| anyhow::anyhow!("Search index is busy; try again."))?) } else { None };
     let mut found: std::collections::BTreeMap<String, IndexInfo> = Default::default();
     let entries = match std::fs::read_dir(&engine.directory) {
@@ -1348,8 +1449,20 @@ fn indexes(captured: &CapturedHistory, home: &Path, env: &HashMap<String, String
     for entry in &entries {
         let filename = entry.file_name().to_string_lossy().into_owned();
         // Index names hold no dots, so everything before the first one groups the index with its side files.
-        let Some((name, _)) = filename.split_once('.').filter(|_| filename.starts_with("rs-commands-v")) else { continue };
-        let info = found.entry(name.to_string()).or_insert_with(|| IndexInfo { name: name.to_string(), bytes: 0, current: name == current || name == format!("{current}-typed") });
+        let name = if filename.starts_with("rs-commands-v") {
+            filename.split_once('.').map(|(name, _)| name.to_string())
+        } else if filename.starts_with("tldr-") && filename.ends_with(".vec") {
+            Some(filename.clone())
+        } else {
+            None
+        };
+        let Some(name) = name else { continue };
+        let is_current = if filename.starts_with("tldr-") {
+            tldr_current.as_deref() == Some(&filename)
+        } else {
+            name == current || name == format!("{current}-typed")
+        };
+        let info = found.entry(name.clone()).or_insert_with(|| IndexInfo { name, bytes: 0, current: is_current });
         info.bytes += entry.metadata()?.len();
         if prune && !info.current {
             std::fs::remove_file(entry.path())?;
@@ -1624,6 +1737,25 @@ mod tests {
     }
 
     #[test]
+    fn tldr_pick_arguments_and_lbuffer_context() {
+        assert!(Cli::try_parse_from(["smcli", "pick", "--tldr"]).is_ok());
+        for flag in ["--suggest", "--files", "--grep"] {
+            assert!(Cli::try_parse_from(["smcli", "pick", "--tldr", flag]).is_err());
+        }
+        assert_eq!(tldr_context("sudo env git rebase "), TldrContext {
+            leading: "sudo env ".into(),
+            program: Some("git".into()),
+            prefix_words: vec!["git".into(), "rebase".into()],
+        });
+        assert_eq!(tldr_context("command /usr/bin/bun "), TldrContext {
+            leading: "command ".into(),
+            program: Some("bun".into()),
+            prefix_words: vec!["bun".into()],
+        });
+        assert_eq!(tldr_context("  "), TldrContext { leading: String::new(), program: None, prefix_words: Vec::new() });
+    }
+
+    #[test]
     fn fallback_history_picker_includes_oldest_distinct_capture() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("smcli-fallback-history-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir)?;
@@ -1717,7 +1849,8 @@ mod tests {
         let normal = engine.directory.join(format!("{}.db", engine.index_name()));
         let typed = engine.directory.join(format!("{}-typed.db", engine.index_name()));
         let old = engine.directory.join("rs-commands-v1-old.db");
-        for path in [&normal, &typed, &old] { std::fs::write(path, b"index")?; }
+        let old_tldr = engine.directory.join("tldr-old.vec");
+        for path in [&normal, &typed, &old, &old_tldr] { std::fs::write(path, b"index")?; }
         let c = captured.clone();
         let home = dir.clone();
         let attempt = std::thread::spawn(move || indexes(&c, &home, &HashMap::new(), true, false));
@@ -1725,7 +1858,7 @@ mod tests {
         assert!(old.exists());
         drop(lock);
         indexes(&captured, &dir, &HashMap::new(), true, false)?;
-        assert!(normal.exists() && typed.exists() && !old.exists());
+        assert!(normal.exists() && typed.exists() && !old.exists() && !old_tldr.exists());
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

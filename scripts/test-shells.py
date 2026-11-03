@@ -849,6 +849,145 @@ def run_shared_service(chosen):
           "killed mid-session, nothing lost or duplicated.")
 
 
+TLDR_STUB = """#!/usr/bin/env python3
+# Stub picker: logs each call as JSON, answers `pick --tldr` with the caller's SMCLI_LBUFFER plus
+# SMCLI_TLDR_CHOICE (unset choice = Esc: no output), exits 2 like an old binary when SMCLI_TLDR_OLD is set.
+import json, os, sys
+log = os.environ.get("SMCLI_TLDR_LOG")
+if log:
+    with open(log, "a") as handle:
+        handle.write(json.dumps({"argv": sys.argv[1:],
+                                 "lbuffer": os.environ.get("SMCLI_LBUFFER"),
+                                 "query": os.environ.get("SMCLI_TLDR_QUERY")}) + "\\n")
+if "--tldr" in sys.argv[1:]:
+    if os.environ.get("SMCLI_TLDR_OLD"):
+        sys.stderr.write("error: unrecognized option '--tldr'\\n")
+        sys.exit(2)
+    choice = os.environ.get("SMCLI_TLDR_CHOICE")
+    if choice:
+        print(os.environ.get("SMCLI_LBUFFER", "") + choice)
+"""
+
+
+def tldr_calls(log):
+    if not log.exists():
+        return []
+    return [json.loads(line) for line in log.read_text().splitlines()]
+
+
+def run_tldr(variant):
+    """@@ + Tab replaces the line through the (stubbed) tldr picker; @@x, @word, Esc and old binaries leave it alone."""
+    kind = variant.kind
+    # Bash 3 completion can only replace the current word, so the typed-query and bare-@@ cases don't apply.
+    modern = kind != "bash" or variant.keys
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory).resolve()
+        runtime = tempfile.mkdtemp(prefix="smcli-sh.", dir="/tmp")
+        env = new_environment(home, runtime, variant)
+        log = home / "tldr-log"
+        stub = home / "tldr-stub"
+        stub.write_text(TLDR_STUB)
+        stub.chmod(0o755)
+        env["SMCLI_TLDR_LOG"] = str(log)
+        t = Terminal(variant.path, variant.args, env, str(home))
+        try:
+            t.drain()
+            setup_prompt(t, kind)
+            if variant.prelude:
+                t.send(variant.prelude)
+            t.send(init_line(kind))
+            quoted_stub = shlex.quote(str(stub))
+            t.send(f"set -g _smcli_complete_bin {quoted_stub}" if kind == "fish" else f"_smcli_complete_bin={quoted_stub}")
+            setenv = (lambda n, v: f"set -gx {n} {v}") if kind == "fish" else (lambda n, v: f"export {n}={v}")
+            unset = (lambda n: f"set -e {n}") if kind == "fish" else (lambda n: f"unset {n}")
+            t.send(setenv("SMCLI_TLDR_CHOICE", "'add --global @'"))
+
+            def last_call():
+                calls = [c for c in tldr_calls(log) if "--tldr" in c["argv"]]
+                assert calls, (variant.label, tldr_calls(log))
+                return calls[-1]
+
+            def clear():
+                t.type("\x03")
+                t.until_prompt(redrawn=True)
+
+            # printf @@ + Tab: the picker is called with the line before @@; its choice replaces the line, never runs.
+            count = len(read_records(env))
+            t.type("printf @@")
+            t.type("\t")
+            if modern:
+                t.until_text("printf add --global @")
+                clear()
+                # bash-preexec's DEBUG trap replays the last history line on any bind -x, so a Tab there records a
+                # duplicate of the previous command (pre-existing; the other variants prove the choice never ran).
+                if not variant.prelude:
+                    assert len(read_records(env)) == count, (variant.label, "the tldr choice ran", commands(env))
+                call = last_call()
+                assert call["argv"] == ["pick", "--tldr"], (variant.label, call)
+                assert call["lbuffer"] == "printf " and call["query"] == "", (variant.label, call)
+            else:
+                # Bash 3 can't rewrite the line (Readline splits @@ at the second @), so the hook leaves the line
+                # unchanged and never opens the picker; running it is inert (printf prints its arguments).
+                time.sleep(0.5)
+                t.type(" MARK\n")
+                t.until_prompt()
+                assert commands(env)[-1] == "printf @@ MARK", (variant.label, commands(env)[-2:])
+                assert not any("--tldr" in c["argv"] for c in tldr_calls(log)), (variant.label, tldr_calls(log))
+            if modern:
+                t.type("printf @@ install globally")
+                t.type("\t")
+                t.until_text("printf add --global @")
+                clear()
+                call = last_call()
+                assert call["lbuffer"] == "printf " and call["query"] == "install globally", (variant.label, call)
+                # A bare @@ searches everything: the picker gets an empty program context.
+                t.type("@@")
+                t.type("\t")
+                t.until_text("add --global @")
+                clear()
+                call = last_call()
+                assert call["lbuffer"] == "" and call["query"] == "", (variant.label, call)
+            # @@x, @src and @scope/pkg are not command help: the old @ completion runs, the line stays.
+            before_calls = len(tldr_calls(log))
+            t.type("cat @src")
+            t.type("\t")
+            time.sleep(0.5)
+            t.type(" MARK\n")
+            t.until_prompt()
+            assert commands(env)[-1] == "cat @src MARK", (variant.label, commands(env)[-2:])
+            t.type("@@x")
+            t.type("\t")
+            time.sleep(0.5)
+            clear()
+            t.type("npm i @scope/pkg")
+            t.type("\t")
+            time.sleep(0.5)
+            clear()
+            assert not any("--tldr" in c["argv"] for c in tldr_calls(log)[before_calls:]), (variant.label, tldr_calls(log)[before_calls:])
+            # Esc (the picker prints nothing) restores the line unchanged.
+            t.send(unset("SMCLI_TLDR_CHOICE"))
+            t.type("printf @@")
+            t.type("\t")
+            time.sleep(0.5)
+            t.type(" MARK\n")
+            t.until_prompt()
+            assert commands(env)[-1] == "printf @@ MARK", (variant.label, commands(env)[-2:])
+            # An old binary without --tldr errors out and the line stays unchanged.
+            t.send(setenv("SMCLI_TLDR_OLD", "1"))
+            t.type("printf @@")
+            t.type("\t")
+            time.sleep(0.5)
+            t.type(" MARK\n")
+            t.until_prompt()
+            assert commands(env)[-1] == "printf @@ MARK", (variant.label, commands(env)[-2:])
+            t.wait_exit(0)
+            print(f"{variant.label}: @@ command help (tldr) passed.")
+        finally:
+            t.close()
+            stop_services(env)
+            shutil.rmtree(runtime, ignore_errors=True)
+
+
 ARGV_STUB = """#!/usr/bin/env python3
 import os, sys
 path = os.environ.get("SMCLI_ARGV_LOG")
@@ -1134,6 +1273,7 @@ for variant in found:
     run_variant(variant)
     run_alias_capture(variant)
     run_at_completion(variant)
+    run_tldr(variant)
     run_custom_tab(variant)
 by_label = {v.label: v for v in found}
 zsh_variant = next((v for v in found if v.kind == "zsh"), None)

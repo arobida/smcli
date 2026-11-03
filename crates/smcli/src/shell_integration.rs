@@ -160,7 +160,7 @@ if [[ ${_smcli_installed-} != 1 ]]; then
         }
         _smcli_preexec() {
             local prior_status=$2 entry
-            if [[ $_smcli_armed == 1 && $1 != _smcli_prompt && $1 != _smcli_ready && $1 != _smcli_pick && $1 != _smcli_pick_left && $1 != _smcli_pick_right && $1 != _smcli_pick_files && $1 != _smcli_pick_grep ]]; then
+            if [[ $_smcli_armed == 1 && $1 != _smcli_prompt && $1 != _smcli_ready && $1 != _smcli_pick && $1 != _smcli_pick_left && $1 != _smcli_pick_right && $1 != _smcli_pick_files && $1 != _smcli_pick_grep && $1 != _smcli_tab ]]; then
                 _smcli_started=${EPOCHREALTIME:-$((_smcli_epoch + SECONDS))}
                 _smcli_armed=0
                 _smcli_pending=1
@@ -374,6 +374,36 @@ fi
 # smcli: @ path completion. Typed text is unchanged unless completion is invoked.
 if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
     _smcli_complete_bin=\#(binary)
+    # Command help (@@): split the text before the cursor ($1) at the last whole-word @@ — a space or the line's
+    # start before it, a space or the cursor after. Sets _smcli_tl (text before @@) and _smcli_tq (text after, one
+    # space stripped) and returns 0; anything else returns 1. Runs before every @ path-completion branch.
+    # Cursor offset of the first bare @ in $1 (end of line if none); @scope/pkg is text, as in picker.rs.
+    _smcli_bare_at() {
+        local rest=$1 head=
+        while [[ $rest == *@* ]]; do
+            head+=${rest%%@*}; rest=${rest#*@}
+            [[ $rest == [[:alnum:]_./-]* ]] || { _smcli_at=${#head}; return; }
+            head+=@
+        done
+        _smcli_at=${#1}
+    }
+    _smcli_tldr_split() {
+        _smcli_tl= _smcli_tq=
+        local rest=$1 consumed= head last before found=
+        while [[ $rest == *@@* ]]; do
+            head=${rest%%@@*}
+            last=${rest#*@@}
+            before=$consumed$head
+            if [[ ( -z $before || $before == *[[:space:]] ) && ( -z $last || $last == [[:space:]]* ) ]]; then
+                _smcli_tl=$before
+                _smcli_tq=${last# }
+                found=1
+            fi
+            consumed=$before@@
+            rest=$last
+        done
+        [[ -n $found ]]
+    }
     if (( BASH_VERSINFO[0] >= 4 )); then
         # Macros and bind -x commands cannot be chained through a Readline function.
         _smcli_tab_custom=$(bind -s 2>/dev/null; bind -X 2>/dev/null)
@@ -389,7 +419,17 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
             (( BASH_VERSINFO[0] >= 5 )) || local LC_ALL=C
             local before=${READLINE_LINE:0:READLINE_POINT} after=${READLINE_LINE:READLINE_POINT}
             local word=${before##*[[:space:]]} cmd=${READLINE_LINE%%[[:space:]]*} hit hits
-            if [[ $word == @* ]]; then
+            if _smcli_tldr_split "$before"; then
+                # Command help: the picker prints the replacement line (nothing on Esc or an old binary).
+                local chosen
+                chosen=$(env SMCLI_SHELL=bash SMCLI_LBUFFER="$_smcli_tl" SMCLI_TLDR_QUERY="$_smcli_tq" "$_smcli_complete_bin" pick --tldr </dev/tty)
+                if [[ -n $chosen ]]; then
+                    READLINE_LINE=$chosen$after
+                    _smcli_bare_at "$chosen"
+                    READLINE_POINT=$_smcli_at
+                fi
+                bind '"\e[0n": redraw-current-line'
+            elif [[ $word == @* ]]; then
                 hits=$(SMCLI_SHELL=bash "$_smcli_complete_bin" complete --word "$word" --command "$cmd" --limit 2)
                 hit=$hits
                 if [[ $hits == *$'\n'* ]]; then
@@ -414,6 +454,10 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
         _smcli_complete() {
             local cur=${COMP_WORDS[COMP_CWORD]} cmd=${COMP_WORDS[0]} line
             COMPREPLY=()
+            # shortcut: Readline treats the second @ of @@ as a word break, so Bash 3 completion can only replace
+            # one @ and a clean rewrite is impossible; the check runs first and leaves the line unchanged (today it
+            # would list every file). Upgrade if Bash 3 must have command help.
+            _smcli_tldr_split "${COMP_LINE:0:COMP_POINT}" && return
             [[ $cur == @* ]] || return
             while IFS= read -r line; do
                 [[ -n $line ]] && COMPREPLY+=("$line")
@@ -612,8 +656,50 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
         _smcli_tab_orig=${${(z)"$(bindkey '^I')"}[-1]}
         [[ -n $_smcli_tab_orig && $_smcli_tab_orig != (undefined-key|*_smcli_complete_widget) ]] || _smcli_tab_orig=expand-or-complete
     fi
+    # Command help (@@): split LBUFFER ($1) at the last whole-word @@ — a space or the line's start before it, a
+    # space or the cursor after. Sets _smcli_tl/_smcli_tq and returns 0 on a match. Runs before every @ branch.
+    # Cursor offset of the first bare @ in $1 (end of line if none); @scope/pkg is text, as in picker.rs.
+    _smcli_bare_at() {
+        local rest=$1 head=
+        while [[ $rest == *@* ]]; do
+            head+=${rest%%@*}; rest=${rest#*@}
+            [[ $rest == [[:alnum:]_./-]* ]] || { _smcli_at=${#head}; return; }
+            head+=@
+        done
+        _smcli_at=${#1}
+    }
+    _smcli_tldr_split() {
+        setopt localoptions noglob noshwordsplit
+        _smcli_tl= _smcli_tq=
+        local rest=$1 consumed= head last before found=
+        while [[ $rest == *@@* ]]; do
+            head=${rest%%@@*}
+            last=${rest#*@@}
+            before=$consumed$head
+            if [[ ( -z $before || $before == *[[:space:]] ) && ( -z $last || $last == [[:space:]]* ) ]]; then
+                _smcli_tl=$before
+                _smcli_tq=${last# }
+                found=1
+            fi
+            consumed=$before@@
+            rest=$last
+        done
+        [[ -n $found ]]
+    }
     _smcli_complete_widget() {
         setopt localoptions noglob noshwordsplit
+        if _smcli_tldr_split "$LBUFFER"; then
+            # Command help: the picker prints the replacement line (nothing on Esc or an old binary).
+            local chosen
+            chosen=$(env SMCLI_SHELL=zsh SMCLI_LBUFFER="$_smcli_tl" SMCLI_TLDR_QUERY="$_smcli_tq" "$_smcli_complete_bin" pick --tldr </dev/tty)
+            if [[ -n $chosen ]]; then
+                BUFFER=$chosen$RBUFFER
+                _smcli_bare_at "$chosen"
+                CURSOR=$_smcli_at
+            fi
+            zle reset-prompt
+            return
+        fi
         local word=${LBUFFER##*[[:space:]]} cmd=${${(z)BUFFER}[1]}
         if [[ $word != @* ]]; then
             # Plugins that wrap Tab (fzf-tab, autosuggestions) can chain back into us: a re-entry does plain completion.
@@ -832,6 +918,29 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
     set -g _smcli_complete_bin \#(fishBinary)
     function _smcli_complete_widget
         set -l token (commandline -ct)
+        # Command help (@@): the last whole-word @@ before the cursor — a space or the line's start before it, a
+        # space or the cursor after. Runs before the @ path completion, which @@ would otherwise match.
+        set -l before (commandline -c | string collect)
+        set -l m (string match -r -- '^(?:(.*[[:space:]]))?@@(?:[[:space:]](.*))?$' -- "$before")
+        if test $status -eq 0
+            # $m[1] is the whole match; the groups start at index 2.
+            set -l lbuffer ""
+            set -l query ""
+            test (count $m) -ge 2; and set lbuffer $m[2]
+            test (count $m) -ge 3; and set query $m[3]
+            set -l chosen (env SMCLI_SHELL=fish SMCLI_LBUFFER="$lbuffer" SMCLI_TLDR_QUERY="$query" $_smcli_complete_bin pick --tldr </dev/tty | string collect)
+            if test -n "$chosen"
+                set -l full (commandline | string collect)
+                set -l after (string sub -s (math (commandline -C) + 1) -- "$full")
+                commandline -r -- "$chosen$after"
+                # The first bare @ is the placeholder; @scope/pkg is text (picker.rs is_placeholder).
+                set -l head (string match -r -- '^(.*?)@(?![[:alnum:]_./-])' $chosen)[2]
+                test -n "$head"; or string match -qr -- '^@(?![[:alnum:]_./-])' $chosen; or set head $chosen
+                commandline -C (string length -- "$head")
+            end
+            commandline -f repaint
+            return
+        end
         if string match -q -- '@*' -- $token
             set -l cmd (commandline -op)
             set -l hits (SMCLI_SHELL=fish command $_smcli_complete_bin complete --word "$token" --command $cmd[1])
@@ -886,6 +995,38 @@ mod tests {
             assert!(hooks.contains("_smcli_complete"), "{shell}");
             assert!(hooks.contains("SMCLI_NO_KEYS"), "{shell}");
         }
+    }
+
+    #[test]
+    fn tldr_cursor_lands_on_first_bare_at() {
+        for shell in ["bash", "zsh"] {
+            let hooks = render_with_keys(shell, "smcli", true, false, false, false, false, true).unwrap();
+            let start = hooks.find("_smcli_bare_at() {").unwrap();
+            let func = &hooks[start..start + hooks[start..].find("\n    }\n").unwrap() + 6];
+            let script = format!("{func}\nfor l in 'npm i @scope/pkg @' 'tar -xf @ -C @' 'ls'; do _smcli_bare_at \"$l\"; echo $_smcli_at; done");
+            let Ok(out) = std::process::Command::new(shell).arg("-c").arg(&script).output() else { continue };
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "17\n8\n2\n", "{shell}");
+        }
+    }
+
+    #[test]
+    fn tldr_double_at_check_precedes_every_at_branch() {
+        for shell in ["bash", "zsh", "fish"] {
+            let hooks = render_with_keys(shell, "smcli", true, false, false, false, false, true).unwrap();
+            assert!(hooks.contains("pick --tldr"), "{shell} missing pick --tldr");
+            assert!(hooks.contains("SMCLI_TLDR_QUERY"), "{shell} missing the prefilled query");
+            assert!(hooks.contains("SMCLI_LBUFFER"), "{shell} missing SMCLI_LBUFFER");
+        }
+        let bash = render_with_keys("bash", "smcli", true, false, false, false, false, true).unwrap();
+        // Both bash completion paths (@ entry points) check @@ first; only the modern one can rewrite the line.
+        assert_eq!(bash.matches("_smcli_tldr_split \"").count(), 2, "bash has two @ completion paths");
+        for at in bash.match_indices("== @*") {
+            assert!(bash[..at.0].contains("_smcli_tldr_split"), "an @ branch runs before the @@ check");
+        }
+        let zsh = render_with_keys("zsh", "smcli", true, false, false, false, false, true).unwrap();
+        assert!(zsh.find("pick --tldr").unwrap() < zsh.find("!= @*").unwrap(), "zsh @ branch runs first");
+        let fish = render_with_keys("fish", "smcli", true, false, false, false, false, true).unwrap();
+        assert!(fish.find("pick --tldr").unwrap() < fish.find("'@*'").unwrap(), "fish @ branch runs first");
     }
 
     #[test]

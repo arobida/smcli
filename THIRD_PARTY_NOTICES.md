@@ -1585,9 +1585,52 @@ California, USA.  All Rights Reserved.  Permission to copy and
 distribute verbatim copies of this document is granted.
 ```
 
+## Bundled data
+
+Converted offline at build time by `scripts/gen-tldr.py` from a pinned tldr-pages commit.
+
+### tldr (tldr-pages, CC-BY-4.0)
+
+From https://github.com/tldr-pages/tldr, commit `18143f5a282f5284fa1edf83c3e96e5c69356dfc`. 1 header, 31410 example entries in `tldr.jsonl`. The pages' CC-BY attribution follows (full license text in `Data/tldr/LICENSE.md`).
+
+```text
+<!-- markdownlint-disable MD041 -->
+Copyright © 2014—present the [tldr-pages team](https://github.com/orgs/tldr-pages/people)
+and [contributors](https://github.com/tldr-pages/tldr/graphs/contributors).
+
+**This work is licensed under the
+[Creative Commons Attribution 4.0 International License](https://creativecommons.org/licenses/by/4.0/)
+(CC-BY).**
+
+----
+
+The contents of the [scripts/](https://github.com/tldr-pages/tldr/tree/main/scripts) directory
+are licensed under the MIT license:
+
+> **The MIT License**
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy
+> of this software and associated documentation files (the "Software"), to deal
+> in the Software without restriction, including without limitation the rights
+> to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+> copies of the Software, and to permit persons to whom the Software is
+> furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in
+> all copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+> IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+> FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+> AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+> LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+> OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+> THE SOFTWARE.
+```
+
 ## Rust crates linked by smcli and smcli-service
 
-279 third-party crates across aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-gnu (normal dependencies only; Cargo feature unification and proc-macros may overstate the linked set), with the license expression each declares.
+281 third-party crates across aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-gnu (normal dependencies only; Cargo feature unification and proc-macros may overstate the linked set), with the license expression each declares.
 
 | Crate | Version | License |
 |---|---|---|
@@ -1658,6 +1701,7 @@ distribute verbatim copies of this document is granted.
 | esaxx-rs | 0.1.10 | Apache-2.0 |
 | fallible-iterator | 0.3.0 | MIT/Apache-2.0 |
 | fallible-streaming-iterator | 0.1.9 | MIT/Apache-2.0 |
+| fastrand | 2.5.0 | Apache-2.0 OR MIT |
 | fff-grep | 0.11.0 | MIT |
 | fff-notify-debouncer-full | 0.9.4 | MIT OR Apache-2.0 |
 | fff-query-parser | 0.11.0 | MIT |
@@ -1822,6 +1866,7 @@ distribute verbatim copies of this document is granted.
 | synchronoise | 1.0.1 | MIT OR Apache-2.0 |
 | synstructure | 0.14.0 | MIT |
 | taladb | 0.12.0 | MIT OR Apache-2.0 |
+| tempfile | 3.27.0 | MIT OR Apache-2.0 |
 | thiserror | 1.0.69 | MIT OR Apache-2.0 |
 | thiserror | 2.0.21 | MIT OR Apache-2.0 |
 | thiserror-impl | 1.0.69 | MIT OR Apache-2.0 |
@@ -2100,7 +2145,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-#### adler2 2.0.1, allocator-api2 0.2.21, anyhow 1.0.104, dary_heap 0.3.9, displaydoc 0.2.7, indoc 2.0.8, itoa 1.0.18, lazy_static 1.5.1, linux-raw-sys 0.12.1, minimal-lexical 0.2.1, monostate 0.1.18, monostate-impl 0.1.18, once_cell 1.21.4, paste 1.0.15, pastey 0.2.3, pathdiff 0.2.3, pin-project-lite 0.2.17, portable-atomic 1.15.0, proc-macro2 1.0.107, quote 1.0.47, rustc-hash 2.1.3, rustix 1.1.5, rustversion 1.0.23, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.154, syn 2.0.119, syn 3.0.9, thiserror 1.0.69, thiserror 2.0.21, thiserror-impl 1.0.69, thiserror-impl 2.0.21, unicode-ident 1.0.27, unsafe-libyaml 0.2.11, zmij 1.0.23
+#### adler2 2.0.1, allocator-api2 0.2.21, anyhow 1.0.104, dary_heap 0.3.9, displaydoc 0.2.7, fastrand 2.5.0, indoc 2.0.8, itoa 1.0.18, lazy_static 1.5.1, linux-raw-sys 0.12.1, minimal-lexical 0.2.1, monostate 0.1.18, monostate-impl 0.1.18, once_cell 1.21.4, paste 1.0.15, pastey 0.2.3, pathdiff 0.2.3, pin-project-lite 0.2.17, portable-atomic 1.15.0, proc-macro2 1.0.107, quote 1.0.47, rustc-hash 2.1.3, rustix 1.1.5, rustversion 1.0.23, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.154, syn 2.0.119, syn 3.0.9, thiserror 1.0.69, thiserror 2.0.21, thiserror-impl 1.0.69, thiserror-impl 2.0.21, unicode-ident 1.0.27, unsafe-libyaml 0.2.11, zmij 1.0.23
 
 ```text
 Permission is hereby granted, free of charge, to any
@@ -2128,7 +2173,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-#### ahash 0.8.12, arrayvec 0.7.8, base64 0.13.1, base64 0.22.1, bitflags 2.13.2, bstr 1.13.1, by_address 1.2.1, cfg-if 1.0.5, crossbeam-channel 0.5.17, crossbeam-deque 0.8.8, crossbeam-epoch 0.9.21, crossbeam-queue 0.3.14, crossbeam-utils 0.8.23, displaydoc 0.2.7, either 1.19.0, embedded-io 0.4.0, embedded-io 0.6.1, equivalent 1.0.3, errno 0.3.14, flate2 1.1.10, fnv 1.0.7, form_urlencoded 1.2.2, git2 0.21.0, hashbrown 0.17.1, heck 0.5.0, idna 1.1.0, idna_adapter 1.2.2, indexmap 2.14.2, itertools 0.14.0, lazy_static 1.5.1, libgit2-sys 0.18.8+1.9.7, libz-sys 1.1.30, linux-raw-sys 0.12.1, lock_api 0.4.14, log 0.4.34, matrixmultiply 0.3.11, ndarray 0.15.6, num-complex 0.4.6, num-integer 0.1.47, num-traits 0.2.19, once_cell 1.21.4, page_size 0.6.0, palette 0.7.7, palette_derive 0.7.7, palette_math 0.7.7, parking_lot 0.12.5, parking_lot_core 0.9.12, percent-encoding 2.3.2, postcard 1.1.3, rawpointer 0.2.1, rayon 1.12.0, rayon-cond 0.4.0, rayon-core 1.13.0, regex 1.13.1, regex-automata 0.4.18, regex-syntax 0.8.11, rustix 1.1.5, rustls 0.23.46, scopeguard 1.2.0, signal-hook 0.3.18, signal-hook-mio 0.2.5, signal-hook-registry 1.4.8, smallvec 1.16.3, stable_deref_trait 1.2.1, symlink 0.1.0, thread_local 1.1.10, unicode-normalization-alignments 0.1.12, unicode-segmentation 1.13.3, unicode-truncate 2.0.1, unicode-width 0.2.2, url 2.5.8, uuid 1.28.0
+#### ahash 0.8.12, arrayvec 0.7.8, base64 0.13.1, base64 0.22.1, bitflags 2.13.2, bstr 1.13.1, by_address 1.2.1, cfg-if 1.0.5, crossbeam-channel 0.5.17, crossbeam-deque 0.8.8, crossbeam-epoch 0.9.21, crossbeam-queue 0.3.14, crossbeam-utils 0.8.23, displaydoc 0.2.7, either 1.19.0, embedded-io 0.4.0, embedded-io 0.6.1, equivalent 1.0.3, errno 0.3.14, fastrand 2.5.0, flate2 1.1.10, fnv 1.0.7, form_urlencoded 1.2.2, git2 0.21.0, hashbrown 0.17.1, heck 0.5.0, idna 1.1.0, idna_adapter 1.2.2, indexmap 2.14.2, itertools 0.14.0, lazy_static 1.5.1, libgit2-sys 0.18.8+1.9.7, libz-sys 1.1.30, linux-raw-sys 0.12.1, lock_api 0.4.14, log 0.4.34, matrixmultiply 0.3.11, ndarray 0.15.6, num-complex 0.4.6, num-integer 0.1.47, num-traits 0.2.19, once_cell 1.21.4, page_size 0.6.0, palette 0.7.7, palette_derive 0.7.7, palette_math 0.7.7, parking_lot 0.12.5, parking_lot_core 0.9.12, percent-encoding 2.3.2, postcard 1.1.3, rawpointer 0.2.1, rayon 1.12.0, rayon-cond 0.4.0, rayon-core 1.13.0, regex 1.13.1, regex-automata 0.4.18, regex-syntax 0.8.11, rustix 1.1.5, rustls 0.23.46, scopeguard 1.2.0, signal-hook 0.3.18, signal-hook-mio 0.2.5, signal-hook-registry 1.4.8, smallvec 1.16.3, stable_deref_trait 1.2.1, symlink 0.1.0, tempfile 3.27.0, thread_local 1.1.10, unicode-normalization-alignments 0.1.12, unicode-segmentation 1.13.3, unicode-truncate 2.0.1, unicode-width 0.2.2, url 2.5.8, uuid 1.28.0
 
 ```text
 Apache License
@@ -12536,6 +12581,36 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+#### tempfile 3.27.0
+
+```text
+Copyright (c) 2015 Steven Allen
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 ```
 
 #### time 0.3.55, time-core 0.1.9, time-macros 0.2.32

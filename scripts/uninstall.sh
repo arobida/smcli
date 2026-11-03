@@ -169,5 +169,6 @@ fi
 # 5. The executables, this script last.
 rm -f "$prefix/smcli" "$prefix/smcli-service"
 rm -rf "$prefix/potion-shell-16m"
+rm -rf "$prefix/tldr"
 say "Removed smcli. Open a new terminal (the current one keeps the old hooks until it exits)."
 rm -f "$prefix/smcli-uninstall"

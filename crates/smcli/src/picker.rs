@@ -40,6 +40,7 @@ pub enum Mode {
     History,
     Files,
     Grep,
+    Tldr,
 }
 impl Mode {
     pub fn as_str(self) -> &'static str {
@@ -47,6 +48,7 @@ impl Mode {
             Self::History => "history",
             Self::Files => "files",
             Self::Grep => "grep",
+            Self::Tldr => "tldr",
         }
     }
 }
@@ -98,6 +100,10 @@ pub struct Picker {
     pub files_line: Option<String>,
     /// Colour inline rows from `LS_COLORS` instead of only the terminal theme.
     pub ls_colors: bool,
+    pub tldr_entries: Vec<smcli_search::tldr::Entry>,
+    pub tldr_all: bool,
+    pub tldr_program: Option<String>,
+    pub tldr_status: Option<String>,
 }
 impl Picker {
     /// Native history is oldest first; captured history is newest first.
@@ -133,6 +139,10 @@ impl Picker {
             kind: 0,
             files_line: None,
             ls_colors: false,
+            tldr_entries: Vec::new(),
+            tldr_all: false,
+            tldr_program: None,
+            tldr_status: None,
         }
     }
 }
@@ -346,11 +356,11 @@ fn widen_scope(scope: &str, home: &str) -> Option<String> {
 /// A file choice is unquoted: the CLI must validate the shell insertion context and quote it.
 pub fn run(
     mut picker: Picker,
-    search: Option<Box<dyn FnMut(&str) -> Result<Vec<String>> + Send>>,
+    search: Option<Box<dyn FnMut(&str, bool) -> Result<Vec<String>> + Send>>,
     files: Option<Box<dyn FnMut(Mode, &str, u8, &str, Option<&str>) -> Result<FileResults> + Send>>,
     inline: bool,
 ) -> Result<Option<Choice>> {
-    let search = search.map(|mut callback| worker(move |(q, _): &(String, u64)| callback(q)));
+    let search = search.map(|mut callback| worker(move |(q, _, all): &(String, u64, bool)| callback(q, *all)));
     let files = files.map(|mut callback| worker(move |(mode, q, kind, scope, path): &(Mode, String, u8, String, Option<String>)| {
         callback(*mode, q, *kind, scope, path.as_deref())
     }));
@@ -381,7 +391,13 @@ pub fn run(
     let mut tall = false;
     let mut page_size = 1usize;
     let mut hits = Vec::new();
-    let mut status = String::new();
+    let mut status = if picker.mode == Mode::Tldr {
+        picker.tldr_status.clone().unwrap_or_else(|| "indexing tldr…".into())
+    } else {
+        String::new()
+    };
+    let mut tldr_ranked: Vec<usize> = Vec::new();
+    let mut tldr_observed: Option<(String, bool)> = None;
     let mut filtered: Option<((String, bool, bool), Vec<String>)> = None;
     let starred: HashSet<String> = picker.suggested.iter().cloned().collect();
     let home = std::env::var("HOME").unwrap_or_default();
@@ -418,9 +434,18 @@ pub fn run(
             }
         }
         if let Some((requests, replies)) = &search {
-            if let Ok(((query, generation), result)) = replies.try_recv() {
+            if let Ok(((query, generation, all), result)) = replies.try_recv() {
                 semantic_busy = false;
-                if picker.mode == Mode::History && generation == semantic_generation && query == picker.query && semantic_pending.is_none() {
+                if picker.mode == Mode::Tldr && query == picker.query && all == picker.tldr_all {
+                    match result {
+                        Ok(results) => {
+                            tldr_ranked = results.into_iter().filter_map(|index| index.parse().ok()).filter(|index: &usize| *index < picker.tldr_entries.len()).collect();
+                            selected = 0;
+                            status = if tldr_ranked.is_empty() && !all { picker.tldr_status.clone().unwrap_or_default() } else { String::new() };
+                        }
+                        Err(error) => status = error.to_string(),
+                    }
+                } else if picker.mode == Mode::History && generation == semantic_generation && query == picker.query && semantic_pending.is_none() {
                     match result {
                         Ok(results) => {
                             semantic = Some((query, results));
@@ -434,12 +459,20 @@ pub fn run(
             if !semantic_busy {
                 if let Some(query) = semantic_pending.take() {
                     if picker.mode == Mode::History && query == picker.query {
-                        semantic_busy = requests.send((query, semantic_generation)).is_ok();
+                        semantic_busy = requests.send((query, semantic_generation, false)).is_ok();
+                    }
+                } else if picker.mode == Mode::Tldr {
+                    let key = (picker.query.clone(), picker.tldr_all);
+                    if tldr_observed.as_ref() != Some(&key) {
+                        tldr_ranked.clear();
+                        tldr_observed = Some(key);
+                        semantic_busy = requests.send((picker.query.clone(), semantic_generation, picker.tldr_all)).is_ok();
+                        status = if !picker.tldr_all { picker.tldr_status.clone().unwrap_or_else(|| "indexing tldr…".into()) } else { "indexing tldr…".into() };
                     }
                 }
             }
         }
-        if picker.mode != Mode::History && fetched.as_ref() != Some(&current) {
+        if matches!(picker.mode, Mode::Files | Mode::Grep) && fetched.as_ref() != Some(&current) {
             hits.clear();
             selected = 0;
             status.clear();
@@ -457,7 +490,7 @@ pub fn run(
                 status = "files and grep need smcli-service".into();
             }
         }
-        let file_pending = picker.mode != Mode::History && fetched.as_ref() != Some(&current);
+        let file_pending = matches!(picker.mode, Mode::Files | Mode::Grep) && fetched.as_ref() != Some(&current);
         let busy = file_busy || semantic_busy || file_pending;
         if busy && spun.elapsed() >= Duration::from_millis(80) {
             spinner = (spinner + 1) % 10;
@@ -474,10 +507,13 @@ pub fn run(
             filtered = Some((key_now, commands));
         }
         let commands = &filtered.as_ref().unwrap().1;
-        let count = if picker.mode == Mode::History {
-            commands.len()
-        } else {
-            hits.len()
+        if picker.mode == Mode::Tldr && tldr_observed.as_ref() != Some(&(picker.query.clone(), picker.tldr_all)) {
+            tldr_ranked.clear();
+        }
+        let count = match picker.mode {
+            Mode::History => commands.len(),
+            Mode::Tldr => tldr_ranked.len(),
+            _ => hits.len(),
         };
         selected = selected.min(count.saturating_sub(1));
         // Coalesce key repeat: draw only once queued input is handled, else held arrows pile up behind frames.
@@ -490,7 +526,7 @@ pub fn run(
             let [header_area, filter_area, search_area, navigation_area, list_area, stripe_area, global_area] = if compact { inline_layout(area) } else { picker_layout(area) };
             let boxed = search_area.height == 3;
             // Header shows cwd and current scope; single-file grep names the file as its scope.
-            let scope_label = if history {
+            let scope_label = if history || picker.mode == Mode::Tldr {
                 String::new()
             } else {
                 let displayed = if picker.mode == Mode::Grep && picker.single_file_path.is_some() {
@@ -501,7 +537,9 @@ pub fn run(
                 };
                 format!("{}  →  {}", abbreviate(&cwd, &home), displayed)
             };
-            let header = if let Some(line) = edit_files_header(picker.mode, picker.files_line.as_deref(), true) {
+            let header = if picker.mode == Mode::Tldr {
+                Line::from(vec![Span::styled(" tldr ", ACCENT), Span::styled(picker.title.clone().unwrap_or_default(), ACCENT.add_modifier(Modifier::BOLD))])
+            } else if let Some(line) = edit_files_header(picker.mode, picker.files_line.as_deref(), true) {
                 line
             } else if compact && (!history || (picker.suggested_view && picker.title.is_some())) {
                 // Only the searched directory, which grows and shrinks as Tab moves in and out; suggestions name the cwd.
@@ -512,12 +550,12 @@ pub fn run(
             } else {
                 Line::from(vec![Span::styled(format!(" {label} "), ACCENT), Span::styled(scope_label, ACCENT.add_modifier(Modifier::BOLD)), Span::styled(if history { "" } else { " ›" }, ACCENT.add_modifier(Modifier::BOLD))])
             };
-            let found = if compact { format!("{count} Results") } else { format!("{count} {} results", if picker.mode == Mode::Grep { "grep" } else { "files" }) };
+            let found = if compact { format!("{count} Results") } else { format!("{count} {} results", picker.mode.as_str()) };
             let summary = if history {
                 if status.is_empty() && picker.suggested_view && picker.suggested.is_empty() {
                     "no suggestions for this directory".into()
                 } else if compact && status.is_empty() { found } else { visible(&status) }
-            } else if hits.is_empty() {
+            } else if (picker.mode == Mode::Tldr && tldr_ranked.is_empty()) || (picker.mode != Mode::Tldr && hits.is_empty()) {
                 if status.is_empty() { "no matches".into() } else { visible(&status) }
             } else if status.is_empty() { found } else { visible(&status) };
             let mut summary = Line::styled(format!(" {summary} "), MUTED);
@@ -565,6 +603,17 @@ pub fn run(
                     if compact && picker.suggested_view && starred.contains(c) { line.push(Span::raw(" ✨")); }
                     ListItem::new(Line::from(line))
                 }).collect()
+            } else if picker.mode == Mode::Tldr {
+                tldr_ranked.iter().enumerate().map(|(i, index)| {
+                    let entry = &picker.tldr_entries[*index];
+                    let mut line: Vec<Span> = cursor(i == selected).into_iter().collect();
+                    if picker.tldr_all {
+                        line.push(Span::styled(format!("{}  ", entry.program), ACCENT));
+                    }
+                    line.push(Span::styled(format!("{}  ", visible(&entry.description)), MUTED));
+                    line.push(Span::styled(visible(&entry.template), Style::new().add_modifier(Modifier::BOLD)));
+                    ListItem::new(Line::from(line))
+                }).collect()
             } else {
                 hits.iter().enumerate().map(|(i, h)| {
                     let name = &h.path;
@@ -592,6 +641,8 @@ pub fn run(
                 vec![("tab", "into"), ("⇧tab", "out"), ("^T", "dirs/files")]
             } else if picker.mode == Mode::Grep {
                 vec![("⇧tab", "out")]
+            } else if picker.mode == Mode::Tldr {
+                vec![("^A", "page/all")]
             } else {
                 vec![]
             };
@@ -600,12 +651,12 @@ pub fn run(
             frame.render_widget(Paragraph::new(hint_line(&filters)), filter_area);
             frame.render_widget(Paragraph::new(hint_line(&[("[ ⏎ ]", "accept"), ("↑↓", "move"), ("PgUp/PgDn", "page")])), navigation_area);
             let mut globals = vec![("esc", "cancel")];
-            if picker.mode != Mode::Files { globals.push(("^T", "files")); }
-            if picker.mode != Mode::History { globals.push(("^R", "history")); }
-            if picker.mode == Mode::History {
-                globals.push(("^E", "edit paths"));
+            if picker.mode != Mode::Tldr {
+                if picker.mode != Mode::Files { globals.push(("^T", "files")); }
+                if picker.mode != Mode::History { globals.push(("^R", "history")); }
+                if picker.mode == Mode::History { globals.push(("^E", "edit paths")); }
+                if picker.mode != Mode::Grep { globals.push(("^G", "grep")); }
             }
-            if picker.mode != Mode::Grep { globals.push(("^G", "grep")); }
             globals.push(("^U", "clear"));
             let fade = if tick < 3 { Modifier::DIM } else { Modifier::empty() };
             if compact {
@@ -695,6 +746,13 @@ pub fn run(
                         semantic: semantic_active,
                         edit_paths: false,
                     })
+                } else if picker.mode == Mode::Tldr {
+                    Some(Choice::Command {
+                        command: smcli_search::tldr::to_placeholders(&picker.tldr_entries[tldr_ranked[selected]].template),
+                        query: picker.query,
+                        semantic: false,
+                        edit_paths: false,
+                    })
                 } else {
                     Some(Choice::File {
                         hit: hits[selected].clone(),
@@ -712,11 +770,18 @@ pub fn run(
                     semantic_generation += 1;
                     selected = 0;
                     status.clear();
-                } else {
+                } else if picker.mode != Mode::Tldr {
                     switch_mode(&mut picker, Mode::History, &mut saved, &mut selected, &mut status);
                 }
             }
-            KeyCode::Char('t') if ctrl => {
+            KeyCode::Char('a') if ctrl && picker.mode == Mode::Tldr && picker.tldr_program.is_some() => {
+                picker.tldr_all = !picker.tldr_all;
+                picker.title = Some(if picker.tldr_all { "all installed".into() } else { picker.tldr_program.clone().unwrap() });
+                tldr_ranked.clear();
+                selected = 0;
+                status = "indexing tldr…".into();
+            }
+            KeyCode::Char('t') if ctrl && picker.mode != Mode::Tldr => {
                 if picker.mode == Mode::Files {
                     kind = (kind + 1) % 3;
                     selected = 0;
@@ -725,7 +790,7 @@ pub fn run(
                     kind = picker.kind;
                 }
             }
-            KeyCode::Char('g') if ctrl && picker.mode != Mode::Grep => switch_mode(&mut picker, Mode::Grep, &mut saved, &mut selected, &mut status),
+            KeyCode::Char('g') if ctrl && !matches!(picker.mode, Mode::Grep | Mode::Tldr) => switch_mode(&mut picker, Mode::Grep, &mut saved, &mut selected, &mut status),
             KeyCode::Char('e') if ctrl && picker.mode == Mode::History && count > 0 => {
                 return Ok(Some(Choice::Command {
                     command: commands[selected].clone(),
