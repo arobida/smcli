@@ -13,7 +13,7 @@ Open work, not scheduled. macOS and Linux are supported today; search is include
 
 - **fgrep on large trees:** partial results are reported, the budget is enforced on zero-match searches,
   and stale queries are coalesced. Still open: a running obsolete query finishes before the next, resume from
-  `next_file_offset`, and choose an interactive budget by measurement. See `fgrep-notes.md`.
+  `next_file_offset`, and choose an interactive budget by measurement. Historical measurements and corrections remain in the October 30 review.
 - **Incremental corpus for writes from another process:** a fallback record, import or prune makes the
   next search rebuild the corpus (about 760 ms at 100k runs). Today only the service's own records update
   it in place.

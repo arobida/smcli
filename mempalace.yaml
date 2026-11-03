@@ -1,0 +1,30 @@
+# Room order matters: the first room whose name/keyword matches a path folder wins,
+# and "smcli" token-matches "smcli-core", so the specific crates come before cli.
+wing: smcli
+rooms:
+  - name: core
+    description: smcli-core — history DB, capture filters, ranking, config, service protocol
+    keywords: [smcli-core]
+  - name: search
+    description: smcli-search — hybrid BM25 + embedding search, TalaDB index, Potion model
+    keywords: [smcli-search, models, potion-shell-16m]
+  - name: service
+    description: smcli-service — long-lived socket service, file search (fff)
+    keywords: [smcli-service]
+  - name: cli
+    description: smcli CLI — clap commands, ratatui picker/menu, shell hooks
+    keywords: [smcli]
+  - name: scripts
+    description: Build, install, test and benchmark scripts
+    keywords: [scripts]
+  - name: specs
+    description: OpenSpec changes and specs
+    keywords: [openspec]
+  - name: agents
+    description: Agent plans, reviews, reference runbooks, Claude commands/skills
+    keywords: [agents, .claude]
+  - name: docs
+    description: Design docs, drafts and briefs
+    keywords: [docs, designs]
+  - name: general
+    description: Everything else (top-level files, data)

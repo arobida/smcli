@@ -4,6 +4,22 @@ What this repo does: smcli captures shell history, ranks commands and searches f
 
 Baseline: main `2b14ebf`, including the existing uncommitted command-completion work. No source, worktree, branch or existing document was deleted. REMOVE means a candidate for a later cleanup, not an action performed here.
 
+## Cleanup applied — 2026-11-03
+
+User authorized removal of findings 1–6 and 9, and archival of 7–8. The findings below remain as historical evidence; their REMOVE/HOLD labels describe the audit state before this cleanup.
+
+- **1 done:** removed the clean, merged semantic-accuracy worktree through Git. Local and remote branches were left intact.
+- **2 done:** deleted `.delta` in full. At the user's explicit follow-up request, also deleted the recovery archive created during cleanup; no recovery copy was retained by this session.
+- **3 done:** removed the service's unused direct TalaDB declaration and refreshed Cargo.lock. TalaDB remains a transitive search dependency.
+- **4 done:** deleted `design_draft.md` and removed stale draft-only instructions from the semantic-search design.
+- **5 done:** deleted `fgrep-notes.md`, retained the remaining resume/cancellation/budget decisions in roadmap, and repaired current index/plan references. Dated audit evidence remains historical.
+- **6 done:** deleted both completed path-edit plans. Implementation and tests remain intact.
+- **7 archived:** `openspec/changes/archive/2026-11-03-fff-scoped-navigation`; canonical `file-picker-scope` specification synced, including the resolved cwd/directory protocol mapping.
+- **8 archived:** `openspec/changes/archive/2026-11-03-command-completion-index`; canonical `command-completion-index` specification synced.
+- **9 done:** removed obsolete cache instructions from the search README and replaced the original help implementation plan with current UI/placeholder behavior and links to the command-index contract. Legacy-cache pruning and its test remain.
+
+Cleanup does not remove unrelated untracked `concepts_brief.md` or `mempalace.yaml`. No application behavior was intentionally changed. Validation passed: make build, make docs, git diff --check, all seven OpenSpec specifications under strict validation, and assertions that both archives retain their full requirement blocks. The full test suite was not rerun for this dependency/documentation cleanup.
+
 ## Should fix
 
 ### 1. REMOVE: the merged semantic-accuracy worktree
@@ -65,6 +81,28 @@ All other Delta snapshot IDs are HOLD: `093c6j7g09j4`, `0dpmhv32pdam`, `52s20khp
 - **Fix:** Sync its spec and resolved cwd clarification into the canonical specs, then archive the change using the existing OpenSpec workflow. Mark for active-directory removal only after that sync.
 - **If we skip it:** Completed work looks pending; deleting it directly discards useful requirements.
 
+## Recheck after command-completion changes
+
+Rechecked against main `468e56b` on 2026-11-03, including implementation commit `725eef4`. Findings 1–7 remain applicable. The previously uncommitted command-completion sources/specs are now tracked implementation; they are not removal candidates. Only `concepts_brief.md`, `design_draft.md` and `mempalace.yaml` remain untracked at the start of this recheck.
+
+The registered semantic-accuracy worktree is still clean and has zero commits outside main. All 22 Delta snapshots retain the same HEAD and clean/dirty classification: 19 dirty, two clean ancestor snapshots, one clean non-ancestor snapshot. Disk totals remain approximately 1.6 GB for Delta and 5.3 GB for Kero. Source-name and dependency checks again found no confirmed dead Rust function and only the previously identified unused direct service TalaDB declaration.
+
+### 8. ARCHIVE: completed command-completion change
+
+- **What this is:** `openspec/changes/command-completion-index/tasks.md` now has every task checked, and commit `725eef4` contains the implementation.
+- **Problem:** The completed change remains in the active directory. Its only command-completion specification is under that change; there is no canonical `openspec/specs/command-completion-index/spec.md`.
+- **Fix:** Sync the specification into the canonical specs and archive the change through the existing workflow. Keep `command_source.rs`, `commands.rs`, their callers and tests: they are used.
+- **If we skip it:** Completed work looks pending. Deleting the change before syncing would discard the program-selection and index contracts.
+
+### 9. RETIRE obsolete cache instructions; update the search README
+
+- **What this is:** `crates/smcli-search/README.md:10` still advertises `corpus_vectors`; line 17 describes the old `tldr-*.vec` format. The original natural-language-help design repeats those instructions at lines 125 and 251–256.
+- **Problem:** Commit `725eef4` deletes `corpus_vectors`, the cache reader/writer and the associated cache test. Runtime help now reads `commands::CommandIndex`; old `.vec` files are only legacy prune targets. Following the README names an API that no longer exists.
+- **Fix:** Remove the obsolete cache paragraphs/API entry from the README and describe the current command index. Mark the original help design as implemented and its cache/program-set sections as superseded by the command-completion specification; archive it only after preserving the remaining UI and placeholder requirements. Keep legacy `.vec` pruning and its test because existing installations can still contain those files.
+- **If we skip it:** Current documentation tells contributors to maintain or rebuild a deleted storage path and gives an outdated description of which programs bare `@@` searches.
+
+Recheck verification: reviewed the implementation commit and new source/index call paths, checked literal references across the primary tree including tests/config/docs, and reran Git worktree/status and symbol/dependency scans. No build or test suite was run for this report-only update. The repository-wide `git diff --check` now passes; the earlier tldr EOF whitespace warning has been fixed.
+
 ## Keep / not proven removable
 
 - Rust code: scanned function names across all crate sources and checked single-occurrence candidates. No confirmed dead function. Trait methods are invoked through their traits; comparison helpers in ranking.rs are called by tests in lib.rs. `FileWatcher`'s apparently unread field owns a live watcher and must stay.
@@ -73,7 +111,7 @@ All other Delta snapshot IDs are HOLD: `093c6j7g09j4`, `0dpmhv32pdam`, `52s20khp
 - Dated codebase reviews, semantic-search results and evidence scripts: historical evidence, not redundant current instructions. Findings marked fixed do not erase the evidence.
 - `build-test-efficiency.md`: many tasks have landed, but Linux acceptance was not verified here; do not delete the remaining acceptance obligations.
 - `semantic-search-accuracy.md` and its brief: implementation/results differ from the original staged proposal; not enough evidence to discard the remaining scope. Label status and repair stale references before deciding what to archive.
-- `concepts_brief.md`, new command-completion sources/specs and `mempalace.yaml`: uncommitted work; no deletion justified by this audit.
+- `concepts_brief.md` and `mempalace.yaml`: uncommitted work; no deletion justified by this audit. Command-completion sources are now committed and used; the completed change documentation is covered by finding 8.
 - `.claude` OpenSpec skills/commands and `scripts/ateam.sh`: developer-invoked entry points; absence from application callers does not make them dead.
 - Crate/source READMEs and the drift report: keep until their contracts/corrections are reconciled; age alone is not proof of redundancy.
 

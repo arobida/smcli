@@ -12,7 +12,7 @@ exits when idle. CLI fallbacks may also write the database; `service.rs:Service:
 
 No production source here: `Cargo.toml` (package `smcli-service`, edition 2024) plus `src/` and
 `tests/`. Dependencies: `anyhow`, `fff-search` (pinned git rev, `definitions` feature), `libc`,
-`rusqlite`, `smcli-core` (path), `smcli-search` (path), `taladb`; dev-dependency `tempfile`. All logic
+`rusqlite`, `smcli-core` (path), `smcli-search` (path); dev-dependency `tempfile`. All logic
 and symbols live in [`./src/README.md`](src/README.md). It must never link `fff-search` into the CLI:
 ownership of file search stays here.
 

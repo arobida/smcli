@@ -2,7 +2,7 @@
 
 ## Scope
 
-Fix findings 1–16 from [Codebase review and fff investigation (2026-10-30)](../reviews/codebase-review-2026-10-30.md). Nothing else: no fff tuning, no new stores, no Linux runtime work. `agents/plans/fgrep-notes.md` stays as written (the review already records its corrections).
+Fix findings 1–16 from [Codebase review and fff investigation (2026-10-30)](../reviews/codebase-review-2026-10-30.md). Nothing else: no fff tuning, no new stores, no Linux runtime work. Historical fgrep measurements and their corrections remain in the dated review; current open work is in the roadmap.
 
 Pushback, settled before coding:
 
