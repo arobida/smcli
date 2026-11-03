@@ -385,9 +385,11 @@ pub fn run() -> Result<()> {
             let engine = search_engine(&captured, &home, &env)?;
             let lock = engine.lock_index(u32::MAX)?.ok_or_else(|| anyhow::anyhow!("Another smcli is updating the index."))?;
             let entries = corpus(&captured, &home, &env, None, now())?;
-            println!("{}Reindexed {} commands.",
-                if stopped { "Stopped smcli-service to free its model. " } else { "" },
-                engine.reindex_using_lock(&entries, &lock)?);
+            let count = engine.reindex_using_lock(&entries, &lock)?;
+            drop(lock); // CommandIndex::add takes the same directory lock per program
+            let programs = command_index(&captured, &env, &engine, true)?.programs()?.len();
+            println!("{}Reindexed {count} commands and {programs} programs' examples.",
+                if stopped { "Stopped smcli-service to free its model. " } else { "" });
         },
         Command::Indexes { prune, json } => indexes(&captured, &home, &env, prune, json)?,
         Command::Health { json } => {
@@ -1010,70 +1012,109 @@ fn tldr_context(line: &str) -> TldrContext {
     TldrContext { leading, program, prefix_words }
 }
 
-fn current_tldr_platform() -> &'static str {
-    if cfg!(target_os = "macos") { "osx" } else { std::env::consts::OS }
-}
-
 fn pick_tldr(c: &CapturedHistory, home: &Path, env: &HashMap<String, String>) -> Result<()> {
     use crate::picker::{Choice, Mode, Picker};
     use smcli_search::tldr;
 
-    let directory = tldr::bundled_dir().ok_or_else(|| anyhow::anyhow!("tldr data not found beside the smcli executable or in Data/tldr"))?;
-    let corpus = tldr::load(&directory, current_tldr_platform())?;
     let context = tldr_context(env.get("SMCLI_LBUFFER").map(String::as_str).unwrap_or(""));
-    let programs = corpus.entries.iter().map(|entry| entry.program.clone()).collect::<HashSet<_>>();
-    let path = smcli_core::service_protocol::shell_path_snapshot(env.get("PATH").map(String::as_str)).unwrap_or_default();
-    let installed = tldr::installed(&programs, &path);
     let engine = search_engine(c, home, env)?;
-    let index_dir = engine.directory.clone();
+    // Normally built at install (`smcli reindex`); built here only if missing.
+    let index = command_index(c, env, &engine, false)?;
     let potion = engine.potion;
     let program = context.program.clone();
     let prefix = context.prefix_words.clone();
-    let picker_entries = corpus.entries.clone();
-    let tldr_status = context.program.as_ref().filter(|program| !corpus.entries.iter().any(|entry| &entry.program == *program))
-        .map(|program| format!("no tldr page for {program}; Ctrl-A searches all installed"));
-    let mut page_data = None;
-    let mut all_data = None;
-    let search = move |query: &str, all: bool| -> Result<Vec<String>> {
-        type Data = (Vec<usize>, Vec<smcli_search::Entry>, Vec<Vec<f32>>);
-        let data: &mut Data = if all {
-            if all_data.is_none() {
-                let indices = corpus.entries.iter().enumerate().filter(|(_, entry)| installed.contains(&entry.program)).map(|(index, _)| index).collect::<Vec<_>>();
-                let entries = indices.iter().map(|index| corpus.entries[*index].clone()).collect::<Vec<_>>();
-                let vectors = tldr::corpus_vectors(&potion, &corpus, &installed, &index_dir)?;
-                all_data = Some((indices, entries, vectors));
-            }
-            all_data.as_mut().unwrap()
-        } else {
-            if page_data.is_none() {
-                let indices = corpus.entries.iter().enumerate().filter(|(_, entry)| Some(&entry.program) == program.as_ref()).map(|(index, _)| index).collect::<Vec<_>>();
-                let entries = indices.iter().map(|index| corpus.entries[*index].clone()).collect::<Vec<_>>();
-                let vectors = potion.embed(&entries.iter().map(|entry| entry.description.clone()).collect::<Vec<_>>());
-                page_data = Some((indices, entries, vectors));
-            }
-            page_data.as_mut().unwrap()
-        };
-        let query = potion.embed(&[query.to_owned()]).remove(0);
-        let empty = Vec::new();
-        let prefix = if all { &empty } else { &prefix };
-        Ok(tldr::rank_with_vectors(&query, &data.1, &data.2, prefix)
-            .into_iter()
-            .map(|(index, _)| data.0[index].to_string())
-            .collect())
-    };
+    // `@@` only reads: the service syncs the index on capture; without one, the build above stands.
+    // The picker owns every indexed row; the closure ranks a view's subset and returns global row indices.
+    let rows: Vec<(smcli_search::Entry, Vec<f32>, String)> = index
+        .all()?
+        .into_iter()
+        .map(|example| {
+            (
+                smcli_search::Entry { program: example.program, description: example.description, template: example.template },
+                example.embedding,
+                example.source,
+            )
+        })
+        .collect();
     let query = env.get("SMCLI_TLDR_QUERY").map(|query| query.trim_start().to_owned()).unwrap_or_default();
     let mut picker = Picker::new(Vec::new(), Vec::new(), Vec::new(), query);
     picker.mode = Mode::Tldr;
     picker.tldr_all = context.program.is_none();
     picker.tldr_program = context.program.clone();
-    picker.tldr_entries = picker_entries;
     picker.title = Some(if picker.tldr_all { "all installed".into() } else { context.program.clone().unwrap_or_default() });
-    picker.tldr_status = tldr_status;
+    picker.tldr_status = context.program.as_ref().filter(|program| !rows.iter().any(|(entry, _, _)| &entry.program == *program))
+        .map(|program| format!("no examples for {program}; Ctrl-A searches all installed"));
+    picker.tldr_entries = rows.iter().map(|(entry, _, _)| entry.clone()).collect();
+    picker.tldr_sources = rows.iter().map(|(_, _, source)| source.clone()).collect();
+    let entries: Vec<smcli_search::Entry> = rows.iter().map(|(entry, _, _)| entry.clone()).collect();
+    let vectors: Vec<Vec<f32>> = rows.into_iter().map(|(_, vector, _)| vector).collect();
+    let mut page_subset: Option<Vec<usize>> = None;
+    let mut all_subset: Option<Vec<usize>> = None;
+    let search = move |query: &str, all: bool| -> Result<Vec<String>> {
+        let subset: &mut Vec<usize> = if all {
+            if all_subset.is_none() {
+                all_subset = Some((0..entries.len()).collect());
+            }
+            all_subset.as_mut().unwrap()
+        } else {
+            if page_subset.is_none() {
+                page_subset = Some(
+                    entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, entry)| Some(&entry.program) == program.as_ref())
+                        .map(|(index, _)| index)
+                        .collect(),
+                );
+            }
+            page_subset.as_mut().unwrap()
+        };
+        let subset_entries: Vec<smcli_search::Entry> = subset.iter().map(|index| entries[*index].clone()).collect();
+        let subset_vectors: Vec<Vec<f32>> = subset.iter().map(|index| vectors[*index].clone()).collect();
+        let query_vector = potion.embed(&[query.to_owned()]).remove(0);
+        let empty = Vec::new();
+        let prefix = if all { &empty } else { &prefix };
+        Ok(tldr::rank_with_vectors(&query_vector, &subset_entries, &subset_vectors, prefix)
+            .into_iter()
+            .map(|(position, _)| subset[position].to_string())
+            .collect())
+    };
     let config = SmcliConfig::load(&SmcliConfig::location(home, env)).unwrap_or_default();
     if let Some(Choice::Command { command, .. }) = crate::picker::run(picker, Some(Box::new(search)), None, config.at_completion_inline != Some(false))? {
         println!("{}{}", context.leading, command);
     }
     Ok(())
+}
+
+/// The command-completion index for this engine, built from OS-shipped programs plus programs seen in
+/// captured history (both ∩ PATH) when missing, or rebuilt from scratch when `rebuild`.
+fn command_index(c: &CapturedHistory, env: &HashMap<String, String>, engine: &smcli_search::HistorySearch, rebuild: bool) -> Result<smcli_search::commands::CommandIndex> {
+    use smcli_search::commands::{CommandIndex, build, os_programs, system_dirs};
+    use smcli_search::tldr::{self, TldrSource};
+    let platform = tldr::current_platform();
+    let directory = tldr::bundled_dir().ok_or_else(|| anyhow::anyhow!("tldr data not found beside the smcli executable or in Data/tldr"))?;
+    let source = TldrSource::new(&directory, platform)?;
+    let sources: Vec<&dyn smcli_core::command_source::CommandSource> = vec![&source];
+    let index = CommandIndex::new(engine.directory.clone(), engine.potion.clone(), &sources);
+    if rebuild && index.path().exists() {
+        std::fs::remove_file(index.path())?;
+    }
+    if !index.path().exists() {
+        let path = smcli_core::service_protocol::shell_path_snapshot(env.get("PATH").map(String::as_str)).unwrap_or_default();
+        let mut programs = os_programs(&system_dirs(), &path);
+        programs.extend(tldr::installed(&captured_programs(c)?, &path));
+        build(&index, &sources, platform, &programs)?;
+    }
+    Ok(index)
+}
+
+/// First words of captured commands (smcli's own history, distinct).
+fn captured_programs(c: &CapturedHistory) -> Result<HashSet<String>> {
+    let stats = c.command_stats(None, None, now())?;
+    Ok(stats
+        .keys()
+        .filter_map(|key| key.split_whitespace().next().map(|word| word.rsplit('/').next().unwrap_or(word).to_owned()))
+        .collect())
 }
 
 fn pick(
@@ -1432,13 +1473,17 @@ struct IndexInfo {
     current: bool,
 }
 
-/// Every `rs-commands-v*` index next to the history database, grouped by index name; `prune` deletes all but the current model's.
+/// Every `rs-commands-*` index next to the history database, grouped by index name; `prune` deletes all but the current model's.
 fn indexes(captured: &CapturedHistory, home: &Path, env: &HashMap<String, String>, prune: bool, json: bool) -> Result<()> {
     let engine = search_engine(captured, home, env)?;
     let current = engine.index_name();
-    let tldr_current = smcli_search::tldr::bundled_dir()
-        .and_then(|dir| smcli_search::tldr::load(&dir, current_tldr_platform()).ok())
-        .map(|corpus| smcli_search::tldr::cache_name(&engine.potion, &corpus.commit));
+    // The command-completion index (tldr as a source); absent tldr data just means it is not current.
+    let command_current = smcli_search::tldr::bundled_dir()
+        .and_then(|dir| smcli_search::tldr::TldrSource::new(&dir, smcli_search::tldr::current_platform()).ok())
+        .map(|source| {
+            let sources: Vec<&dyn smcli_core::command_source::CommandSource> = vec![&source];
+            smcli_search::commands::CommandIndex::new(engine.directory.clone(), engine.potion.clone(), &sources).index_name()
+        });
     let _lock = if prune { Some(engine.lock_index(20)?.ok_or_else(|| anyhow::anyhow!("Search index is busy; try again."))?) } else { None };
     let mut found: std::collections::BTreeMap<String, IndexInfo> = Default::default();
     let entries = match std::fs::read_dir(&engine.directory) {
@@ -1449,7 +1494,9 @@ fn indexes(captured: &CapturedHistory, home: &Path, env: &HashMap<String, String
     for entry in &entries {
         let filename = entry.file_name().to_string_lossy().into_owned();
         // Index names hold no dots, so everything before the first one groups the index with its side files.
-        let name = if filename.starts_with("rs-commands-v") {
+        // Index names hold no dots, so everything before the first one groups the index with its side files.
+        // Old `tldr-*.vec` vector caches predate the command index; they are never current and prune deletes them.
+        let name = if filename.starts_with("rs-commands-") {
             filename.split_once('.').map(|(name, _)| name.to_string())
         } else if filename.starts_with("tldr-") && filename.ends_with(".vec") {
             Some(filename.clone())
@@ -1458,9 +1505,9 @@ fn indexes(captured: &CapturedHistory, home: &Path, env: &HashMap<String, String
         };
         let Some(name) = name else { continue };
         let is_current = if filename.starts_with("tldr-") {
-            tldr_current.as_deref() == Some(&filename)
+            false
         } else {
-            name == current || name == format!("{current}-typed")
+            name == current || name == format!("{current}-typed") || Some(&name) == command_current.as_ref()
         };
         let info = found.entry(name.clone()).or_insert_with(|| IndexInfo { name, bytes: 0, current: is_current });
         info.bytes += entry.metadata()?.len();

@@ -1,6 +1,6 @@
-use std::{collections::HashSet, path::Path};
+use std::collections::HashSet;
 
-use smcli_search::{Corpus, Entry, Potion, corpus_vectors};
+use smcli_search::{Corpus, Entry, Potion};
 use smcli_search::tldr::{self, rank_with_vectors};
 
 fn entry(program: &str, description: &str, template: &str) -> Entry {
@@ -59,35 +59,6 @@ fn tldr_ranking_applies_prefix_bonus_and_stable_ties() {
     let prefixed = rank_with_vectors(&[1.0, 0.0], &entries, &vectors, &["git".into(), "rebase".into()]);
     assert_eq!(prefixed[0].0, 1);
     assert!((prefixed[0].1 - 1.05).abs() < 1e-6);
-}
-
-#[test]
-fn tldr_cache_build_append_reread_and_model_identity() {
-    let dir = tempfile::tempdir().unwrap();
-    let corpus = Corpus {
-        commit: "abc123".into(),
-        entries: vec![
-            entry("beta", "first beta", "beta one"),
-            entry("beta", "second beta", "beta two"),
-            entry("alpha", "alpha entry", "alpha run"),
-        ],
-    };
-    let index = dir.path().join("index");
-    let potion = Potion::bundled().unwrap();
-    let alpha = HashSet::from(["alpha".to_owned()]);
-    let first = corpus_vectors(&potion, &corpus, &alpha, &index).unwrap();
-    assert_eq!(first.len(), 1);
-    let name = tldr::cache_name(&potion, &corpus.commit);
-    assert!(index.join(&name).is_file());
-    let both = HashSet::from(["alpha".to_owned(), "beta".to_owned()]);
-    let appended = corpus_vectors(&potion, &corpus, &both, &index).unwrap();
-    assert_eq!(appended.len(), 3);
-    assert_eq!(corpus_vectors(&potion, &corpus, &both, &index).unwrap(), appended);
-    let removed = corpus_vectors(&potion, &corpus, &HashSet::from(["beta".to_owned()]), &index).unwrap();
-    assert_eq!(removed.len(), 2);
-    drop(potion);
-    let custom = Potion::from_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Models/potion-shell-16m").as_path()).unwrap();
-    assert_ne!(name, tldr::cache_name(&custom, &corpus.commit));
 }
 
 const EVAL_ENTRIES: &[(&str, &str, &str)] = &[

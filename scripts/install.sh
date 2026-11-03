@@ -215,6 +215,10 @@ if [[ -f $atuin_db && $atuin != no ]]; then
     fi
 fi
 
+# 3c. Build the search and command-completion indexes now (after imports), so the first search or @@ is instant.
+say "Building search indexes (about 30 seconds)..."
+"$smcli" reindex || printf 'warning: index build failed; the first search or @@ builds it instead (or run: smcli reindex)\n' >&2
+
 # 4. The service starts on demand; start it now to check it runs.
 if "$smcli" service start > /dev/null; then
     say "smcli-service is running"

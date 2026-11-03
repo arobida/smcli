@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use model2vec_rs::model::StaticModel;
 
 /// potion-shell-16m (fine-tuned potion-code-16M-v2), shipped as a folder beside the binaries or loaded from a directory. Load once per process; embed in batches.
+#[derive(Clone)]
 pub struct Potion {
     model: StaticModel,
     pub(crate) vocabulary: HashSet<String>,

@@ -1,11 +1,10 @@
 use std::{
-    collections::{HashMap, HashSet},
-    io::Write,
+    collections::HashSet,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::Potion;
 
@@ -34,6 +33,11 @@ struct DataEntry {
     platform: String,
     description: String,
     template: String,
+}
+
+/// Platform name tldr pages use for this OS.
+pub fn current_platform() -> &'static str {
+    if cfg!(target_os = "macos") { "osx" } else { std::env::consts::OS }
 }
 
 /// tldr lives beside the binaries in installs, or under Data/ for development and tests.
@@ -134,6 +138,48 @@ pub fn installed(programs: &HashSet<String>, path: &str) -> HashSet<String> {
         .collect()
 }
 
+/// tldr as a `CommandSource`: wraps a loaded corpus and answers per program,
+/// keeping the platform filter (`common` or current OS) inside the source.
+#[derive(Debug, Clone)]
+pub struct TldrSource {
+    corpus: Corpus,
+}
+
+impl TldrSource {
+    pub fn new(dir: &Path, platform: &str) -> Result<Self> {
+        Ok(Self { corpus: load(dir, platform)? })
+    }
+
+    /// All programs with a page on this platform.
+    pub fn programs(&self) -> HashSet<String> {
+        self.corpus.entries.iter().map(|entry| entry.program.clone()).collect()
+    }
+}
+
+impl smcli_core::command_source::CommandSource for TldrSource {
+    fn name(&self) -> &str {
+        "tldr"
+    }
+
+    fn version(&self) -> &str {
+        &self.corpus.commit
+    }
+
+    fn examples(&self, program: &str, _platform: &str) -> Vec<smcli_core::command_source::CommandExample> {
+        self.corpus
+            .entries
+            .iter()
+            .filter(|entry| entry.program == program)
+            .map(|entry| smcli_core::command_source::CommandExample {
+                program: entry.program.clone(),
+                description: entry.description.clone(),
+                template: entry.template.clone(),
+                source: self.name().into(),
+            })
+            .collect()
+    }
+}
+
 pub fn rank(potion: &Potion, query: &str, entries: &[Entry], prefix_words: &[String]) -> Vec<(usize, f32)> {
     let texts = std::iter::once(query.to_owned())
         .chain(entries.iter().map(|entry| entry.description.clone()))
@@ -172,130 +218,3 @@ pub fn rank_with_vectors(
     ranked
 }
 
-pub fn cache_name(potion: &Potion, commit: &str) -> String {
-    format!("tldr-{commit}-{}-{}-d{}.vec", Potion::NAME, potion.identity, potion.dimension())
-}
-
-#[derive(Serialize, Deserialize)]
-struct CacheHeader {
-    programs: Vec<String>,
-}
-
-struct CachedVectors {
-    order: Vec<String>,
-    vectors: HashMap<String, Vec<Vec<f32>>>,
-}
-
-fn read_cache(path: &Path, corpus: &Corpus, dimension: usize) -> Result<Option<CachedVectors>> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') else { return Ok(None) };
-    let Ok(header) = serde_json::from_slice::<CacheHeader>(&bytes[..newline]) else { return Ok(None) };
-    if header.programs.iter().collect::<HashSet<_>>().len() != header.programs.len() {
-        return Ok(None);
-    }
-    let counts = corpus.entries.iter().fold(HashMap::<&str, usize>::new(), |mut counts, entry| {
-        *counts.entry(&entry.program).or_default() += 1;
-        counts
-    });
-    let row_bytes = dimension.checked_mul(4).ok_or_else(|| anyhow::anyhow!("invalid vector dimension"))?;
-    let expected = header.programs.iter().try_fold(0usize, |total, program| {
-        counts.get(program.as_str()).copied().unwrap_or(0).checked_mul(row_bytes).and_then(|n| total.checked_add(n))
-    });
-    if expected != Some(bytes.len() - newline - 1) {
-        return Ok(None);
-    }
-    let mut offset = newline + 1;
-    let mut vectors = HashMap::new();
-    for program in &header.programs {
-        let count = counts.get(program.as_str()).copied().unwrap_or(0);
-        let mut page = Vec::with_capacity(count);
-        for _ in 0..count {
-            let mut vector = Vec::with_capacity(dimension);
-            for _ in 0..dimension {
-                vector.push(f32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()));
-                offset += 4;
-            }
-            page.push(vector);
-        }
-        vectors.insert(program.clone(), page);
-    }
-    Ok(Some(CachedVectors { order: header.programs, vectors }))
-}
-
-fn write_cache(path: &Path, order: &[String], vectors: &HashMap<String, Vec<Vec<f32>>>) -> Result<()> {
-    let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
-    let temporary = path.with_file_name(format!(".{}.{}-{unique}.tmp", path.file_name().unwrap().to_string_lossy(), std::process::id()));
-    let result = (|| -> Result<()> {
-        #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options.open(&temporary)?;
-        serde_json::to_writer(&mut file, &CacheHeader { programs: order.to_vec() })?;
-        file.write_all(b"\n")?;
-        for program in order {
-            for vector in &vectors[program] {
-                for value in vector {
-                    file.write_all(&value.to_le_bytes())?;
-                }
-            }
-        }
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
-}
-
-/// Vectors for installed entries in corpus order. Existing pages are reused; newly installed pages are appended.
-pub fn corpus_vectors(
-    potion: &Potion,
-    corpus: &Corpus,
-    installed: &HashSet<String>,
-    index_dir: &Path,
-) -> Result<Vec<Vec<f32>>> {
-    std::fs::create_dir_all(index_dir)?;
-    let path = index_dir.join(cache_name(potion, &corpus.commit));
-    let cached = read_cache(&path, corpus, potion.dimension())?;
-    let mut order = cached.as_ref().map(|c| c.order.clone()).unwrap_or_default();
-    let mut vectors = cached.map(|c| c.vectors).unwrap_or_default();
-    let mut seen = HashSet::new();
-    let missing = corpus
-        .entries
-        .iter()
-        .filter(|entry| installed.contains(&entry.program) && !vectors.contains_key(&entry.program))
-        .filter(|entry| seen.insert(entry.program.clone()))
-        .map(|entry| entry.program.clone())
-        .collect::<Vec<_>>();
-    if !missing.is_empty() {
-        let wanted = missing.iter().collect::<HashSet<_>>();
-        let missing_entries = corpus.entries.iter().filter(|entry| wanted.contains(&entry.program)).collect::<Vec<_>>();
-        let embedded = potion.embed(&missing_entries.iter().map(|entry| entry.description.clone()).collect::<Vec<_>>());
-        for (entry, vector) in missing_entries.into_iter().zip(embedded) {
-            vectors.entry(entry.program.clone()).or_insert_with(Vec::new).push(vector);
-        }
-        order.extend(missing);
-        write_cache(&path, &order, &vectors)?;
-    }
-    let mut next = HashMap::<&str, usize>::new();
-    Ok(corpus
-        .entries
-        .iter()
-        .filter(|entry| installed.contains(&entry.program))
-        .filter_map(|entry| {
-            let index = next.entry(&entry.program).or_default();
-            let vector = vectors.get(&entry.program).and_then(|page| page.get(*index)).cloned();
-            *index += 1;
-            vector
-        })
-        .collect())
-}

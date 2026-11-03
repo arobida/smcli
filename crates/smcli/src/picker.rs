@@ -101,6 +101,8 @@ pub struct Picker {
     /// Colour inline rows from `LS_COLORS` instead of only the terminal theme.
     pub ls_colors: bool,
     pub tldr_entries: Vec<smcli_search::tldr::Entry>,
+    /// Source name per tldr_entries row, aligned by index.
+    pub tldr_sources: Vec<String>,
     pub tldr_all: bool,
     pub tldr_program: Option<String>,
     pub tldr_status: Option<String>,
@@ -140,6 +142,7 @@ impl Picker {
             files_line: None,
             ls_colors: false,
             tldr_entries: Vec::new(),
+            tldr_sources: Vec::new(),
             tldr_all: false,
             tldr_program: None,
             tldr_status: None,
@@ -612,6 +615,7 @@ pub fn run(
                     }
                     line.push(Span::styled(format!("{}  ", visible(&entry.description)), MUTED));
                     line.push(Span::styled(visible(&entry.template), Style::new().add_modifier(Modifier::BOLD)));
+                    line.push(Span::styled(format!("  {}", picker.tldr_sources.get(*index).map(String::as_str).unwrap_or("")), MUTED));
                     ListItem::new(Line::from(line))
                 }).collect()
             } else {

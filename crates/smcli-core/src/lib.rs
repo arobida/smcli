@@ -1,3 +1,4 @@
+pub mod command_source;
 pub mod config;
 pub mod context;
 pub mod entry;

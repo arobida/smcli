@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rusqlite::Connection;
+use smcli_core::command_source::CommandSource;
 use smcli_core::config::{CaptureFilter, SmcliConfig};
 use smcli_core::context_cache::ContextCache;
 use smcli_core::entry::SearchEntry;
@@ -27,6 +28,7 @@ use smcli_core::suggestion_index::SuggestionIndex;
 use smcli_core::time::now;
 use smcli_core::unix_socket::{SocketConnection, SocketError, listen_unix};
 use smcli_search::HistorySearch;
+use smcli_search::commands::CommandIndex;
 use smcli_search::corpus::{CorpusState, SearchSignals};
 use smcli_search::native::history_files;
 use smcli_search::setup::search_engine;
@@ -69,6 +71,18 @@ pub struct Service {
     /// Directory context from cache: discovery is a few stats, and Git status refreshes in the background.
     contexts: ContextCache,
     file_search: FileSearch,
+    /// Command-completion sync: the index, programs known after the last sync, last synced PATH, and a one-at-a-time flag.
+    command_sync: Mutex<CommandSync>,
+}
+
+/// State for the service-owned `@@` index sync (design: "Sync, not per-program add").
+/// `known` is the union of indexed and example-less programs from the last sync, so a record
+/// only re-triggers when its program is new or the shell's PATH changed.
+struct CommandSync {
+    index: Option<Arc<CommandIndex>>,
+    known: HashSet<String>,
+    last_path: Option<String>,
+    running: bool,
 }
 
 fn data_version(db: &Connection) -> Result<i64> {
@@ -77,6 +91,14 @@ fn data_version(db: &Connection) -> Result<i64> {
 
 fn inode(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.ino())
+}
+
+/// Program name from a captured command: the first word of its key, basename only (`/usr/bin/tar` -> `tar`).
+fn recorded_program(command: &str, expanded: Option<&str>) -> Option<String> {
+    // The program actually run: the alias expansion when there is one.
+    let word = expanded.unwrap_or(command).split_whitespace().next()?;
+    let program = word.rsplit('/').next().unwrap_or(word);
+    (!program.is_empty()).then(|| program.to_owned())
 }
 
 impl Service {
@@ -122,6 +144,7 @@ impl Service {
                 active: AtomicUsize::new(0),
                 contexts: ContextCache::new(),
                 file_search,
+                command_sync: Mutex::new(CommandSync { index: None, known: HashSet::new(), last_path: None, running: false }),
             }
         });
         Ok(service)
@@ -201,7 +224,7 @@ impl Service {
         unsafe { libc::_exit(0) }
     }
 
-    fn serve(&self, stream: UnixStream, socket_inode: Option<u64>) {
+    fn serve(self: &Arc<Self>, stream: UnixStream, socket_inode: Option<u64>) {
         let mut connection = SocketConnection::from(stream);
         // SAFETY: getuid has no preconditions.
         if connection.peer_uid() != Some(unsafe { libc::getuid() }) {
@@ -232,7 +255,7 @@ impl Service {
         }
     }
 
-    fn dispatch(&self, request: &ServiceRequest) -> ServiceResponse {
+    fn dispatch(self: &Arc<Self>, request: &ServiceRequest) -> ServiceResponse {
         if request.v != VERSION {
             // A rejected version must not refresh idle time, or an old service never exits.
             return ServiceResponse::failure("version", format!("Protocol version {VERSION} required."));
@@ -306,7 +329,7 @@ impl Service {
     }
 
     /// Acknowledged only after the insert commits. A retried event ID is acknowledged again without a new row.
-    fn record(&self, request: &ServiceRequest) -> Result<ServiceResponse> {
+    fn record(self: &Arc<Self>, request: &ServiceRequest) -> Result<ServiceResponse> {
         let (Some(event), Some(command), Some(shell), Some(session), Some(directory), Some(exit_code)) = (
             &request.event, &request.command, &request.shell, &request.session, &request.directory, request.exit_code,
         ) else {
@@ -344,7 +367,88 @@ impl Service {
         let mut response = ServiceResponse::new(true);
         response.event = Some(event.clone());
         response.duplicate = Some(!inserted);
+        if inserted
+            && let Some(program) = recorded_program(command, request.expanded_command.as_deref())
+        {
+            // Off the reply path: sync the command index in the background when the program
+            // is unknown or this shell's PATH was not synced yet.
+            self.maybe_sync_commands(program, request);
+        }
         Ok(response)
+    }
+
+    /// Spawn a background sync unless one is running or the program is known on this PATH.
+    fn maybe_sync_commands(self: &Arc<Self>, program: String, request: &ServiceRequest) {
+        let shell_path = smcli_core::service_protocol::shell_path_snapshot(request.shell_path.as_deref()).unwrap_or_default();
+        {
+            let mut sync = self.command_sync.lock().unwrap_or_else(|e| e.into_inner());
+            if sync.running || (sync.known.contains(&program) && sync.last_path.as_deref() == Some(shell_path.as_str())) {
+                return;
+            }
+            sync.running = true;
+        }
+        let service = Arc::clone(self);
+        let request = request.clone();
+        if std::thread::Builder::new()
+            .spawn(move || service.finish_sync(shell_path, &request))
+            .is_err()
+        {
+            self.command_sync.lock().unwrap_or_else(|e| e.into_inner()).running = false;
+        }
+    }
+
+    /// Compute the wanted set — (OS-shipped ∪ captured-history programs) ∩ this PATH — and sync
+    /// the index to it: add missing programs with examples, delete no-longer-wanted ones, and
+    /// remember example-less programs so repeat captures skip the lookup.
+    /// A missing index means no `@@` build has happened yet; that build covers history-seen
+    /// programs, so nothing is remembered here and the next capture retries.
+    fn finish_sync(&self, shell_path: String, request: &ServiceRequest) {
+        let result = (|| -> Result<()> {
+            let platform = smcli_search::tldr::current_platform();
+            let Some(source) = smcli_search::tldr::bundled_dir()
+                .and_then(|dir| smcli_search::tldr::TldrSource::new(&dir, platform).ok())
+            else {
+                return Ok(());
+            };
+            let index = self.command_index(&source, request)?;
+            if !index.path().exists() {
+                return Ok(());
+            }
+            let mut wanted = smcli_search::commands::os_programs(&smcli_search::commands::system_dirs(), &shell_path);
+            let runs = self.history.runs(&self.user, &self.lock().db)?;
+            let history: HashSet<String> = runs
+                .iter()
+                .filter_map(|run| recorded_program(&run.command, run.expanded_command.as_deref()))
+                .collect();
+            wanted.extend(smcli_search::tldr::installed(&history, &shell_path));
+            let sources: Vec<&dyn CommandSource> = vec![&source];
+            let (indexed, empty) = smcli_search::commands::sync(&index, &sources, platform, &wanted)?;
+            let mut sync = self.command_sync.lock().unwrap_or_else(|e| e.into_inner());
+            sync.known = indexed.union(&empty).cloned().collect();
+            sync.last_path = Some(shell_path);
+            Ok(())
+        })();
+        self.command_sync.lock().unwrap_or_else(|e| e.into_inner()).running = false;
+        // A failed sync stays unremembered (known/last_path untouched) so the next capture retries.
+        let _ = result;
+    }
+
+    /// The command index for the current model and source, cached on first use.
+    fn command_index(&self, source: &smcli_search::tldr::TldrSource, request: &ServiceRequest) -> Result<Arc<CommandIndex>> {
+        let cached = self.command_sync.lock().unwrap_or_else(|e| e.into_inner()).index.clone();
+        if let Some(index) = cached {
+            return Ok(index);
+        }
+        // The service's one engine (loaded on demand): a second model copy would hold two at once.
+        // try_lock: never make a search wait on background sync; a busy service retries on a later capture.
+        let engine = {
+            let Ok(_searching) = self.searching.try_lock() else { anyhow::bail!("search in progress; sync later") };
+            self.current_engine(request)?
+        };
+        let sources: Vec<&dyn CommandSource> = vec![source];
+        let index = Arc::new(CommandIndex::new(engine.directory.clone(), engine.potion.clone(), &sources));
+        self.command_sync.lock().unwrap_or_else(|e| e.into_inner()).index = Some(Arc::clone(&index));
+        Ok(index)
     }
 
     /// Suggest, and the picker's first draw (this directory's suggestions, then all history by last run).
@@ -672,6 +776,147 @@ mod tests {
         std::fs::write(f.home.join("config.toml"), "{}").unwrap();
         f.service.file_search.select(&r);
         assert_eq!(count(), 1);
+    }
+
+    /// One record with a fake program on PATH: the background sync indexes its tldr examples.
+    #[test]
+    fn record_syncs_examples_for_a_new_program_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        let platform = smcli_search::tldr::current_platform();
+        let source = smcli_search::tldr::bundled_dir()
+            .and_then(|dir| smcli_search::tldr::TldrSource::new(&dir, platform).ok())
+            .expect("bundled tldr data");
+        // Pre-existing index with one program, so discovery adds incrementally instead of waiting for a full build.
+        let index = f.service.command_index(&source, &f.request(Operation::Record)).unwrap();
+        let sources: Vec<&dyn CommandSource> = vec![&source];
+        index.add("tar", &CommandIndex::gather(&sources, "tar", platform).expect("tar examples")).unwrap();
+        // A fake jq executable on the request's PATH.
+        let bin = f.home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("jq"), "").unwrap();
+        std::fs::set_permissions(bin.join("jq"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(CommandIndex::gather(&sources, "jq", platform).is_some(), "test needs jq pages in the bundled tldr");
+        let mut r = f.request(Operation::Record);
+        r.event = Some("12345678-89ab-4cde-8012-3456789abcde".into());
+        r.command = Some("jq . file.json".into());
+        r.shell = Some("zsh".into());
+        r.session = Some("test".into());
+        r.exit_code = Some(0);
+        r.shell_path = Some(bin.to_string_lossy().into_owned());
+        f.service.record(&r).unwrap();
+        // The sync thread finishes: jq examples land in the index (what bare `@@` reads).
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            {
+                let sync = f.service.command_sync.lock().unwrap();
+                if sync.known.contains("jq") && sync.last_path.as_deref() == Some(bin.to_string_lossy().as_ref()) {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "sync did not index jq");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let examples = index.examples("jq").unwrap().expect("jq examples indexed");
+        assert!(!examples.is_empty());
+        assert!(examples.iter().all(|example| example.source == "tldr"));
+    }
+
+    /// An indexed program that no longer resolves on the synced PATH loses its examples.
+    #[test]
+    fn record_sync_removes_examples_for_an_uninstalled_program() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        let platform = smcli_search::tldr::current_platform();
+        let source = smcli_search::tldr::bundled_dir()
+            .and_then(|dir| smcli_search::tldr::TldrSource::new(&dir, platform).ok())
+            .expect("bundled tldr data");
+        let index = f.service.command_index(&source, &f.request(Operation::Record)).unwrap();
+        let sources: Vec<&dyn CommandSource> = vec![&source];
+        index.add("tar", &CommandIndex::gather(&sources, "tar", platform).expect("tar examples")).unwrap();
+        let bin = f.home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("jq"), "").unwrap();
+        std::fs::set_permissions(bin.join("jq"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut record = |event: &str, path: &str| {
+            let mut r = f.request(Operation::Record);
+            r.event = Some(event.into());
+            r.command = Some("jq . file.json".into());
+            r.shell = Some("zsh".into());
+            r.session = Some("test".into());
+            r.exit_code = Some(0);
+            r.shell_path = Some(path.into());
+            f.service.record(&r).unwrap();
+        };
+        let bin_path = bin.to_string_lossy().into_owned();
+        record("42345678-89ab-4cde-8012-3456789abcde", &bin_path);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if f.service.command_sync.lock().unwrap().known.contains("jq") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "sync did not index jq");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(index.examples("jq").unwrap().is_some());
+        // Uninstall: the exe is gone. A record with a different PATH re-triggers the sync.
+        std::fs::remove_file(bin.join("jq")).unwrap();
+        record("52345678-89ab-4cde-8012-3456789abcde", &format!("{bin_path}:"));
+        // Poll only the sync state: the index file is single-open, so reading it here would
+        // race the sync thread's open and fail the sync.
+        let changed = format!("{bin_path}:");
+        loop {
+            if f.service.command_sync.lock().unwrap().last_path.as_deref() == Some(changed.as_str()) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "sync did not remove jq");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(index.examples("jq").unwrap().is_none());
+    }
+
+    /// A program no source has examples for is remembered: a repeat capture writes nothing to the index.
+    #[test]
+    fn record_sync_remembers_programs_with_no_examples() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        let platform = smcli_search::tldr::current_platform();
+        let source = smcli_search::tldr::bundled_dir()
+            .and_then(|dir| smcli_search::tldr::TldrSource::new(&dir, platform).ok())
+            .expect("bundled tldr data");
+        let index = f.service.command_index(&source, &f.request(Operation::Record)).unwrap();
+        let sources: Vec<&dyn CommandSource> = vec![&source];
+        index.add("tar", &CommandIndex::gather(&sources, "tar", platform).expect("tar examples")).unwrap();
+        assert!(CommandIndex::gather(&sources, "zzz-smcli-noexamples", platform).is_none());
+        let bin = f.home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("zzz-smcli-noexamples"), "").unwrap();
+        std::fs::set_permissions(bin.join("zzz-smcli-noexamples"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut record = |event: &str| {
+            let mut r = f.request(Operation::Record);
+            r.event = Some(event.into());
+            r.command = Some("zzz-smcli-noexamples --flag".into());
+            r.shell = Some("zsh".into());
+            r.session = Some("test".into());
+            r.exit_code = Some(0);
+            r.shell_path = Some(bin.to_string_lossy().into_owned());
+            f.service.record(&r).unwrap();
+        };
+        record("22345678-89ab-4cde-8012-3456789abcde");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if f.service.command_sync.lock().unwrap().known.contains("zzz-smcli-noexamples") {
+                break;
+            }
+            assert!(Instant::now() < deadline, "sync did not remember the empty program");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(index.examples("zzz-smcli-noexamples").unwrap().is_none());
+        // Second capture: remembered, so no index write (the taladb file is untouched).
+        let modified = std::fs::metadata(index.path()).unwrap().modified().unwrap();
+        record("32345678-89ab-4cde-8012-3456789abcde");
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(std::fs::metadata(index.path()).unwrap().modified().unwrap(), modified);
     }
 
     #[test]

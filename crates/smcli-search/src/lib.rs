@@ -1,3 +1,4 @@
+pub mod commands;
 pub mod corpus;
 pub mod evidence;
 pub mod identifiers;
@@ -23,7 +24,7 @@ mod tokenizer;
 
 pub use index::HistorySearch;
 pub use potion::Potion;
-pub use tldr::{Corpus, Entry, corpus_vectors, rank};
+pub use tldr::{Corpus, Entry, TldrSource, rank};
 pub use tokenizer::ShellTokenizer;
 
 #[cfg(test)]
