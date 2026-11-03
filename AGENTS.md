@@ -13,7 +13,10 @@ By using the kero skill you are allowed to open new sessions with the list of ag
 pisol=pi --model openai/gpt-6.1-sol --thinking low
 piterra=pi --model openai/gpt-6.1-terra --thinking low
 piluna=pi --model openai/gpt-6-luna --thinking low
-pikcode=pi --model opencode-go/kimi-k2.7-code --thinking low
+pikcode=pi --model kimi-coding/kimi-for-coding --thinking low
+pik3-256=pi --model kimi-coding/k3-256k --thinking low
+pik3=pi --model kimi-coding/k3 --thinking high
+pik31pro=pi --model kimi-coding/k3.1-pro --thinking high
 pidflash=pi --model opencode-go/deepseek-v4.1-flash --thinking high
 pigrok47=pi --model xai/grok-4.7 --thinking high
 pigrok46=pi --model xai/grok-4.6 --thinking high
