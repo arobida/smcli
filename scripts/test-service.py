@@ -523,7 +523,10 @@ try:
     assert run("health", SMCLI_SERVICE="0", check=False).returncode == 0
     # The index manager lists both, marks the current one, and --prune deletes only the other model's.
     listed = {i["name"]: i["current"] for i in json.loads(run("indexes", "--json", SMCLI_SERVICE="0").stdout)}
-    assert listed == {"rs-commands-v3-potion-othermodel-d256": False, current.split(".")[0]: True}, listed
+    # The command-completion index (named by its bundled sources) is listed too, and is current.
+    bundled = [name for name in listed if "-bundled-tldr@" in name]
+    assert len(bundled) == 1, listed
+    assert listed == {"rs-commands-v3-potion-othermodel-d256": False, current.split(".")[0]: True, bundled[0]: True}, listed
     run("indexes", "--prune", SMCLI_SERVICE="0")
     assert not any("othermodel" in n for n in os.listdir(search_dir)) and os.path.exists(f"{search_dir}/{current}")
     run("service", "start")
