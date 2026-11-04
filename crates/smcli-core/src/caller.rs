@@ -51,6 +51,8 @@ pub struct CallerContext {
 #[derive(Debug, Clone)]
 pub struct LaunchSettings {
     pub home: PathBuf,
+    /// Config the launch environment names (`SMCLI_CONFIG`, `XDG_CONFIG_HOME`); used when a request names neither home nor config.
+    pub config: PathBuf,
     pub idle: Duration,
     pub fff_max: usize,
     pub fff_idle: Duration,
@@ -60,8 +62,10 @@ impl LaunchSettings {
     pub fn from_env(env: &HashMap<String, String>) -> Self {
         let idle = env.get("SMCLI_SERVICE_IDLE").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(1800.0);
         let fff_idle = env.get("SMCLI_FFF_IDLE").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(600.0);
+        let home = PathBuf::from(env.get("HOME").cloned().unwrap_or_else(|| "/".into()));
         Self {
-            home: PathBuf::from(env.get("HOME").cloned().unwrap_or_else(|| "/".into())),
+            config: SmcliConfig::location(&home, env),
+            home,
             idle: Duration::from_secs_f64(idle),
             fff_max: env.get("SMCLI_FFF_MAX").and_then(|v| v.parse().ok()).unwrap_or(4),
             fff_idle: Duration::from_secs_f64(fff_idle),
@@ -90,8 +94,12 @@ impl CallerContext {
 
     /// Rebuilds the context a client applied. Missing home uses the service's launch home.
     pub fn from_request(request: &ServiceRequest, launch: &LaunchSettings) -> Self {
-        let home = request.home.as_deref().filter(|p| !p.is_empty()).map(PathBuf::from).unwrap_or_else(|| launch.home.clone());
-        let config = request.config.as_deref().filter(|p| !p.is_empty()).map(PathBuf::from).unwrap_or_else(|| home.join(".config/smcli/config.json"));
+        let caller_home = request.home.as_deref().filter(|p| !p.is_empty()).map(PathBuf::from);
+        let config = request.config.as_deref().filter(|p| !p.is_empty()).map(PathBuf::from).unwrap_or_else(|| match &caller_home {
+            Some(home) => SmcliConfig::location(home, &HashMap::new()),
+            None => launch.config.clone(),
+        });
+        let home = caller_home.unwrap_or_else(|| launch.home.clone());
         Self {
             home,
             config,
@@ -214,11 +222,20 @@ mod tests {
         request.cwd = Some(caller.cwd.clone());
         let launch = LaunchSettings {
             home: PathBuf::from("/launch-home"),
+            config: PathBuf::from("/launch-home/.config/smcli/config.json"),
             idle: Duration::from_secs(1),
             fff_max: 1,
             fff_idle: Duration::from_secs(1),
         };
         assert_eq!(CallerContext::from_request(&request, &launch), caller);
         assert_eq!(CallerContext::from_env(&env()), caller);
+    }
+
+    #[test]
+    fn launch_config_honors_xdg_config_home() {
+        let env = HashMap::from([("HOME".to_string(), "/h".to_string()), ("XDG_CONFIG_HOME".to_string(), "/x".to_string())]);
+        let launch = LaunchSettings::from_env(&env);
+        assert_eq!(launch.config, PathBuf::from("/x/smcli/config.json"));
+        assert_eq!(CallerContext::from_request(&ServiceRequest::new(Operation::Search), &launch).config, launch.config);
     }
 }
