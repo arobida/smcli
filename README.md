@@ -232,6 +232,12 @@ Project-index ranking switches are controlled by `SMCLI_RANKING_OFF`: `index`, `
 $ make test
 ```
 
+Rust tests run under [cargo-nextest](https://nexte.st), which runs every crate's tests in
+parallel. Install it once with `cargo install cargo-nextest --locked`. `make test` is the full
+gate: Rust tests plus the black-box CLI, shell, service, picker and install suites. While
+editing, run one slice, for example `make test-rust PKG=smcli-core FILTER=history`. Plain
+`cargo test` still works, but it is slower and runs the ranking tests twice.
+
 ## Backend baseline and fff experiment
 
 Before changing shell transports or search ownership:

@@ -33,12 +33,12 @@ Review note (2026-10-24): the original draft proposed eleven new targets, pair-a
 
 Expose the existing harnesses so one can be run without the whole gate. Each assumes `make build` output.
 
-| Target         | Runs                                                                                                            |
-| -------------- | --------------------------------------------------------------------------------------------------------------- |
-| `test-rust`    | `cargo test $(if $(PKG),-p $(PKG),--workspace) $(FILTER)` (e.g. `make test-rust PKG=smcli-core FILTER=history`) |
-| `test-shells`  | `build` + `scripts/test-shells.py` (honors existing `SMCLI_TEST_ONLY`)                                          |
-| `test-service` | `build` + `scripts/test-service.py`                                                                             |
-| `test-install` | `build` + `scripts/test-install.sh`                                                                             |
+| Target         | Runs                                                                                                                   |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `test-rust`    | `cargo nextest run $(if $(PKG),-p $(PKG),--workspace) $(FILTER)` (e.g. `make test-rust PKG=smcli-core FILTER=history`) |
+| `test-shells`  | `build` + `scripts/test-shells.py` (honors existing `SMCLI_TEST_ONLY`)                                                 |
+| `test-service` | `build` + `scripts/test-service.py`                                                                                    |
+| `test-install` | `build` + `scripts/test-install.sh`                                                                                    |
 
 Move the inline CLI checks in `scripts/test.sh` only if a harness needs the shared setup; otherwise leave them. `test` keeps running everything once.
 

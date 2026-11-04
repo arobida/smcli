@@ -91,7 +91,7 @@ baseline:
 # Builds and runs the full test suite on Linux in Docker (needs a running daemon); Linux output stays in a volume.
 linux:
 	docker run --rm -v "$(CURDIR)":/src -w /src -v smcli-cargo:/usr/local/cargo/registry -v smcli-cargo-git:/usr/local/cargo/git -v smcli-target:/target \
-		-e CARGO_TARGET_DIR=/target rust:1.99 sh -c 'apt-get update -qq && apt-get install -y -qq zsh fish python3 sqlite3 git > /dev/null && git config --global --add safe.directory "*" && bash scripts/test.sh'
+		-e CARGO_TARGET_DIR=/target rust:1.99 sh -c 'apt-get update -qq && apt-get install -y -qq zsh fish python3 sqlite3 git > /dev/null && git config --global --add safe.directory "*" && curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/cargo/bin && bash scripts/test.sh'
 
 # Formats every hand-written markdown doc with iwe. Generated docs are skipped: regenerate them instead.
 GENERATED_DOCS := THIRD_PARTY_NOTICES
