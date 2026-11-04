@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use smcli_search::{Corpus, Entry, Potion};
+use smcli_search::{Entry, Potion};
 use smcli_search::tldr::{self, rank_with_vectors};
 
 fn entry(program: &str, description: &str, template: &str) -> Entry {

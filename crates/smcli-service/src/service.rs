@@ -833,7 +833,7 @@ mod tests {
         std::fs::create_dir(&bin).unwrap();
         std::fs::write(bin.join("jq"), "").unwrap();
         std::fs::set_permissions(bin.join("jq"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut record = |event: &str, path: &str| {
+        let record = |event: &str, path: &str| {
             let mut r = f.request(Operation::Record);
             r.event = Some(event.into());
             r.command = Some("jq . file.json".into());
@@ -885,7 +885,7 @@ mod tests {
         std::fs::create_dir(&bin).unwrap();
         std::fs::write(bin.join("zzz-smcli-noexamples"), "").unwrap();
         std::fs::set_permissions(bin.join("zzz-smcli-noexamples"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut record = |event: &str| {
+        let record = |event: &str| {
             let mut r = f.request(Operation::Record);
             r.event = Some(event.into());
             r.command = Some("zzz-smcli-noexamples --flag".into());
