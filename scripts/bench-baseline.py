@@ -3,6 +3,7 @@
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import math
@@ -17,9 +18,11 @@ import shutil
 import signal
 import sqlite3
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 
 
@@ -89,6 +92,8 @@ class Terminal:
         self.start = time.perf_counter_ns()
         self.pid, self.fd = pty.fork()
         if self.pid == 0:
+            # A real terminal has a size; at 0x0 the inline picker draws nothing.
+            fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
             os.chdir(directory)
             os.execve(argv[0], argv, env)
         self.reaped = False
@@ -104,6 +109,9 @@ class Terminal:
                     raise RuntimeError(f"terminal closed: {data!r}") from error
                 if not part:
                     break
+                # Answer cursor-position queries like a real terminal; unanswered, crossterm waits 2 s.
+                for _ in range(part.count(b"\x1b[6n")):
+                    os.write(self.fd, b"\x1b[1;1R")
                 data += part
                 if marker in data:
                     return data
