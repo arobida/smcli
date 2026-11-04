@@ -2,7 +2,7 @@
 
 ## Overview
 
-The workspace manifest (`../Cargo.toml:workspace.members`) includes the four crates below. The CLI and service share core history/protocol types and the search library; only the service links fff-search.
+The workspace manifest (`../Cargo.toml:workspace.members`) includes the four crates below. `smcli-core` owns history SQL and caller context; `smcli-search` owns index files. Only the service links fff-search or loads the model at runtime; CLI init and reindex load it under the model lock.
 
 ## Interface
 

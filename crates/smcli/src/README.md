@@ -6,15 +6,15 @@ The `smcli` executable source tree: CLI dispatch, the ratatui picker and menu, s
 
 ## Interface
 
-- `cli.rs:run` dispatches subcommands; `cli.rs:pick_tldr` runs the tldr command picker for `smcli pick --tldr`.
-- `cli.rs:indexes` lists history indexes and tldr vector-cache files beside the database; `--prune` removes non-current entries.
+- `cli/mod.rs:run` dispatches subcommands; `cli/tldr.rs` runs the tldr command picker for `smcli pick --tldr`.
+- `cli/index.rs` lists history and command-example indexes beside the database; `--prune` removes non-current entries.
 - `complete.rs:complete_local` provides in-process `@` path completion; `LocalFileSearch` handles file and grep fallback.
 - `context.rs:run` prints repository/project context.
 - `picker.rs:Mode`, `Choice`, and `Picker` implement the interactive history, files, grep, and tldr views.
 - `shell_integration.rs` generates Bash, Zsh, and Fish hooks.
 - `initialize.rs:run` describes an unchanged model without loading it; a changed model and `initialize.rs:reindex` stop the service and refuse if its model lock stays held for five seconds. Reindex also prepares command examples.
-- `cli.rs:index_health` and `indexes` use `configured_model` and model-free index naming; health never embeds a probe.
-- `cli.rs:tldr_ranker` requests service embeddings with a two-second timeout, accepts only the current command-index model name and matching vector dimensions, and latches word ranking after the first unusable reply.
+- `cli/index.rs` uses `configured_model` and model-free index naming; health never embeds a probe.
+- `cli/tldr.rs:tldr_ranker` requests service embeddings with a two-second timeout, accepts only the current command-index model name and matching vector dimensions, and latches word ranking after the first unusable reply.
 
 ## Natural-language command help
 
@@ -35,7 +35,7 @@ The CLI reads the command-example index without loading Potion. It asks the serv
 
 ## Side Effects
 
-- Reads/writes captured history SQLite and `{db}.search/` indexes, including the tldr vector cache.
+- Reads/writes captured history via `smcli-core` and `{db}.search/` indexes via `smcli-search`, including command examples.
 - May spawn or stop `smcli-service`.
 - The picker opens `/dev/tty` and switches terminal mode.
 - Reads model/configuration files, bundled tldr JSONL, native history, and project directories.

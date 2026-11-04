@@ -29,10 +29,10 @@ ownership of file search stays here.
   `smcli_core::service_client`): only the same uid may use the socket.
 - The search index and corpus are rebuildable caches: `service.rs:Service::refresh` invalidates history caches after external database writes;
   `Service::build_corpus` checks native-history stamps and a five-minute corpus lifetime.
-- `service.rs:Service::load_engine` drops the old engine and cached command index before building the new one, and clears the synced program/PATH cache. Command indexes are keyed by their index name.
+- `service.rs:Service::load_engine` keys engines by content-derived model identity, drops the old engine and cached command index before building a new one, and clears the synced program/PATH cache. Command indexes are keyed by their index name.
 - Search, `embed` and background command sync hold `Service::searching` for their whole model-using operation. Background sync skips busy work and retries on a later capture; command-index preparation can block searches, whose clients may time out and degrade.
 - The service takes `<db>.search/model.lock` before its first model load and retains the same descriptor until exit, including across model switches. If init/reindex holds it, search and `embed` fail without loading; background warmup ignores that failure and later requests retry.
-- Protocol-v4 `embed` requires `query` (empty means prepare only). `mode:"commands"` prepares the index on the caller’s `shellPath` and ensures an optional `command`; nonempty queries return finite vectors with the matching command-index name in `model`.
+- Each request supplies caller context; the service uses launch settings rather than the launching shell’s environment. Protocol-v4 `embed` requires `query` (empty means prepare only). `mode:"commands"` prepares the index on the caller’s `shellPath` and ensures an optional `command`; nonempty queries return finite vectors with the matching command-index name in `model`.
 
 ## Side Effects
 

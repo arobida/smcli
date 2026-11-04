@@ -5,7 +5,7 @@ metadata native history doesn't reliably keep: the working directory, exit code,
 start time, duration, user, host, and terminal session. Search commands with keyword
 and semantic matching, or rank captured commands for your current directory.
 Search uses potion-shell-16m (potion-code-16M-v2 fine-tuned on shell commands), a static model shipped beside the binaries (about 33 MB, MIT licensed,
-see `Models/`). Search works on macOS and Linux.
+see `Models/`). Search works on macOS and Linux. If the service is unavailable, history search uses keyword matching and `@@` ranks existing examples by words; no embedding model is loaded in the CLI.
 
 > [!NOTE]
 > Native shell history stores the command line and little else. smcli never rewrites
@@ -107,7 +107,7 @@ smcli init --keys [LIST]      # picker keys only: ask, or ctrl-r,left,right | ct
 smcli init --potion [DIR]     # use another Model2Vec model dir (no DIR: the built-in one)
 smcli init --default          # back to the default: the built-in Potion model
 smcli reindex                 # discard the search index and re-embed every command
-smcli health [--json]         # index coverage, size, and embedding model check (exit 1 if broken)
+smcli health [--json]         # index coverage, size, and model identity (exit 1 if broken)
 smcli import legacy.jsonl     # import older smcli JSONL logs (not native history)
 smcli import --atuin [db]     # import Atuin history (default ~/.local/share/atuin/history.db)
 smcli import --atuin --replace [db]  # discard existing smcli history, then import
@@ -214,7 +214,7 @@ Project-index ranking switches are controlled by `SMCLI_RANKING_OFF`: `index`, `
   `~/.config/smcli/config.json` (or `$XDG_CONFIG_HOME/smcli/config.json`);
   `SMCLI_CONFIG` overrides that file's path. `init` configures search, not capture,
   and is not required for the built-in model.
-- `import` of legacy JSONL is transactional and deduplicates matching imported records; repeated imports preserve existing rows (`crates/smcli/src/cli.rs:import`).
+- `import` of legacy JSONL is transactional and deduplicates matching imported records; repeated imports preserve existing rows (`crates/smcli-core/src/import.rs`).
 - Like Atuin, capture skips commands typed with a leading space, commands containing likely
   secrets (AWS, GitHub, GitLab, Slack, Stripe, Google, npm, Anthropic/OpenAI keys), and any
   matching regexes in the config file: `"historyFilter": ["^vault "]` for commands,
@@ -250,7 +250,7 @@ measurements, dependency/API verification, limitations, and the next gate.
 
 ### System Overview
 
-The two executables share `smcli-core` for captured history/protocol types and `smcli-search` for local hybrid search. `smcli-service` keeps history/search state open and alone links fff-search; the CLI retains local history/search and picker fallbacks without fff-specific evidence. See the crate manifests and child contracts for ownership.
+The executables share `smcli-core`, the sole owner of captured-history SQL, and `smcli-search`, the sole owner of index files. `smcli-service` owns runtime embeddings and alone links fff-search. Without a usable service, history search falls back to keyword matching and `@@` to word ranking; service-only fff evidence is unavailable.
 
 ### Interface
 
@@ -261,15 +261,15 @@ The two executables share `smcli-core` for captured history/protocol types and `
 ### Invariants
 
 - Native shell history is read-only; captured history cannot alias `HISTFILE` (`crates/smcli-search/src/native.rs:HistoryFile::read`, `crates/smcli-core/src/history.rs:CapturedHistory::check_separate`).
-- History and runtime paths require current-user ownership and private permissions (`crates/smcli-core/src/history.rs:CapturedHistory::connect`, `service_location.rs:ServiceLocation::prepare`). Search caches contain command text and also require a private directory (`crates/smcli-search/src/index.rs:HistorySearch::prepare_directory`).
+- History and runtime paths require current-user ownership and private permissions (`crates/smcli-core/src/history.rs:CapturedHistory::connect`, `service_location.rs:ServiceLocation::prepare`). Search caches contain command text and also require a private directory (`crates/smcli-search/src/index.rs:prepare_directory`).
 - Protocol JSON is one request/response per connection; version mismatches are rejected in dispatch, while clients handle unavailable/stale services (`crates/smcli-service/src/service.rs:Service::serve`, `Service::dispatch`; `crates/smcli-core/src/service_client.rs:ServiceClient`).
 - Embeddings run locally from the shipped model folder, with checkout fallback for development; model-specific index names prevent vector reuse across identities (`crates/smcli-search/src/potion.rs:Potion::bundled`, `index.rs:HistorySearch::index_name`).
-- Initialization attempts to stop the service when changing models but can proceed if shutdown fails; service reload drops its old engine before loading another (`crates/smcli/src/initialize.rs:run`, `cli.rs:run`; `crates/smcli-service/src/service.rs:Service::load_engine`).
+- Model-changing initialization and reindex stop the service and refuse to load weights if the per-database model lock remains held. The service holds that lock while its model is resident and drops its old engine before loading another (`crates/smcli/src/initialize.rs`; `crates/smcli-service/src/service.rs:Service::load_engine`).
 
 ### Side Effects
 
 - Persistent captured-history SQLite rows, selection records, migrations and config writes (`crates/smcli-core/src/history.rs:CapturedHistory`, `config.rs:SmcliConfig::save`); rebuildable TalaDB search caches (`crates/smcli-search/src/index.rs:HistorySearch`).
-- Service process/socket lifecycle, local filesystem watchers and Git-status subprocesses (`crates/smcli-core/src/service_client.rs:ServiceClient`, `context_cache.rs:GitStatus::read`; `crates/smcli-service/src/file_search.rs:FileSearch`).
+- Service process/socket lifecycle, local filesystem watchers and Git-status subprocesses (`crates/smcli-core/src/service_client.rs:ServiceClient`, `crates/smcli-core/src/context.rs:GitStatus::read`; `crates/smcli-service/src/file_search.rs:FileSearch`).
 - Interactive terminal modes and user-opted shell hooks (`crates/smcli/src/picker.rs:TerminalSession`, `shell_integration.rs:render_config`). Install/uninstall can change shell startup files and remove smcli data; see the scripts contract.
 
 ### Verification

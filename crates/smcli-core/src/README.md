@@ -18,8 +18,8 @@
 - `prune.rs` implements `CapturedHistory::prune(filter, dry, cleanup)` and exposes `PruneReport { database_exists, commands, removed_commands, removed_selections, backup }` and `PruneError`. `commands` contains typed commands for dry-run display; `backup` is a `.v7.bak` path whose possible retained history needs a caller warning. A post-commit cleanup or compaction failure returns `PruneError` with the same counts and backup, so the caller can warn before returning the combined maintenance error.
 - `parse::{CommandFlag, CommandBreakdown}`; `parse::{command_flags, shell_words, safe_expansion, is_smcli_command, program_of, glob_match, path_placeholders, path_arguments, last_command_word}`.
 - `ranking::{Signal, CandidateKind, Candidate, Pick, SelectionLog}`; `ranking::RankingContext::{new, disabled, uses, in_project, kind, same_kind, candidates_of}`; `ranking::{uses, candidates, apply_ranking_signals, has_prefix, suggestion_why}`.
-- `service_client::ServiceClient::{new, socket, send}`.
-- `service_location::ServiceLocation::{new, fingerprint, prepare}`; `service_location::{build, relative_insert}`.
+- `caller::CallerContext` carries request-scoped home, config, cwd, session, shell history, PATH and ranking settings; `request` validates typed protocol requests. `service_client::ServiceClient::{new, socket, send}` uses an allowlisted environment for service launch.
+- `service_location::ServiceLocation::{new, fingerprint, prepare}`; `service_location::build`; `paths::relative_insert`.
 - `service_protocol::{VERSION, MAX_SHELL_PATH_BYTES, MAX_MESSAGE_BYTES, MAX_RESPONSE_BYTES, IO_TIMEOUT, MAX_CONNECTIONS}`; `service_protocol::{Operation, ServiceRequest, ServiceResponse, Failure, FileHit, FileIndexInfo, SearchFilter, Suggestion, SearchEntry, ProjectContext, Repository, Project, GitStatus}`; `service_protocol::{shell_path_snapshot, encode_line, decode_line}`.
 - `suggestion_index::{CommandAffinity, SuggestionIndex}`.
 - `time::{now, format_iso8601, parse_iso8601}`.
@@ -46,7 +46,7 @@ Subdirectories: none (this is the leaf module directory; `../tests/` holds integ
 
 - Disk: creates/writes the SQLite database at `SMCLI_DB` or `~/.local/share/smcli/history.db` (WAL mode, `synchronous=NORMAL`); creates the config at `SMCLI_CONFIG` / `$XDG_CONFIG_HOME/smcli/config.json` / `~/.config/smcli/config.json`; creates the runtime directory, socket and lock files; writes a `.migration.lock` and `.v7.bak` during migration.
 - Processes: `service_client.rs::ServiceClient::launch` spawns `smcli-service` detached via `posix_spawn` (no terminal, stdio → `/dev/null`, extra descriptors closed); `send`/`replace` can stop and replace a stale/mismatched-version service.
-- `context.rs::ProjectContext::discover` only stats and reads small files — it never runs Git or executes a manifest. `context.rs::GitStatus::read` is the exception: it runs `/usr/bin/env git --no-pager -C <root> status --porcelain=v2 --branch` (no shell, `GIT_OPTIONAL_LOCKS=0`, killed after its timeout). Directory watching and the context cache live in `smcli-service`.
+- `context.rs::ProjectContext::discover` only stats and reads small files — it never runs Git or executes a manifest. `context.rs::GitStatus::read` runs Git without a shell or optional locks and kills it after its timeout. Directory watching and the context cache live in `smcli-service`.
 
 ## Verification
 

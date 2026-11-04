@@ -40,7 +40,7 @@ No subdirectories: all modules sit directly in this path.
 - Expansion terms come from `ProjectEvidence::grep_terms` under a 20 ms budget, only when no hit already covers 75 % of the query, filtered to 3–128 ASCII identifier characters, deduplicated, limited to 16, and worth at most `0.15 * score` (`crates/smcli-search/src/index.rs:expansion_terms`, `merge_expansion`).
 - Empty query with a non-empty filter lists matches by most recent run; an empty query with no filter is an error (`HistorySearch::search_with_evidence`).
 - History indexes use `rs-commands-v4-potion-shell-16m-<identity>-d<dimension>` (plus `-typed` when aliases are off); command examples use `rs-examples-v1-potion-shell-16m-<identity>-<sources>-d<dimension>`. Identity is `b3` plus the first 16 hexadecimal BLAKE3 digits over the resolved config, tokenizer and weights, each prefixed by its little-endian u64 byte length. Copies of the same model share index names. Text with no known tokens embeds to a fixed `1/sqrt(len)` vector, leaving its ranking to the keyword leg (`Potion::embed`).
-- `Potion` is documented as loaded once per process and embedded in batches (`crates/smcli-search/src/potion.rs:Potion`); nothing in the type prevents loading a second model, so "one model per process" is a caller convention.
+- The service owns runtime model loading and holds the model lock while weights are resident; model-changing init and reindex take the same lock before loading (`crates/smcli-search/src/setup.rs:model_lock`).
 - `working_directory` prefers the shell's `$PWD`, kept as typed, and falls back to the process directory (`crates/smcli-search/src/setup.rs:working_directory`).
 
 ## Side Effects

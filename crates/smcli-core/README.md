@@ -33,7 +33,7 @@ and the `src/` and `tests/` trees. Dependencies are `anyhow`, `libc`, `regex`, `
   tokens, and the user's `historyFilter`/`cwdFilter` regexes are rejected when the corresponding filters are enabled (`CaptureFilter::allows_run`).
 - `time.rs` formats ISO 8601 timestamps and parses `Z`/`±HH:MM` forms; stored run times are epoch seconds. Ranking
   decay halves usage every `history.rs::USAGE_HALF_LIFE` (14 days).
-- The client/service protocol is versioned (`service_protocol.rs::VERSION == 3`) and frozen in
+- The client/service protocol is versioned (`service_protocol.rs::VERSION == 4`) and frozen in
   fixtures; a version mismatch or a stale binary must fall back or be replaced, never half-parse.
 
 ## Side Effects

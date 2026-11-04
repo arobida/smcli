@@ -27,7 +27,7 @@ started on demand by `smcli-core`'s client and stops itself when unused.
 - The socket name fingerprints the supplied database path (`smcli_core::service_location::ServiceLocation::fingerprint`); `main.rs:start` locks the associated lock file before binding.
 - Only the lock holder binds (`main.rs::start`); a concurrent start exits `0` instead of stealing the socket.
 - `service.rs:Service::serve` rejects peers whose uid differs from the service uid; `smcli_core::service_client` checks the server peer.
-- Protocol version is enforced (`smcli_core::service_protocol::VERSION == 3`); a rejected version returns a `version` failure and must not refresh idle time, so an old service still exits.
+- Protocol version is enforced (`smcli_core::service_protocol::VERSION == 4`); a rejected version returns a `version` failure and must not refresh idle time, so an old service still exits.
 - `record` validates through `smcli_core::history::CapturedHistory::append` and applies the caller's `CaptureFilter`; a retried event ID inserts no new row (`Service::record`, `CapturedHistory::append`).
 - `ranked` requires an absolute directory and `limit` in `1..=1000`; evidence signals (`files`, `git`, `evidence`) are only applied while a ready, non-scanning fff index exists.
 - `search` requires a query and absolute directory, `limit` in `1..=1000`; the corpus is reused for the same directory/project/native-file stamp up to 5 minutes.
