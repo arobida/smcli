@@ -584,7 +584,13 @@ fn project_config_scores(query: &PreparedQuery, signals: &SearchSignals) -> Hash
 }
 
 /// Absolute cosine is retained; context and config matches each have their own bounded boost.
+#[cfg(test)]
 pub(crate) fn rerank_intent(hits: Vec<Hit>, query: &PreparedQuery, signals: &SearchSignals) -> Vec<SearchEntry> {
+    rerank_intent_with_affinity(hits, query, signals, &HashMap::new())
+}
+
+pub(crate) fn rerank_intent_with_affinity(hits: Vec<Hit>, query: &PreparedQuery, signals: &SearchSignals,
+                                        affinity: &HashMap<String, f64>) -> Vec<SearchEntry> {
     let meaningful = PreparedQuery { original: query.original.clone(),
         terms: query.terms.iter().filter(|(t, _)| !is_stopword(t)).cloned().collect() };
     let project_commands = signals.context.as_ref().map(|context| {
@@ -629,6 +635,7 @@ pub(crate) fn rerank_intent(hits: Vec<Hit>, query: &PreparedQuery, signals: &Sea
         entry.why = Some(why);
         (offset, entry, score)
     }).collect::<Vec<_>>();
+    apply_affinity(&mut ranked, affinity, false);
     ranked.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
     ranked.into_iter().map(|(_, entry, _)| entry).collect()
 }
@@ -645,6 +652,11 @@ pub fn rerank(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &Se
 
 pub fn rerank_with_evidence(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &SearchSignals,
                             project: Option<&dyn crate::ProjectEvidence>) -> Vec<SearchEntry> {
+    rerank_with_affinity(hits, literal, query, now, signals, project, &HashMap::new())
+}
+
+pub(crate) fn rerank_with_affinity(hits: Vec<Hit>, literal: bool, query: &str, now: f64, signals: &SearchSignals,
+                                  project: Option<&dyn crate::ProjectEvidence>, affinity: &HashMap<String, f64>) -> Vec<SearchEntry> {
     let query_terms: Vec<String> = query.to_lowercase().split_whitespace().map(String::from).collect();
     let terms = smcli_core::parse::shell_words(query).unwrap_or_default();
     let context = signals.context.as_ref();
@@ -765,8 +777,29 @@ pub fn rerank_with_evidence(hits: Vec<Hit>, literal: bool, query: &str, now: f64
             (offset, entry, score)
         })
         .collect();
+    apply_affinity(&mut scored, affinity, literal);
     scored.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
     scored.into_iter().map(|(_, entry, _)| entry).collect()
+}
+
+fn apply_affinity(scored: &mut [(usize, SearchEntry, f64)], affinity: &HashMap<String, f64>, literal: bool) {
+    let exact = |entry: &SearchEntry| entry.why.as_ref().is_some_and(|why| why.iter().any(|w| w == "exact words"));
+    let exact_scores = if literal {
+        scored.iter().filter(|(_, entry, _)| exact(entry)).map(|(offset, _, score)| (*offset, *score)).collect::<Vec<_>>()
+    } else { vec![] };
+    for (offset, entry, score) in scored {
+        if let Some(bonus) = affinity.get(&entry.key()).filter(|bonus| **bonus > 0.0) {
+            let boosted = *score + bonus;
+            // Affinity must never cross an exact literal hit that previously outranked this row.
+            let ceiling = exact_scores.iter().filter(|(other, cap)| other != offset && *score <= *cap)
+                .map(|(_, cap)| *cap).min_by(f64::total_cmp);
+            let boosted = ceiling.map_or(boosted, |cap| boosted.min(cap - f64::EPSILON * cap.abs().max(1.0)));
+            if boosted > *score {
+                *score = boosted;
+                entry.why.get_or_insert_default().push("command-index affinity".into());
+            }
+        }
+    }
 }
 
 /// One lookup for the pool. Names the budget did not check are absent, which is neutral.
@@ -785,6 +818,19 @@ fn command_identifier(command: &str, found: &[crate::evidence::IdentifierEvidenc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_bridge_affinity_cannot_cross_any_exact_literal_hit() {
+        let exact = |text| { let mut entry = SearchEntry::new(text, 0, "native"); entry.why = Some(vec!["exact words".into()]); entry };
+        let mut scored = vec![(0, exact("lower exact"), 0.5), (1, exact("higher exact"), 1.0),
+            (2, SearchEntry::new("partial", 0, "native"), 0.99)];
+        apply_affinity(&mut scored, &HashMap::from([("partial".into(), 0.05)]), true);
+        assert!(scored[2].2 < scored[1].2);
+        assert!(scored[2].2 > 0.99);
+        scored[2].2 = 0.5;
+        apply_affinity(&mut scored, &HashMap::from([("partial".into(), 0.05)]), true);
+        assert_eq!(scored[2].2, 0.5, "equal-score ties must not cross either");
+    }
 
     fn entry(command: &str, runs: i64, frecency: f64, successes: Option<i64>, runs_here: i64) -> SearchEntry {
         SearchEntry {

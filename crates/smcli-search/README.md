@@ -20,6 +20,14 @@ The bundled `tldr/tldr.jsonl` is read-only data. Its first JSONL record provides
 
 See the [command-completion specification](../../openspec/specs/command-completion-index/spec.md) for the program-selection contract.
 
+### Service-only history-search bridge
+
+When the service has an existing command index for the current model and source versions, intent search looks up up to three descriptions at similarity ≥0.60. It strips template placeholders, embeds those command-shaped queries in one batch, and recalls only rows already in history. Each recalled cosine is multiplied by description similarity and max-merged with the direct history score. Templates themselves are never search results.
+
+Intent and literal reranking also use indexed program/subcommand/flag affinity: +0.01 for the program, +0.02 for a matching subcommand, and up to +0.02 for shared flags, taking the best template. This bonus cannot lift a row past an exact literal keyword hit. Missing, building, locked or otherwise unreadable command indexes are silently ignored; ordinary search never builds them. In-process CLI search stays keyword-only and receives neither bridge recall nor affinity.
+
+`make ranking` reports the command-bridge natural-language cohort alongside the existing cohorts; existing NL floors and the literal floor gate remain enforced.
+
 ## Invariants
 
 - Native shell history is input only; the crate never writes those paths.

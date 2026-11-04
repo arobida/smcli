@@ -93,6 +93,20 @@ pub struct IndexedExample {
     pub embedding: Vec<f32>,
 }
 
+/// A description match used only to recall and rank existing history rows.
+#[derive(Debug, Clone)]
+pub struct DescriptionMatch {
+    pub template: String,
+    pub similarity: f64,
+}
+
+/// Resolve tldr option alternations (`{{[-p|--patch]}}` -> `--patch`) and drop value placeholders.
+fn bridge_template(template: &str) -> String {
+    crate::tldr::to_placeholders(template).split_whitespace().filter(|word| {
+        !word.contains('@') && !word.contains("{{") && !word.contains("/path/to/") && !word.starts_with('<') && !word.ends_with('>')
+    }).collect::<Vec<_>>().join(" ")
+}
+
 /// The persistent index of command examples, one TalaDB file named
 /// `rs-examples-v1-{model}-{sources}-d{dim}` next to the history search index.
 pub struct CommandIndex {
@@ -170,6 +184,20 @@ impl CommandIndex {
         }
         found.sort_by(|a, b| a.description.cmp(&b.description).then_with(|| a.source.cmp(&b.source)));
         Ok(Some(found))
+    }
+
+    /// Best description matches, never building an absent index. Callers may silently skip errors.
+    pub fn description_matches(&self, vector: &[f32], k: usize, floor: f64) -> Result<Vec<DescriptionMatch>> {
+        if !self.path().is_file() { return Ok(Vec::new()); }
+        let db = taladb::open(self.path())?;
+        let examples = db.typed::<IndexedExample>("examples")?;
+        Ok(examples.raw().find_nearest("embedding", vector, k, None)?.into_iter().filter_map(|hit| {
+            let similarity = f64::from(hit.score);
+            if similarity < floor { return None; }
+            let Some(taladb::Value::Str(template)) = hit.document.get("template") else { return None; };
+            let template = bridge_template(template);
+            (!template.is_empty()).then_some(DescriptionMatch { template, similarity })
+        }).collect())
     }
 
     /// Every indexed example in one read, sorted like `examples`.

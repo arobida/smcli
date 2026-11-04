@@ -427,13 +427,56 @@ impl World {
         let stats = self.log.command_stats(Some(&directory), context.project_root.as_deref(), context.kind(), NOW).unwrap();
         let corpus = search_corpus(stats, &[]);
         let signals = search_signals(&self.log, Some(context), &HashMap::from([("PWD".into(), directory)])).unwrap();
+        let sources = smcli_search::commands::bundled_sources().unwrap();
+        let refs = smcli_search::commands::source_refs(&sources);
+        let command_index = smcli_search::commands::CommandIndex::new(format!("{}/index", self.root), Potion::bundled().unwrap(), &refs);
+        if !command_index.path().exists() {
+            let examples = ["git", "git-reset", "git-log", "git-diff", "tar", "docker", "docker-ps", "curl", "lsof", "du", "gh", "bun", "cargo", "swift", "npm", "make"]
+                .into_iter().flat_map(|program| smcli_search::commands::CommandIndex::gather(&refs, program, smcli_search::tldr::current_platform()).unwrap_or_default()).collect::<Vec<_>>();
+            command_index.add_all(&examples).unwrap();
+        }
+        let lock = self.engine.lock_index(20).unwrap();
         self.engine
-            .search(item.query, &corpus, 10, &SearchFilter::default(), None, &signals, NOW)
+            .search_with_command_index(item.query, &corpus, 10, &SearchFilter::default(), None, &signals, NOW, None, lock.as_ref(), Some(&command_index))
             .unwrap()
             .into_iter()
             .map(|e| (e.command, e.why.unwrap_or_default()))
             .collect()
     }
+}
+
+/// Bridge queries deliberately share no word with their expected history command.
+const BRIDGE_CASES: &[(&str, &str)] = &[
+    ("undo last commit", "git reset --soft HEAD~1"),
+    ("show recent commits", "git log --oneline -20"),
+    ("unpack an archive", "tar -xzf archive.tgz"),
+    ("show running containers", "docker ps"),
+    ("download a resource", "curl -O https://example.com/file.tgz"),
+    ("see what changed", "git diff"),
+];
+
+#[test]
+fn rank_command_bridge_eval() {
+    let mut world = World::new();
+    for (_, command) in BRIDGE_CASES {
+        world.habit(command, "bridge", 4);
+    }
+    for command in ["git status", "git commit -m update", "tar -czf backup.tgz .", "docker compose up -d", "ls -la"] {
+        world.habit(command, "bridge", 4);
+    }
+    let mut score = Score::default();
+    for (query, expected) in BRIDGE_CASES {
+        let words: std::collections::HashSet<_> = expected.split_whitespace().collect();
+        assert!(query.split_whitespace().all(|word| !words.contains(word)));
+        let c = case(Original, "command-bridge", Search, "bridge", query, expected);
+        let hits = world.search(&c);
+        let rank = hits.iter().position(|h| h.0 == *expected).map(|i| i + 1);
+        score.add(rank);
+        println!("  command-bridge {query:?}: expected {expected:?}, rank {rank:?}");
+    }
+    println!("  command-bridge natural-language: {}", score.line());
+    assert!(score.mrr() > 0.732 && score.first_rate() > 0.67 && score.third_rate() > 0.67,
+        "bridge must improve every metric over its frozen pre-bridge baseline");
 }
 
 /// Frozen before policy tuning: nine reproductions and ten tuning/ten held-out queries.
@@ -506,6 +549,15 @@ fn rank_natural_language_eval() {
     }
     for (cohort, score) in &scores {
         println!("  NL floor {cohort}: {}", score.line());
+        let (mrr, top1, top3) = match *cohort {
+            "held-out" => (22.0 / 27.0, 7.0 / 9.0, 8.0 / 9.0),
+            "reproduction" => (0.875, 0.8, 0.9),
+            "tuning" => (5.0 / 6.0, 0.8, 0.9),
+            "project-config" => (1.0, 1.0, 1.0),
+            _ => unreachable!(),
+        };
+        assert!(score.mrr() + 1e-12 >= mrr && score.first_rate() >= top1 && score.third_rate() >= top3,
+            "NL {cohort} regressed below its pre-bridge baseline");
     }
 }
 

@@ -33,6 +33,7 @@ started on demand by `smcli-core`'s client and stops itself when unused.
 - `search` requires a query and absolute directory, `limit` in `1..=1000`; the corpus is reused for the same directory/project/native-file stamp up to 5 minutes.
 - File search reuses a ready ancestor index when available. When creating an index outside a repository, content indexing is disabled outside home and at home or its direct children; deeper home scopes may enable it (`file_search.rs::content_indexing_enabled`, `scoped_index`).
 - `file_search.rs::FileSearch::select` records selection metadata after resolving the root and rejecting absolute, empty, NUL-containing, overlong, empty-component or `..`-component paths. It does not require the target to exist or resolve symlinks, so this lexical validation does not guarantee filesystem containment.
+- History search may use the cached current-model/current-source command index as a service-only recall and affinity signal. It never builds that index during search or returns its templates. Missing, building or foreign-process-locked command indexes leave history results unchanged. The existing `searching` guard serializes command-index use with model changes and command-index builds/syncs; the history-index lock remains held while both indexes are queried.
 
 ## Side Effects
 

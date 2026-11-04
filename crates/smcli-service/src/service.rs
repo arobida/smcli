@@ -649,8 +649,15 @@ impl Service {
             let (entries, programs) = self.current_corpus(&caller, &directory, project.as_deref(), kind.as_deref())?;
             let evidence = FileSearch::root(&directory).and_then(|root| self.file_search.ready(&root))
                 .map(crate::file_search::evidence::IndexEvidence);
-            let hits = engine.search_with_evidence_using_lock(&query, &entries, limit as usize, &filter, Some(&programs), &signals, now(),
-                evidence.as_ref().map(|e| e as &dyn smcli_search::ProjectEvidence), lock.as_ref())?;
+            // Bundled sources are fixed for this binary, so a cached index for this model is current; parsing them costs ~5MB per search.
+            let cached = self.command_sync.lock().unwrap_or_else(|e| e.into_inner()).index.clone()
+                .filter(|index| index.model == engine.potion.model_id() && index.directory == engine.directory);
+            let command_index = cached.or_else(|| smcli_search::commands::bundled_sources().map(|sources| {
+                let refs = smcli_search::commands::source_refs(&sources);
+                self.command_index_locked(&engine, &refs)
+            }));
+            let hits = engine.search_with_command_index(&query, &entries, limit as usize, &filter, Some(&programs), &signals, now(),
+                evidence.as_ref().map(|e| e as &dyn smcli_search::ProjectEvidence), lock.as_ref(), command_index.as_deref())?;
             let mut response = ServiceResponse::new(true);
             response.hits = Some(hits);
             Ok(response)
@@ -854,6 +861,33 @@ mod tests {
             let response = f.service.dispatch(&request);
             assert_eq!(response.error.unwrap().code, "bad_request", "{op:?}");
         }
+    }
+
+    #[test]
+    fn command_bridge_search_uses_current_index_without_building_it() {
+        let f = Fixture::new();
+        let histfile = f.home.join("bridge_history");
+        std::fs::write(&histfile, "git reset --soft HEAD~1\ngit status\ngit commit -m update\n").unwrap();
+        let mut request = f.request(Operation::Search);
+        request.query = Some("undo last commit".into());
+        request.histfile = Some(histfile.to_string_lossy().into_owned());
+        request.shell = Some("zsh".into());
+        let sources = smcli_search::commands::bundled_sources().unwrap();
+        let refs = smcli_search::commands::source_refs(&sources);
+        let index = f.command_index(&refs);
+        assert!(!index.path().exists());
+        assert!(f.service.dispatch(&request).ok);
+        assert!(!index.path().exists(), "ordinary search never builds the command index");
+        index.add_all(&[smcli_core::command_source::CommandExample {
+            program: "git".into(), description: "undo last commit".into(),
+            template: "git reset --soft {{revision}}".into(), source: "fixture".into(),
+        }]).unwrap();
+        let response = f.service.dispatch(&request);
+        assert!(response.ok, "{response:?}");
+        let hits = response.hits.unwrap();
+        assert_eq!(hits[0].command, "git reset --soft HEAD~1");
+        assert!(hits[0].why.as_ref().unwrap().iter().any(|reason| reason == "command-index affinity"));
+        assert!(hits.iter().all(|hit| !hit.command.contains("{{")));
     }
 
     #[test]

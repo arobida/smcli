@@ -66,6 +66,31 @@ impl IndexedCommand {
     }
 }
 
+/// Command-index descriptions consulted per search, and the similarity they must reach.
+const BRIDGE_MATCHES: usize = 3;
+const BRIDGE_FLOOR: f64 = 0.60;
+
+/// Affinity uses indexed metadata and only scores history candidates, never project additions.
+fn command_affinity(commands: &TypedCollection<IndexedCommand>, hits: &[Hit], matches: &[crate::commands::DescriptionMatch]) -> Result<HashMap<String, f64>> {
+    if matches.is_empty() { return Ok(HashMap::new()); }
+    let templates = matches.iter().map(|matched| {
+        let mut entry = SearchEntry::new(&matched.template, 0, "template");
+        entry.flags = smcli_core::parse::command_flags(&matched.template);
+        IndexedCommand::new(&entry, String::new())
+    }).collect::<Vec<_>>();
+    let keys = hits.iter().map(|(entry, _)| entry.key()).collect::<Vec<_>>();
+    Ok(commands.find(json!({"command": {"$in": keys}}))?.into_iter().map(|entry| {
+        let bonus = templates.iter().filter(|template| entry.program.is_some() && entry.program == template.program).map(|template| {
+            let subcommand = entry.subcommand.is_some() && entry.subcommand == template.subcommand;
+            let flags = if template.flags.is_empty() { 0.0 } else {
+                template.flags.iter().filter(|flag| entry.flags.contains(flag)).count() as f64 / template.flags.len() as f64
+            };
+            0.01 + if subcommand { 0.02 } else { 0.0 } + 0.02 * flags
+        }).fold(0.0, f64::max);
+        (entry.command, bonus)
+    }).collect())
+}
+
 /// The filter as a TalaDB query over `IndexedCommand`, `None` when empty. `allows` stays the final check.
 pub fn index_filter(filter: &SearchFilter) -> Option<Json> {
     let mut parts = vec![];
@@ -224,6 +249,14 @@ impl HistorySearch {
     pub fn search_with_evidence_using_lock(&self, query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter,
                   programs: Option<&HashMap<String, HashSet<String>>>, signals: &SearchSignals, now: f64,
                   evidence: Option<&dyn crate::ProjectEvidence>, lock: Option<&File>) -> Result<Vec<SearchEntry>> {
+        self.search_with_command_index(query, corpus, limit, filter, programs, signals, now, evidence, lock, None)
+    }
+
+    /// Service-only bridge; an unavailable command index leaves the existing search path unchanged.
+    pub fn search_with_command_index(&self, query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter,
+                  programs: Option<&HashMap<String, HashSet<String>>>, signals: &SearchSignals, now: f64,
+                  evidence: Option<&dyn crate::ProjectEvidence>, lock: Option<&File>,
+                  command_index: Option<&crate::commands::CommandIndex>) -> Result<Vec<SearchEntry>> {
         let plan = match plan_query(query, corpus, limit, filter, programs, signals)? {
             Ok(plan) => plan,
             Err(matches) => return Ok(matches),
@@ -253,13 +286,42 @@ impl HistorySearch {
             let vocabulary = crate::corpus::query_vocabulary(corpus, signals);
             let prepared = crate::corpus::prepare_intent_query(&stripped, &vocabulary, Some(&self.potion.vocabulary));
             let vector = self.potion.embed(&[prepared.embedding_query()]).remove(0);
-            let hits = commands.raw().find_nearest("embedding", &vector, (limit * 4).max(40),
+            let mut hits: Vec<Hit> = commands.raw().find_nearest("embedding", &vector, (limit * 4).max(40),
                 index_filter(active).map(|f| filter_from_json(&f)).transpose()?)?
                 .into_iter().filter_map(|hit| {
                     let Some(Value::Str(key)) = hit.document.get("command") else { return None; };
                     Some((corpus.get(key).filter(|e| active.allows(e))?.clone(), f64::from(hit.score)))
                 }).collect();
-            return Ok(self.intent_search(&stripped, corpus, limit, active, signals, Some((prepared, vector, hits))));
+            let matches = command_index.map(|index| index.description_matches(&vector, BRIDGE_MATCHES, BRIDGE_FLOOR).unwrap_or_default()).unwrap_or_default();
+            if !matches.is_empty() {
+                // Commit the whole recall leg only on success, so contention cannot leave partial results.
+                let recalled = (|| -> Result<Vec<Hit>> {
+                    let templates = matches.iter().map(|m| m.template.clone()).collect::<Vec<_>>();
+                    let vectors = self.potion.embed(&templates);
+                    let mut recalled = Vec::new();
+                    for (matched, template_vector) in matches.iter().zip(vectors) {
+                        for hit in commands.raw().find_nearest("embedding", &template_vector, (limit * 4).max(40),
+                            index_filter(active).map(|f| filter_from_json(&f)).transpose()?)? {
+                            let Some(Value::Str(key)) = hit.document.get("command") else { continue; };
+                            if let Some(entry) = corpus.get(key).filter(|e| active.allows(e)) {
+                                recalled.push((entry.clone(), matched.similarity * f64::from(hit.score)));
+                            }
+                        }
+                    }
+                    Ok(recalled)
+                })();
+                if let Ok(recalled) = recalled {
+                    let mut position: HashMap<String, usize> = hits.iter().enumerate().map(|(i, h)| (h.0.key(), i)).collect();
+                    for (entry, score) in recalled {
+                        match position.entry(entry.key()) {
+                            std::collections::hash_map::Entry::Occupied(i) => { let hit = &mut hits[*i.get()]; hit.1 = hit.1.max(score); }
+                            std::collections::hash_map::Entry::Vacant(slot) => { slot.insert(hits.len()); hits.push((entry, score)); }
+                        }
+                    }
+                }
+            }
+            let affinity = command_affinity(&commands, &hits, &matches).unwrap_or_default();
+            return Ok(self.intent_search_with_affinity(&stripped, corpus, limit, active, signals, Some((prepared, vector, hits)), &affinity));
         }
         // Filters narrow candidates in the index, so a bounded pool is enough to rerank with usage.
         let text = ShellTokenizer::encoded(&stripped);
@@ -348,15 +410,23 @@ impl HistorySearch {
                 }
             }
         }
+        let matches = command_index.map(|index| index.description_matches(&vector, BRIDGE_MATCHES, BRIDGE_FLOOR).unwrap_or_default()).unwrap_or_default();
+        let affinity = command_affinity(&commands, &hits, &matches).unwrap_or_default();
         drop(db);
         let existing: HashSet<String> = hits.iter().map(|h| h.0.key()).collect();
         hits.extend(signals.additions(&stripped, corpus, &existing, final_filter, now));
-        Ok(crate::corpus::rerank_with_evidence(hits, literal, &stripped, now, signals, evidence).into_iter().take(limit).collect())
+        Ok(crate::corpus::rerank_with_affinity(hits, literal, &stripped, now, signals, evidence, &affinity).into_iter().take(limit).collect())
     }
 
     /// Index contention uses the same cosine semantics, but must embed the in-memory corpus.
     fn intent_search(&self, query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter,
                      signals: &SearchSignals, indexed: Option<(crate::corpus::PreparedQuery, Vec<f32>, Vec<Hit>)>) -> Vec<SearchEntry> {
+        self.intent_search_with_affinity(query, corpus, limit, filter, signals, indexed, &HashMap::new())
+    }
+
+    fn intent_search_with_affinity(&self, query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter,
+                     signals: &SearchSignals, indexed: Option<(crate::corpus::PreparedQuery, Vec<f32>, Vec<Hit>)>,
+                     affinity: &HashMap<String, f64>) -> Vec<SearchEntry> {
         let fallback = indexed.is_none();
         let (prepared, vector, mut hits) = indexed.unwrap_or_else(|| {
             let prepared = crate::corpus::prepare_intent_query(query, &crate::corpus::query_vocabulary(corpus, signals), Some(&self.potion.vocabulary));
@@ -386,7 +456,7 @@ impl HistorySearch {
             let vectors = self.potion.embed(&pending.iter().map(embedding_text).collect::<Vec<_>>());
             hits.extend(pending.into_iter().zip(vectors).map(|(entry, v)| (entry, cosine(&vector, &v))));
         }
-        crate::corpus::rerank_intent(hits, &prepared, signals).into_iter().take(limit).collect()
+        crate::corpus::rerank_intent_with_affinity(hits, &prepared, signals, affinity).into_iter().take(limit).collect()
     }
 
     /// Discards the index and embeds every command again. Returns the number embedded.
@@ -922,6 +992,30 @@ fn merge_expansion(hits: &mut Vec<Hit>, entry: &SearchEntry, score: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_bridge_affinity_uses_program_subcommand_and_flags() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let db = taladb::open(root.path().join("fixture.taladb"))?;
+        let commands = db.typed::<IndexedCommand>("commands")?;
+        let hits = ["tar -xzf a.tgz", "tar -czf b.tgz", "git reset --soft HEAD~1", "git status", "ls -la"].into_iter().map(|text| {
+            let mut entry = SearchEntry::new(text, 1, "native");
+            entry.flags = smcli_core::parse::command_flags(text);
+            (entry, 0.5)
+        }).collect::<Vec<_>>();
+        commands.insert_many(&hits.iter().map(|(entry, _)| IndexedCommand::new(entry, String::new())).collect::<Vec<_>>())?;
+        let matches = ["tar -xzf", "git reset --soft"].map(|template| crate::commands::DescriptionMatch { template: template.into(), similarity: 1.0 });
+        let affinity = command_affinity(&commands, &hits, &matches)?;
+        assert!(affinity["tar -xzf a.tgz"] > affinity["tar -czf b.tgz"]);
+        assert!(affinity["git reset --soft HEAD~1"] > affinity["git status"]);
+        assert_eq!(affinity["ls -la"], 0.0);
+        let prepared = crate::corpus::prepare_intent_query("unpack an archive", &HashSet::new(), None);
+        let ranked = crate::corpus::rerank_intent_with_affinity(hits[..2].to_vec(), &prepared, &SearchSignals::default(), &affinity);
+        assert_eq!(ranked[0].command, "tar -xzf a.tgz");
+        let literal = crate::corpus::rerank_with_affinity(hits[..2].to_vec(), true, "tar -czf b.tgz", 0.0, &SearchSignals::default(), None, &affinity);
+        assert_eq!(literal[0].command, "tar -czf b.tgz");
+        Ok(())
+    }
 
     fn report_model() -> crate::ModelId {
         crate::ModelId { identity: "report-fixture".into(), dimension: 2 }
