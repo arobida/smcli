@@ -6,34 +6,65 @@ This file provides guidance to coding agents when working with code in this repo
 
 ## Agent Team(can be referenced by saying ateam)
 
-By using the kero skill you are allowed to open new sessions with the list of agents I will provide. Whenever you are asked you should efficiently delegate task to the appropriate agent and act as the orchestrator and let them handle the tasks. Do not perform redudant testing or rerun them unecessarily. The list will show two things first an alias followed by the command needed to open the agent in the new sesion.
+A native Claude agent named the **Orchestrator** runs every team below and handles all Kero commands. When you are asked to delegate, do not open sessions or drive panes yourself: choose the team and agent from the routing table, then have the Orchestrator start it, prompt it, and read the result. The Orchestrator owns `kero new`/`prompt`/`wait`/`read`/`close`; do not run them directly. The list shows two things: an alias, then the command the Orchestrator uses to open the agent.
 
-### Agents List:
+> Some agents are better at certain tasks than others (try to use free models as much as possible). Pick a team, then take the first row in its routing table that matches the job.
 
+### GPT Team (oteam)
+
+| Task type                                                                                      | Route to  | Why                                                                                                      |
+| ---------------------------------------------------------------------------------------------- | --------- | -------------------------------------------------------------------------------------------------------- |
+| Planning a change and implementing that plan, long refactors, long agent sessions              | `pisol`   | Best GPT coder; beats Terra by ~13 pts when planning in long sessions, but ~4x the cost and ~3.5x slower |
+| Default: reading code, code review, Q&A, small fixes, running tests, docs/writing, screenshots | `piterra` | Within a couple points of Sol on these, ~4x cheaper and much faster; strong vision and writing           |
+| Lookups, grep-style questions, extraction, summaries you will check yourself                   | `piluna`  | ~1/10 of Terra's price but 10-15 pts weaker and unreliable one-shot; never for edits that matter         |
+
+```
 pisol=pi --model openai/gpt-6.1-sol --thinking low
 piterra=pi --model openai/gpt-6.1-terra --thinking low
 piluna=pi --model openai/gpt-6-luna --thinking low
-pikcode=pi --model kimi-coding/kimi-for-coding --thinking low
-pik3-256=pi --model kimi-coding/k3-256k --thinking low
-pik3=pi --model kimi-coding/k3 --thinking high
-pik31pro=pi --model kimi-coding/k3.1-pro --thinking high
-pidflash=pi --model opencode-go/deepseek-v4.1-flash --thinking high
+```
+
+### Grok Team (gteam)
+
+| Task type                                                                                           | Route to   | Why                                                                                                                 |
+| --------------------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------- |
+| Long multi-step terminal work, multi-file migrations, running test suites, thorough codebase review | `pigrok47` | Same price as 4.6 but ~2x on Terminal-Bench 4.0 and ahead on 16 of 18 benchmarks; token-heavy, weak at front-end/UI |
+| Fallback when `pigrok47` is busy or rate-limited                                                    | `pigrok46` | Same price as 4.7 and weaker nearly everywhere; no task where it is the better pick                                 |
+| Commit messages                                                                                     | `pigrok45` | Older and cheaper on cache; fine for short structured text, not for coding                                          |
+
+```
 pigrok47=pi --model xai/grok-4.7 --thinking high
 pigrok46=pi --model xai/grok-4.6 --thinking high
 pigrok45=pi --model xai/grok-4.5 --thinking low
+```
 
-#### Agent Affinities
+### Kimi Team (kteam)
 
-> Some agents are better at certain tasks than others(try to use free models as much as possible)
+| Task type                                                                              | Route to   | Why                                                                                                                                         |
+| -------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Hard bugs, root-cause diagnosis, planning, hard terminal tasks                         | `kik31pro` | Strongest Kimi (Terminal-Bench 4.0 ~66%); better than K3 at diagnosis and planning but slow (~2x the time, ~2x the tokens); pinned to `low` |
+| Whole-repo analysis past 256K, multi-agent orchestration, research, front-end/3D/WebGL | `kik3`     | 1M context; strong at orchestration, research and visual front-end work                                                                     |
+| Everyday features, routine Q&A, single/small-file edits                                | `kik3-256` | K3 quality within 256K at ~half the quota of `kik3`                                                                                         |
+| Implement a scoped feature, review a change, code completion, quick fixes              | `kikcode`  | Close to K3 on coding with much leaner thinking, so cheaper and quicker per task; pinned to `high` (default `max`)                          |
 
-pisol: great for complicated reasoning tasks
-piterra: great for running test and code review
-piluna: great fast general purpose worker
-pikcode: great at writing code
-pidflash: good fast general purpose model with vision
-pigrok47: complicated reasoning tasks
-pigrok46: general purpose model
-pigrok45: decent model should stick to using with commit messages
+```
+kikcode=kimi -m kimi-code/kimi-for-coding --auto
+kik3=kimi -m kimi-code/k3 --auto
+kik31pro=kimi -m kimi-code/k3.1-pro --auto
+kik3-256=kimi -m kimi-code/k3-256k --auto
+```
+
+Effort is pinned per model by `[models."<alias>".overrides] default_effort` in `~/.kimi-code/config.toml` (`k3.1-pro` low, the rest high). Do not set global `[thinking].effort` — it overrides the main agent's model default. The Orchestrator opens each as a Kero session and drives it; it uses `-p "<prompt>"` instead of `--auto` only for a throwaway one-shot.
+
+### Other
+
+| Task type                                                                           | Route to   | Why                                                                                                                    |
+| ----------------------------------------------------------------------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------- |
+| Cheap long sessions, analysis/planning, self-checking its own changes, vision tasks | `pidflash` | Top open-weight coder in one independent long-session test (80%, ~$0.14 a session, the fastest); 1M context and vision |
+
+```
+pidflash=pi --model opencode-go/deepseek-v4.1-flash --thinking high
+```
 
 <-- End of do not edit -->
 
@@ -44,7 +75,7 @@ Stage, write commit messages, and push using [Stage, commit, and push](agents/re
 ## Search
 
 - Code: semble (`semble search "<query>" crates scripts`). Always pass those paths, not the repo root: semble does not read `.git/info/exclude`, so a root search returns stale Swift copies from `.delta/worktrees`.
-- Markdown: iwe owns every hand-written `.md` file (`.iwe/config.toml`); its formatting is the house style. Read with `iwe find --lexical "<query>"`, `iwe retrieve <key>`, `iwe tree`. Create, move and change docs through iwe (`iwe new`, `create`, `update`, `rename`, `delete`, `extract`, `inline`) so links stay correct. After any markdown edit, run `make docs`.
+- Markdown: iwe owns every hand-written `.md` file (`.iwe/config.toml`); its formatting is the house style. Read with `iwe find --lexical "<query>"`, `iwe retrieve -k <key>`, `iwe tree`. Create, move and change docs through iwe (`iwe new`, `create`, `update`, `rename`, `delete`, `extract`, `inline`) so links stay correct. After any markdown edit, run `make docs`.
 - Generated markdown is the exception: `THIRD_PARTY_NOTICES.md` is written by `make notices` (`scripts/gen-notices.py`). Never format or edit it through iwe, and never run a bare `iwe normalize` (it rewrites every doc, generated ones included); `make docs` skips them. A new generated doc goes in `GENERATED_DOCS` in the Makefile.
 
 ## Building
@@ -56,7 +87,7 @@ Use the Makefile for builds; don't hand-roll `cargo build` commands.
 - `make uninstall` — runs `~/.local/bin/smcli-uninstall $(ARGS)`, falling back to `scripts/uninstall.sh`.
 - `make release` — same, without cleaning (faster). `make build` — debug build; `make run ARGS="..."` builds and runs the CLI.
 - `make test` — full test suite (`scripts/test.sh`): `cargo test --workspace`, then black-box CLI checks against a temp `HOME`, `SMCLI_DB` and `SMCLI_RUNTIME_DIR`.
-- Focused slices of the gate, each assuming `make build` output: `make test-rust` (`PKG=smcli-core FILTER=history`
+- Focused slices of the gate (black-box targets build automatically): `make test-rust` (`PKG=smcli-core FILTER=history`
   narrows crate and test), `make test-cli` (CLI smoke), `make test-picker` (file + alias picker), `make test-shells` (honors `SMCLI_TEST_ONLY`), `make test-service`, `make test-install`. Match the slice to what changed: picker/menu -> `test-picker` + `test-rust PKG=smcli`, hooks -> `test-shells`, service -> `test-service`, install -> `test-install`.
 - `make ranking` — scores suggest/search ranking on the fixed query set (`crates/smcli-search/tests/ranking.rs`); run after ranking changes.
 - `make linux` — full test suite on Linux in Docker (needs a running daemon).
@@ -73,8 +104,8 @@ Cargo workspace (`crates/`), macOS and Linux, search included on both. Two execu
 
 Libraries: `smcli-core` (SQLite captured history at `~/.local/share/smcli/history.db`, capture filters, ranking/suggestions, config, socket client and protocol), `smcli-search` (hybrid BM25 + embedding search over captured and native history in a TalaDB index; Potion only).
 
-Client/service protocol (`smcli-core/src/service_protocol.rs`, frozen fixtures in `crates/smcli-core/tests/fixtures/service_protocol`): one newline-delimited JSON request and one response per connection, versioned. On a version mismatch or no service, the CLI falls back to doing the work in-process, so every operation must work both ways. The service identifies its binary by path/mtime/size so a rebuilt binary is detected.
+Client/service protocol (`smcli-core/src/service_protocol.rs`, frozen fixtures in `crates/smcli-core/tests/fixtures/service_protocol`): one newline-delimited JSON request and one response per connection, versioned. On a version mismatch or no service, history and search fall back in-process; service-only file-search ranking evidence is unavailable. The service identifies its binary by path/mtime/size so a rebuilt binary is detected.
 
-Models: `smcli init --potion DIR` switches model and `--default` goes back. A model's index is named by its identity, so a switch rebuilds the index on the next search, and init says so. Never hold two models at once: init and `smcli reindex` stop the service before loading a model, and the service drops its old engine before building a new one (`load_engine`). `smcli indexes [--prune]` lists every index on disk, marks the current model's, and deletes the others.
+Models: `smcli init --potion DIR` switches model and `--default` goes back. A model's index is named by its identity, so a switch rebuilds the index on the next search, and init says so. To avoid holding two models at once, init (when changing models) and `smcli reindex` attempt to stop the service before loading a model; they can proceed if shutdown fails. The service drops its old engine before building a new one (`load_engine`). `smcli indexes [--prune]` lists every index on disk, marks the current model's, and deletes the others.
 
 Native shell history files are read-only: never rewrite them. smcli keeps its own SQLite log.

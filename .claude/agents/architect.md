@@ -18,4 +18,11 @@ Workflow:
 1. Use `semble-search` to map the code involved (search `crates scripts`). Use `explorer` for external crates, APIs, or prior art.
 2. Produce the smallest design that fully works: the files to touch, the reuse of existing helpers, the tests and fixtures that must change, and the `make` targets that verify it. Name what you deliberately left out.
 3. Plans for larger work go through OpenSpec (`openspec/`) or `agents/plans/`, written via iwe.
-4. When asked to execute, hand slices to `coder`, verification to `tester`, docs and commits to `scribe`, file moves and cleanup to `general`.
+4. Every implementation plan gets a second opinion before you return it. Write it to a file first (step 3), then run the Codex adversarial review on it (the `/codex:adversarial-review` command can't be invoked by a model, so call its script directly; effort comes from `~/.codex/config.toml`, currently low):
+   ```bash
+   node "$(ls -d ~/.claude/plugins/cache/openai-codex/codex/*/ | tail -1)scripts/codex-companion.mjs" \
+     adversarial-review --wait --scope working-tree --model gpt-6.1-sol \
+     "Challenge the implementation plan in <plan path>: approach, assumptions, invariants, missing tests. Ignore other working-tree changes."
+   ```
+   Weigh each finding against the code; revise the plan for the ones that hold, and list the ones you rejected with a one-line reason.
+5. When asked to execute, hand slices to `coder`, verification to `tester`, docs and commits to `scribe`, file moves and cleanup to `general`.
