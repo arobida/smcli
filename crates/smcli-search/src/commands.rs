@@ -291,6 +291,17 @@ pub fn build(
     Ok((indexed, empty))
 }
 
+/// Add `program` when a source has examples for it and the index lacks it, so an interrupted build
+/// heals on use. Returns whether it was added.
+pub fn ensure(index: &CommandIndex, sources: &[&dyn CommandSource], platform: &str, program: &str) -> Result<bool> {
+    if index.programs()?.contains(program) {
+        return Ok(false);
+    }
+    let Some(examples) = CommandIndex::gather(sources, program, platform) else { return Ok(false) };
+    index.add(program, &examples)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +524,19 @@ mod tests {
         assert_eq!(tar[0].source, "stub");
         assert!(index.examples("noexamples").unwrap().is_none());
         assert!(index.examples("onlylinux").unwrap().is_none());
+        assert_eq!(index.programs().unwrap(), HashSet::from(["tar".to_owned()]));
+    }
+
+    #[test]
+    fn ensure_adds_a_missing_program_once() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = PlatformSource;
+        let sources: Vec<&dyn CommandSource> = vec![&source];
+        let index = CommandIndex::new(root.path(), Potion::bundled().unwrap(), &sources);
+        assert!(ensure(&index, &sources, "osx", "tar").unwrap(), "a partial index gains the asked-for program");
+        assert!(!ensure(&index, &sources, "osx", "tar").unwrap(), "already indexed: nothing to do");
+        assert!(!ensure(&index, &sources, "osx", "noexamples").unwrap());
         assert_eq!(index.programs().unwrap(), HashSet::from(["tar".to_owned()]));
     }
 }

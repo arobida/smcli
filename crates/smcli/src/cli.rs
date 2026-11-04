@@ -388,7 +388,7 @@ pub fn run() -> Result<()> {
             let entries = corpus(&captured, &home, &env, None, None, now())?;
             let count = engine.reindex_using_lock(&entries, &lock)?;
             drop(lock); // CommandIndex::add takes the same directory lock per program
-            let programs = command_index(&captured, &env, &engine, true)?.programs()?.len();
+            let programs = command_index(&captured, &env, &engine, true, None)?.programs()?.len();
             println!("{}Reindexed {count} commands and {programs} programs' examples.",
                 if stopped { "Stopped smcli-service to free its model. " } else { "" });
         },
@@ -1020,7 +1020,7 @@ fn pick_tldr(c: &CapturedHistory, home: &Path, env: &HashMap<String, String>) ->
     let context = tldr_context(env.get("SMCLI_LBUFFER").map(String::as_str).unwrap_or(""));
     let engine = search_engine(c, home, env)?;
     // Normally built at install (`smcli reindex`); built here only if missing.
-    let index = command_index(c, env, &engine, false)?;
+    let index = command_index(c, env, &engine, false, context.program.as_deref())?;
     let potion = engine.potion;
     let program = context.program.clone();
     let prefix = context.prefix_words.clone();
@@ -1088,9 +1088,10 @@ fn pick_tldr(c: &CapturedHistory, home: &Path, env: &HashMap<String, String>) ->
 }
 
 /// The command-completion index for this engine, built from OS-shipped programs plus programs seen in
-/// captured history (both ∩ PATH) when missing, or rebuilt from scratch when `rebuild`.
-fn command_index(c: &CapturedHistory, env: &HashMap<String, String>, engine: &smcli_search::HistorySearch, rebuild: bool) -> Result<smcli_search::commands::CommandIndex> {
-    use smcli_search::commands::{CommandIndex, build, bundled_sources, os_programs, source_refs, system_dirs};
+/// captured history (both ∩ PATH) when missing, or rebuilt from scratch when `rebuild`. `program`, when on PATH
+/// and missing from the index, is added now: without the service an interrupted build never fills in otherwise.
+fn command_index(c: &CapturedHistory, env: &HashMap<String, String>, engine: &smcli_search::HistorySearch, rebuild: bool, program: Option<&str>) -> Result<smcli_search::commands::CommandIndex> {
+    use smcli_search::commands::{CommandIndex, build, bundled_sources, ensure, os_programs, source_refs, system_dirs};
     use smcli_search::tldr;
     let platform = tldr::current_platform();
     let sources = bundled_sources().ok_or_else(|| anyhow::anyhow!("tldr data not found beside the smcli executable or in Data/tldr"))?;
@@ -1099,11 +1100,14 @@ fn command_index(c: &CapturedHistory, env: &HashMap<String, String>, engine: &sm
     if rebuild && index.path().exists() {
         std::fs::remove_file(index.path())?;
     }
+    let path = smcli_core::service_protocol::shell_path_snapshot(env.get("PATH").map(String::as_str)).unwrap_or_default();
     if !index.path().exists() {
-        let path = smcli_core::service_protocol::shell_path_snapshot(env.get("PATH").map(String::as_str)).unwrap_or_default();
         let mut programs = os_programs(&system_dirs(), &path);
         programs.extend(tldr::installed(&captured_programs(c)?, &path));
         build(&index, &refs, platform, &programs)?;
+    }
+    if let Some(program) = program.filter(|p| !tldr::installed(&std::collections::HashSet::from([p.to_string()]), &path).is_empty()) {
+        ensure(&index, &refs, platform, program)?;
     }
     Ok(index)
 }
