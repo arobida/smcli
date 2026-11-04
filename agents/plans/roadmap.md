@@ -49,3 +49,5 @@ Open work, not scheduled. macOS and Linux are supported today; search is include
 ## Ideas (unscheduled)
 
 - Richer target discovery; optional MCP exposure.
+- Zsh ghost text: an `smcli` strategy for zsh-autosuggestions (`smcli suggest` as the source), active only
+  when that plugin is loaded. Fish and Bash unchanged.
