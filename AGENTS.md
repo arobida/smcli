@@ -86,7 +86,7 @@ Use the Makefile for builds; don't hand-roll `cargo build` commands.
 - `make install` — release build, then `scripts/install.sh` installs it on this machine (binaries and model in `~/.local/bin`, shell hooks, keys, service; `ARGS="--yes"` etc. pass through).
 - `make uninstall` — runs `~/.local/bin/smcli-uninstall $(ARGS)`, falling back to `scripts/uninstall.sh`.
 - `make release` — same, without cleaning (faster). `make build` — debug build; `make run ARGS="..."` builds and runs the CLI.
-- `make test` — full test suite (`scripts/test.sh`): `cargo test --workspace`, then black-box CLI checks against a temp `HOME`, `SMCLI_DB` and `SMCLI_RUNTIME_DIR`.
+- `make test` — full test suite (`scripts/test.sh`): `cargo nextest run --workspace` (install: `cargo install cargo-nextest --locked`; config in `.config/nextest.toml`), then black-box CLI checks against a temp `HOME`, `SMCLI_DB` and `SMCLI_RUNTIME_DIR`.
 - Focused slices of the gate (black-box targets build automatically): `make test-rust` (`PKG=smcli-core FILTER=history`
   narrows crate and test), `make test-cli` (CLI smoke), `make test-picker` (file + alias picker), `make test-shells` (honors `SMCLI_TEST_ONLY`), `make test-service`, `make test-install`. Match the slice to what changed: picker/menu -> `test-picker` + `test-rust PKG=smcli`, hooks -> `test-shells`, service -> `test-service`, install -> `test-install`.
 - `make ranking` — scores suggest/search ranking on the fixed query set (`crates/smcli-search/tests/ranking.rs`); run after ranking changes.

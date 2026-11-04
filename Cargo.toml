@@ -1,3 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+
+# Model inference in tests is ~2x faster with optimized deps; own crates stay fast to rebuild.
+[profile.dev.package."*"]
+opt-level = 3

@@ -46,7 +46,7 @@ test:
 
 # One slice of the gate, for the edit/test loop. Each assumes `make build` output.
 test-rust:
-	cargo test $(if $(PKG),-p $(PKG),--workspace) $(FILTER)
+	cargo nextest run $(if $(PKG),-p $(PKG),--workspace) $(FILTER)
 
 # Black-box CLI smoke: usage, history, search, init --keys, shell-init, clean-dist, @-completion.
 test-cli: build

@@ -1,0 +1,3 @@
+[profile.default]
+# smcli-search's lib includes tests/ranking.rs via #[path] for its comparison tests; its tests already run in the ranking binary.
+default-filter = "not (package(smcli-search) & kind(lib) & test(/^ranking::/))"

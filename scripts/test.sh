@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 unset "${!SMCLI_@}" XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME
 
 # Close stdin so a stray interactive path (e.g. `smcli init` questionnaire) cannot stall the gate.
-cargo test --workspace </dev/null
+cargo nextest run --workspace </dev/null
 cargo build --workspace
 bin_dir="$(cd "${CARGO_TARGET_DIR:-target}/debug" && pwd)"
 
