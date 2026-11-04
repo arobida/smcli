@@ -120,6 +120,36 @@ Run `smcli` with no arguments in a terminal for an interactive menu. For the res
 $ smcli --help
 ```
 
+## Stats
+
+Local snapshot measured on 2026-11-03 on a MacBookPro18,3 (Apple Silicon, arm64), macOS 27.2, using the installed binaries and an existing personal history. Sizes use MiB (1,048,576 bytes); these are workload-specific measurements, not fixed requirements.
+
+| Component                                         | Size      |
+| ------------------------------------------------- | --------- |
+| CLI binary (`smcli`)                              | 13.02 MiB |
+| Service binary (`smcli-service`)                  | 15.90 MiB |
+| Shared potion-shell-16m model folder (disk usage) | 31.98 MiB |
+
+The measured installation had two current index/cache files:
+
+| Index/cache                  | File size | Allocated disk space |
+| ---------------------------- | --------- | -------------------- |
+| Command-history search index | 68.50 MiB | 49.86 MiB            |
+| tldr vector cache            | 1.41 MiB  | 1.41 MiB             |
+| Total                        | 69.91 MiB | 51.27 MiB            |
+
+The full smcli data directory occupied 70.10 MiB, including these indexes, the SQLite history database and sidecars, and a 6.76 MiB backup. File size and allocated space can differ on the filesystem. Index counts and sizes grow with history, cached examples, and model changes; inspect yours with `smcli indexes --json`.
+
+| Resource / operation                          | Observed result                                         |
+| --------------------------------------------- | ------------------------------------------------------- |
+| CLI peak resident RAM per search/suggest call | About 7.8 MiB                                           |
+| Service resident RAM after history searches   | About 196 MiB                                           |
+| Service idle CPU snapshot                     | 0.0%                                                    |
+| Warm history search, 20 sequential runs       | 117 ms mean; 112–140 ms range                           |
+| Service CPU time across those 20 searches     | 1.51 CPU-seconds (about 65% of one core during the run) |
+
+Search measurements used `smcli search 'git status' --limit 5 --json` through the running service. CLI peak RAM came from `/usr/bin/time -l`; service RAM and CPU time came from `ps`, sampled between calls. The service holds most search state and stays running after the CLI exits. Cold starts, interactive pickers, file/grep workloads, and sustained load were not measured.
+
 ## How it works
 
 - Native history is read from `~/.bash_history`, `~/.zsh_history`, and the
