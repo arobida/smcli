@@ -24,7 +24,7 @@ Runs store only `directory`, not a kind.
 
 ## Decisions
 
-**Kind of a past run directory: `discover`, cached per distinct directory.** Kind is the primary kind of the nearest project at or above the run directory. The service computes it once per distinct directory when it builds its suggestion index and search corpus, and keeps the map in memory; the in-process path computes it for the distinct directories it scans, memoized for that call. Alternative: a `kind` column at record time (schema v9) survives deletions but needs a migration and a backfill that can only use `discover` anyway, so it adds code before it is known to matter.
+**Kind of a past run directory: a cheap manifest probe, cached per distinct directory.** Kind is the primary kind of the nearest project at or above the run directory, found by walking up and statting only the `MANIFESTS` names (equal to `discover`'s first project kind, without reading Git or parsing manifests, starting from the directory's real path as `discover` does). The service keeps the kinds in a cache whose entries expire after 60 seconds; a lookup probes only directories holding a command that matched the prefix, an expired or missing entry is probed again, and a deleted directory probes as unknown. The in-process path memoizes per call. All kind work is skipped when the cwd has no kind or `kind` is switched off. Alternative: a `kind` column at record time (schema v9) survives deletions but needs a migration and a backfill that can only use `discover` anyway, so it adds code before it is known to matter.
 
 **Cost bound.** Distinct run directories at 100k runs are expected to be in the low thousands; `discover` only stats and reads small files. The baseline gate (spec) is the check; if first-request cost is too high, bound the lookup to the top-N directories by run count and treat the rest as unknown (no boost), which the spec already allows.
 
@@ -38,5 +38,5 @@ Runs store only `directory`, not a kind.
 
 - [Narrow-window weights in `corpus.rs` shift] → the new boost is added beside, not inside, the existing project boost; rerun `make ranking` and keep every floor.
 - [Directories under a monorepo root report the root's kind] → acceptable; the same rule already defines "in this project".
-- [Kinds go stale when a manifest is added] → the service rebuilds its index on its existing triggers; a stale kind only misses a boost, never penalizes.
+- [Kinds go stale in the service] → entries expire after 60 seconds, so through the service suggest sees a kind change within 60 seconds and search by the next corpus rebuild (at most 5 minutes, sooner on a change of directory), while in-process ranking stops at once; the search corpus counts `runs_kind` when it is built (rebuilt at most every 5 minutes). A stale kind can leave a boost on a deleted directory for up to 60 seconds in suggest and until the next corpus rebuild in search, never more.
 - [Index build slows on very large histories] → measured by the baseline gate; fallback is the top-N bound above.

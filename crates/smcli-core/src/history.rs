@@ -9,6 +9,7 @@ use rusqlite::{Connection, OpenFlags, params, params_from_iter, types::Value};
 use crate::config::CaptureFilter;
 use crate::entry::{trim_slash, command_key, command_parts};
 use crate::parse::{CommandBreakdown, base_name, command_flags, is_smcli_command};
+use crate::context::directory_kind_memo;
 use crate::ranking::{RankingContext, SelectionLog, Signal, apply_ranking_signals, suggestion_why, uses};
 use crate::time::{format_iso8601, now};
 
@@ -122,6 +123,8 @@ pub struct CommandStats {
     pub runs_here: i64,
     /// Runs in the project root passed to `command_stats`, or below it.
     pub runs_project: i64,
+    /// Runs in any directory whose project has the kind of the project root passed to `command_stats`.
+    pub runs_kind: i64,
 }
 
 /// One captured run, as the in-memory suggestion index and search corpus need it.
@@ -394,7 +397,7 @@ impl CapturedHistory {
 
     /// One row per distinct command: run count, its flags, and the most recent run's time, directory, exit code,
     /// author, and intent, plus usage aggregates from the same grouped query; `directory` scopes `runs_here`.
-    pub fn command_stats(&self, directory: Option<&str>, project: Option<&str>, now: f64) -> Result<HashMap<String, CommandStats>> {
+    pub fn command_stats(&self, directory: Option<&str>, project: Option<&str>, kind: Option<&str>, now: f64) -> Result<HashMap<String, CommandStats>> {
         if !self.exists() {
             return Ok(HashMap::new());
         }
@@ -445,7 +448,26 @@ impl CapturedHistory {
                 successes: row.get::<_, i64>(9)? + if answers { ones } else { 0 },
                 runs_here: row.get(11)?,
                 runs_project: row.get(12)?,
+                runs_kind: 0,
             });
+        }
+        // Kinds are not stored: look each distinct run directory up once. `kind` None (no project kind, or the tier
+        // switched off) skips this query.
+        if let Some(kind) = kind {
+            let mut kinds = HashMap::new();
+            let mut statement = db.prepare(
+                "SELECT command, expanded_command, directory, COUNT(*) FROM commands WHERE deleted_at IS NULL
+                 GROUP BY command, expanded_command, directory",
+            )?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                let key = command_key(&row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?.as_deref());
+                if let Some(stat) = stats.get_mut(&key)
+                    && directory_kind_memo(&mut kinds, &row.get::<_, String>(2)?).as_deref() == Some(kind)
+                {
+                    stat.runs_kind += row.get::<_, i64>(3)?;
+                }
+            }
         }
         Ok(stats)
     }
@@ -461,9 +483,10 @@ impl CapturedHistory {
         let db = self.connect(false)?;
         let here = trim_slash(directory);
         #[derive(Default)]
-        struct Tally { score: f64, runs: i64, runs_here: i64, project_runs: i64, last_run: f64, last_exit_code: i64 }
+        struct Tally { score: f64, runs: i64, runs_here: i64, project_runs: i64, kind_runs: i64, last_run: f64, last_exit_code: i64 }
         let mut tallies: HashMap<String, Tally> = HashMap::new();
         let mut answering: HashMap<String, bool> = HashMap::new();
+        let mut kinds = HashMap::new();
         {
             let mut statement = db.prepare(
                 "SELECT c.command, c.directory, c.started_at, c.exit_code, c.expanded_command
@@ -483,16 +506,24 @@ impl CapturedHistory {
                 let started: f64 = row.get(2)?;
                 let exit_code: i64 = row.get(3)?;
                 let in_project = context.is_some_and(|c| c.in_project(&run_directory));
+                // Only runs elsewhere need a kind; the lookup is skipped when the tier is off or the cwd has none.
+                // shortcut: without the service every call re-probes every distinct non-project directory; cache across calls if the in-process path ever keeps a long-lived index.
+                let nested = here != "/" && run_directory != "/"
+                    && (run_directory.starts_with(&format!("{here}/")) || here.starts_with(&format!("{run_directory}/")));
+                // Same kind only when no stronger tier claims the run, matching the service index.
+                let same_kind = run_directory != here && !in_project && !nested && context.is_some_and(|c| {
+                    c.kind().is_some() && c.same_kind(directory_kind_memo(&mut kinds, &run_directory).as_deref())
+                });
                 // Halves every two weeks, so habits outweigh one-offs without old habits winning forever.
                 let mut weight = 0.5f64.powf((now - started).max(0.0) / USAGE_HALF_LIFE);
                 if run_directory == here {
                     weight *= 4.0;
                 } else if in_project {
                     weight *= 3.0;
-                } else if here != "/" && run_directory != "/"
-                    && (run_directory.starts_with(&format!("{here}/")) || here.starts_with(&format!("{run_directory}/")))
-                {
+                } else if nested {
                     weight *= 2.0;
+                } else if same_kind {
+                    weight *= 1.5;
                 }
                 if exit_code != 0 && !INTERRUPTED_EXIT_CODES.contains(&exit_code) {
                     let answers = *answering.entry(command_key(&command, expanded.as_deref())).or_insert_with(|| answers_with_exit_code(primary));
@@ -505,6 +536,7 @@ impl CapturedHistory {
                 tally.runs += 1;
                 if run_directory == here { tally.runs_here += 1; }
                 if in_project { tally.project_runs += 1; }
+                if same_kind { tally.kind_runs += 1; }
                 tally.last_run = started;
                 tally.last_exit_code = exit_code;
             }
@@ -520,6 +552,7 @@ impl CapturedHistory {
         };
         let picks = self.picks(5_000, &db)?.weights(prefix, now);
         let why = apply_ranking_signals(&mut scores, prefix, context, previous.as_deref(), &followers, &picks);
+        let kind = context.and_then(|c| c.project_kind.as_deref());
         let mut ranked: Vec<(String, f64)> = scores.into_iter().collect();
         let last = |command: &str| tallies.get(command).map_or(f64::NEG_INFINITY, |t| t.last_run);
         ranked.sort_by(|a, b| {
@@ -530,11 +563,11 @@ impl CapturedHistory {
             .take(limit)
             .map(|(command, score)| match tallies.get(&command) {
                 None => Suggestion {
-                    why: suggestion_why(0, 0, why.get(&command)), expanded_command: command_parts(&command).1, command: command_parts(&command).0, score, runs: 0, runs_here: 0,
+                    why: suggestion_why(0, 0, 0, None, why.get(&command)), expanded_command: command_parts(&command).1, command: command_parts(&command).0, score, runs: 0, runs_here: 0,
                     last_run: String::new(), last_exit_code: 0,
                 },
                 Some(t) => Suggestion {
-                    why: suggestion_why(t.runs_here, t.project_runs, why.get(&command)), expanded_command: command_parts(&command).1, command: command_parts(&command).0, score, runs: t.runs,
+                    why: suggestion_why(t.runs_here, t.project_runs, t.kind_runs, kind, why.get(&command)), expanded_command: command_parts(&command).1, command: command_parts(&command).0, score, runs: t.runs,
                     runs_here: t.runs_here, last_run: format_iso8601(t.last_run, false), last_exit_code: t.last_exit_code,
                 },
             })
@@ -794,7 +827,7 @@ mod tests {
         assert_eq!(suggestions.iter().map(|s| s.command.as_str()).collect::<Vec<_>>(), ["git status", "git stash"]);
         assert_eq!(suggestions[0].runs_here, 2);
         assert_eq!(suggestions[0].why.as_deref(), Some(&["used here".to_string()][..]));
-        let stats = log.command_stats(Some("/repo"), None, now).unwrap();
+        let stats = log.command_stats(Some("/repo"), None, None, now).unwrap();
         assert_eq!(stats["git status"].runs, 2);
         assert_eq!(stats["grep x y"].successes, 1);
         assert_eq!(stats["git stash"].successes, 0);
@@ -819,7 +852,7 @@ mod tests {
             run.started_at = Some(at);
             log.append(&run, "", Some(&db)).unwrap();
         }
-        let cat = &log.command_stats(None, None, at).unwrap()["cat"];
+        let cat = &log.command_stats(None, None, None, at).unwrap()["cat"];
         assert_eq!((cat.runs, cat.last_run, cat.last_directory.as_str(), cat.last_exit_code), (2, at, "/new", 1));
     }
 
@@ -980,7 +1013,7 @@ mod tests {
         drop(old);
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&log.path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let stats = log.command_stats(None, None, 10.0).unwrap();
+        let stats = log.command_stats(None, None, None, 10.0).unwrap();
         assert_eq!(stats["git commit -m x --amend"].flags, ["-m", "--amend"]);
     }
 

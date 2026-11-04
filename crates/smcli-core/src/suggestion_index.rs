@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
+use crate::context::{KIND_CACHE_TTL, KindCache, directory_kind};
 use crate::history::{
     INTERRUPTED_EXIT_CODES, Run, Suggestion, USAGE_HALF_LIFE, answers_with_exit_code,
 };
@@ -87,6 +89,9 @@ pub struct SuggestionIndex {
     base: f64,
     commands: HashMap<String, Tally>,
     directories: HashMap<String, HashMap<String, DirectoryTally>>,
+    /// Project kind of each run directory, re-probed when an entry is older than its ttl (up to 60 s of lag).
+    /// Shared with snapshots and behind a mutex because ranking only borrows the index.
+    kinds: Arc<Mutex<KindCache>>,
     answering: HashMap<String, bool>,
     history: Vec<Run>,
     affinity: CommandAffinity,
@@ -99,6 +104,7 @@ impl SuggestionIndex {
             base: runs.last().map_or_else(now, |r| r.started_at),
             commands: HashMap::new(),
             directories: HashMap::new(),
+            kinds: Arc::new(Mutex::new(KindCache::new(KIND_CACHE_TTL))),
             answering: HashMap::new(),
             history: vec![],
             affinity: CommandAffinity::new(),
@@ -120,7 +126,7 @@ impl SuggestionIndex {
         // Keep directory iteration order so floating-point accumulation is identical.
         let mut directories = self.directories.clone();
         for tallies in directories.values_mut() { tallies.retain(|key, _| commands.contains_key(key)); }
-        Self { base: self.base, commands, directories, answering: HashMap::new(), history: vec![],
+        Self { base: self.base, commands, directories, kinds: Arc::clone(&self.kinds), answering: HashMap::new(), history: vec![],
             affinity: self.affinity.clone(), picks: self.picks.clone() }
     }
 
@@ -229,18 +235,27 @@ impl SuggestionIndex {
             .map(|(c, t)| (c.clone(), t.score))
             .collect();
         let mut project_runs: HashMap<String, i64> = HashMap::new();
+        let mut kind_runs: HashMap<String, i64> = HashMap::new();
         for (directory, tallies) in &self.directories {
+            // Only a directory holding a command that matched the prefix can contribute anything.
+            if !tallies.keys().any(|command| scores.contains_key(command)) {
+                continue;
+            }
             let in_project = context.is_some_and(|c| c.in_project(directory));
-            let bonus = if directory == here {
-                3.0
+            let (bonus, same_kind) = if directory == here {
+                (3.0, false)
             } else if in_project {
-                2.0
+                (2.0, false)
             } else if here != "/"
                 && directory != "/"
                 && (directory.starts_with(&format!("{here}/"))
                     || here.starts_with(&format!("{directory}/")))
             {
-                1.0
+                (1.0, false)
+            } else if context.is_some_and(|c| {
+                c.kind().is_some() && c.same_kind(self.kind_of(directory).as_deref())
+            }) {
+                (0.5, true)
             } else {
                 continue;
             };
@@ -249,6 +264,9 @@ impl SuggestionIndex {
                     *score += bonus * tally.score;
                     if in_project {
                         *project_runs.entry(command.clone()).or_default() += tally.runs;
+                    }
+                    if same_kind {
+                        *kind_runs.entry(command.clone()).or_default() += tally.runs;
                     }
                 }
             }
@@ -335,6 +353,8 @@ impl SuggestionIndex {
                 let explanation = suggestion_why(
                     runs_here,
                     *project_runs.get(&command).unwrap_or(&0),
+                    *kind_runs.get(&command).unwrap_or(&0),
+                    context.and_then(|c| c.project_kind.as_deref()),
                     why.get(&command),
                 );
                 Suggestion {
@@ -349,6 +369,16 @@ impl SuggestionIndex {
                 }
             })
             .collect()
+    }
+
+    /// The cached kind of a run directory; the kinds mutex is released while the disk is probed.
+    fn kind_of(&self, directory: &str) -> Option<String> {
+        if let Some(kind) = self.kinds.lock().unwrap().lookup(directory) {
+            return kind;
+        }
+        let kind = directory_kind(directory);
+        self.kinds.lock().unwrap().insert(directory, kind.clone());
+        kind
     }
 
     /// The last command a session ran, which transitions out of the session's next command key on.
@@ -376,6 +406,149 @@ mod tests {
     use crate::config::CaptureFilter;
     use crate::history::{CapturedHistory, NewRun, user_name};
     use crate::ranking::{Candidate, CandidateKind};
+
+    #[test]
+    fn snapshots_share_kind_cache_and_disabled_tiers_do_not_probe() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = crate::context::real_path(temp.path().to_str().unwrap()).unwrap();
+        let here = format!("{root}/here");
+        let sibling = format!("{root}/sibling");
+        std::fs::create_dir_all(&sibling)?;
+        std::fs::write(format!("{sibling}/Cargo.toml"), "{}")?;
+        let run = Run {
+            command: "kt nextest".into(), expanded_command: None, directory: sibling.clone(),
+            started_at: 1_700_000_000.0, exit_code: 0, session: "s".into(),
+        };
+        let index = SuggestionIndex::new(vec![run.clone()], SelectionLog::default());
+        let on = RankingContext { project_kind: Some("rust".into()), ..Default::default() };
+        let first = index.snapshot("kt ", Some(&on)).suggestions_at(&here, "kt ", 10, run.started_at, Some(&on));
+        assert_eq!(first[0].why, Some(vec!["used in a rust project".into()]));
+        std::fs::remove_dir_all(&sibling)?;
+        let second = index.snapshot("kt ", Some(&on)).suggestions_at(&here, "kt ", 10, run.started_at, Some(&on));
+        assert_eq!(second, first, "the second request must use the first snapshot's cached probe");
+
+        for context in [
+            RankingContext::default(),
+            RankingContext { project_kind: Some("rust".into()), off: [Signal::Kind].into(), ..Default::default() },
+        ] {
+            let cold = SuggestionIndex::new(vec![run.clone()], SelectionLog::default());
+            cold.snapshot("kt ", Some(&context)).suggestions_at(&here, "kt ", 10, run.started_at, Some(&context));
+            assert!(cold.kinds.lock().unwrap().lookup(&sibling).is_none(), "kind lookup must be skipped");
+        }
+        Ok(())
+    }
+
+    /// A habit from a sibling project of the same kind outranks an equal one from another kind, the cwd's own
+    /// project still wins, and the database scan and the index agree, also with `kind` switched off.
+    #[test]
+    fn same_kind_tier_agrees_between_scan_and_index() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = crate::context::real_path(temp.path().to_str().unwrap()).unwrap();
+        for (dir, manifest) in [("here", "Cargo.toml"), ("sibling", "Cargo.toml"), ("web", "package.json")] {
+            std::fs::create_dir_all(format!("{root}/{dir}"))?;
+            std::fs::write(format!("{root}/{dir}/{manifest}"), "{}")?;
+        }
+        let history = CapturedHistory::new(temp.path().join("history.db"));
+        let db = history.open_connection()?;
+        let now = 1_700_000_000.0;
+        // The other-kind run is fresher than the sibling's, so only the tier can put the sibling's habit ahead of it.
+        for (i, (command, directory)) in [("kt gone", "gone"), ("kt nextest", "sibling"), ("kt own", "here"), ("kt newthing", "web")]
+            .into_iter().enumerate() {
+            for n in 0..3 {
+                let directory = format!("{root}/{directory}");
+                let mut run = NewRun::new(command, "zsh", &directory, 0);
+                run.started_at = Some(now - 1000.0 + (i * 3 + n) as f64);
+                run.session = command;
+                history.append(&run, "", Some(&db))?;
+            }
+        }
+        let here = format!("{root}/here");
+        let project = crate::context::ProjectContext::discover(&here);
+        let ranked = |off: &str| -> anyhow::Result<(Vec<String>, Vec<String>, Option<Vec<String>>)> {
+            let env = std::collections::HashMap::from([("SMCLI_RANKING_OFF".to_string(), off.to_string())]);
+            let context = RankingContext::new(&project, None, &env);
+            let scan = history.suggestions(&user_name(), &here, "kt ", 10, now, Some(&context))?;
+            let index = SuggestionIndex::new(history.runs(&user_name(), &db)?, history.picks(100, &db)?)
+                .suggestions_at(&here, "kt ", 10, now, Some(&context));
+            let names = |v: &[crate::history::Suggestion]| v.iter().map(|s| s.command.clone()).collect::<Vec<_>>();
+            Ok((names(&scan), names(&index), scan.iter().find(|s| s.command == "kt nextest").and_then(|s| s.why.clone())))
+        };
+        let (scan, index, why) = ranked("")?;
+        assert_eq!(scan[..2], ["kt own", "kt nextest"], "here > same kind > other kinds");
+        assert_eq!(scan, index);
+        assert_eq!(why, Some(vec!["used in a rust project".to_string()]));
+        let (scan, index, why) = ranked("kind")?;
+        assert_eq!(scan[0], "kt own");
+        assert_ne!(scan[1], "kt nextest", "off: the fresher runs win; a gone directory gets no boost");
+        assert_eq!(scan, index);
+        assert_eq!(why, None);
+        Ok(())
+    }
+
+    #[test]
+    fn same_kind_ancestor_outside_the_project_counts_as_ancestor_only() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = crate::context::real_path(temp.path().to_str().unwrap()).unwrap();
+        std::fs::create_dir_all(format!("{root}/repo/crate/src"))?;
+        std::fs::write(format!("{root}/repo/Cargo.toml"), "{}")?;
+        std::fs::write(format!("{root}/repo/crate/Cargo.toml"), "{}")?;
+        let history = CapturedHistory::new(temp.path().join("history.db"));
+        let db = history.open_connection()?;
+        let now = 1_700_000_000.0;
+        let parent = format!("{root}/repo");
+        let mut run = NewRun::new("kt up", "zsh", &parent, 0);
+        run.started_at = Some(now - 10.0);
+        history.append(&run, "", Some(&db))?;
+        let here = format!("{root}/repo/crate/src");
+        let project = crate::context::ProjectContext::discover(&here);
+        let env = std::collections::HashMap::new();
+        let context = RankingContext::new(&project, None, &env);
+        let scan = history.suggestions(&user_name(), &here, "kt ", 10, now, Some(&context))?;
+        let index = SuggestionIndex::new(history.runs(&user_name(), &db)?, history.picks(100, &db)?)
+            .suggestions_at(&here, "kt ", 10, now, Some(&context));
+        // The ancestor tier claims the run, so neither path explains it as a same-kind habit.
+        assert_eq!(scan[0].why, index[0].why);
+        assert_ne!(scan[0].why, Some(vec!["used in a rust project".to_string()]));
+        Ok(())
+    }
+
+    /// A run directory deleted after the index was built: the scan sees it gone at once; the index keeps the cached
+    /// kind (up to the ttl) and drops the boost once the entry expires. The fresher other-kind run wins without it.
+    #[test]
+    fn deleted_directory_loses_its_boost() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = crate::context::real_path(temp.path().to_str().unwrap()).unwrap();
+        for (dir, manifest) in [("here", "Cargo.toml"), ("sibling", "Cargo.toml"), ("web", "package.json")] {
+            std::fs::create_dir_all(format!("{root}/{dir}"))?;
+            std::fs::write(format!("{root}/{dir}/{manifest}"), "{}")?;
+        }
+        let history = CapturedHistory::new(temp.path().join("history.db"));
+        let db = history.open_connection()?;
+        let now = 1_700_000_000.0;
+        for (i, (command, directory)) in [("kt nextest", "sibling"), ("kt newthing", "web")].into_iter().enumerate() {
+            for n in 0..3 {
+                let directory = format!("{root}/{directory}");
+                let mut run = NewRun::new(command, "zsh", &directory, 0);
+                run.started_at = Some(now - 1000.0 + (i * 3 + n) as f64);
+                run.session = command;
+                history.append(&run, "", Some(&db))?;
+            }
+        }
+        let here = format!("{root}/here");
+        let context = RankingContext::new(&crate::context::ProjectContext::discover(&here), None, &Default::default());
+        let index = SuggestionIndex::new(history.runs(&user_name(), &db)?, history.picks(100, &db)?);
+        let first = |v: Vec<crate::history::Suggestion>| (v[0].command.clone(), v.iter().find(|s| s.command == "kt nextest").unwrap().why.clone());
+        let boosted = Some(vec!["used in a rust project".to_string()]);
+        assert_eq!(first(index.suggestions_at(&here, "kt ", 10, now, Some(&context))), ("kt nextest".into(), boosted.clone()));
+
+        std::fs::remove_dir_all(format!("{root}/sibling"))?;
+        let scan = history.suggestions(&user_name(), &here, "kt ", 10, now, Some(&context))?;
+        assert_eq!(first(scan), ("kt newthing".into(), None), "in-process: no boost at once");
+        assert_eq!(first(index.suggestions_at(&here, "kt ", 10, now, Some(&context))), ("kt nextest".into(), boosted), "cached kind until it expires");
+        index.kinds.lock().unwrap().ttl = std::time::Duration::ZERO;
+        assert_eq!(first(index.suggestions_at(&here, "kt ", 10, now, Some(&context))), ("kt newthing".into(), None), "expired: re-probed as gone");
+        Ok(())
+    }
 
     #[test]
     fn matches_database_scan() -> anyhow::Result<()> {

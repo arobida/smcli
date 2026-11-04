@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 
@@ -45,6 +45,75 @@ pub fn real_path(path: &str) -> Option<String> {
     std::fs::canonicalize(path).ok().map(|p| p.to_string_lossy().into_owned())
 }
 
+/// The primary kind of the nearest project at or above `directory`: `discover(..).projects.first().kind` without
+/// reading Git or parsing manifests (only `regular_file` stats), starting from the directory's real path like
+/// `discover`. A directory that is gone or has no manifest has none, so its runs get no same-kind boost (and no
+/// penalty).
+pub fn directory_kind(directory: &str) -> Option<String> {
+    if !Path::new(directory).is_dir() {
+        return None;
+    }
+    let mut current = real_path(directory).unwrap_or_else(|| directory.to_string());
+    for _ in 0..MAX_LEVELS {
+        let has = |file: &&str| regular_file(&format!("{current}/{file}"));
+        if let Some((_, kind)) = MANIFESTS.iter().find(|(names, _)| names.iter().any(has)) {
+            return Some((*kind).into());
+        }
+        let up = parent(&current);
+        // Like discover, projects above the Git repository root do not count.
+        if up == current || ProjectContext::repository(&current).is_some() {
+            return None;
+        }
+        current = up;
+    }
+    None
+}
+
+/// `directory_kind` remembered for `ttl`: an expired or missing entry is probed again, and a deleted directory
+/// probes as unknown. The service keeps one so a long-lived index notices a manifest added or a directory removed
+/// within the ttl. It can never hold more entries than the distinct directories the index keeps.
+#[derive(Debug, Clone)]
+pub struct KindCache {
+    pub ttl: std::time::Duration,
+    entries: HashMap<String, (Option<String>, std::time::Instant)>,
+}
+
+pub const KIND_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl KindCache {
+    pub fn new(ttl: std::time::Duration) -> Self {
+        Self { ttl, entries: HashMap::new() }
+    }
+
+    /// A fresh entry's kind, or None when `directory` must be probed (and then `insert`ed).
+    pub fn lookup(&self, directory: &str) -> Option<Option<String>> {
+        self.entries.get(directory).filter(|(_, at)| at.elapsed() < self.ttl).map(|(kind, _)| kind.clone())
+    }
+
+    pub fn insert(&mut self, directory: &str, kind: Option<String>) {
+        self.entries.insert(directory.into(), (kind, std::time::Instant::now()));
+    }
+
+    pub fn get(&mut self, directory: &str) -> Option<String> {
+        if let Some(kind) = self.lookup(directory) {
+            return kind;
+        }
+        let kind = directory_kind(directory);
+        self.insert(directory, kind.clone());
+        kind
+    }
+}
+
+/// `directory_kind` remembered in `memo`, for loops over many runs in few directories.
+pub fn directory_kind_memo(memo: &mut HashMap<String, Option<String>>, directory: &str) -> Option<String> {
+    if let Some(kind) = memo.get(directory) {
+        return kind.clone();
+    }
+    let kind = directory_kind(directory);
+    memo.insert(directory.into(), kind.clone());
+    kind
+}
+
 pub(crate) fn read_small_file(path: &str, limit: u64) -> Option<String> {
     if !regular_file(path) { return None; }
     let mut data = Vec::new();
@@ -67,7 +136,7 @@ impl ProjectContext {
         let mut current = start.clone();
         for _ in 0..MAX_LEVELS {
             visited.push(current.clone());
-            if let Some(repository) = Self::repository(&current) {
+            if let Some(repository) = ProjectContext::repository(&current) {
                 context.repository = Some(repository);
                 break;
             }
@@ -348,6 +417,53 @@ fn make_targets(text: Option<&str>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_kind_is_the_nearest_projects_primary_kind() {
+        let root = tempfile_dir();
+        let write = |file: &str| {
+            let path = format!("{root}/{file}");
+            std::fs::create_dir_all(parent(&path)).unwrap();
+            std::fs::write(path, "{}").unwrap();
+        };
+        write("crate/Cargo.toml");
+        write("crate/src/deep/x");
+        write("crate/Makefile");
+        write("mono/package.json");
+        write("mono/pkg/Makefile");
+        write("plain/x");
+        write("mono/inner/.git/HEAD");
+        write("mono/inner/src/x");
+        let mut memo = HashMap::new();
+        let kind = |memo: &mut HashMap<_, _>, d: &str| directory_kind_memo(memo, &format!("{root}/{d}"));
+        assert_eq!(kind(&mut memo, "crate/src/deep").as_deref(), Some("rust"), "nested, and a language beats make");
+        assert_eq!(kind(&mut memo, "mono/pkg").as_deref(), Some("make"), "nearest project wins");
+        assert_eq!(kind(&mut memo, "mono").as_deref(), Some("node"));
+        assert_eq!(kind(&mut memo, "gone/away"), None, "a missing directory is unknown");
+        assert_eq!(kind(&mut memo, "plain"), None, "no manifest is unknown");
+        assert_eq!(memo.len(), 5);
+        assert_eq!(kind(&mut memo, "mono/inner/src"), None, "a project above the Git root does not count");
+        // The cheap probe is exactly discover's first project kind.
+        for d in ["crate/src/deep", "crate", "mono/pkg", "mono", "mono/inner/src", "plain", "gone/away"] {
+            let path = format!("{root}/{d}");
+            let expected = Path::new(&path).is_dir().then(|| ProjectContext::discover(&path).projects.first().map(|p| p.kind.clone())).flatten();
+            assert_eq!(directory_kind(&path), expected, "{d}");
+        }
+    }
+
+    /// A symlinked directory is probed at its real path, so its kind equals discover's first kind for the link.
+    #[test]
+    fn symlinked_directory_probes_its_real_path() {
+        let root = tempfile_dir();
+        std::fs::create_dir_all(format!("{root}/real/crate/src")).unwrap();
+        std::fs::write(format!("{root}/real/Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::os::unix::fs::symlink(format!("{root}/real/crate"), format!("{root}/link")).unwrap();
+        let link = format!("{root}/link");
+        let expected = ProjectContext::discover(&link).projects.first().map(|p| p.kind.clone());
+        assert_eq!(directory_kind(&link), expected);
+        assert_eq!(directory_kind(&link).as_deref(), Some("rust"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn discover_projects_and_git_state() {

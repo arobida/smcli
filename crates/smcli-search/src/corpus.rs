@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use smcli_core::context::{KIND_CACHE_TTL, KindCache};
 use smcli_core::entry::{SearchEntry, SearchFilter, command_key, command_parts};
 use smcli_core::history::{CommandStats, INTERRUPTED_EXIT_CODES, Run, USAGE_HALF_LIFE, answers_with_exit_code};
 use smcli_core::parse::{CommandBreakdown, command_flags, is_smcli_command, program_of};
@@ -25,6 +26,10 @@ pub fn search_corpus(captured: HashMap<String, CommandStats>, native: &[String])
 pub struct CorpusState {
     pub directory: String,
     pub project: Option<String>,
+    /// The cwd project's kind when the same-kind tier applies (set by the holder; None counts no `runs_kind` in `add`),
+    /// and the kind of each run directory seen.
+    pub kind: Option<String>,
+    kinds: KindCache,
     pub as_of: f64,
     pub entries: HashMap<String, SearchEntry>,
     /// Each program in `entries` with the words that follow it, for `is_literal_query`.
@@ -39,6 +44,8 @@ impl CorpusState {
         let mut state = Self {
             directory: directory.into(),
             project: project.map(String::from),
+            kind: None,
+            kinds: KindCache::new(KIND_CACHE_TTL),
             as_of,
             entries: HashMap::new(),
             programs: HashMap::new(),
@@ -96,6 +103,9 @@ impl CorpusState {
         if self.project.as_deref().is_some_and(|p| within(&run.directory, p)) {
             stats.runs_project += 1;
         }
+        if self.kind.is_some() && self.kinds.get(&run.directory) == self.kind {
+            stats.runs_kind += 1;
+        }
         self.captured.insert(key.clone(), stats);
         if let Some(entry) = self.make_entry(&key) {
             add_program(&entry, &mut self.programs);
@@ -119,6 +129,7 @@ impl CorpusState {
             successes: stats.successes,
             runs_here: stats.runs_here,
             runs_project: stats.runs_project,
+            runs_kind: stats.runs_kind,
             why: None,
         });
         let Some(count) = self.native_counts.get(command) else { return entry };
@@ -517,10 +528,13 @@ fn head_match(entry: &SearchEntry, query: &PreparedQuery) -> bool {
     [Some(entry.primary()), entry.secondary()].into_iter().flatten().any(|s|
         head_command(s).is_some_and(|head| query.terms.iter().any(|(term, _)| *term == head)))
 }
+const SAME_KIND_WEIGHT: f64 = 0.2;
 pub(crate) const INTENT_HERE_WEIGHT: f64 = 0.01;
 pub(crate) const INTENT_HERE_CAP: f64 = 0.04;
 pub(crate) const INTENT_PROJECT_WEIGHT: f64 = 0.01;
 pub(crate) const INTENT_PROJECT_CAP: f64 = 0.02;
+pub(crate) const INTENT_KIND_WEIGHT: f64 = 0.005;
+pub(crate) const INTENT_KIND_CAP: f64 = 0.01;
 pub(crate) const INTENT_FRECENCY_WEIGHT: f64 = 0.005;
 pub(crate) const INTENT_FRECENCY_CAP: f64 = 0.03;
 pub(crate) const INTENT_HEAD_WEIGHT: f64 = 0.02;
@@ -587,6 +601,12 @@ pub(crate) fn rerank_intent(hits: Vec<Hit>, query: &PreparedQuery, signals: &Sea
         if entry.runs_here > 0 { why.push("used here".into()); }
         if uses(signals.context.as_ref(), Signal::Project) {
             boost += (INTENT_PROJECT_WEIGHT * (entry.runs_project.max(0) as f64).ln_1p()).min(INTENT_PROJECT_CAP);
+        }
+        if entry.runs_here == 0 && entry.runs_project == 0 && entry.runs_kind > 0 && uses(signals.context.as_ref(), Signal::Kind)
+            && let Some(kind) = signals.context.as_ref().and_then(|c| c.project_kind.as_deref())
+        {
+            boost += (INTENT_KIND_WEIGHT * (entry.runs_kind as f64).ln_1p()).min(INTENT_KIND_CAP);
+            why.push(format!("used in a {kind} project"));
         }
         boost += (INTENT_FRECENCY_WEIGHT * entry.frecency.max(0.0).ln_1p()).min(INTENT_FRECENCY_CAP);
         if head_match(&entry, query) { boost += INTENT_HEAD_WEIGHT; }
@@ -668,6 +688,12 @@ pub fn rerank_with_evidence(hits: Vec<Hit>, literal: bool, query: &str, now: f64
             } else if entry.runs_project > 0 && uses(context, Signal::Project) {
                 boost += 1.0 * (entry.runs_project as f64 / entry.runs.max(1) as f64 + 0.25).min(1.0);
                 why.push("used in this project".into());
+            } else if entry.runs_kind > 0 && uses(context, Signal::Kind)
+                && let Some(kind) = context.and_then(|c| c.project_kind.as_deref())
+            {
+                // Below the project tier (1.0): a habit from sibling projects of the same kind.
+                boost += SAME_KIND_WEIGHT * (entry.runs_kind as f64 / entry.runs.max(1) as f64 + 0.25).min(1.0);
+                why.push(format!("used in a {kind} project"));
             }
             if entry.last_run_epoch().is_some_and(|last| now - last < 7.0 * 86_400.0) {
                 boost += 0.1;
@@ -882,9 +908,34 @@ mod tests {
             history.append(&run, "", Some(&db)).unwrap();
             state.add(&Run { command: "gl".into(), expanded_command: Some(expanded.into()), directory: "/repo".into(), started_at: 99.0, exit_code: 0, session: "unknown".into() });
         }
-        let rebuilt = CorpusState::new(history.command_stats(Some("/repo"), None, 100.0).unwrap(), &[], "/repo", None, 100.0);
+        let rebuilt = CorpusState::new(history.command_stats(Some("/repo"), None, None, 100.0).unwrap(), &[], "/repo", None, 100.0);
         assert_eq!(state.entries, rebuilt.entries);
         assert_eq!(state.entries.len(), 2);
+    }
+
+    #[test]
+    fn same_kind_runs_count_the_same_incrementally_and_rebuilt() {
+        let root = tempfile::tempdir().unwrap();
+        let base = smcli_core::context::real_path(root.path().to_str().unwrap()).unwrap();
+        for (dir, manifest) in [("a", "Cargo.toml"), ("b", "Cargo.toml"), ("c", "package.json")] {
+            std::fs::create_dir_all(format!("{base}/{dir}")).unwrap();
+            std::fs::write(format!("{base}/{dir}/{manifest}"), "{}").unwrap();
+        }
+        let history = smcli_core::history::CapturedHistory::new(root.path().join("history.db"));
+        let db = history.open_connection().unwrap();
+        let project = format!("{base}/a");
+        let mut state = CorpusState::new(HashMap::new(), &[], &project, Some(&project), 100.0);
+        state.kind = Some("rust".into());
+        for dir in ["a", "b", "b", "c", "gone"] {
+            let directory = format!("{base}/{dir}");
+            let mut run = smcli_core::history::NewRun::new("kt run", "zsh", &directory, 0);
+            run.started_at = Some(99.0);
+            history.append(&run, "", Some(&db)).unwrap();
+            state.add(&Run { command: "kt run".into(), expanded_command: None, directory, started_at: 99.0, exit_code: 0, session: "s".into() });
+        }
+        let rebuilt = CorpusState::new(history.command_stats(Some(&project), Some(&project), Some("rust"), 100.0).unwrap(), &[], &project, Some(&project), 100.0);
+        assert_eq!(state.entries["kt run"].runs_kind, 3, "a, b and b; not c (node) or the missing directory");
+        assert_eq!(state.entries, rebuilt.entries);
     }
 
     #[test]

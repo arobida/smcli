@@ -612,7 +612,8 @@ impl Service {
             // Lock before reading the corpus so prune cannot leave a stale snapshot in the index.
             let lock = engine.lock_index(20)?;
             // Read native history files and stats outside `state` so records don't wait on I/O.
-            let (entries, programs) = self.current_corpus(request, directory, project.as_deref())?;
+            let kind = context.kind().map(String::from);
+            let (entries, programs) = self.current_corpus(request, directory, project.as_deref(), kind.as_deref())?;
             let filter = request.filter.clone().unwrap_or_default();
             let evidence = FileSearch::root(directory).and_then(|root| self.file_search.ready(&root))
                 .map(crate::file_search::evidence::IndexEvidence);
@@ -628,12 +629,12 @@ impl Service {
     /// The caller's view of the environment: its HISTFILE and SHELL pick the native history files.
     /// Copies of the corpus entries and programs, so the search runs outside `state`.
     // shortcut: copies the corpus per search; share it (Arc + copy-on-record) if it shows up in profiles.
-    fn current_corpus(&self, request: &ServiceRequest, directory: &str, project: Option<&str>)
+    fn current_corpus(&self, request: &ServiceRequest, directory: &str, project: Option<&str>, kind: Option<&str>)
         -> Result<(HashMap<String, SearchEntry>, HashMap<String, HashSet<String>>)> {
-        self.build_corpus(request, directory, project, || {})
+        self.build_corpus(request, directory, project, kind, || {})
     }
 
-    fn build_corpus(&self, request: &ServiceRequest, directory: &str, project: Option<&str>, before_publish: impl FnOnce())
+    fn build_corpus(&self, request: &ServiceRequest, directory: &str, project: Option<&str>, kind: Option<&str>, before_publish: impl FnOnce())
         -> Result<(HashMap<String, SearchEntry>, HashMap<String, HashSet<String>>)> {
         let mut environment = self.environment.clone();
         environment.remove("HISTFILE");
@@ -652,7 +653,7 @@ impl Service {
             let mut state = self.lock();
             Self::refresh(&mut state)?;
             if let Some(c) = state.corpus.as_ref().filter(|c| {
-                c.state.directory == directory && c.state.project.as_deref() == project && c.native == stamp
+                c.state.directory == directory && c.state.project.as_deref() == project && c.state.kind.as_deref() == kind && c.native == stamp
                     && c.built.elapsed() < Duration::from_secs(300)
             }) {
                 return Ok((c.state.entries.clone(), c.state.programs.clone()));
@@ -662,8 +663,9 @@ impl Service {
         let native: Vec<String> =
             files.iter().filter_map(|f| f.read().ok()).flat_map(|t| t.split('\n').map(String::from).collect::<Vec<_>>()).collect();
         let as_of = now();
-        let captured = self.history.command_stats(Some(directory), project, as_of)?;
-        let corpus = CorpusState::new(captured, &native, directory, project, as_of);
+        let captured = self.history.command_stats(Some(directory), project, kind, as_of)?;
+        let mut corpus = CorpusState::new(captured, &native, directory, project, as_of);
+        corpus.kind = kind.map(String::from);
         let copies = (corpus.entries.clone(), corpus.programs.clone());
         before_publish();
         let mut state = self.lock();
@@ -942,9 +944,9 @@ mod tests {
         let f = Fixture::new();
         let r = f.request(Operation::Search);
         let directory = r.directory.as_deref().unwrap();
-        f.service.build_corpus(&r, directory, None, || f.record()).unwrap();
+        f.service.build_corpus(&r, directory, None, None, || f.record()).unwrap();
         assert!(f.service.lock().corpus.is_none());
-        let (entries, _) = f.service.current_corpus(&r, directory, None).unwrap();
+        let (entries, _) = f.service.current_corpus(&r, directory, None, None).unwrap();
         assert!(entries.contains_key("echo concurrent"));
     }
 
@@ -958,13 +960,13 @@ mod tests {
         r.histfile = Some(path.to_string_lossy().into_owned());
         r.login_shell = Some("/bin/zsh".into());
         let directory = r.directory.as_deref().unwrap();
-        f.service.current_corpus(&r, directory, None).unwrap();
+        f.service.current_corpus(&r, directory, None, None).unwrap();
         std::fs::write(&path, "echo after!\n").unwrap();
         let seconds = first.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let nanos = (first.duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() + 1) % 1_000_000_000;
         let modified = std::time::UNIX_EPOCH + Duration::new(seconds, nanos);
         std::fs::File::options().write(true).open(&path).unwrap().set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
-        let (entries, _) = f.service.current_corpus(&r, directory, None).unwrap();
+        let (entries, _) = f.service.current_corpus(&r, directory, None, None).unwrap();
         assert!(entries.contains_key("echo after!"));
         assert!(!entries.contains_key("echo before"));
     }

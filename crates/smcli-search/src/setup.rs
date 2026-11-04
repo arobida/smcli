@@ -13,13 +13,13 @@ use crate::{HistorySearch, Potion};
 
 /// Captured stats plus native history. Native files are best-effort: an unreadable one should not block the rest.
 pub fn corpus(captured: &CapturedHistory, home: &Path, environment: &HashMap<String, String>, project: Option<&str>,
-              now: f64) -> Result<HashMap<String, SearchEntry>> {
+              kind: Option<&str>, now: f64) -> Result<HashMap<String, SearchEntry>> {
     let native: Vec<String> = history_files(home, environment)?
         .iter()
         .filter_map(|f| f.read().ok())
         .flat_map(|text| text.split('\n').map(String::from).collect::<Vec<_>>())
         .collect();
-    let stats = captured.command_stats(Some(&working_directory(environment)), project, now)?;
+    let stats = captured.command_stats(Some(&working_directory(environment)), project, kind, now)?;
     Ok(search_corpus(stats, &native))
 }
 

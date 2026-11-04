@@ -424,3 +424,47 @@ Native shell adapters, cached Git/package context, the fff file/grep picker mode
 concurrency, malformed-input, stale-index, large-repository and eviction tests are done. Still open: a license for smcli and the xdiff (LGPL) decision
 (`THIRD_PARTY_NOTICES.md`, `fff-licenses.md`), and persistent-socket or async-suggestion work that is only
 justified if measurements ask for it.
+
+## Project-kind ranking check — 2026-11-04
+
+### Method
+
+Same harness and machine, one run at a time with nothing else running. Before: `main` at ee731bf. After: the
+project-kind-ranking change on top of 0222408. Each side ran `make baseline` (in-process, `dist/baseline.json`) and
+`make baseline BENCH_ARGS="--service on --output dist/baseline-service.json"`. The bench commands ran from a directory
+with a `Cargo.toml`, so the kind code was exercised. Warm is the median of 20 samples. A cell is within noise when it
+moves by no more than the larger of 10% or the before p95-minus-median spread.
+
+### Result
+
+All 24 warm medians are within noise: 12 in-process and 12 service, at 1k, 10k and 100k rows.
+
+Warm medians, ms, before → after:
+
+| Rows | Cell                | In-process    | Service       |
+| ---- | ------------------- | ------------- | ------------- |
+| 1k   | suggest             | 11.6 → 12.0   | 8.2 → 8.7     |
+| 1k   | suggest git         | 11.0 → 11.4   | 8.4 → 8.6     |
+| 1k   | search 'git status' | 101.1 → 105.2 | 46.0 → 46.7   |
+| 1k   | search intent       | 102.3 → 104.0 | 46.0 → 47.7   |
+| 10k  | suggest             | 24.0 → 22.0   | 9.6 → 10.3    |
+| 10k  | suggest git         | 17.1 → 15.8   | 9.2 → 10.1    |
+| 10k  | search 'git status' | 161.0 → 159.9 | 68.9 → 70.1   |
+| 10k  | search intent       | 162.5 → 163.2 | 72.4 → 72.5   |
+| 100k | suggest             | 132.2 → 133.6 | 11.1 → 11.7   |
+| 100k | suggest git         | 60.8 → 60.1   | 10.9 → 11.3   |
+| 100k | search 'git status' | 485.9 → 482.6 | 123.4 → 125.8 |
+| 100k | search intent       | 497.4 → 500.1 | 134.6 → 136.8 |
+
+### First-request differences
+
+Reported, not gated:
+
+- In-process 100k `search intent` p95 went from 503 to 968 ms with an unchanged median (497 → 500 ms). A tail
+  outlier; not investigated in this run.
+- In-process 1k `search 'git status'` first request: 173 → 195 ms (+13%).
+- In-process 10k `search 'git status'` first request: 510 → 438 ms (−14%).
+- Service 100k `suggest` first request: 201 → 185 ms (−8%).
+
+This run measured the code before the last review fixes. Those fixes only remove work (a shared cache, and probes
+skipped when the tier cannot apply), so the numbers do not cover the final code.

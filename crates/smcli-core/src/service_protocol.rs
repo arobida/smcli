@@ -349,6 +349,9 @@ pub struct SearchEntry {
     pub runs_here: i64,
     #[serde(deserialize_with = "numbers::integer")]
     pub runs_project: i64,
+    /// Runs in other projects of the cwd project's kind; ranking input only, never on the wire.
+    #[serde(skip)]
+    pub runs_kind: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub why: Option<Vec<String>>,
 }

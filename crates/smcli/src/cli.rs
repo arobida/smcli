@@ -319,6 +319,7 @@ pub fn run() -> Result<()> {
                         &home,
                         &env,
                         context.project_root.as_deref(),
+                        context.kind(),
                         now(),
                     )?;
                     engine.search_with_evidence_using_lock(
@@ -384,7 +385,7 @@ pub fn run() -> Result<()> {
             let stopped = stop_service(&service);
             let engine = search_engine(&captured, &home, &env)?;
             let lock = engine.lock_index(u32::MAX)?.ok_or_else(|| anyhow::anyhow!("Another smcli is updating the index."))?;
-            let entries = corpus(&captured, &home, &env, None, now())?;
+            let entries = corpus(&captured, &home, &env, None, None, now())?;
             let count = engine.reindex_using_lock(&entries, &lock)?;
             drop(lock); // CommandIndex::add takes the same directory lock per program
             let programs = command_index(&captured, &env, &engine, true)?.programs()?.len();
@@ -393,7 +394,7 @@ pub fn run() -> Result<()> {
         },
         Command::Indexes { prune, json } => indexes(&captured, &home, &env, prune, json)?,
         Command::Health { json } => {
-            let corpus = corpus(&captured, &home, &env, None, now())?;
+            let corpus = corpus(&captured, &home, &env, None, None, now())?;
             let report = index_health(&captured, &home, &env, &corpus);
             if json {
                 print_json(&report)?;
@@ -1109,7 +1110,7 @@ fn command_index(c: &CapturedHistory, env: &HashMap<String, String>, engine: &sm
 
 /// First words of captured commands (smcli's own history, distinct).
 fn captured_programs(c: &CapturedHistory) -> Result<HashSet<String>> {
-    let stats = c.command_stats(None, None, now())?;
+    let stats = c.command_stats(None, None, None, now())?;
     Ok(stats
         .keys()
         .filter_map(|key| key.split_whitespace().next().map(|word| word.rsplit('/').next().unwrap_or(word).to_owned()))
@@ -1216,7 +1217,7 @@ fn pick(
                     },
                 };
                 let lock = engine.lock_index(20)?;
-                let entries = corpus(&c, &home, &env, context.project_root.as_deref(), now())?;
+                let entries = corpus(&c, &home, &env, context.project_root.as_deref(), context.kind(), now())?;
                 let signals = search_signals(&c, Some(context.clone()), &env)?;
                 engine.search_with_evidence_using_lock(q, &entries, 100, &SearchFilter::default(), None, &signals, now(), None, lock.as_ref())?
             }

@@ -19,6 +19,7 @@ pub enum Signal {
     Expand,
     Evidence,
     Alias,
+    Kind,
 }
 
 impl Signal {
@@ -37,6 +38,7 @@ impl Signal {
             "expand" => Self::Expand,
             "evidence" => Self::Evidence,
             "alias" => Self::Alias,
+            "kind" => Self::Kind,
             _ => return None,
         })
     }
@@ -72,6 +74,8 @@ impl Candidate {
 pub struct RankingContext {
     /// The nearest manifest's directory: runs below it count as the same project.
     pub project_root: Option<String>,
+    /// The nearest project's primary kind: runs from other projects of this kind count a little (`Signal::Kind`).
+    pub project_kind: Option<String>,
     /// The shell session asking, whose previous command selects transitions.
     pub session: Option<String>,
     pub candidates: Vec<Candidate>,
@@ -83,6 +87,7 @@ impl RankingContext {
     pub fn new(project: &ProjectContext, session: Option<String>, environment: &HashMap<String, String>) -> Self {
         Self {
             project_root: project.projects.first().map(|p| p.root.clone()),
+            project_kind: project.projects.first().map(|p| p.kind.clone()),
             session,
             candidates: candidates(project),
             off: Self::disabled(environment),
@@ -100,6 +105,16 @@ impl RankingContext {
     pub fn in_project(&self, directory: &str) -> bool {
         let Some(root) = self.project_root.as_deref().filter(|_| self.uses(Signal::Project)) else { return false };
         directory == root || (root != "/" && directory.starts_with(&format!("{root}/")))
+    }
+
+    /// The cwd project's kind when the same-kind tier applies; None means skip every kind lookup.
+    pub fn kind(&self) -> Option<&str> {
+        self.project_kind.as_deref().filter(|_| self.uses(Signal::Kind))
+    }
+
+    /// Whether a run from a directory of kind `run_kind` is from a project of the cwd project's kind.
+    pub fn same_kind(&self, run_kind: Option<&str>) -> bool {
+        run_kind.is_some() && run_kind == self.kind()
     }
 
     pub fn candidates_of(&self, kind: CandidateKind) -> Vec<&Candidate> {
@@ -397,12 +412,14 @@ pub fn has_prefix(command: &str, prefix: &str) -> bool {
 }
 
 /// The `why` of a suggestion: where it was used, then what the context signals found.
-pub fn suggestion_why(runs_here: i64, project_runs: i64, extra: Option<&Vec<String>>) -> Option<Vec<String>> {
+pub fn suggestion_why(runs_here: i64, project_runs: i64, kind_runs: i64, kind: Option<&str>, extra: Option<&Vec<String>>) -> Option<Vec<String>> {
     let mut lines = vec![];
     if runs_here > 0 {
         lines.push("used here".to_string());
     } else if project_runs > 0 {
         lines.push("used in this project".to_string());
+    } else if let Some(kind) = kind.filter(|_| kind_runs > 0) {
+        lines.push(format!("used in a {kind} project"));
     }
     lines.extend(extra.into_iter().flatten().cloned());
     (!lines.is_empty()).then_some(lines)
@@ -430,6 +447,23 @@ mod tests {
         assert!(swift["Lib"].contains("library Lib"));
         assert!(swift["Lib"].contains("target Lib"));
         assert!(swift["App"].contains("executableTarget App"));
+    }
+
+    #[test]
+    fn kind_comes_from_the_nearest_project_and_switches_off() {
+        let project = |kind: &str| ProjectContext {
+            projects: vec![Project { root: "/r".into(), kind: kind.into(), ..Default::default() }],
+            ..Default::default()
+        };
+        let on = RankingContext::new(&project("rust"), None, &HashMap::new());
+        assert_eq!(on.project_kind.as_deref(), Some("rust"));
+        assert!(on.same_kind(Some("rust")) && !on.same_kind(Some("node")) && !on.same_kind(None));
+        let off = RankingContext::new(&project("rust"), None, &HashMap::from([("SMCLI_RANKING_OFF".into(), "project,kind".into())]));
+        assert!(off.off.contains(&Signal::Kind) && !off.same_kind(Some("rust")));
+        let none = RankingContext::new(&ProjectContext::default(), None, &HashMap::new());
+        assert!(none.project_kind.is_none() && !none.same_kind(None));
+        assert_eq!(suggestion_why(0, 0, 2, Some("rust"), None), Some(vec!["used in a rust project".to_string()]));
+        assert_eq!(suggestion_why(0, 1, 2, Some("rust"), None), Some(vec!["used in this project".to_string()]));
     }
 
     #[test]

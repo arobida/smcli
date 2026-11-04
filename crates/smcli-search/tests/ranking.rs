@@ -104,7 +104,7 @@ const ORIGINAL_CASES: [Case; 34] = [
     case(Original, "git state", Search, "merging", "continue", "git merge --continue"),
 ];
 
-const ADVERSARIAL_CASES: [Case; 16] = [
+const ADVERSARIAL_CASES: [Case; 22] = [
     // Exact literal distinctions: a rare flag variant must beat a frequent near-match.
     case(Adversarial, "flag-variant", Search, "flags", "git reset --soft", "git reset --soft HEAD"),
     case(Adversarial, "revision", Search, "revisions", "HEAD~1", "git reset HEAD~1"),
@@ -125,6 +125,15 @@ const ADVERSARIAL_CASES: [Case; 16] = [
     case(Adversarial, "intent", Search, "intent", "unpack a tarball", "tar -xzf archive.tgz"),
     case(Adversarial, "intent", Search, "intent", "check github login", "gh auth status"),
     case(Adversarial, "cold-start", Suggest, "coldstart", "npm run sto", "npm run storybook"),
+    // Same kind: a fresh Rust crate takes the habit from sibling crates over an equal habit from a Node project.
+    case(Adversarial, "kind", Suggest, "kinda", "ktool n", "ktool nextest run"),
+    case(Adversarial, "kind", Search, "kinda", "ktool", "ktool nextest run"),
+    // The cwd's own project still beats a sibling of the same kind.
+    case(Adversarial, "kind", Suggest, "kindc", "ktool d", "ktool deny check"),
+    case(Adversarial, "kind", Search, "kindc", "ktool", "ktool deny check"),
+    // Outside any project the tier says nothing: the slightly fresher habit wins.
+    case(Adversarial, "kind", Suggest, "kindout", "ktool n", "ktool new thing"),
+    case(Adversarial, "kind", Search, "kindout", "ktool", "ktool new thing"),
 ];
 
 fn long_tail_cases() -> [Case; 2] {
@@ -148,8 +157,8 @@ const HELD_OUT_CASES: [Case; 3] = [
     with_forbidden(case(HeldOut, "whole-token", Search, "heldout", "$make $release", "make release"), "make lint"),
 ];
 
-const CASES: [Case; 53] = {
-    let mut all: [Case; 53] = [ORIGINAL_CASES[0]; 53];
+const CASES: [Case; 59] = {
+    let mut all: [Case; 59] = [ORIGINAL_CASES[0]; 59];
     let mut i = 0;
     while i < ORIGINAL_CASES.len() {
         all[i] = ORIGINAL_CASES[i];
@@ -237,6 +246,14 @@ impl World {
                           "flags", "revisions", "rare-exact", "quoted", "longtail", "camel", "intent", "coldstart", "heldout"] {
             std::fs::create_dir_all(self.path(directory)).unwrap();
         }
+        for crate_dir in ["kinda", "kindb"] {
+            self.write("[package]\nname = \"k\"\n", &format!("{crate_dir}/Cargo.toml"));
+        }
+        for module in ["kindc", "kindd"] {
+            self.write("module k\n", &format!("{module}/go.mod"));
+        }
+        self.write(r#"{"name":"kindnode"}"#, "kindnode/package.json");
+        std::fs::create_dir_all(self.path("kindout")).unwrap();
         // A never-run project script for the cold-start adversarial case.
         self.write(r#"{"name":"coldstart","scripts":{"storybook":"storybook dev","build":"vite build"}}"#,
                    "coldstart/package.json");
@@ -361,6 +378,12 @@ impl World {
         self.run("find . -name '*.md'", "intent", NOW - 14.0, "intent14", 0);
         self.run("git branch", "intent", NOW - 15.0, "intent15", 0);
 
+        // Same-kind history: the habit lives in a sibling crate, the equal distractor in a Node project.
+        self.habit("ktool nextest run", "kindb", 12);
+        self.habit("ktool new thing", "kindnode", 12);
+        self.habit("ktool deny check", "kindc", 12);
+        self.habit("ktool depgraph --all", "kindd", 12);
+
         // Held-out history (kept small and using commands that do not move original cohort scores).
         self.run("git status", "heldout", NOW - 1.0, "held1", 0);
         self.run("git stash", "heldout", NOW - 2.0, "held2", 0);
@@ -388,7 +411,7 @@ impl World {
     }
 
     fn literal(&self, query: &str) -> bool {
-        let corpus = search_corpus(self.log.command_stats(None, None, NOW).unwrap(), &[]);
+        let corpus = search_corpus(self.log.command_stats(None, None, None, NOW).unwrap(), &[]);
         let programs = smcli_search::corpus::program_arguments(&corpus);
         let (stripped, _, _) = smcli_search::corpus::parse_markers(query, &programs, &Default::default());
         smcli_search::corpus::is_literal_query(&stripped, &programs)
@@ -398,7 +421,7 @@ impl World {
     fn search(&self, item: &Case) -> Vec<(String, Vec<String>)> {
         let directory = self.path(item.directory);
         let context = self.context(item);
-        let stats = self.log.command_stats(Some(&directory), context.project_root.as_deref(), NOW).unwrap();
+        let stats = self.log.command_stats(Some(&directory), context.project_root.as_deref(), context.kind(), NOW).unwrap();
         let corpus = search_corpus(stats, &[]);
         let signals = search_signals(&self.log, Some(context), &HashMap::from([("PWD".into(), directory)])).unwrap();
         self.engine
@@ -615,6 +638,7 @@ fn rank_the_fixed_query_set_above_the_regression_floor() {
     let mut misses = vec![];
     let mut held_out_violations = vec![];
     let mut literal_search = Score::default();
+    let mut same_kind = Score::default();
     let long_tail = long_tail_cases();
     for item in CASES.iter().chain(long_tail.iter()) {
         let ranked = if item.kind == Suggest { world.suggest(item) } else { world.search(item) };
@@ -622,6 +646,7 @@ fn rank_the_fixed_query_set_above_the_regression_floor() {
         let key = (item.cohort, item.kind, item.group.to_string());
         scores.entry(key).or_default().add(rank);
         totals.entry((item.cohort, item.kind)).or_default().add(rank);
+        if item.group == "kind" { same_kind.add(rank); }
         let literal = item.kind == Search && world.literal(item.query);
         if literal && item.cohort == Original { literal_search.add(rank); }
         if rank != Some(1) {
@@ -661,6 +686,7 @@ fn rank_the_fixed_query_set_above_the_regression_floor() {
         let kind = if *kind == Suggest { "suggest" } else { "search" };
         println!("  {cohort:<12} {kind:<7} {:<24} {}", "TOTAL", score.line());
     }
+    println!("  {:<12} {:<7} {:<24} {}", "adversarial", "both", "kind TOTAL", same_kind.line());
     if !misses.is_empty() {
         println!("ranking misses:\n{}", misses.join("\n"));
     }
@@ -706,7 +732,7 @@ fn rank_record_time_aliases() {
             log.append(&run, "", Some(&db)).unwrap();
         }
     }
-    let corpus = search_corpus(log.command_stats(Some("/alias-fixture"), None, NOW).unwrap(), &["nativegst".into(), "oldalias".into()]);
+    let corpus = search_corpus(log.command_stats(Some("/alias-fixture"), None, None, NOW).unwrap(), &["nativegst".into(), "oldalias".into()]);
     let gl: Vec<_> = corpus.values().filter(|e| e.command == "gl").collect();
     assert_eq!(gl.len(), 2);
     assert_eq!(gl.iter().map(|e| e.runs).sum::<i64>(), 4);
@@ -792,7 +818,7 @@ fn alias_ranks() -> Vec<Option<usize>> {
         for (typed, expanded, _) in &cases {
             add(typed, Some(*expanded).filter(|e| with_expansion && smcli_core::parse::safe_expansion(e)));
         }
-        let corpus = search_corpus(log.command_stats(Some("/alias-eval"), None, NOW).unwrap(), &[]);
+        let corpus = search_corpus(log.command_stats(Some("/alias-eval"), None, None, NOW).unwrap(), &[]);
         let engine = HistorySearch::new(root.path().join("index"), Potion::bundled().unwrap());
         let (mut all, mut git, mut personal) = (Score::default(), Score::default(), Score::default());
         let mut ranks = Vec::new();

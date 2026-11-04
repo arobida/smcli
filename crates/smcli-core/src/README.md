@@ -9,13 +9,13 @@
 - `config::home_dir` — resolves `$HOME`, falling back to `pw_dir` then `/`.
 - `config::SmcliConfig` — user settings; `location`, `load`, `save`.
 - `config::CaptureFilter` — `standard`, `new`, `allows_run`, `allows`.
-- `context::ProjectContext::discover`, `context::real_path`, `context::NODE_MANAGERS`.
+- `context::ProjectContext::discover`, `context::real_path`, `context::NODE_MANAGERS`; `context::KindCache::{new, lookup, insert, get}`.
 - `context_cache::GitStatus::{clean, parse, read, run_git}`; `context_cache::ContextCache::{new, context, invalidate}`.
 - `entry::{command_key, command_parts, trim_slash}`; `entry::SearchEntry::{new, from_key, key, primary, secondary, program, subcommand, last_run_epoch}`; `service_protocol::Suggestion::key` (implemented in `entry.rs`); `entry::SearchFilter::{merge_parsed, is_empty, allows}`.
 - `history::{USAGE_HALF_LIFE, INTERRUPTED_EXIT_CODES, VERSION, answers_with_exit_code, user_name, parse_pipestatus, is_timestamp, is_event_id}`.
 - `history::{CommandStats, Run, NewRun}`; `history::CapturedHistory::{new, location, open_connection, append, check_separate, record_selection, selection_scores, record_pick, picks, picker_recents, previous_command, followers, runs, command_stats, suggestions}`.
 - `parse::{CommandFlag, CommandBreakdown}`; `parse::{command_flags, shell_words, safe_expansion, is_smcli_command, program_of, glob_match, path_placeholders, path_arguments, last_command_word}`.
-- `ranking::{Signal, CandidateKind, Candidate, Pick, SelectionLog}`; `ranking::RankingContext::{new, disabled, uses, in_project, candidates_of}`; `ranking::{uses, candidates, apply_ranking_signals, has_prefix, suggestion_why}`.
+- `ranking::{Signal, CandidateKind, Candidate, Pick, SelectionLog}`; `ranking::RankingContext::{new, disabled, uses, in_project, kind, same_kind, candidates_of}`; `ranking::{uses, candidates, apply_ranking_signals, has_prefix, suggestion_why}`.
 - `service_client::ServiceClient::{new, socket, send}`.
 - `service_location::ServiceLocation::{new, fingerprint, prepare}`; `service_location::{build, relative_insert}`.
 - `service_protocol::{VERSION, MAX_SHELL_PATH_BYTES, MAX_MESSAGE_BYTES, MAX_RESPONSE_BYTES, IO_TIMEOUT, MAX_CONNECTIONS}`; `service_protocol::{Operation, ServiceRequest, ServiceResponse, Failure, FileHit, FileIndexInfo, SearchFilter, Suggestion, SearchEntry, ProjectContext, Repository, Project, GitStatus}`; `service_protocol::{shell_path_snapshot, encode_line, decode_line}`.

@@ -4,7 +4,7 @@
 
 ### Requirement: Same-kind project tier
 
-Suggest and search SHALL boost a command run in a directory whose nearest project has the same primary kind as the cwd's nearest project. The boost SHALL be smaller than the boost for runs in the cwd's own project and SHALL only raise a command's rank. When the cwd is not in a project, or a run directory's kind cannot be determined, ranking SHALL equal ranking without this tier.
+Suggest and search SHALL boost a command run in a directory whose nearest project has the cwd project's primary kind, by less than runs in the cwd's own project, and only to raise its rank. With no project at the cwd or no determinable kind, ranking SHALL equal ranking without the tier. Through the service, suggest sees a kind change within 60 seconds and search by the next corpus rebuild (at most 5 minutes, sooner on a change of directory).
 
 #### Scenario: Habit from another crate in a fresh crate
 
@@ -22,6 +22,12 @@ Suggest and search SHALL boost a command run in a directory whose nearest projec
 
 - **WHEN** a run's directory no longer exists or has no recognized manifest
 - **THEN** that run gets no same-kind boost and is not penalized
+
+#### Scenario: Kind change seen through the service
+
+- **GIVEN** the service has ranked with a run directory's kind cached
+- **WHEN** that directory is deleted or loses its manifest
+- **THEN** through the service, suggest sees the kind change within 60 seconds and search by the next corpus rebuild (at most 5 minutes, sooner on a change of directory), and in-process ranking stops at once
 
 #### Scenario: Outside any project
 
