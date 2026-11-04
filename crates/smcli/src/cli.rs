@@ -705,6 +705,7 @@ fn files_kind(c: &CapturedHistory, env: &HashMap<String, String>) -> u8 {
     let Some(command) = smcli_core::parse::last_command_word(line, env.get("SMCLI_SHELL").map(String::as_str).unwrap_or("bash")) else { return 0 };
     let command = command.rsplit('/').next().unwrap_or(&command).to_string();
     if is_directory_command(&command) { return 1; }
+    // Pre-C files_majority take(20) was on this same filtered stream, so the SQL cursor stops there too.
     let Ok(rows) = c.file_kind_rows(&user_name(), 20, |raw| {
         smcli_core::parse::program_of(raw, smcli_core::parse::CommandBreakdown::parse(raw).as_ref()).as_deref() == Some(command.as_str())
     }) else { return 0 };

@@ -2459,7 +2459,6 @@ dependencies = [
  "libc",
  "nucleo-matcher",
  "ratatui",
- "rusqlite",
  "serde",
  "serde_json",
  "smcli-core",
