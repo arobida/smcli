@@ -15,6 +15,7 @@ Working notes, reviews and reference material for agents. Nothing here is built 
 - `shipit-checklist.md` — licensing and distribution checklist that must pass before any public binary ships.
 - `codebase-review-fixes.md` — wave plan and agent assignments for fixing the 2026-10-30 review findings.
 - `semantic-search-accuracy.md` — design for natural-language Tab search accuracy: query correction, coverage gate, head-command boost, evidence/relevance scoring; brief in `semantic-search-accuracy-brief.md`.
+- `service-only-model-ownership.md` — make `smcli-service` the only runtime owner of the Potion model: header-only model identity in the CLI, keyword and word-rank fallbacks, protocol v4 `embed` op for `@@`.
 
 ## reviews/
 
