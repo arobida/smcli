@@ -1089,13 +1089,12 @@ fn pick_tldr(c: &CapturedHistory, home: &Path, env: &HashMap<String, String>) ->
 /// The command-completion index for this engine, built from OS-shipped programs plus programs seen in
 /// captured history (both ∩ PATH) when missing, or rebuilt from scratch when `rebuild`.
 fn command_index(c: &CapturedHistory, env: &HashMap<String, String>, engine: &smcli_search::HistorySearch, rebuild: bool) -> Result<smcli_search::commands::CommandIndex> {
-    use smcli_search::commands::{CommandIndex, build, os_programs, system_dirs};
-    use smcli_search::tldr::{self, TldrSource};
+    use smcli_search::commands::{CommandIndex, build, bundled_sources, os_programs, source_refs, system_dirs};
+    use smcli_search::tldr;
     let platform = tldr::current_platform();
-    let directory = tldr::bundled_dir().ok_or_else(|| anyhow::anyhow!("tldr data not found beside the smcli executable or in Data/tldr"))?;
-    let source = TldrSource::new(&directory, platform)?;
-    let sources: Vec<&dyn smcli_core::command_source::CommandSource> = vec![&source];
-    let index = CommandIndex::new(engine.directory.clone(), engine.potion.clone(), &sources);
+    let sources = bundled_sources().ok_or_else(|| anyhow::anyhow!("tldr data not found beside the smcli executable or in Data/tldr"))?;
+    let refs = source_refs(&sources);
+    let index = CommandIndex::new(engine.directory.clone(), engine.potion.clone(), &refs);
     if rebuild && index.path().exists() {
         std::fs::remove_file(index.path())?;
     }
@@ -1103,7 +1102,7 @@ fn command_index(c: &CapturedHistory, env: &HashMap<String, String>, engine: &sm
         let path = smcli_core::service_protocol::shell_path_snapshot(env.get("PATH").map(String::as_str)).unwrap_or_default();
         let mut programs = os_programs(&system_dirs(), &path);
         programs.extend(tldr::installed(&captured_programs(c)?, &path));
-        build(&index, &sources, platform, &programs)?;
+        build(&index, &refs, platform, &programs)?;
     }
     Ok(index)
 }
@@ -1477,13 +1476,11 @@ struct IndexInfo {
 fn indexes(captured: &CapturedHistory, home: &Path, env: &HashMap<String, String>, prune: bool, json: bool) -> Result<()> {
     let engine = search_engine(captured, home, env)?;
     let current = engine.index_name();
-    // The command-completion index (tldr as a source); absent tldr data just means it is not current.
-    let command_current = smcli_search::tldr::bundled_dir()
-        .and_then(|dir| smcli_search::tldr::TldrSource::new(&dir, smcli_search::tldr::current_platform()).ok())
-        .map(|source| {
-            let sources: Vec<&dyn smcli_core::command_source::CommandSource> = vec![&source];
-            smcli_search::commands::CommandIndex::new(engine.directory.clone(), engine.potion.clone(), &sources).index_name()
-        });
+    // The command-completion index (bundled sources in priority order); absent tldr data just means it is not current.
+    let command_current = smcli_search::commands::bundled_sources().map(|sources| {
+        let refs = smcli_search::commands::source_refs(&sources);
+        smcli_search::commands::CommandIndex::new(engine.directory.clone(), engine.potion.clone(), &refs).index_name()
+    });
     let _lock = if prune { Some(engine.lock_index(20)?.ok_or_else(|| anyhow::anyhow!("Search index is busy; try again."))?) } else { None };
     let mut found: std::collections::BTreeMap<String, IndexInfo> = Default::default();
     let entries = match std::fs::read_dir(&engine.directory) {

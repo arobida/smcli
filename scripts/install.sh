@@ -62,6 +62,9 @@ done
 tldr="$from/tldr"
 [[ -d $tldr ]] || tldr="$here/../Data/tldr"
 [[ -s $tldr/tldr.jsonl ]] || die "missing or empty tldr/tldr.jsonl beside $from/smcli"
+# cheat is optional: installed when present, never an error when absent.
+cheat="$from/cheat"
+[[ -d $cheat ]] || cheat="$here/../Data/cheat"
 say "Installing smcli and smcli-service to $prefix"
 mkdir -p "$prefix"
 stage=$(mktemp -d "$prefix/.smcli-install.XXXXXX")
@@ -73,6 +76,7 @@ for name in smcli smcli-service; do
 done
 cp -RL "$model" "$stage/potion-shell-16m"
 cp -RL "$tldr" "$stage/tldr"
+[[ -s $cheat/cheat.jsonl ]] && cp -RL "$cheat" "$stage/cheat"
 "$stage/smcli" --help > /dev/null || die "the staged smcli does not run"
 "$stage/smcli-service" --help > "$stage/service-help" 2>&1 && service_status=0 || service_status=$?
 [[ $service_status == 2 ]] && grep -q '^Usage: smcli-service ' "$stage/service-help" || die "the staged smcli-service does not run"
@@ -85,6 +89,8 @@ rm -rf "$prefix/potion-shell-16m"
 mv "$stage/potion-shell-16m" "$prefix/potion-shell-16m"
 rm -rf "$prefix/tldr"
 mv "$stage/tldr" "$prefix/tldr"
+rm -rf "$prefix/cheat"
+[[ -d $stage/cheat ]] && mv "$stage/cheat" "$prefix/cheat"
 # The uninstaller ships with the install, so it works without the release archive or checkout.
 uninstaller="$here/uninstall.sh"
 [[ -f $uninstaller ]] && install -m 755 "$uninstaller" "$prefix/smcli-uninstall"

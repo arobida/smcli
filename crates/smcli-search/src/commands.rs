@@ -52,6 +52,36 @@ pub fn system_dirs() -> Vec<PathBuf> {
     SYSTEM_DIRS.iter().map(PathBuf::from).collect()
 }
 
+/// The bundled example sources in priority order: tldr first, cheat/cheatsheets as the fallback
+/// for programs tldr has no page for. `None` when the required tldr data is missing or unreadable
+/// (cheat is optional: its absence just leaves tldr alone). One place builds this list so the CLI
+/// and the service agree on sources and therefore on the index name.
+pub fn bundled_sources() -> Option<Vec<Box<dyn CommandSource>>> {
+    let platform = crate::tldr::current_platform();
+    let dir = crate::tldr::bundled_dir()?;
+    sources_from(&dir, platform, crate::cheat::bundled_dir())
+}
+
+/// tldr (required) plus the cheat fallback when its data loads; `None` only when tldr fails.
+fn sources_from(
+    tldr_dir: &Path,
+    platform: &str,
+    cheat_dir: Option<PathBuf>,
+) -> Option<Vec<Box<dyn CommandSource>>> {
+    let mut sources: Vec<Box<dyn CommandSource>> = vec![Box::new(crate::tldr::TldrSource::new(tldr_dir, platform).ok()?)];
+    if let Some(dir) = cheat_dir {
+        if let Ok(cheat) = crate::cheat::CheatSource::new(&dir) {
+            sources.push(Box::new(cheat));
+        }
+    }
+    Some(sources)
+}
+
+/// Borrow the boxed sources as the trait-object slices `CommandIndex` takes.
+pub fn source_refs(sources: &[Box<dyn CommandSource>]) -> Vec<&dyn CommandSource> {
+    sources.iter().map(|source| &**source).collect()
+}
+
 /// One indexed example; `description` is embedded, `template` is what `@@` inserts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -152,14 +182,13 @@ impl CommandIndex {
         Ok(self.all()?.into_iter().map(|example| example.program).collect())
     }
 
-    /// Ask every source for `program`'s examples; `None` when no source has any.
-    /// `platform` is forwarded for sources that keep a per-platform corpus.
+    /// Ask sources in priority order for `program`'s examples; the first source with any wins.
+    /// `None` when no source has any. `platform` is forwarded for sources that keep a per-platform corpus.
     pub fn gather(sources: &[&dyn CommandSource], program: &str, platform: &str) -> Option<Vec<CommandExample>> {
-        let examples: Vec<CommandExample> = sources
-            .iter()
-            .flat_map(|source| source.examples(program, platform))
-            .collect();
-        (!examples.is_empty()).then_some(examples)
+        sources.iter().find_map(|source| {
+            let examples = source.examples(program, platform);
+            (!examples.is_empty()).then_some(examples)
+        })
     }
 
     /// Embed and add one program's examples to the index. Existing rows for the
@@ -296,6 +325,130 @@ mod tests {
                     }]
                 })
                 .unwrap_or_default()
+        }
+    }
+
+    /// Lower-priority stub covering `tar` differently and `onlyfallback`, which PlatformSource lacks.
+    struct FallbackSource;
+    impl CommandSource for FallbackSource {
+        fn name(&self) -> &str {
+            "fallback"
+        }
+        fn version(&self) -> &str {
+            "2"
+        }
+        fn examples(&self, program: &str, _platform: &str) -> Vec<CommandExample> {
+            (program == "tar" || program == "onlyfallback")
+                .then(|| {
+                    vec![CommandExample {
+                        program: program.into(),
+                        description: format!("{program} fallback"),
+                        template: format!("{program} --fallback"),
+                        source: self.name().into(),
+                    }]
+                })
+                .unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn gather_uses_the_first_source_with_examples() {
+        let first = PlatformSource;
+        let second = FallbackSource;
+        let sources: Vec<&dyn CommandSource> = vec![&first, &second];
+        // Both have tar: only the higher-priority source's examples count.
+        let tar = CommandIndex::gather(&sources, "tar", "osx").unwrap();
+        assert_eq!(tar.len(), 1);
+        assert_eq!(tar[0].source, "stub");
+        // Missing from the first source: falls back to the second.
+        let fallback = CommandIndex::gather(&sources, "onlyfallback", "osx").unwrap();
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].source, "fallback");
+        // No source has it.
+        assert!(CommandIndex::gather(&sources, "noexamples", "osx").is_none());
+    }
+
+    /// Selects a PATH candidate with production filtering and indexes that selected set.
+    #[cfg(unix)]
+    fn build_path_program(sources: &[&dyn CommandSource], program: &str) -> (String, HashSet<String>, Vec<IndexedExample>) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join(program);
+        std::fs::write(&executable, "#!/bin/sh\\nexit 0\\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let candidates = os_programs(&[dir.path().to_path_buf()], &dir.path().to_string_lossy());
+        let wanted = HashSet::from([program.to_owned()]).intersection(&candidates).cloned().collect::<HashSet<_>>();
+        assert_eq!(wanted, HashSet::from([program.to_owned()]));
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let index = CommandIndex::new(root.path(), Potion::bundled().unwrap(), sources);
+        build(&index, sources, crate::tldr::current_platform(), &wanted).unwrap();
+        (index.index_name(), wanted, index.examples(program).unwrap().unwrap())
+    }
+
+    /// A cheat-only program's examples land in the index naming `cheat` as their source.
+    #[cfg(unix)]
+    #[test]
+    fn build_indexes_cheat_only_program_from_the_cheat_source() {
+        let tldr_dir = crate::tldr::bundled_dir().expect("bundled tldr data");
+        let cheat_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cheat_dir.path().join("cheat.jsonl"),
+            "{\"version\": 1, \"cheat_commit\": \"testcommit\", \"license\": \"CC0-1.0\"}\n\n            {\"program\": \"zzz-cheatexample\", \"platform\": \"common\", \"description\": \"Run it\", \"template\": \"zzz-cheatexample --flag\"}\n",
+        )
+        .unwrap();
+        let sources = super::sources_from(&tldr_dir, "osx", Some(cheat_dir.path().to_path_buf())).unwrap();
+        let refs = super::source_refs(&sources);
+        let (name, selected, indexed) = build_path_program(&refs, "zzz-cheatexample");
+        assert!(selected.contains("zzz-cheatexample"));
+        assert!(indexed.iter().all(|example| example.source == "cheat"));
+        assert!(name.contains("cheat@testcommit"));
+    }
+
+    /// Missing or corrupt cheat data leaves a tldr-only source list: the index name has no cheat part.
+    #[test]
+    fn build_falls_back_to_tldr_alone_when_cheat_data_is_missing_or_corrupt() {
+        let tldr_dir = crate::tldr::bundled_dir().expect("bundled tldr data");
+        let platform = crate::tldr::current_platform();
+        for corrupt in [false, true] {
+            let cheat_dir = tempfile::tempdir().unwrap();
+            if corrupt {
+                std::fs::write(cheat_dir.path().join("cheat.jsonl"), "not json\n{{{\n").unwrap();
+            }
+            let sources = super::sources_from(&tldr_dir, platform, Some(cheat_dir.path().to_path_buf())).unwrap();
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].name(), "tldr");
+            let refs = super::source_refs(&sources);
+            let (name, selected, examples) = build_path_program(&refs, "tar");
+            assert!(selected.contains("tar"));
+            assert!(!name.contains("cheat"));
+            assert!(name.contains("tldr@"));
+            assert!(!examples.is_empty());
+            assert!(examples.iter().all(|example| example.source == "tldr"));
+        }
+        // No cheat directory at all: same tldr-only outcome.
+        let sources = super::sources_from(&tldr_dir, platform, None).unwrap();
+        assert_eq!(sources.len(), 1);
+    }
+
+    /// The bundled sources in priority order against the real bundled data: tldr first,
+    /// tar comes only from tldr, and a program tldr lacks (acl) falls back to cheat.
+    #[test]
+    fn bundled_sources_are_ordered_and_fallback() {
+        let Some(sources) = super::bundled_sources() else {
+            eprintln!("bundled tldr data not available; skipping");
+            return;
+        };
+        assert_eq!(sources[0].name(), "tldr");
+        let refs = super::source_refs(&sources);
+        if crate::cheat::bundled_dir().is_some() {
+            assert_eq!(sources[1].name(), "cheat");
+            let tar = CommandIndex::gather(&refs, "tar", "osx").expect("tar examples");
+            assert!(tar.iter().all(|example| example.source == "tldr"));
+            let acl = CommandIndex::gather(&refs, "acl", "osx").expect("acl cheat examples");
+            assert!(acl.iter().all(|example| example.source == "cheat"));
+        } else {
+            assert_eq!(sources.len(), 1);
         }
     }
 

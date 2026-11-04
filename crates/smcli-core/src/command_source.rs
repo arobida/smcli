@@ -1,5 +1,7 @@
 //! Pluggable sources of command examples for `@@` completion. smcli-core owns the trait;
-//! implementations (tldr, later cheat.sh) live in crates that have their data loaders.
+//! implementations (tldr and the lower-priority cheat/cheatsheets fallback) live in
+//! crates that have their data loaders. Sources are tried in priority order: a program's
+//! examples come only from the highest-priority source that has any.
 //! Sources answer offline by program name; smcli decides which programs to ask about.
 
 /// One example of using a program: a description and a command template.

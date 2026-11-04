@@ -405,12 +405,11 @@ impl Service {
     fn finish_sync(&self, shell_path: String, request: &ServiceRequest) {
         let result = (|| -> Result<()> {
             let platform = smcli_search::tldr::current_platform();
-            let Some(source) = smcli_search::tldr::bundled_dir()
-                .and_then(|dir| smcli_search::tldr::TldrSource::new(&dir, platform).ok())
-            else {
+            let Some(sources) = smcli_search::commands::bundled_sources() else {
                 return Ok(());
             };
-            let index = self.command_index(&source, request)?;
+            let refs = smcli_search::commands::source_refs(&sources);
+            let index = self.command_index(&refs, request)?;
             if !index.path().exists() {
                 return Ok(());
             }
@@ -421,8 +420,7 @@ impl Service {
                 .filter_map(|run| recorded_program(&run.command, run.expanded_command.as_deref()))
                 .collect();
             wanted.extend(smcli_search::tldr::installed(&history, &shell_path));
-            let sources: Vec<&dyn CommandSource> = vec![&source];
-            let (indexed, empty) = smcli_search::commands::sync(&index, &sources, platform, &wanted)?;
+            let (indexed, empty) = smcli_search::commands::sync(&index, &refs, platform, &wanted)?;
             let mut sync = self.command_sync.lock().unwrap_or_else(|e| e.into_inner());
             sync.known = indexed.union(&empty).cloned().collect();
             sync.last_path = Some(shell_path);
@@ -434,7 +432,7 @@ impl Service {
     }
 
     /// The command index for the current model and source, cached on first use.
-    fn command_index(&self, source: &smcli_search::tldr::TldrSource, request: &ServiceRequest) -> Result<Arc<CommandIndex>> {
+    fn command_index(&self, sources: &[&dyn CommandSource], request: &ServiceRequest) -> Result<Arc<CommandIndex>> {
         let cached = self.command_sync.lock().unwrap_or_else(|e| e.into_inner()).index.clone();
         if let Some(index) = cached {
             return Ok(index);
@@ -445,8 +443,7 @@ impl Service {
             let Ok(_searching) = self.searching.try_lock() else { anyhow::bail!("search in progress; sync later") };
             self.current_engine(request)?
         };
-        let sources: Vec<&dyn CommandSource> = vec![source];
-        let index = Arc::new(CommandIndex::new(engine.directory.clone(), engine.potion.clone(), &sources));
+        let index = Arc::new(CommandIndex::new(engine.directory.clone(), engine.potion.clone(), sources));
         self.command_sync.lock().unwrap_or_else(|e| e.into_inner()).index = Some(Arc::clone(&index));
         Ok(index)
     }
@@ -784,19 +781,17 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let f = Fixture::new();
         let platform = smcli_search::tldr::current_platform();
-        let source = smcli_search::tldr::bundled_dir()
-            .and_then(|dir| smcli_search::tldr::TldrSource::new(&dir, platform).ok())
-            .expect("bundled tldr data");
+        let sources = smcli_search::commands::bundled_sources().expect("bundled tldr data");
+        let refs = smcli_search::commands::source_refs(&sources);
         // Pre-existing index with one program, so discovery adds incrementally instead of waiting for a full build.
-        let index = f.service.command_index(&source, &f.request(Operation::Record)).unwrap();
-        let sources: Vec<&dyn CommandSource> = vec![&source];
-        index.add("tar", &CommandIndex::gather(&sources, "tar", platform).expect("tar examples")).unwrap();
+        let index = f.service.command_index(&refs, &f.request(Operation::Record)).unwrap();
+        index.add("tar", &CommandIndex::gather(&refs, "tar", platform).expect("tar examples")).unwrap();
         // A fake jq executable on the request's PATH.
         let bin = f.home.join("bin");
         std::fs::create_dir(&bin).unwrap();
         std::fs::write(bin.join("jq"), "").unwrap();
         std::fs::set_permissions(bin.join("jq"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(CommandIndex::gather(&sources, "jq", platform).is_some(), "test needs jq pages in the bundled tldr");
+        assert!(CommandIndex::gather(&refs, "jq", platform).is_some(), "test needs jq pages in the bundled tldr");
         let mut r = f.request(Operation::Record);
         r.event = Some("12345678-89ab-4cde-8012-3456789abcde".into());
         r.command = Some("jq . file.json".into());
@@ -828,12 +823,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let f = Fixture::new();
         let platform = smcli_search::tldr::current_platform();
-        let source = smcli_search::tldr::bundled_dir()
-            .and_then(|dir| smcli_search::tldr::TldrSource::new(&dir, platform).ok())
-            .expect("bundled tldr data");
-        let index = f.service.command_index(&source, &f.request(Operation::Record)).unwrap();
-        let sources: Vec<&dyn CommandSource> = vec![&source];
-        index.add("tar", &CommandIndex::gather(&sources, "tar", platform).expect("tar examples")).unwrap();
+        let sources = smcli_search::commands::bundled_sources().expect("bundled tldr data");
+        let refs = smcli_search::commands::source_refs(&sources);
+        let index = f.service.command_index(&refs, &f.request(Operation::Record)).unwrap();
+        index.add("tar", &CommandIndex::gather(&refs, "tar", platform).expect("tar examples")).unwrap();
         let bin = f.home.join("bin");
         std::fs::create_dir(&bin).unwrap();
         std::fs::write(bin.join("jq"), "").unwrap();
@@ -881,13 +874,11 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let f = Fixture::new();
         let platform = smcli_search::tldr::current_platform();
-        let source = smcli_search::tldr::bundled_dir()
-            .and_then(|dir| smcli_search::tldr::TldrSource::new(&dir, platform).ok())
-            .expect("bundled tldr data");
-        let index = f.service.command_index(&source, &f.request(Operation::Record)).unwrap();
-        let sources: Vec<&dyn CommandSource> = vec![&source];
-        index.add("tar", &CommandIndex::gather(&sources, "tar", platform).expect("tar examples")).unwrap();
-        assert!(CommandIndex::gather(&sources, "zzz-smcli-noexamples", platform).is_none());
+        let sources = smcli_search::commands::bundled_sources().expect("bundled tldr data");
+        let refs = smcli_search::commands::source_refs(&sources);
+        let index = f.service.command_index(&refs, &f.request(Operation::Record)).unwrap();
+        index.add("tar", &CommandIndex::gather(&refs, "tar", platform).expect("tar examples")).unwrap();
+        assert!(CommandIndex::gather(&refs, "zzz-smcli-noexamples", platform).is_none());
         let bin = f.home.join("bin");
         std::fs::create_dir(&bin).unwrap();
         std::fs::write(bin.join("zzz-smcli-noexamples"), "").unwrap();

@@ -125,20 +125,30 @@ w(f"From `lmdb-master-sys {lmdb['version']}`.\n")
 w("```text\n" + (read(lmdb_license[0]) if lmdb_license else "LICENSE file not found in the crate; see lmdb-master-sys.") + "\n```\n")
 
 w("## Bundled data\n")
-w("Converted offline at build time by `scripts/gen-tldr.py` from a pinned tldr-pages commit.\n")
+w("Converted offline at build time by `scripts/gen-tldr.py` and `scripts/gen-cheat.py` from pinned upstream commits.\n")
+ORIGINS = {
+    # data folder: (github repo, commit header key)
+    "tldr": ("tldr-pages/tldr", "tldr_commit"),
+    "cheat": ("cheat/cheatsheets", "cheat_commit"),
+}
 for folder in sorted(glob.glob(f"{root}/Data/*/")):
     name = os.path.basename(folder.rstrip("/"))
-    license_path = os.path.join(folder, "LICENSE.md")
-    if not os.path.isfile(license_path):
-        sys.exit(f"Data/{name} has no LICENSE.md; bundled data needs its attribution")
-    jsonl = os.path.join(folder, "tldr.jsonl")
+    license_path = next((os.path.join(folder, n) for n in sorted(os.listdir(folder))
+                         if n.split(".")[0].upper() == "LICENSE" and os.path.isfile(os.path.join(folder, n))), None)
+    if not license_path:
+        sys.exit(f"Data/{name} has no LICENSE file; bundled data needs its attribution")
+    jsonl = os.path.join(folder, f"{name}.jsonl")
     with open(jsonl) as handle:
         header = json.loads(handle.readline())
         entries = sum(1 for _ in handle)
-    w(f"### {name} (tldr-pages, {header['license']})\n")
-    w(f"From https://github.com/tldr-pages/tldr, commit `{header['tldr_commit']}`. "
-      f"{header['version']} header, {entries} example entries in `tldr.jsonl`. "
-      f"The pages' CC-BY attribution follows (full license text in `Data/tldr/LICENSE.md`).\n")
+    repo, commit_key = ORIGINS.get(name, (name, None))
+    commit = header.get(commit_key) if commit_key else None
+    if not commit:
+        sys.exit(f"Data/{name}/{name}.jsonl header lacks a pinned commit; bundled data needs one")
+    w(f"### {name} ({repo}, {header['license']})\n")
+    w(f"From https://github.com/{repo}, commit `{commit}`. "
+      f"{header['version']} header, {entries} example entries in `{name}.jsonl`. "
+      f"The upstream license follows (full license text in `Data/{name}/{os.path.basename(license_path)}`).\n")
     w("```text\n" + read(license_path) + "\n```\n")
 
 w("## Rust crates linked by smcli and smcli-service\n")

@@ -2,7 +2,7 @@ PYTHON ?= python3
 DIST := dist
 STAMP := $(shell date +%Y%m%d-%H%M%S)-$(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)
 
-.PHONY: build release fresh install uninstall tldr test test-rust test-cli test-picker test-shells test-service test-install clean run baseline ranking tldr-ranking linux docs notices
+.PHONY: build release fresh install uninstall tldr cheat test test-rust test-cli test-picker test-shells test-service test-install clean run baseline ranking tldr-ranking linux docs notices
 
 PKG ?=
 FILTER ?=
@@ -21,6 +21,7 @@ release:
 	ln -sf smcli-service-$(STAMP) $(DIST)/smcli-service
 	rm -rf $(DIST)/potion-shell-16m && cp -R Models/potion-shell-16m $(DIST)/potion-shell-16m
 	rm -rf $(DIST)/tldr && cp -R Data/tldr $(DIST)/tldr
+	rm -rf $(DIST)/cheat && cp -R Data/cheat $(DIST)/cheat
 	@echo "Built $(DIST)/smcli-$(STAMP) (latest: $(DIST)/smcli)"
 	@echo ""
 	@echo "Try it in this shell (loads the zsh hooks from the new build):"
@@ -35,6 +36,10 @@ fresh:
 # Regenerates Data/tldr from a local tldr-pages checkout at its current commit: make tldr TLDR=<checkout>.
 tldr:
 	$(PYTHON) scripts/gen-tldr.py TLDR=$(TLDR)
+
+# Regenerates Data/cheat from a local cheat/cheatsheets checkout at its current commit: make cheat CHEAT=<checkout>.
+cheat:
+	$(PYTHON) scripts/gen-cheat.py CHEAT=$(CHEAT)
 
 test:
 	bash scripts/test.sh

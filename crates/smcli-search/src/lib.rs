@@ -1,3 +1,4 @@
+pub mod cheat;
 pub mod commands;
 pub mod corpus;
 pub mod evidence;
@@ -24,6 +25,7 @@ mod tokenizer;
 
 pub use index::HistorySearch;
 pub use potion::Potion;
+pub use cheat::CheatSource;
 pub use tldr::{Corpus, Entry, TldrSource, rank};
 pub use tokenizer::ShellTokenizer;
 
