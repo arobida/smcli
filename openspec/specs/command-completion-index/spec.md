@@ -60,12 +60,16 @@ The service SHALL keep the index in sync: the wanted set is (OS-shipped programs
 
 ### Requirement: Pluggable example sources
 
-Examples SHALL come from one or more sources, each identified by name and version, that answer "examples for program P on this platform". Each example SHALL carry a description, a command template and its source name. Adding or removing a source SHALL NOT require changes to the index or `@@` behavior beyond the examples offered. Sources SHALL answer offline at query time. Sources SHALL be ordered by priority, and a program's examples SHALL come only from the highest-priority source that has any for it.
+Examples SHALL come from one or more sources, each identified by name and version, that answer "examples for program P on this platform". Each example SHALL carry a description, a command template and its source name. Adding or removing a source SHALL NOT require changes to the index or `@@` behavior beyond the examples offered. Sources SHALL answer offline at query time.
 
 #### Scenario: tldr as a source
 
 - **WHEN** tldr is the only configured source
 - **THEN** `@@` results match today's tldr examples for indexed programs, and only platform `common` or current-OS pages are used
+
+### Requirement: Source priority order
+
+Sources SHALL be ordered by priority, and a program's examples SHALL come only from the highest-priority source that has any for it.
 
 #### Scenario: Two sources for one program
 
