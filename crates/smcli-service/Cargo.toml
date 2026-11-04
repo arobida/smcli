@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.104"
 fff-search = { git = "https://github.com/dmtrKovalenko/fff", rev = "95fd777c2529fc7b4d7572dabff64cc07268f2c5", version = "0.11.0", features = ["definitions"] }
 libc = "0.2.191"
+notify = "8.2.0"
 rusqlite = "0.40.2"
 smcli-core = { version = "0.1.0", path = "../smcli-core" }
 smcli-search = { version = "0.1.0", path = "../smcli-search" }

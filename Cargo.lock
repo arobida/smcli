@@ -2472,7 +2472,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "libc",
- "notify 8.2.0",
  "regex",
  "rusqlite",
  "serde",
@@ -2503,6 +2502,7 @@ dependencies = [
  "anyhow",
  "fff-search",
  "libc",
+ "notify 8.2.0",
  "rusqlite",
  "smcli-core",
  "smcli-search",

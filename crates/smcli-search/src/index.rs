@@ -94,7 +94,7 @@ pub struct HistorySearch {
     pub potion: Potion,
 }
 
-/// Swift's `commands-v*` files live in the same directory; this prefix keeps the two from deleting each other's index.
+/// History-index version prefix. A rebuild deletes older history indexes and leaves command-example caches alone.
 const VERSION: &str = "rs-commands-v4";
 
 #[cfg(test)]
@@ -516,7 +516,7 @@ impl HistorySearch {
         }
     }
 
-    /// Serializes index writers with the same `lock` file (flock) the Swift build uses. Tries `attempts` times,
+    /// Serializes index writers with flock on the shared lock file. Tries `attempts` times,
     /// 50 ms apart; `None` when another process still holds it.
     pub fn lock_index(&self, attempts: u32) -> Result<Option<File>> {
         lock_index_directory(&self.directory, attempts)

@@ -1,4 +1,4 @@
-//! Swift ServiceProtocol wire DTOs; no socket, dispatch, or binary identity logic.
+//! Service protocol wire DTOs; no socket, dispatch, or binary identity logic.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -370,7 +370,7 @@ pub struct Suggestion {
     pub why: Option<Vec<String>>,
 }
 
-// Swift initializer defaults are not decoding defaults: all nonoptional keys remain required (`Default` is for Rust callers only).
+// Constructor defaults are not decoding defaults: all nonoptional keys remain required (`Default` is for Rust callers only).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchEntry {
@@ -552,7 +552,7 @@ mod numbers {
             .transpose()
     }
 
-    // serde_json otherwise turns nonfinite doubles into null; Swift JSONEncoder throws.
+    // serde_json otherwise turns nonfinite doubles into null; encoding must fail instead.
     pub fn finite<S: Serializer>(value: &f64, s: S) -> Result<S::Ok, S::Error> {
         if !value.is_finite() {
             return Err(serde::ser::Error::custom("nonfinite double"));

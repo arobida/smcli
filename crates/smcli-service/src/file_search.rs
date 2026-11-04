@@ -5,7 +5,7 @@ use smcli_core::request::{Complete as CompleteQuery, FileQuery, Select as Select
 #[cfg(test)]
 use smcli_core::request::Request;
 use smcli_core::service_protocol::FailureCode;
-use smcli_core::{context::ProjectContext, service_location::relative_insert, service_protocol::{FileHit, FileIndexInfo, ServiceResponse}};
+use smcli_core::{context::ProjectContext, paths::relative_insert, service_protocol::{FileHit, FileIndexInfo, ServiceResponse}};
 #[cfg(test)]
 use smcli_core::service_protocol::ServiceRequest;
 
@@ -191,7 +191,6 @@ impl FileSearch {
         let directory = directory.as_str();
         let query = query.as_str();
         let home = home.unwrap_or_else(|| self.home.clone());
-        let home_str = home.to_string_lossy().into_owned();
         let path_filter = path.as_deref();
         let result = (|| -> Result<ServiceResponse> {
             let (scope, (index, id, prefix)) = if scoped {
@@ -234,7 +233,7 @@ impl FileSearch {
                 let mut provenance = vec![name.into()];
                 if picked.contains_key(path.trim_end_matches('/')) { provenance.push("picked".into()); }
                 let git = file.map(|f| fff_search::git::format_git_status(f.git_status)).as_deref().map(git).flatten();
-                Some(FileHit { insert: relative_insert(&path, &scope, &cwd, Some(&home_str)), path, provenance, git, line: None, column: None, text: None, definition: None })
+                Some(FileHit { insert: relative_insert(&path, &scope, &cwd), path, provenance, git, line: None, column: None, text: None, definition: None })
             };
             let score_of = |fff_path: &str| {
                 let p = prefix.as_deref().and_then(|pre| fff_path.strip_prefix(pre)).unwrap_or(fff_path);
@@ -324,12 +323,11 @@ impl FileSearch {
     }
 
     fn complete_query(&self, parsed: CompleteQuery) -> ServiceResponse {
-        let CompleteQuery { directory, query, limit, dirs_only, home } = parsed;
+        let CompleteQuery { directory, query, limit, dirs_only, home: _ } = parsed;
         let directory = directory.as_str();
         let query = query.as_str();
         let Some(root) = Self::root(directory) else { return ServiceResponse::failure("failed", format!("Cannot resolve {directory}.")); };
         let result = (|| -> Result<ServiceResponse> {
-            let home = home.unwrap_or_else(|| self.home.clone());
             let (index, id) = self.index(&root)?;
             let picked = (self.scores)(&root);
             if query.contains('\0') { return Err(anyhow!("NUL in query")); }
@@ -383,9 +381,8 @@ impl FileSearch {
             };
             let mut order: Vec<_> = (0..paths.len()).collect();
             order.sort_by(|&a, &b| key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
-            let home_str = home.to_string_lossy().into_owned();
             let hits = order.into_iter().take(limit as usize).map(|i| FileHit {
-                insert: relative_insert(&paths[i].0, &root, &directory, Some(&home_str)),
+                insert: relative_insert(&paths[i].0, &root, &directory),
                 path: paths[i].0.clone(),
                 provenance: vec!["complete".into()],
                 git: git(fff_search::git::format_git_status(paths[i].1)),

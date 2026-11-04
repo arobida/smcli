@@ -1118,12 +1118,12 @@ impl TerminalSession {
             .open("/dev/tty")
             .context("pick needs a terminal")?;
         enable_raw_mode()?;
-        // Alternate screen like the Swift picker; an inline viewport queries the cursor position, which some ptys never answer.
+        // Alternate screen; an inline viewport queries the cursor position, which some ptys never answer.
         let mut display = tty.try_clone().context("pick needs a terminal")?;
         let terminal = execute!(display, ratatui::crossterm::terminal::EnterAlternateScreen)
             .map_err(anyhow::Error::from)
             .and_then(|_| {
-                // Like Swift: a terminal reporting no size (some ptys) is drawn as 24x80.
+                // A terminal reporting no size (some ptys) is drawn as 24x80.
                 let (columns, rows) = ratatui::crossterm::terminal::size().ok().filter(|&(_, rows)| rows > 0).unwrap_or((80, 24));
                 let viewport = Viewport::Fixed(ratatui::layout::Rect::new(0, 0, columns, rows));
                 Ok(Terminal::with_options(CrosstermBackend::new(display), TerminalOptions { viewport })?)

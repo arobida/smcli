@@ -12,7 +12,7 @@ scoring, the client/service wire protocol, and the Unix-socket transport the CLI
 ## Interface
 
 This directory has no production source: it holds `Cargo.toml` (package `smcli-core`, edition 2024)
-and the `src/` and `tests/` trees. Dependencies are `anyhow`, `libc`, `notify`, `regex`, `rusqlite`
+and the `src/` and `tests/` trees. Dependencies are `anyhow`, `libc`, `regex`, `rusqlite`
 (bundled SQLite, with the `functions` feature for the SQL helpers `smcli_decay`, `smcli_key`,
 `smcli_internal`), `serde` and `serde_json`; dev-dependency `tempfile`. All logic and symbols live in
 [`./src/README.md`](src/README.md).
@@ -42,7 +42,7 @@ and the `src/` and `tests/` trees. Dependencies are `anyhow`, `libc`, `notify`, 
   directory (`SMCLI_RUNTIME_DIR` / `$XDG_RUNTIME_DIR/smcli` / `$TMPDIR/smcli-<uid>`) with per-database
   `.sock` and `.lock` files, and migration artifacts (`.migration.lock`, `.v7.bak`).
 - Processes: the client can spawn `smcli-service` on demand and stop a stale one; the crate otherwise
-  spawns no processes except `context_cache.rs::GitStatus::read`'s `git` (see src contract).
+  spawns no processes except `context.rs::GitStatus::read`'s `git` (see src contract).
 - Network: none. All transport is a local Unix-domain socket.
 
 ## Verification

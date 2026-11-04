@@ -1,7 +1,6 @@
 use smcli_search::Potion;
 
-/// reference.json: model2vec (Python) embeddings of the shipped model, the same file the Swift
-/// `Match model2vec reference embeddings` test passes against.
+/// reference.json: model2vec (Python) embeddings of the shipped model.
 #[test]
 fn match_model2vec_reference_embeddings() {
     let reference: serde_json::Value = serde_json::from_str(include_str!("reference.json")).unwrap();

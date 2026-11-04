@@ -81,30 +81,6 @@ pub fn build(executable: &Path) -> Option<String> {
     ))
 }
 
-/// `path` (under `root`) as seen from `cwd`; insertion paths stay absolute outside `cwd`.
-pub fn relative_insert(path: &str, root: &str, cwd: &str, _home: Option<&str>) -> String {
-    if path.is_empty() {
-        return String::new();
-    }
-    let dir = path.ends_with('/');
-    let target = fs::canonicalize(Path::new(root).join(path));
-    let Ok(target) = target else {
-        return path.to_owned();
-    };
-    let cwd = fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
-    let is_root = |p: &Path| p.as_os_str() == "/";
-    let result = if !is_root(&cwd) && let Ok(rel) = target.strip_prefix(&cwd) {
-        if rel.as_os_str().is_empty() {
-            ".".into()
-        } else {
-            rel.to_string_lossy().into_owned()
-        }
-    } else {
-        target.to_string_lossy().into_owned()
-    };
-    if dir && !result.ends_with('/') { format!("{result}/") } else { result }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,51 +145,4 @@ mod tests {
         assert_eq!(build(&temporary.path().join("missing")), None);
     }
 
-    #[test]
-    fn relative_insert_cases() {
-        let temporary = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(temporary.path()).unwrap();
-        fs::create_dir(root.join("x")).unwrap();
-        fs::create_dir(root.join("y")).unwrap();
-        fs::write(root.join("x/a.swift"), "").unwrap();
-        fs::write(root.join("x/b.swift"), "").unwrap();
-        let root = root.to_str().unwrap();
-        assert_eq!(relative_insert("x/a.swift", root, &format!("{root}/x"), None), "a.swift");
-        let abs = fs::canonicalize(Path::new(root).join("x/b.swift")).unwrap().to_string_lossy().into_owned();
-        assert_eq!(relative_insert("x/b.swift", root, &format!("{root}/y"), None), abs);
-        assert_eq!(relative_insert("x/b.swift", root, "/", None), abs);
-        assert_eq!(relative_insert("x/b.swift", root, root, None), "x/b.swift");
-        assert_eq!(relative_insert("", root, root, None), "");
-        symlink(format!("{root}/x"), format!("{root}/alias")).unwrap();
-        assert_eq!(relative_insert("x/a.swift", root, &format!("{root}/alias"), None), "a.swift");
-    }
-
-    #[test]
-    fn relative_insert_falls_back_to_home_or_absolute() {
-        let temporary = tempfile::tempdir().unwrap();
-        let home = temporary.path().join("home");
-        fs::create_dir_all(home.join("Dev/other")).unwrap();
-        fs::create_dir_all(home.join("elsewhere")).unwrap();
-        let root = home.join("Dev/project");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("file.rs"), "").unwrap();
-        fs::write(home.join("elsewhere/out.rs"), "").unwrap();
-        let home = fs::canonicalize(&home).unwrap();
-        let root = fs::canonicalize(&root).unwrap();
-        let root = root.to_str().unwrap();
-        let home = home.to_str().unwrap();
-        // Inside cwd -> relative.
-        assert_eq!(relative_insert("file.rs", root, root, Some(home)), "file.rs");
-        // Outside cwd but under home -> absolute insertion path.
-        let project_file = fs::canonicalize(Path::new(root).join("file.rs")).unwrap();
-        let insert = relative_insert("file.rs", root, &format!("{home}/Dev/other"), Some(home));
-        assert_eq!(insert, project_file.to_string_lossy());
-        assert!(Path::new(&insert).is_file());
-        let elsewhere = fs::canonicalize(Path::new(home).join("elsewhere/out.rs")).unwrap();
-        assert_eq!(relative_insert("../../elsewhere/out.rs", root, root, Some(home)), elsewhere.to_string_lossy());
-        // Outside home -> absolute.
-        fs::write(temporary.path().join("outside.rs"), "").unwrap();
-        let outside = fs::canonicalize(temporary.path().join("outside.rs")).unwrap();
-        assert_eq!(relative_insert("../../../outside.rs", root, root, Some(home)), outside.to_string_lossy());
-    }
 }

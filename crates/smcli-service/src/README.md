@@ -39,7 +39,7 @@ started on demand by `smcli-core`'s client and stops itself when unused.
 - Disk: reads native history files (as a snapshot stamp of path/size/mtime/dev/ino); writes
   `file_selections` and `command_selections` rows and new `commands` rows into the database; removes the
   socket file on shutdown, idle exit, or signal (only while its inode is still ours).
-- Processes: runs `git status` for Git status via `smcli_core::context_cache::GitStatus::read` (no shell, no
+- Processes: runs `git status` for Git status via `smcli_core::context::GitStatus::read` (no shell, no
   optional locks, timeout-killed); spawns fff file-system watchers per indexed root.
 - Threads: one per accepted connection; `MAX_CONNECTIONS == 64` limits admission after spawning and excess requests are rejected as busy, so it is not a thread cap. Also: a 15-second idle watcher, a
   background search warm thread, `ContextCache` background Git-status refreshers, and fff scan/watcher

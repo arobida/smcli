@@ -1,149 +1,9 @@
 use std::collections::HashMap;
-use std::io::Read;
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::service_protocol::{GitStatus, ProjectContext, Repository};
-use crate::time::now;
-
-impl GitStatus {
-    pub fn clean(&self) -> bool {
-        self.staged + self.unstaged + self.untracked + self.conflicted == 0
-    }
-
-    /// Header lines start with `# `; entries are `1`/`2` (changed; `XY` is index then work tree, `.` for none),
-    /// `u` (unmerged) and `?` (untracked). Ignored entries (`!`) aren't requested.
-    /// `fetched_at` is supplied explicitly so parsing is deterministic.
-    pub fn parse(output: &str, fetched_at: f64) -> Self {
-        let mut status = Self {
-            oid: None,
-            branch: None,
-            upstream: None,
-            ahead: 0,
-            behind: 0,
-            staged: 0,
-            unstaged: 0,
-            untracked: 0,
-            conflicted: 0,
-            fetched_at,
-        };
-        for line in output.lines().filter(|l| !l.is_empty()) {
-            let mut rest = line.trim_start_matches(' ');
-            let mut words = Vec::new();
-            for _ in 0..2 {
-                let (word, tail) = rest.split_once(' ').unwrap_or((rest, ""));
-                if !word.is_empty() {
-                    words.push(word);
-                }
-                rest = tail.trim_start_matches(' ');
-            }
-            if !rest.is_empty() {
-                words.push(rest);
-            }
-            match line.chars().next() {
-                Some('#') => {
-                    if words.len() < 3 {
-                        continue;
-                    }
-                    let key = words[1];
-                    let value = words[2].to_string();
-                    match key {
-                        "branch.oid" => status.oid = (value != "(initial)").then_some(value),
-                        "branch.head" => status.branch = (value != "(detached)").then_some(value),
-                        "branch.upstream" => status.upstream = Some(value),
-                        "branch.ab" => {
-                            let parts: Vec<_> = value.split(' ').collect();
-                            if parts.len() == 2 {
-                                status.ahead =
-                                    parts[0].get(1..).and_then(|s| s.parse().ok()).unwrap_or(0);
-                                status.behind =
-                                    parts[1].get(1..).and_then(|s| s.parse().ok()).unwrap_or(0);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Some('1' | '2') => {
-                    let Some(codes) = words.get(1) else { continue };
-                    let codes: Vec<_> = codes.chars().collect();
-                    if codes.len() != 2 {
-                        continue;
-                    }
-                    if codes[0] != '.' {
-                        status.staged += 1;
-                    }
-                    if codes[1] != '.' {
-                        status.unstaged += 1;
-                    }
-                }
-                Some('u') => status.conflicted += 1,
-                Some('?') => status.untracked += 1,
-                _ => {}
-            }
-        }
-        status
-    }
-
-    /// Runs Git without a shell or optional locks (so it never contends with the user's own Git), killed after
-    /// `timeout` seconds. None on timeout or failure.
-    pub fn read(root: &str, timeout: f64) -> Option<Self> {
-        Self::run_git(
-            &["-C", root, "status", "--porcelain=v2", "--branch"],
-            timeout,
-        )
-        .map(|output| Self::parse(&output, now()))
-    }
-
-    pub fn run_git(arguments: &[&str], timeout: f64) -> Option<String> {
-        let mut command = Command::new("/usr/bin/env");
-        command.args(["git", "--no-pager"]).args(arguments);
-        for (key, _) in std::env::vars_os().filter(|(k, _)| k.to_string_lossy().starts_with("GIT_"))
-        {
-            command.env_remove(key);
-        }
-        command
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("LC_ALL", "C")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .stdout(Stdio::piped());
-        let mut child = command.spawn().ok()?;
-        let mut pipe = child.stdout.take()?;
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        // A thread of its own: the shared pool can be busy with callers blocked on this very read.
-        std::thread::spawn(move || {
-            let mut output = Vec::new();
-            let result = pipe.read_to_end(&mut output).map(|_| output);
-            let _ = sender.send(result);
-        });
-        let deadline = Instant::now()
-            + Duration::from_secs_f64(if timeout.is_finite() {
-                timeout.max(0.0)
-            } else {
-                0.0
-            });
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(5))
-                }
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-            }
-        };
-        // A daemon Git started (fsmonitor) can keep the pipe open; the output is complete once Git exits.
-        let output = receiver.recv_timeout(Duration::from_secs(1)).ok()?.ok()?;
-        status
-            .success()
-            .then(|| String::from_utf8_lossy(&output).into_owned())
-    }
-}
+use smcli_core::service_protocol::{GitStatus, ProjectContext, Repository};
+use smcli_core::time::now;
 
 type StatusReader = dyn Fn(&str) -> Option<GitStatus> + Send + Sync;
 struct Entry {
@@ -393,31 +253,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_porcelain() {
-        let status = GitStatus::parse(
-            "# branch.oid abc\n# branch.head main\n# branch.upstream origin/main\n# branch.ab +2 -3\n1 M. rest\n2 .M rest\nu UU rest\n? file\n! ignored\n1 broken\n",
-            42.0,
-        );
-        assert_eq!(
-            (
-                status.ahead,
-                status.behind,
-                status.staged,
-                status.unstaged,
-                status.conflicted,
-                status.untracked
-            ),
-            (2, 3, 1, 1, 1, 1)
-        );
-        assert_eq!(status.branch.as_deref(), Some("main"));
-        assert_eq!(status.fetched_at, 42.0);
-        assert!(!status.clean());
-        let detached = GitStatus::parse("# branch.oid (initial)\n# branch.head (detached)\n", 0.0);
-        assert!(detached.clean());
-        assert_eq!((detached.oid, detached.branch), (None, None));
-    }
-
-    #[test]
     fn refresh_is_nonblocking_and_failure_keeps_status() {
         fn send_sync<T: Send + Sync>() {}
         send_sync::<ContextCache>();
@@ -580,12 +415,5 @@ mod tests {
         }
     }
 
-    #[test]
-    fn git_read_failure_and_timeout() {
-        assert!(GitStatus::read("/smcli-does-not-exist", 1.0).is_none());
-        assert!(GitStatus::run_git(&["--version"], 1.0).is_some());
-        assert!(
-            GitStatus::run_git(&["-c", "alias.smclisleep=!sleep 2", "smclisleep"], 0.01).is_none()
-        );
-    }
+
 }

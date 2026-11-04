@@ -1,3 +1,4 @@
+mod context_cache;
 mod file_search;
 mod test_candidates;
 mod service;

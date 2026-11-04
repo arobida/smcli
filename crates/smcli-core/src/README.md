@@ -9,8 +9,7 @@
 - `config::home_dir` — resolves `$HOME`, falling back to `pw_dir` then `/`.
 - `config::SmcliConfig` — user settings; `location`, `load`, `save`.
 - `config::CaptureFilter` — `standard`, `new`, `allows_run`, `allows`.
-- `context::ProjectContext::discover`, `context::real_path`, `context::NODE_MANAGERS`; `context::KindCache::{new, lookup, insert, get}`.
-- `context_cache::GitStatus::{clean, parse, read, run_git}`; `context_cache::ContextCache::{new, context, invalidate}`.
+- `context::ProjectContext::discover`, `context::real_path`, `context::NODE_MANAGERS`; `context::KindCache::{new, lookup, insert, get}`; `context::GitStatus::{clean, parse, read, run_git}`.
 - `entry::{command_key, command_parts, trim_slash}`; `entry::SearchEntry::{new, from_key, key, primary, secondary, program, subcommand, last_run_epoch}`; `service_protocol::Suggestion::key` (implemented in `entry.rs`); `entry::SearchFilter::{merge_parsed, is_empty, allows}`.
 - `history::{USAGE_HALF_LIFE, INTERRUPTED_EXIT_CODES, VERSION, answers_with_exit_code, user_name, parse_pipestatus, is_timestamp, is_event_id}`.
 - `history::{CommandStats, Run, NewRun}`; `history::CapturedHistory::{new, location, open_connection, append, check_separate, record_selection, selection_scores, record_pick, picks, picker_recents, previous_command, followers, runs, command_stats, suggestions, export_rows, file_kind_rows, last_directory, recent_distinct}`.
@@ -47,8 +46,7 @@ Subdirectories: none (this is the leaf module directory; `../tests/` holds integ
 
 - Disk: creates/writes the SQLite database at `SMCLI_DB` or `~/.local/share/smcli/history.db` (WAL mode, `synchronous=NORMAL`); creates the config at `SMCLI_CONFIG` / `$XDG_CONFIG_HOME/smcli/config.json` / `~/.config/smcli/config.json`; creates the runtime directory, socket and lock files; writes a `.migration.lock` and `.v7.bak` during migration.
 - Processes: `service_client.rs::ServiceClient::launch` spawns `smcli-service` detached via `posix_spawn` (no terminal, stdio → `/dev/null`, extra descriptors closed); `send`/`replace` can stop and replace a stale/mismatched-version service.
-- Background work: `context_cache.rs::ContextCache::start_refresh` starts Git-status refresh threads; `FileWatcher` subscribes to filesystem notifications via `notify` and invalidates cached context.
-- `context.rs::ProjectContext::discover` only stats and reads small files — it never runs Git or executes a manifest. `context_cache.rs::GitStatus::read` is the exception: it runs `/usr/bin/env git --no-pager -C <root> status --porcelain=v2 --branch` (no shell, `GIT_OPTIONAL_LOCKS=0`, killed after its timeout).
+- `context.rs::ProjectContext::discover` only stats and reads small files — it never runs Git or executes a manifest. `context.rs::GitStatus::read` is the exception: it runs `/usr/bin/env git --no-pager -C <root> status --porcelain=v2 --branch` (no shell, `GIT_OPTIONAL_LOCKS=0`, killed after its timeout). Directory watching and the context cache live in `smcli-service`.
 
 ## Verification
 

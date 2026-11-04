@@ -7,6 +7,7 @@ pub mod history;
 pub mod import;
 pub mod prune;
 pub mod parse;
+pub mod paths;
 pub mod ranking;
 pub mod request;
 pub mod time;
@@ -17,7 +18,6 @@ pub mod unix_socket;
 pub mod service_client;
 
 pub mod suggestion_index;
-pub mod context_cache;
 pub mod tests_discovery;
 
 mod passwd;

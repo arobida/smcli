@@ -16,13 +16,13 @@ use smcli_core::caller::{CallerContext, LaunchSettings};
 use smcli_core::request::{Embed as EmbedQuery, Ranked, Record as RecordQuery, Request, Search as SearchQuery, Select as SelectQuery};
 use smcli_core::command_source::CommandSource;
 use smcli_core::config::{CaptureFilter, SmcliConfig};
-use smcli_core::context_cache::ContextCache;
+use crate::context_cache::ContextCache;
 use smcli_core::entry::SearchEntry;
 use smcli_core::history::{CapturedHistory, NewRun, Run, user_name};
 use smcli_core::ranking::{RankingContext, Signal};
 use smcli_core::service_location::{ServiceLocation, build};
 use smcli_core::service_protocol::{
-    IO_TIMEOUT, MAX_CONNECTIONS, MAX_MESSAGE_BYTES, Operation, ServiceRequest, ServiceResponse,
+    FailureCode, IO_TIMEOUT, MAX_CONNECTIONS, MAX_MESSAGE_BYTES, Operation, ServiceRequest, ServiceResponse,
     VERSION, decode_line, encode_line,
 };
 use smcli_core::suggestion_index::SuggestionIndex;
@@ -301,7 +301,7 @@ impl Service {
             Request::Suggest(ranked) => self.ranked(ranked, false),
             Request::Pick(ranked) => self.ranked(ranked, true),
         };
-        result.unwrap_or_else(|e| ServiceResponse::failure("failed", e.to_string()))
+        result.unwrap_or_else(|e| ServiceResponse::failure(FailureCode::Failed.as_str(), e.to_string()))
     }
 
     /// Runs a file operation outside `state`, keeping the service alive while it works.
@@ -608,7 +608,8 @@ impl Service {
         let service = Arc::clone(self);
         std::thread::spawn(move || {
             let _searching = service.searching.lock();
-            let _ = service.launch.home;
+            let caller = CallerContext::from_request(&ServiceRequest::new(Operation::Search), &service.launch);
+            let _ = service.current_engine(&caller.config);
         });
     }
 
