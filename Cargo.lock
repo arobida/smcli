@@ -2464,7 +2464,6 @@ dependencies = [
  "serde_json",
  "smcli-core",
  "smcli-search",
- "taladb",
  "uuid",
 ]
 

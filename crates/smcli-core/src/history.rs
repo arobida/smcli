@@ -574,7 +574,79 @@ impl CapturedHistory {
             .collect())
     }
 
-    // shortcut: `importAtuin`, `importLegacy`, `prune` and `records` are not ported yet; they come with their CLI commands in Phase 4.
+    pub fn export_rows(&self) -> Result<Vec<serde_json::Value>> {
+        if !self.path.exists() {
+            return Ok(vec![]);
+        }
+        let db = self.open_connection()?;
+        let mut statement=db.prepare("SELECT c.started_at,c.duration_ms,s.user,s.host,s.id,s.shell,c.directory,c.command,c.exit_code,COUNT(*) OVER (PARTITION BY c.command,c.expanded_command ORDER BY c.started_at,c.id),c.uuid,c.author,c.intent,c.pipestatus,c.flags,c.expanded_command FROM commands c JOIN sessions s ON s.id=c.session WHERE c.deleted_at IS NULL ORDER BY c.started_at,c.id")?;
+        let rows=statement.query_map([],|r| {
+            let command:String=r.get(7)?;
+            let mut value=serde_json::json!({"timestamp":format_iso8601(r.get(0)?,true),"user":r.get::<_,String>(2)?,"host":r.get::<_,String>(3)?,"session":r.get::<_,String>(4)?,"shell":r.get::<_,String>(5)?,"directory":r.get::<_,String>(6)?,"command":command,"exitCode":r.get::<_,i64>(8)?,"runCount":r.get::<_,i64>(9)?});
+            let expanded: Option<String> = r.get(15)?;
+            if let Some(breakdown)=crate::parse::CommandBreakdown::parse(expanded.as_deref().unwrap_or(&command)) {value["breakdown"]=serde_json::to_value(breakdown).unwrap();}
+            for (name,index) in [("id",10),("author",11),("intent",12),("expandedCommand",15)] {if let Some(v)=r.get::<_,Option<String>>(index)? {value[name]=v.into();}}
+            if let Some(v)=r.get::<_,Option<i64>>(1)? {value["durationMs"]=v.into();}
+            if let Some(v)=r.get::<_,Option<String>>(13)? {value["pipestatus"]=serde_json::json!(v.split_whitespace().filter_map(|s|s.parse::<i64>().ok()).collect::<Vec<_>>());}
+            if let Some(v)=r.get::<_,Option<String>>(14)?.filter(|v| !v.trim().is_empty()) {value["flags"]=serde_json::json!(v.split_whitespace().collect::<Vec<_>>());}
+            Ok(value)
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Newest-first rows for the CLI's file-versus-directory majority.
+    /// Stops once `keep` has accepted `limit` rows; the picker only uses 20 program matches.
+    pub fn file_kind_rows(
+        &self,
+        user: &str,
+        limit: usize,
+        mut keep: impl FnMut(&str) -> bool,
+    ) -> Result<Vec<(String, Option<String>, String, String)>> {
+        if !self.path.exists() || limit == 0 {
+            return Ok(vec![]);
+        }
+        let db = self.open_connection()?;
+        let mut stmt = db.prepare("SELECT c.command, c.expanded_command, c.directory, s.shell FROM commands c JOIN sessions s ON s.id=c.session WHERE s.user=?1 ORDER BY c.started_at DESC,c.id DESC")?;
+        let mut rows = stmt.query(rusqlite::params![user])?;
+        let mut kept = Vec::new();
+        while let Some(row) = rows.next()? {
+            let command: String = row.get(0)?;
+            if !keep(&command) {
+                continue;
+            }
+            kept.push((command, row.get(1)?, row.get(2)?, row.get(3)?));
+            if kept.len() == limit {
+                break;
+            }
+        }
+        Ok(kept)
+    }
+
+    pub fn last_directory(&self, command_key: &str, user: &str) -> Option<String> {
+        if !self.path.exists() {
+            return None;
+        }
+        let db = self.open_connection().ok()?;
+        let mut stmt = db
+            .prepare(
+                "SELECT c.directory FROM commands c JOIN sessions s ON s.id = c.session
+                 WHERE smcli_key(c.command, c.expanded_command) = ? AND s.user = ?
+                 ORDER BY c.started_at DESC, c.id DESC LIMIT 1",
+            )
+            .ok()?;
+        stmt.query_row(rusqlite::params![command_key, user], |r| r.get::<_, String>(0))
+            .ok()
+    }
+
+    pub fn recent_distinct(&self, user: &str) -> Result<Vec<String>> {
+        let db = self.open_connection()?;
+        let mut statement = db.prepare(
+            "SELECT DISTINCT smcli_key(c.command,c.expanded_command) FROM commands c JOIN sessions s ON s.id = c.session
+             WHERE s.user = ? AND c.deleted_at IS NULL AND NOT smcli_internal(COALESCE(c.expanded_command,c.command))
+             ORDER BY c.started_at DESC, c.id DESC",
+        )?;
+        Ok(statement.query_map([user], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
 
     /// VACUUM INTO includes committed WAL pages; a filesystem copy of history.db alone would not.
     fn backup_before_v8(&self, db: &Connection) -> Result<()> {
@@ -784,6 +856,50 @@ fn backfill_flags(db: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_kind_rows_and_last_directory_are_user_scoped() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let c = CapturedHistory::new(temporary.path().join("history.db"));
+        assert!(c.file_kind_rows("test", usize::MAX, |_| true)?.is_empty());
+        assert_eq!(c.last_directory("gl", "test"), None);
+        let db = c.open_connection()?;
+        db.execute_batch("INSERT INTO sessions(id,user,host,shell) VALUES('s','test','host','zsh'),('other','other','host','bash');
+            INSERT INTO commands(session,started_at,directory,command,expanded_command,exit_code) VALUES
+            ('s',1,'/first','gl','git log',0),('s',1,'/latest','gl','git log',0),
+            ('s',2,'/plain','gl',NULL,0),('other',3,'/other','gl','git log',0);")?;
+        let rows = c.file_kind_rows("test", usize::MAX, |_| true)?;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], ("gl".into(), None, "/plain".into(), "zsh".into()));
+        let mut seen = 0;
+        let limited = c.file_kind_rows("test", 1, |_| {
+            seen += 1;
+            true
+        })?;
+        assert_eq!(limited, [rows[0].clone()]);
+        assert_eq!(seen, 1, "stop after the first accepted row");
+        assert_eq!(c.last_directory(&command_key("gl", Some("git log")), "test"), Some("/latest".into()));
+        assert_eq!(c.last_directory("gl", "test"), Some("/plain".into()));
+        assert_eq!(c.last_directory("gl", "missing"), None);
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_history_picker_includes_oldest_distinct_capture() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let dir = temporary.path().to_path_buf();
+        let c = CapturedHistory::new(dir.join("history.db"));
+        for n in 0..52 {
+            let command = format!("command-{n:02}");
+            let mut run = NewRun::new(&command, "zsh", "/tmp", 0);
+            run.started_at = Some(1_700_000_000.0 + n as f64);
+            c.append(&run, "", None)?;
+        }
+        let recent = c.recent_distinct(&user_name())?;
+        assert!(recent.iter().any(|key| crate::entry::command_parts(key).0 == "command-00"));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     fn temp_db() -> (tempfile::TempDir, CapturedHistory) {
         let dir = tempfile::tempdir().unwrap();

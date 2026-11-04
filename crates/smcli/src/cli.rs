@@ -11,7 +11,7 @@ use smcli_core::{
     time::{format_iso8601, now, parse_iso8601},
 };
 use smcli_search::setup::{configured_model, corpus, index_directory, search_signals, working_directory};
-use smcli_search::{lexical_search, index::lock_index_directory};
+use smcli_search::lexical_search;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -577,32 +577,13 @@ fn record(
     Ok(())
 }
 
-fn records(c: &CapturedHistory) -> Result<Vec<serde_json::Value>> {
-    if !c.path.exists() {
-        return Ok(vec![]);
-    }
-    let db = c.open_connection()?;
-    let mut statement=db.prepare("SELECT c.started_at,c.duration_ms,s.user,s.host,s.id,s.shell,c.directory,c.command,c.exit_code,COUNT(*) OVER (PARTITION BY c.command,c.expanded_command ORDER BY c.started_at,c.id),c.uuid,c.author,c.intent,c.pipestatus,c.flags,c.expanded_command FROM commands c JOIN sessions s ON s.id=c.session WHERE c.deleted_at IS NULL ORDER BY c.started_at,c.id")?;
-    let rows=statement.query_map([],|r| {
-        let command:String=r.get(7)?;
-        let mut value=serde_json::json!({"timestamp":format_iso8601(r.get(0)?,true),"user":r.get::<_,String>(2)?,"host":r.get::<_,String>(3)?,"session":r.get::<_,String>(4)?,"shell":r.get::<_,String>(5)?,"directory":r.get::<_,String>(6)?,"command":command,"exitCode":r.get::<_,i64>(8)?,"runCount":r.get::<_,i64>(9)?});
-        let expanded: Option<String> = r.get(15)?;
-        if let Some(breakdown)=smcli_core::parse::CommandBreakdown::parse(expanded.as_deref().unwrap_or(&command)) {value["breakdown"]=serde_json::to_value(breakdown).unwrap();}
-        for (name,index) in [("id",10),("author",11),("intent",12),("expandedCommand",15)] {if let Some(v)=r.get::<_,Option<String>>(index)? {value[name]=v.into();}}
-        if let Some(v)=r.get::<_,Option<i64>>(1)? {value["durationMs"]=v.into();}
-        if let Some(v)=r.get::<_,Option<String>>(13)? {value["pipestatus"]=serde_json::json!(v.split_whitespace().filter_map(|s|s.parse::<i64>().ok()).collect::<Vec<_>>());}
-        if let Some(v)=r.get::<_,Option<String>>(14)?.filter(|v| !v.trim().is_empty()) {value["flags"]=serde_json::json!(v.split_whitespace().collect::<Vec<_>>());}
-        Ok(value)
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
 fn history(
     c: &CapturedHistory,
     home: &Path,
     env: &HashMap<String, String>,
     json: bool,
 ) -> Result<()> {
-    let records = records(c)?;
+    let records = c.export_rows()?;
     if json {
         return print_json(&records);
     }
@@ -655,119 +636,30 @@ fn prune(c: &CapturedHistory, filter: &CaptureFilter, dry: bool) -> Result<()> {
         Some(smcli_search::index::lock_index_directory(&directory, u32::MAX)?
             .ok_or_else(|| anyhow::anyhow!("Another smcli is updating the index."))?)
     };
-    let mut db = c.open_connection()?;
-    // Dry-run is read-only: Deferred avoids taking the write lock that blocks concurrent capture.
-    let tx = db.transaction_with_behavior(if dry {
-        rusqlite::TransactionBehavior::Deferred
-    } else {
-        rusqlite::TransactionBehavior::Immediate
-    })?;
-    let mut commands = HashSet::new();
-    let mut ids = vec![];
-    {
-        let mut s =
-            tx.prepare("SELECT id,command,directory,expanded_command FROM commands ORDER BY started_at,id")?;
-        for row in s.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-            ))
-        })? {
-            let (id, command, d, expanded) = row?;
-            if !filter.allows(&command, &d) || expanded.as_deref().is_some_and(|e| !filter.allows(e, &d)) {
-                ids.push(id);
-                commands.insert(smcli_core::entry::command_key(&command, expanded.as_deref()));
+    let pruned = c.prune(filter, dry, || smcli_search::index::remove_history_indexes(&directory));
+    let report = match pruned {
+        Ok(report) => report,
+        Err(error) => {
+            if let Some(failed) = error.downcast_ref::<smcli_core::prune::PruneError>() {
+                println!("Removed {} commands and {} selections.", failed.removed_commands, failed.removed_selections);
+                warn_migration_backup(failed.backup.as_deref());
             }
+            return Err(error);
         }
-    }
-    let mut file_picks = vec![];
-    {
-        let mut s = tx.prepare("SELECT id,query,root FROM file_selections")?;
-        for row in s.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))? {
-            let (id, query, root) = row?;
-            // Blank-query picks still carry a root; cwd filters must remove them too.
-            if !filter.allows(&query, &root) {
-                file_picks.push(id);
-            }
-        }
-    }
-    let mut picks = vec![];
-    {
-        let mut s = tx.prepare(
-            "SELECT id,command,query,directory FROM command_selections ORDER BY selected_at,id",
-        )?;
-        for row in s.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        })? {
-            let (id, command, q, d) = row?;
-            // Only a rejected query removes a selection on its own; selections of a pruned command go with it.
-            let (typed, expanded) = smcli_core::entry::command_parts(&command);
-            if commands.contains(&command) || !filter.allows_run(&typed, expanded.as_deref(), &d) || (!q.is_empty() && !filter.allows(&q, &d)) {
-                picks.push(id);
-            }
-        }
-    }
-    let selection_removed = picks.len() + file_picks.len();
+    };
     if dry {
-        for command in &commands {
-            println!("{}", smcli_core::entry::command_parts(command).0);
-        }
-        tx.rollback()?;
-        println!("{} commands and {} selections would be removed.", ids.len(), selection_removed);
+        for command in report.commands { println!("{command}"); }
+        println!("{} commands and {} selections would be removed.", report.removed_commands, report.removed_selections);
     } else {
-        let removed = ids.len();
-        for id in ids {
-            tx.execute("DELETE FROM commands WHERE id=?", [id])?;
-        }
-        for id in picks {
-            tx.execute("DELETE FROM command_selections WHERE id=?", [id])?;
-        }
-        for id in file_picks {
-            tx.execute("DELETE FROM file_selections WHERE id=?", [id])?;
-        }
-        for command in &commands {
-            tx.execute("DELETE FROM command_selections WHERE command=?", [command])?;
-        }
-        tx.commit()?;
-        println!("Removed {removed} commands and {selection_removed} selections.");
-        let mut backup = c.path.as_os_str().to_owned();
-        backup.push(".v7.bak");
-        let backup = std::path::PathBuf::from(backup);
-        if backup.exists() {
-            eprintln!("smcli: migration backup {} may still contain pruned history; remove it manually if no longer needed.", backup.display());
-        }
-        finish_prune(&db, &directory)?;
+        println!("Removed {} commands and {} selections.", report.removed_commands, report.removed_selections);
+        warn_migration_backup(report.backup.as_deref());
     }
     Ok(())
 }
 
-fn finish_prune(db: &rusqlite::Connection, directory: &Path) -> Result<()> {
-    let cleanup = (|| -> Result<()> {
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?;
-            if entry.file_name().to_string_lossy().starts_with("rs-commands-v") {
-                if entry.file_type()?.is_dir() {
-                    std::fs::remove_dir_all(entry.path())?;
-                } else {
-                    std::fs::remove_file(entry.path())?;
-                }
-            }
-        }
-        Ok(())
-    })();
-    let maintenance = db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
-    match (cleanup, maintenance) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(cleanup), Ok(())) => bail!("History was pruned, but index cleanup failed: {cleanup:#}"),
-        (Ok(()), Err(maintenance)) => bail!("History was pruned, but database compaction failed: {maintenance}"),
-        (Err(cleanup), Err(maintenance)) => bail!("History was pruned, but index cleanup failed: {cleanup:#}; database compaction failed: {maintenance}"),
+fn warn_migration_backup(backup: Option<&Path>) {
+    if let Some(backup) = backup {
+        eprintln!("smcli: migration backup {} may still contain pruned history; remove it manually if no longer needed.", backup.display());
     }
 }
 fn import(
@@ -790,123 +682,9 @@ fn import(
                     .join("atuin/history.db")
             })
     });
-    ensure!(
-        source != c.path
-            && std::fs::canonicalize(&source).ok()
-                != std::fs::canonicalize(&c.path)
-                    .ok()
-                    .filter(|_| c.path.exists()),
-        "Cannot import history into itself"
-    );
     let capture_filter = CaptureFilter::new(&SmcliConfig::load(&SmcliConfig::location(home, env))?)?;
-    let mut db = c.open_connection()?;
-    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let mut count = 0;
-    if atuin {
-        let from = rusqlite::Connection::open_with_flags(
-            &source,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        let columns = from
-            .prepare("PRAGMA table_info(history)")?
-            .query_map([], |r| r.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        ensure!(
-            [
-                "id",
-                "timestamp",
-                "duration",
-                "exit",
-                "command",
-                "cwd",
-                "session",
-                "hostname"
-            ]
-            .iter()
-            .all(|s| columns.iter().any(|c| c == s)),
-            "Not an Atuin history database"
-        );
-        let optional = ["deleted_at", "shell", "author", "intent"].map(|s| {
-            if columns.iter().any(|c| c == s) {
-                s
-            } else {
-                "NULL"
-            }
-        });
-        let sql = format!(
-            "SELECT id,timestamp,duration,exit,command,cwd,session,hostname,{} FROM history ORDER BY timestamp",
-            optional.join(",")
-        );
-        let mut stmt = from.prepare(&sql)?;
-        let mut rows = stmt.query([])?;
-        if replace {
-            tx.execute_batch(
-                "DELETE FROM commands; DELETE FROM sessions; DELETE FROM command_selections;",
-            )?;
-        }
-        while let Some(r) = rows.next()? {
-            let hostname: String = r.get(7)?;
-            let (host, user) = hostname.split_once(':').unwrap_or((&hostname, "unknown"));
-            let session = format!("atuin-{}", r.get::<_, String>(6)?);
-            let shell = r
-                .get::<_, Option<String>>(9)?
-                .filter(|s| !s.is_empty())
-                .unwrap_or("unknown".into());
-            tx.execute(
-                "INSERT OR IGNORE INTO sessions(id,user,host,shell) VALUES(?,?,?,?)",
-                rusqlite::params![session, user, host, shell],
-            )?;
-            let command: String = r.get(4)?;
-            let flags = smcli_core::parse::command_flags(&command).join(" ");
-            let duration: i64 = r.get(2)?;
-            count+=tx.execute("INSERT INTO commands(session,started_at,duration_ms,directory,command,exit_code,uuid,deleted_at,author,intent,flags) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(uuid) DO UPDATE SET deleted_at=excluded.deleted_at",rusqlite::params![session,r.get::<_,i64>(1)? as f64/1e9,if duration<0{None}else{Some(duration/1_000_000)},r.get::<_,String>(5)?,command,r.get::<_,i64>(3)?,r.get::<_,String>(0)?,r.get::<_,Option<i64>>(8)?.map(|n|n as f64/1e9),r.get::<_,Option<String>>(10)?,r.get::<_,Option<String>>(11)?,flags])?;
-        }
-    } else {
-        for line in std::fs::read_to_string(&source)?
-            .lines()
-            .filter(|l| !l.is_empty())
-        {
-            let r: serde_json::Value = serde_json::from_str(line)?;
-            let text = |key: &str| -> Result<&str> {
-                r[key]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("Missing {key} in legacy record"))
-            };
-            let user = text("user")?;
-            let shell = text("shell")?;
-            let session = format!("imported-{user}-{shell}");
-            let command = text("command")?;
-            let expanded = match r.get("expandedCommand") {
-                None | Some(serde_json::Value::Null) => None,
-                Some(serde_json::Value::String(text)) => Some(text.as_str()),
-                _ => bail!("Invalid expanded command."),
-            };
-            ensure!(expanded.is_none_or(|e| smcli_core::parse::safe_expansion(e) && e != command), "Invalid expanded command.");
-            let stamp = parse_iso8601(text("timestamp")?)
-                .ok_or_else(|| anyhow::anyhow!("Invalid timestamp"))?;
-            let directory = text("directory")?;
-            let exit_code = r["exitCode"].as_i64().ok_or_else(|| anyhow::anyhow!("Missing exitCode"))?;
-            if !capture_filter.allows_run(command, expanded, directory) { continue; }
-            tx.execute(
-                "INSERT OR IGNORE INTO sessions(id,user,host,shell) VALUES(?,?,'unknown',?)",
-                rusqlite::params![session, user, shell],
-            )?;
-            // Repeat imports must not double run counts: this import-only natural key skips a stored record.
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM commands WHERE session = ? AND started_at = ? AND command = ? AND directory = ? AND exit_code = ? AND expanded_command IS ?)",
-                rusqlite::params![session, stamp, command, directory, exit_code, expanded],
-                |r| r.get(0),
-            )?;
-            if !exists {
-                tx.execute("INSERT INTO commands(session,started_at,directory,command,exit_code,flags,expanded_command) VALUES(?,?,?,?,?,?,?)",rusqlite::params![session,stamp,directory,command,exit_code,smcli_core::parse::command_flags(expanded.unwrap_or(command)).join(" "),expanded])?;
-                count += 1;
-            }
-        }
-    }
-    tx.commit()?;
-    if replace {
-        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
-    }
+    let count = if atuin { c.import_atuin(&source, &capture_filter, replace)? }
+        else { c.import_legacy(&source, &capture_filter)? };
     println!("Imported {count} records into {}.", c.path.display());
     Ok(())
 }
@@ -921,12 +699,10 @@ fn files_kind(c: &CapturedHistory, env: &HashMap<String, String>) -> u8 {
     let Some(command) = smcli_core::parse::last_command_word(line, env.get("SMCLI_SHELL").map(String::as_str).unwrap_or("bash")) else { return 0 };
     let command = command.rsplit('/').next().unwrap_or(&command).to_string();
     if is_directory_command(&command) { return 1; }
-    let Some(db) = c.path.exists().then(|| c.open_connection().ok()).flatten() else { return 0 };
-    let Ok(mut stmt) = db.prepare("SELECT c.command, c.expanded_command, c.directory, s.shell FROM commands c JOIN sessions s ON s.id=c.session WHERE s.user=?1 ORDER BY c.started_at DESC,c.id DESC") else { return 0 };
-    let Ok(rows) = stmt.query_map(rusqlite::params![user_name()], |r| Ok((r.get::<_,String>(0)?, r.get::<_,Option<String>>(1)?, r.get::<_,String>(2)?, r.get::<_,String>(3)?))) else { return 0 };
-    files_majority(rows.flatten().filter(|(raw, _, _, _)| {
-        smcli_core::parse::program_of(raw, smcli_core::parse::CommandBreakdown::parse(raw).as_ref()).as_deref() == Some(&command)
-    }).map(|(raw, expanded, cwd, shell)| {
+    let Ok(rows) = c.file_kind_rows(&user_name(), 20, |raw| {
+        smcli_core::parse::program_of(raw, smcli_core::parse::CommandBreakdown::parse(raw).as_ref()).as_deref() == Some(command.as_str())
+    }) else { return 0 };
+    files_majority(rows.into_iter().map(|(raw, expanded, cwd, shell)| {
         let (mut dirs, mut files) = (0, 0);
         let command = expanded.as_deref().unwrap_or(&raw);
         for path in smcli_core::parse::path_arguments(command, &shell, |p| Path::new(&cwd).join(p).exists()) {
@@ -941,32 +717,6 @@ fn files_kind(c: &CapturedHistory, env: &HashMap<String, String>) -> u8 {
 fn files_majority(rows: impl IntoIterator<Item = (usize, usize)>) -> u8 {
     let (dirs, files) = rows.into_iter().take(20).fold((0, 0), |(d, f), (dirs, files)| (d + dirs, f + files));
     if dirs > files { 1 } else if files > dirs { 2 } else { 0 }
-}
-
-fn command_directory(c: &CapturedHistory, user: &str, command_key: &str) -> Option<String> {
-    if !c.path.exists() {
-        return None;
-    }
-    let db = c.open_connection().ok()?;
-    let mut stmt = db
-        .prepare(
-            "SELECT c.directory FROM commands c JOIN sessions s ON s.id = c.session
-             WHERE smcli_key(c.command, c.expanded_command) = ? AND s.user = ?
-             ORDER BY c.started_at DESC, c.id DESC LIMIT 1",
-        )
-        .ok()?;
-    stmt.query_row(rusqlite::params![command_key, user], |r| r.get::<_, String>(0))
-        .ok()
-}
-
-fn fallback_picker_recents(c: &CapturedHistory, user: &str) -> Result<Vec<String>> {
-    let db = c.open_connection()?;
-    let mut statement = db.prepare(
-        "SELECT DISTINCT smcli_key(c.command,c.expanded_command) FROM commands c JOIN sessions s ON s.id = c.session
-         WHERE s.user = ? AND c.deleted_at IS NULL AND NOT smcli_internal(COALESCE(c.expanded_command,c.command))
-         ORDER BY c.started_at DESC, c.id DESC",
-    )?;
-    Ok(statement.query_map([user], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1152,7 +902,7 @@ fn pick(
     let user = user_name();
     let recent = match served.and_then(|r| r.recent_entries) {
         Some(r) => r.into_iter().map(|entry| entry.key()).collect(),
-        None => fallback_picker_recents(c, &user)?,
+        None => c.recent_distinct(&user)?,
     };
     let native = smcli_search::native::history_files(home, env)?
         .iter()
@@ -1288,7 +1038,7 @@ fn pick(
                 let typed = crate::picker::history_insert(&command);
                 if edit_paths {
                     let shell = env.get("SMCLI_SHELL").map(String::as_str).unwrap_or("bash");
-                    let dir = command_directory(c, &user, &command).unwrap_or_else(|| d.clone());
+                    let dir = c.last_directory(&command, &user).unwrap_or_else(|| d.clone());
                     if let Some((rewritten, pos)) = smcli_core::parse::path_placeholders(&typed, shell, |path| {
                         std::path::Path::new(&dir).join(path).exists()
                     }) {
@@ -1457,13 +1207,6 @@ pub(crate) fn stop_service(service: &ServiceClient) -> bool {
         .is_some_and(|r| r.ok)
 }
 
-#[derive(serde::Serialize)]
-struct IndexInfo {
-    name: String,
-    bytes: u64,
-    current: bool,
-}
-
 /// History and command-example indexes next to the database; `prune` keeps only the current model's.
 fn indexes(captured: &CapturedHistory, home: &Path, env: &HashMap<String, String>, prune: bool, json: bool) -> Result<()> {
     let model = configured_model(home, env)?;
@@ -1474,39 +1217,9 @@ fn indexes(captured: &CapturedHistory, home: &Path, env: &HashMap<String, String
         let refs = smcli_search::commands::source_refs(&sources);
         smcli_search::commands::CommandIndex::reader(directory.clone(), model.clone(), &refs).index_name()
     });
-    let _lock = if prune { Some(lock_index_directory(&directory, 20)?.ok_or_else(|| anyhow::anyhow!("Search index is busy; try again."))?) } else { None };
-    if prune { smcli_search::index::remove_legacy_indexes(&directory)?; }
-    let mut found: std::collections::BTreeMap<String, IndexInfo> = Default::default();
-    let entries = match std::fs::read_dir(&directory) {
-        Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(e.into()),
-    };
-    for entry in &entries {
-        let filename = entry.file_name().to_string_lossy().into_owned();
-        // Index names hold no dots, so everything before the first one groups the index with its side files.
-        // Index names hold no dots, so everything before the first one groups the index with its side files.
-        // Old `tldr-*.vec` vector caches predate the command index; they are never current and prune deletes them.
-        let name = if filename.starts_with("rs-commands-") || filename.starts_with("rs-examples-") {
-            filename.split_once('.').map(|(name, _)| name.to_string())
-        } else if filename.starts_with("tldr-") && filename.ends_with(".vec") {
-            Some(filename.clone())
-        } else {
-            None
-        };
-        let Some(name) = name else { continue };
-        let is_current = if filename.starts_with("tldr-") {
-            false
-        } else {
-            name == current || name == format!("{current}-typed") || Some(&name) == command_current.as_ref()
-        };
-        let info = found.entry(name.clone()).or_insert_with(|| IndexInfo { name, bytes: 0, current: is_current });
-        info.bytes += entry.metadata()?.len();
-        if prune && !info.current {
-            std::fs::remove_file(entry.path())?;
-        }
-    }
-    let list: Vec<_> = found.into_values().collect();
+    let mut current_names = vec![current.clone(), format!("{current}-typed")];
+    current_names.extend(command_current);
+    let list = smcli_search::index::list_indexes(&directory, &current_names, prune)?;
     if json {
         return print_json(&list);
     }
@@ -1530,107 +1243,30 @@ fn index_health(
     env: &HashMap<String, String>,
     corpus: &HashMap<String, SearchEntry>,
 ) -> IndexHealth {
-    let mut report = IndexHealth {
-        path: format!("{}.search", captured.path.display()),
-        commands: corpus.len(),
-        ..Default::default()
+    let model = match configured_model(home, env) {
+        Ok(model) => model,
+        Err(error) => return IndexHealth {
+            path: format!("{}.search", captured.path.display()),
+            commands: corpus.len(),
+            problems: vec![format!("{error:#}")],
+            ..Default::default()
+        },
     };
-    let result = (|| -> Result<()> {
-        use std::collections::HashSet;
-        use std::os::unix::fs::MetadataExt;
-        let model = configured_model(home, env)?;
-        let index_dir = index_directory(captured);
-        let name = smcli_search::index_name(&model);
-        let command_current = smcli_search::commands::bundled_sources().map(|sources| {
-            let refs = smcli_search::commands::source_refs(&sources);
-            smcli_search::commands::CommandIndex::reader(index_dir.clone(), model.clone(), &refs).index_name()
-        });
-        report.embedder = format!("{} ({} dimensions), {}", smcli_search::Potion::NAME, model.dimension, model.identity);
-        let path = index_dir.join(format!("{name}.taladb"));
-        report.path = path.to_string_lossy().into_owned();
-        let directory = match std::fs::symlink_metadata(&index_dir) {
-            Ok(metadata) => metadata,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                report.missing = corpus.len();
-                return Ok(());
-            }
-            Err(e) => return Err(e.into()),
-        };
-        ensure!(
-            directory.is_dir()
-                && directory.uid() == unsafe { libc::getuid() }
-                && directory.mode() & 0o077 == 0,
-            "Search index must be a private directory owned by you (chmod 700): {}",
-            index_dir.display()
-        );
-        let mut latest = None;
-        for entry in std::fs::read_dir(&index_dir)? {
-            let entry = entry?;
-            let filename = entry.file_name().to_string_lossy().into_owned();
-            if (filename.starts_with("rs-commands-v") || filename.starts_with("rs-examples-"))
-                && filename.ends_with(".taladb")
-                && filename != format!("{name}.taladb")
-                && command_current.as_ref().is_none_or(|current| filename != format!("{current}.taladb"))
-            {
-                report.other_indexes.push(filename.clone());
-            }
-            if filename.starts_with(&format!("{name}.")) {
-                let info = std::fs::symlink_metadata(entry.path())?;
-                ensure!(
-                    info.is_file() && info.uid() == unsafe { libc::getuid() },
-                    "Index files must be regular files owned by you: {}",
-                    entry.path().display()
-                );
-                report.bytes += info.len();
-                if let Ok(time) = info.modified() {
-                    latest = Some(
-                        latest.map_or(time, |previous: std::time::SystemTime| previous.max(time)),
-                    );
-                }
-            }
-        }
-        report.other_indexes.sort();
-        report.last_updated = latest
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|t| format_iso8601(t.as_secs_f64(), false));
-        if !path.try_exists()? {
-            report.missing = corpus.len();
-            return Ok(());
-        }
-        report.built = true;
-        let _lock = lock_index_directory(&index_dir, 1)?
-            .ok_or_else(|| anyhow::anyhow!("Another smcli owns the index; check again when it finishes."))?;
-        // Never use HistorySearch::open_index here: it deletes unreadable caches instead of reporting them.
-        let db = taladb::open(&path)
-            .map_err(|e| anyhow::anyhow!("Index is unreadable ({e}); run `smcli reindex`."))?;
-        let rows = db
-            .collection("commands")?
-            .aggregate(vec![taladb::Stage::Project {
-                fields: vec!["doc".into()],
-                include: true,
-                keep_id: false,
-            }])?;
-        let indexed: HashSet<String> = rows
-            .iter()
-            .filter_map(|r| match r.get("doc") {
-                Some(taladb::Value::Str(doc)) => Some(doc.clone()),
-                _ => None,
-            })
-            .collect();
-        let expected: HashSet<String> = corpus
-            .values()
-            .map(|entry| smcli_search::corpus::search_document(entry, false))
-            .collect();
-        report.indexed = indexed.len();
-        report.missing = expected.difference(&indexed).count();
-        report.stale = indexed.difference(&expected).count();
-        Ok(())
-    })();
-    if let Err(error) = result {
-        report.problems.push(format!("{error:#}"));
+    let report = smcli_search::index::inspect(&index_directory(captured), &model, corpus);
+    IndexHealth {
+        embedder: format!("{} ({} dimensions), {}", smcli_search::Potion::NAME, model.dimension, model.identity),
+        path: report.path,
+        built: report.built,
+        indexed: report.indexed,
+        commands: report.commands,
+        missing: report.missing,
+        stale: report.stale,
+        bytes: report.bytes,
+        last_updated: report.last_updated,
+        other_indexes: report.other_indexes,
+        problems: report.problems,
+        healthy: report.healthy,
     }
-    report.healthy = report.problems.is_empty();
-    report
 }
 
 #[cfg(test)]
@@ -1676,17 +1312,64 @@ mod tests {
             for file in std::fs::read_dir(directory)? {
                 let path = file?.path();
                 if path.is_dir() { scan(&path)?; }
-                else if path.extension().is_some_and(|ext| ext == "rs") && path.file_name().unwrap() != "initialize.rs" {
+                else if path.extension().is_some_and(|ext| ext == "rs") {
                     let text = std::fs::read_to_string(&path)?;
                     let production = text.split("#[cfg(test)]").next().unwrap();
-                    for forbidden in ["search_engine(", "Potion::bundled(", "Potion::from_dir(", ".embed("] {
-                        assert!(!production.contains(forbidden), "{} loads the model via {forbidden}", path.display());
+                    for forbidden in ["rusqlite::", "taladb::"] {
+                        assert!(!production.contains(forbidden), "{} accesses storage via {forbidden}", path.display());
+                    }
+                    if path.file_name().unwrap() != "initialize.rs" {
+                        for forbidden in ["search_engine(", "Potion::bundled(", "Potion::from_dir(", ".embed("] {
+                            assert!(!production.contains(forbidden), "{} loads the model via {forbidden}", path.display());
+                        }
                     }
                 }
             }
             Ok(())
         }
         scan(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+    }
+
+    #[test]
+    fn smcli_has_no_storage_dependencies() {
+        let manifest = include_str!("../Cargo.toml");
+        let mut dependencies = false;
+        for line in manifest.lines().map(str::trim) {
+            if line.starts_with('[') { dependencies = line == "[dependencies]"; }
+            else if dependencies && let Some((name, _)) = line.split_once('=') {
+                assert!(!["rusqlite", "taladb"].contains(&name.trim()), "{name} must not be a production dependency");
+            }
+        }
+    }
+
+    #[test]
+    fn health_json_preserves_cli_fields_and_model_errors() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("smcli-health-output-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir)?;
+        let captured = CapturedHistory::new(dir.join("history.db"));
+        let env = HashMap::from([("SMCLI_CONFIG".into(), dir.join("config.json").to_string_lossy().into_owned())]);
+        let corpus = HashMap::from([("git status".into(), SearchEntry::new("git status", 1, "native"))]);
+        let report = serde_json::to_value(index_health(&captured, &dir, &env, &corpus))?;
+        assert_eq!(report["healthy"], true);
+        assert_eq!(report["built"], false);
+        assert_eq!(report["commands"], 1);
+        assert_eq!(report["missing"], 1);
+        assert_eq!(report["indexed"], 0);
+        assert_eq!(report["stale"], 0);
+        assert_eq!(report["bytes"], 0);
+        assert_eq!(report["otherIndexes"], serde_json::json!([]));
+        assert_eq!(report["problems"], serde_json::json!([]));
+        assert!(report.get("lastUpdated").is_none());
+        assert!(report["embedder"].as_str().unwrap().contains(smcli_search::Potion::NAME));
+        assert!(report["path"].as_str().unwrap().starts_with(index_directory(&captured).to_str().unwrap()));
+        assert!(!index_directory(&captured).exists());
+        std::fs::write(dir.join("config.json"), r#"{"potionPath":"/missing/smcli-model"}"#)?;
+        let failed = serde_json::to_value(index_health(&captured, &dir, &env, &corpus))?;
+        assert_eq!(failed["healthy"], false);
+        assert_eq!(failed["commands"], 1);
+        assert_eq!(failed["problems"].as_array().unwrap().len(), 1);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     fn tldr_entries() -> Vec<smcli_search::Entry> {
@@ -1926,193 +1609,6 @@ mod tests {
     }
 
     #[test]
-    fn fallback_history_picker_includes_oldest_distinct_capture() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("smcli-fallback-history-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir)?;
-        let c = CapturedHistory::new(dir.join("history.db"));
-        for n in 0..52 {
-            let command = format!("command-{n:02}");
-            let mut run = NewRun::new(&command, "zsh", "/tmp", 0);
-            run.started_at = Some(1_700_000_000.0 + n as f64);
-            c.append(&run, "", None)?;
-        }
-        let recent = fallback_picker_recents(&c, &user_name())?;
-        assert!(recent.iter().any(|key| smcli_core::entry::command_parts(key).0 == "command-00"));
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
-    fn atuin_import_deduplicates_and_replace_is_atomic() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("smcli-atuin-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir)?;
-        let source = dir.join("atuin.db");
-        let db = rusqlite::Connection::open(&source)?;
-        db.execute_batch("CREATE TABLE history(id TEXT,timestamp INTEGER,duration INTEGER,exit INTEGER,command TEXT,cwd TEXT,session TEXT,hostname TEXT,deleted_at INTEGER); INSERT INTO history VALUES('atuin-id',1700000000000000000,1000000000,0,'git status','/tmp','session','host:user',NULL);")?;
-        let c = CapturedHistory::new(dir.join("history.db"));
-        for _ in 0..2 {
-            import(&c, &dir, &HashMap::new(), true, false, Some(source.clone()))?;
-        }
-        let rows = records(&c)?;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["durationMs"], 1000);
-        assert_eq!(rows[0]["user"], "user");
-        db.execute("UPDATE history SET deleted_at=1700000001 WHERE id='atuin-id'", [])?;
-        import(&c, &dir, &HashMap::new(), true, false, Some(source.clone()))?;
-        assert!(records(&c)?.is_empty());
-        db.execute("UPDATE history SET deleted_at=NULL WHERE id='atuin-id'", [])?;
-        import(&c, &dir, &HashMap::new(), true, false, Some(source.clone()))?;
-        assert_eq!(records(&c)?.len(), 1);
-        import(&c, &dir, &HashMap::new(), true, true, Some(source))?;
-        assert_eq!(records(&c)?.len(), 1);
-        drop(db);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
-    fn health_checks_coverage_without_rebuilding() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("smcli-health-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir)?;
-        let captured = CapturedHistory::new(dir.join("history.db"));
-        let env = HashMap::from([(
-            "SMCLI_CONFIG".into(),
-            dir.join("config.json").to_string_lossy().into_owned(),
-        )]);
-        let corpus = HashMap::from([(
-            "git status".into(),
-            SearchEntry::new("git status", 1, "native"),
-        )]);
-        let missing = index_health(&captured, &dir, &env, &corpus);
-        assert!(missing.healthy && !missing.built);
-        assert_eq!(missing.missing, 1);
-        assert!(!Path::new(&missing.path).exists());
-        let model = dir.join("model");
-        std::fs::create_dir(&model)?;
-        let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Models/potion-shell-16m");
-        for file in ["config.json", "tokenizer.json", "model.safetensors"] { std::fs::copy(bundled.join(file), model.join(file))?; }
-        SmcliConfig { potion_path: Some(model.to_string_lossy().into_owned()), ..Default::default() }
-            .save(&dir.join("config.json"))?;
-        let engine = search_engine(&captured, &dir, &env)?;
-        engine.reindex(&corpus)?;
-        let weights = std::fs::read(model.join("model.safetensors"))?;
-        let length = u64::from_le_bytes(weights[..8].try_into().unwrap()) as usize;
-        std::fs::write(model.join("model.safetensors"), &weights[..8 + length])?;
-        assert!(smcli_search::Potion::from_dir(&model).is_err(), "health must work with header-only weights");
-        let header_model = configured_model(&dir, &env)?;
-        assert_ne!(header_model, engine.potion.model_id(), "truncating weights changes content identity");
-        assert!(!index_health(&captured, &dir, &env, &corpus).built);
-        // Keep the coverage fixture under the header-only model's content-derived name.
-        std::fs::rename(engine.directory.join(format!("{}.taladb", engine.index_name())),
-            engine.directory.join(format!("{}.taladb", smcli_search::index_name(&header_model))))?;
-        let built = index_health(&captured, &dir, &env, &corpus);
-        assert!(built.healthy, "{:?}", built.problems);
-        assert!(built.built);
-        assert_eq!(built.indexed, 1);
-        assert_eq!(built.missing, 0);
-        assert_eq!(
-            index_health(&captured, &dir, &env, &HashMap::new()).stale,
-            1
-        );
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(engine.directory.join("lock"))?;
-        lock.lock()?;
-        assert!(!index_health(&captured, &dir, &env, &corpus).healthy);
-        drop(lock);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
-    fn indexes_prune_respects_lock_and_keeps_current_typed() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("smcli-index-lock-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir)?;
-        let captured = CapturedHistory::new(dir.join("history.db"));
-        let engine = search_engine(&captured, &dir, &HashMap::new())?;
-        let lock = engine.lock_index(1)?.unwrap();
-        let normal = engine.directory.join(format!("{}.db", engine.index_name()));
-        let typed = engine.directory.join(format!("{}-typed.db", engine.index_name()));
-        let old = engine.directory.join("rs-commands-v1-old.db");
-        let old_tldr = engine.directory.join("tldr-old.vec");
-        let sources = smcli_search::commands::bundled_sources().unwrap();
-        let refs = smcli_search::commands::source_refs(&sources);
-        let commands = smcli_search::commands::CommandIndex::reader(&engine.directory, engine.potion.model_id(), &refs).path();
-        let other_commands = engine.directory.join("rs-examples-v1-potion-shell-16m-othermodel-test@1-d256.taladb");
-        let legacy_commands = engine.directory.join("rs-commands-potion-shell-16m-bundled-old.taladb");
-        for path in [&normal, &typed, &old, &old_tldr, &commands, &other_commands, &legacy_commands] { std::fs::write(path, b"index")?; }
-        let c = captured.clone();
-        let home = dir.clone();
-        let attempt = std::thread::spawn(move || indexes(&c, &home, &HashMap::new(), true, false));
-        assert!(attempt.join().unwrap().is_err());
-        assert!(old.exists());
-        drop(lock);
-        indexes(&captured, &dir, &HashMap::new(), true, false)?;
-        assert!(normal.exists() && typed.exists() && commands.exists());
-        assert!(!old.exists() && !old_tldr.exists() && !other_commands.exists() && !legacy_commands.exists());
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
-    fn prune_cleanup_runs_when_database_compaction_fails() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("smcli-prune-maintenance-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir)?;
-        let captured = CapturedHistory::new(dir.join("history.db"));
-        let db = captured.open_connection()?;
-        let index = index_directory(&captured);
-        drop(smcli_search::index::lock_index_directory(&index, 1)?);
-        let stale = index.join("rs-commands-v1-old");
-        std::fs::write(&stale, b"secret-cmd")?;
-        db.execute_batch("BEGIN; INSERT INTO sessions(id,user,host,shell) VALUES('s','test','host','bash');")?;
-        let error = finish_prune(&db, &index).unwrap_err().to_string();
-        assert!(error.contains("database compaction failed"), "{error}");
-        assert!(!stale.exists(), "stale index must be removed despite compaction failure");
-        let error = finish_prune(&db, &dir.join("missing")).unwrap_err().to_string();
-        assert!(error.contains("index cleanup failed") && error.contains("database compaction failed"), "{error}");
-        db.execute_batch("ROLLBACK")?;
-        drop(db);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
-    fn prune_removes_index_directories_without_loading_model() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("smcli-prune-no-model-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir)?;
-        let captured = CapturedHistory::new(dir.join("history.db"));
-        let db = captured.open_connection()?;
-        db.execute_batch("INSERT INTO sessions(id,user,host,shell) VALUES('s','test','unknown','zsh');
-            INSERT INTO commands(session,started_at,directory,command,exit_code) VALUES('s',1,'/tmp','secret-cmd',0);")?;
-        drop(db);
-        let config = dir.join("config.json");
-        std::fs::write(&config, format!("{{\"potionPath\":\"{}\"}}", dir.join("missing-model").display()))?;
-        let env = HashMap::from([("SMCLI_CONFIG".into(), config.to_string_lossy().into_owned())]);
-        assert!(search_engine(&captured, &dir, &env).is_err());
-        let index = index_directory(&captured);
-        drop(smcli_search::index::lock_index_directory(&index, 1)?);
-        let old = index.join("rs-commands-v1-old");
-        std::fs::create_dir(&old)?;
-        std::fs::write(old.join("secret"), b"secret-cmd")?;
-        let command_examples = index.join("rs-examples-v1-potion-shell-16m-test-stub@1-d256.taladb");
-        std::fs::write(&command_examples, b"command examples")?;
-        let outside = dir.join("outside");
-        std::fs::create_dir(&outside)?;
-        std::fs::write(outside.join("keep"), b"keep")?;
-        std::os::unix::fs::symlink(&outside, index.join("rs-commands-v1-link"))?;
-        let filter = CaptureFilter::new(&SmcliConfig { history_filter: Some(vec!["^secret".into()]), ..Default::default() })?;
-        prune(&captured, &filter, false)?;
-        assert!(!old.exists());
-        assert!(!index.join("rs-commands-v1-link").exists());
-        assert!(command_examples.exists(), "history prune must leave command examples alone");
-        assert!(outside.join("keep").exists());
-        assert_eq!(captured.open_connection()?.query_row("SELECT count(*) FROM commands", [], |r| r.get::<_, i64>(0))?, 0);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
     fn prune_waits_for_search_with_pre_prune_corpus() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("smcli-prune-race-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir)?;
@@ -2142,173 +1638,4 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn prune_keeps_clean_selections_of_allowed_commands() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("smcli-prune-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir)?;
-        let c = CapturedHistory::new(dir.join("history.db"));
-        let db = c.open_connection()?;
-        db.execute_batch(
-            "INSERT INTO sessions(id,user,host,shell) VALUES('s','test','unknown','zsh');
-             INSERT INTO commands(session,started_at,directory,command,exit_code) VALUES
-               ('s',1700000000.0,'/tmp','git push',0),
-               ('s',1700000001.0,'/tmp','secret-cmd',0);
-             INSERT INTO file_selections(root,path,mode,query,selected_at) VALUES('/tmp','secret.txt','files','secret query',1700000005.0);
-             INSERT INTO command_selections(query,command,kind,directory,selected_at) VALUES
-               ('AKIAABCDEFGHIJKLMNOP','git push','search','/tmp',1700000002.0),
-               ('push','git push','search','/tmp',1700000003.0),
-               ('push','secret-cmd','search','/tmp',1700000004.0);",
-        )?;
-        drop(db);
-        let filter = CaptureFilter::new(&SmcliConfig {
-            history_filter: Some(vec!["^secret".into()]),
-            ..Default::default()
-        })?;
-        prune(&c, &filter, false)?;
-        let db = c.open_connection()?;
-        let commands: Vec<String> = db
-            .prepare("SELECT command FROM commands ORDER BY id")?
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        assert_eq!(commands, ["git push"]);
-        let selections: Vec<String> = db
-            .prepare("SELECT query FROM command_selections ORDER BY id")?
-            .query_map([], |r| r.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        assert_eq!(selections, ["push"]);
-        assert_eq!(db.query_row("SELECT count(*) FROM file_selections", [], |r| r.get::<_, i64>(0))?, 0);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
-    fn prune_removes_blank_query_file_selections_in_excluded_directories() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("smcli-prune-blank-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir)?;
-        let c = CapturedHistory::new(dir.join("history.db"));
-        let db = c.open_connection()?;
-        db.execute_batch(
-            "INSERT INTO file_selections(root,path,mode,query,selected_at) VALUES('/private','private.txt','files','',1700000005.0)",
-        )?;
-        drop(db);
-        let filter = CaptureFilter::new(&SmcliConfig {
-            cwd_filter: Some(vec!["/private".into()]),
-            ..Default::default()
-        })?;
-        prune(&c, &filter, false)?;
-        let db = c.open_connection()?;
-        assert_eq!(db.query_row("SELECT count(*) FROM file_selections", [], |r| r.get::<_, i64>(0))?, 0);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_import_applies_filters_without_expanded_command() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("smcli-legacy-filter-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join(".config/smcli"))?;
-        std::fs::write(
-            dir.join(".config/smcli/config.json"),
-            r#"{"historyFilter":["^secret"]}"#,
-        )?;
-        let c = CapturedHistory::new(dir.join("history.db"));
-        let source = dir.join("legacy.jsonl");
-        let plain = serde_json::json!({"timestamp":"2024-01-01T00:00:00Z","user":"test","shell":"zsh","command":"secret data","directory":"/tmp","exitCode":0});
-        let expanded = serde_json::json!({"timestamp":"2024-01-01T00:00:01Z","user":"test","shell":"zsh","command":"sd","expandedCommand":"secret data","directory":"/tmp","exitCode":0});
-        let allowed = serde_json::json!({"timestamp":"2024-01-01T00:00:02Z","user":"test","shell":"zsh","command":"git status","directory":"/tmp","exitCode":0});
-        std::fs::write(&source, format!("{plain}\n{expanded}\n{allowed}\n"))?;
-        import(&c, &dir, &HashMap::new(), false, false, Some(source))?;
-        let rows = records(&c)?;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["command"], "git status");
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
-    fn alias_export_import_and_prune_keep_variant_identity() -> Result<()> {
-        let root = std::env::temp_dir().join(format!("smcli-alias-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&root)?;
-        let home = root.as_path();
-        let source = CapturedHistory::new(home.join("source.db"));
-        for expanded in ["git log", "git ls-files"] {
-            let mut run = NewRun::new("gl", "zsh", "/repo", 0);
-            run.expanded_command = Some(expanded);
-            run.started_at = Some(1_700_000_000.0);
-            source.append(&run, "", None)?;
-        }
-        let exported = records(&source)?;
-        assert!(exported.iter().all(|r| r["runCount"] == 1));
-        let jsonl = home.join("export.jsonl");
-        std::fs::write(&jsonl, exported.iter().map(|r| format!("{r}\n")).collect::<String>())?;
-        let target = CapturedHistory::new(home.join("target.db"));
-        let env = HashMap::from([("HISTFILE".into(), String::new())]);
-        import(&target, home, &env, false, false, Some(jsonl.clone()))?;
-        import(&target, home, &env, false, false, Some(jsonl))?;
-        assert_eq!(records(&target)?.len(), 2);
-        let db = target.open_connection()?;
-        let filter = CaptureFilter::new(&SmcliConfig { history_filter: Some(vec!["ls-files".into()]), ..Default::default() })?;
-        target.record_pick("gl", &smcli_core::entry::command_key("gl", Some("git log")), "search", "/repo", &CaptureFilter::standard(), now(), &db)?;
-        target.record_pick("gl", &smcli_core::entry::command_key("gl", Some("git ls-files")), "search", "/repo", &CaptureFilter::standard(), now(), &db)?;
-        prune(&target, &filter, false)?;
-        let kept = records(&target)?;
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0]["expandedCommand"], "git log");
-        assert_eq!(db.query_row("SELECT count(*) FROM command_selections", [], |r| r.get::<_, i64>(0))?, 1);
-        drop(db);
-        std::fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn legacy_import_is_idempotent() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("smcli-legacy-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir)?;
-        let c = CapturedHistory::new(dir.join("history.db"));
-        let source = dir.join("legacy.jsonl");
-        let record = serde_json::json!({"timestamp":"2024-01-01T00:00:00Z","user":"test","shell":"zsh","command":"git status","directory":"/tmp","exitCode":0}).to_string();
-        std::fs::write(&source, record)?;
-        for _ in 0..2 {
-            import(&c, &dir, &HashMap::new(), false, false, Some(source.clone()))?;
-        }
-        let rows = records(&c)?;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["runCount"], 1);
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
-
-    #[test]
-    fn imports_are_atomic_and_pruning_honors_dry_run() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("smcli-cli-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir)?;
-        let c = CapturedHistory::new(dir.join("history.db"));
-        let source = dir.join("legacy.jsonl");
-        let good = serde_json::json!({"timestamp":"2024-01-01T00:00:00Z","user":"test","shell":"zsh","command":"secret-test","directory":"/tmp","exitCode":0}).to_string();
-        std::fs::write(&source, format!("{good}\ninvalid\n"))?;
-        assert!(
-            import(
-                &c,
-                &dir,
-                &HashMap::new(),
-                false,
-                false,
-                Some(source.clone())
-            )
-            .is_err()
-        );
-        assert!(records(&c)?.is_empty());
-        std::fs::write(&source, good)?;
-        import(&c, &dir, &HashMap::new(), false, false, Some(source))?;
-        assert_eq!(records(&c)?.len(), 1);
-        let filter = CaptureFilter::new(&SmcliConfig {
-            history_filter: Some(vec!["^secret".into()]),
-            ..Default::default()
-        })?;
-        prune(&c, &filter, true)?;
-        assert_eq!(records(&c)?.len(), 1);
-        prune(&c, &filter, false)?;
-        assert!(records(&c)?.is_empty());
-        std::fs::remove_dir_all(dir)?;
-        Ok(())
-    }
 }

@@ -2,7 +2,7 @@
 
 ## Overview
 
-`smcli-core` shares captured-history SQLite, capture filtering, parsing, ranking, service protocol and socket transport between both executables. Captured-history writes use `history.rs:CapturedHistory`; configuration writes use `config.rs:SmcliConfig::save`. The crate does not link fff-search.
+`smcli-core` shares captured-history SQLite, capture filtering, parsing, ranking, service protocol and socket transport between both executables. Captured-history storage APIs use `history.rs:CapturedHistory`, with import and prune implementations in `import.rs` and `prune.rs`; configuration writes use `config.rs:SmcliConfig::save`. The crate does not link fff-search.
 
 ## Interface
 
@@ -13,7 +13,10 @@
 - `context_cache::GitStatus::{clean, parse, read, run_git}`; `context_cache::ContextCache::{new, context, invalidate}`.
 - `entry::{command_key, command_parts, trim_slash}`; `entry::SearchEntry::{new, from_key, key, primary, secondary, program, subcommand, last_run_epoch}`; `service_protocol::Suggestion::key` (implemented in `entry.rs`); `entry::SearchFilter::{merge_parsed, is_empty, allows}`.
 - `history::{USAGE_HALF_LIFE, INTERRUPTED_EXIT_CODES, VERSION, answers_with_exit_code, user_name, parse_pipestatus, is_timestamp, is_event_id}`.
-- `history::{CommandStats, Run, NewRun}`; `history::CapturedHistory::{new, location, open_connection, append, check_separate, record_selection, selection_scores, record_pick, picks, picker_recents, previous_command, followers, runs, command_stats, suggestions}`.
+- `history::{CommandStats, Run, NewRun}`; `history::CapturedHistory::{new, location, open_connection, append, check_separate, record_selection, selection_scores, record_pick, picks, picker_recents, previous_command, followers, runs, command_stats, suggestions, export_rows, file_kind_rows, last_directory, recent_distinct}`.
+- `file_kind_rows(user, limit, keep)` returns newest-first rows and stops after `limit` rows `keep` accepts, so a picker majority does not scan the rest of the table.
+- `import.rs` implements `CapturedHistory::import_atuin(source, filter, replace)` and `import_legacy(source, filter)`, returning imported row counts. Legacy imports apply capture filters; Atuin imports retain UUID/tombstone behavior without filtering.
+- `prune.rs` implements `CapturedHistory::prune(filter, dry, cleanup)` and exposes `PruneReport { database_exists, commands, removed_commands, removed_selections, backup }` and `PruneError`. `commands` contains typed commands for dry-run display; `backup` is a `.v7.bak` path whose possible retained history needs a caller warning. A post-commit cleanup or compaction failure returns `PruneError` with the same counts and backup, so the caller can warn before returning the combined maintenance error.
 - `parse::{CommandFlag, CommandBreakdown}`; `parse::{command_flags, shell_words, safe_expansion, is_smcli_command, program_of, glob_match, path_placeholders, path_arguments, last_command_word}`.
 - `ranking::{Signal, CandidateKind, Candidate, Pick, SelectionLog}`; `ranking::RankingContext::{new, disabled, uses, in_project, kind, same_kind, candidates_of}`; `ranking::{uses, candidates, apply_ranking_signals, has_prefix, suggestion_why}`.
 - `service_client::ServiceClient::{new, socket, send}`.
@@ -28,7 +31,8 @@ Subdirectories: none (this is the leaf module directory; `../tests/` holds integ
 
 ## Invariants
 
-- Native shell history is never rewritten; database access belongs to `history.rs:CapturedHistory`; config writes belong to `config.rs:SmcliConfig::save`.
+- Imports validate that source and destination paths differ and commit all rows atomically; Atuin replacement deletes are part of that transaction. Native shell history is never rewritten; database access belongs to `history.rs:CapturedHistory`; config writes belong to `config.rs:SmcliConfig::save`.
+- Prune callers hold the search-index lock and supply index cleanup. Core commits deletes, invokes cleanup, then attempts checkpoint/VACUUM even if cleanup fails, preserving combined errors on `PruneError` together with the backup warning. Dry runs roll back without cleanup; core never opens or deletes index files.
 - Database file must be a regular file, owned by the current uid, no group/other permission bits (created `0600`), not a symlink (`history.rs::CapturedHistory::connect`).
 - `SMCLI_DB` must not be the shell's native `HISTFILE`, by path or hard link (`history.rs::CapturedHistory::check_separate`).
 - Storage includes `sessions` and `commands` (UUID deduplication, soft deletion, pipeline statuses and captured alias expansion), plus explicit `file_selections` and `command_selections` (`history.rs::SCHEMA_V1`, `MIGRATION_TO_V2/V5/V6/V7/V8`). Schema is versioned (`history.rs::VERSION == 8`); a newer `user_version` is rejected, version `4` is discarded to `3`, and a `.v7.bak` backup is taken before the v8 migration (`history.rs::backup_before_v8`).

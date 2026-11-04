@@ -523,6 +523,170 @@ impl HistorySearch {
     }
 }
 
+/// Model-free health facts; CLI presentation and serialization stay with the caller.
+#[derive(Debug, Default)]
+pub struct IndexReport {
+    pub path: String,
+    pub built: bool,
+    pub indexed: usize,
+    pub commands: usize,
+    pub missing: usize,
+    pub stale: usize,
+    pub bytes: u64,
+    pub last_updated: Option<String>,
+    pub other_indexes: Vec<String>,
+    pub problems: Vec<String>,
+    pub healthy: bool,
+}
+
+/// Inspect coverage without repairing or rebuilding a cache. Unreadable caches are reported, never deleted.
+pub fn inspect(directory: &Path, model: &crate::ModelId, corpus: &HashMap<String, SearchEntry>) -> IndexReport {
+    let mut report = IndexReport { commands: corpus.len(), ..Default::default() };
+    let result = (|| -> Result<()> {
+        let index_dir = directory;
+        let name = index_name(model);
+        let command_current = crate::commands::bundled_sources().map(|sources| {
+            let refs = crate::commands::source_refs(&sources);
+            crate::commands::CommandIndex::reader(index_dir, model.clone(), &refs).index_name()
+        });
+        let path = index_dir.join(format!("{name}.taladb"));
+        report.path = path.to_string_lossy().into_owned();
+        let directory = match std::fs::symlink_metadata(&index_dir) {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                report.missing = corpus.len();
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        anyhow::ensure!(
+            directory.is_dir()
+                && directory.uid() == unsafe { libc::getuid() }
+                && directory.mode() & 0o077 == 0,
+            "Search index must be a private directory owned by you (chmod 700): {}",
+            index_dir.display()
+        );
+        let mut latest = None;
+        for entry in std::fs::read_dir(&index_dir)? {
+            let entry = entry?;
+            let filename = entry.file_name().to_string_lossy().into_owned();
+            if (filename.starts_with("rs-commands-v") || filename.starts_with("rs-examples-"))
+                && filename.ends_with(".taladb")
+                && filename != format!("{name}.taladb")
+                && command_current.as_ref().is_none_or(|current| filename != format!("{current}.taladb"))
+            {
+                report.other_indexes.push(filename.clone());
+            }
+            if filename.starts_with(&format!("{name}.")) {
+                let info = std::fs::symlink_metadata(entry.path())?;
+                anyhow::ensure!(
+                    info.is_file() && info.uid() == unsafe { libc::getuid() },
+                    "Index files must be regular files owned by you: {}",
+                    entry.path().display()
+                );
+                report.bytes += info.len();
+                if let Ok(time) = info.modified() {
+                    latest = Some(
+                        latest.map_or(time, |previous: std::time::SystemTime| previous.max(time)),
+                    );
+                }
+            }
+        }
+        report.other_indexes.sort();
+        report.last_updated = latest
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|t| smcli_core::time::format_iso8601(t.as_secs_f64(), false));
+        if !path.try_exists()? {
+            report.missing = corpus.len();
+            return Ok(());
+        }
+        report.built = true;
+        let _lock = lock_index_directory(&index_dir, 1)?
+            .ok_or_else(|| anyhow::anyhow!("Another smcli owns the index; check again when it finishes."))?;
+        // Never use HistorySearch::open_index here: it deletes unreadable caches instead of reporting them.
+        let db = taladb::open(&path)
+            .map_err(|e| anyhow::anyhow!("Index is unreadable ({e}); run `smcli reindex`."))?;
+        let rows = db
+            .collection("commands")?
+            .aggregate(vec![taladb::Stage::Project {
+                fields: vec!["doc".into()],
+                include: true,
+                keep_id: false,
+            }])?;
+        let indexed: HashSet<String> = rows
+            .iter()
+            .filter_map(|r| match r.get("doc") {
+                Some(taladb::Value::Str(doc)) => Some(doc.clone()),
+                _ => None,
+            })
+            .collect();
+        let expected: HashSet<String> = corpus
+            .values()
+            .map(|entry| search_document(entry, false))
+            .collect();
+        report.indexed = indexed.len();
+        report.missing = expected.difference(&indexed).count();
+        report.stale = indexed.difference(&expected).count();
+        Ok(())
+    })();
+    if let Err(error) = result {
+        report.problems.push(format!("{error:#}"));
+    }
+    report.healthy = report.problems.is_empty();
+    report
+}
+
+#[derive(Debug, Serialize)]
+pub struct IndexInfo {
+    pub name: String,
+    pub bytes: u64,
+    pub current: bool,
+}
+
+/// List recognized caches by name, optionally pruning all but the supplied current names.
+/// Include the typed-history and command-example names in `current_names` to retain them too.
+pub fn list_indexes(directory: &Path, current_names: &[String], prune: bool) -> Result<Vec<IndexInfo>> {
+    let _lock = if prune { Some(lock_index_directory(directory, 20)?
+        .ok_or_else(|| anyhow::anyhow!("Search index is busy; try again."))?) } else { None };
+    if prune { remove_legacy_indexes(directory)?; }
+    let mut found: std::collections::BTreeMap<String, IndexInfo> = Default::default();
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let filename = entry.file_name().to_string_lossy().into_owned();
+        // Index names have no dots; the first dot separates every sidecar from its index name.
+        let name = if filename.starts_with("rs-commands-") || filename.starts_with("rs-examples-") {
+            filename.split_once('.').map(|(name, _)| name.to_string())
+        } else if filename.starts_with("tldr-") && filename.ends_with(".vec") {
+            Some(filename.clone())
+        } else {
+            None
+        };
+        let Some(name) = name else { continue };
+        let current = !filename.starts_with("tldr-") && current_names.contains(&name);
+        let info = found.entry(name.clone()).or_insert_with(|| IndexInfo { name, bytes: 0, current });
+        info.bytes += entry.metadata()?.len();
+        if prune && !info.current { std::fs::remove_file(entry.path())?; }
+    }
+    Ok(found.into_values().collect())
+}
+
+/// Remove history caches after pruning rows, leaving command examples and unrelated files alone.
+/// The caller holds the directory writer lock across the history prune and this cleanup.
+pub fn remove_history_indexes(directory: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with("rs-commands-v") {
+            if entry.file_type()?.is_dir() { std::fs::remove_dir_all(entry.path())?; }
+            else { std::fs::remove_file(entry.path())?; }
+        }
+    }
+    Ok(())
+}
+
 /// Remove unversioned command-example caches without touching any history index.
 pub fn remove_legacy_indexes(directory: &Path) -> Result<()> {
     remove_indexes_matching(directory, |name| name.starts_with("rs-commands-potion-shell-16m-"))
@@ -758,6 +922,155 @@ fn merge_expansion(hits: &mut Vec<Hit>, entry: &SearchEntry, score: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn report_model() -> crate::ModelId {
+        crate::ModelId { identity: "report-fixture".into(), dimension: 2 }
+    }
+
+    #[test]
+    fn health_checks_coverage_without_rebuilding() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let directory = root.path().join("index");
+        let model = report_model();
+        let corpus = HashMap::from([("git status".into(), SearchEntry::new("git status", 1, "native"))]);
+        let missing = inspect(&directory, &model, &corpus);
+        assert!(missing.healthy && !missing.built);
+        assert_eq!(missing.commands, 1);
+        assert_eq!(missing.missing, 1);
+        assert!(!directory.exists(), "inspection must not create a cache directory");
+        drop(lock_index_directory(&directory, 1)?);
+        let name = index_name(&model);
+        let path = directory.join(format!("{name}.taladb"));
+        let db = taladb::open(&path)?;
+        let entry = corpus.values().next().unwrap();
+        db.typed::<IndexedCommand>("commands")?.insert_many(&[IndexedCommand::new(entry, search_document(entry, false))])?;
+        drop(db);
+        let sidecar = directory.join(format!("{name}.sidecar"));
+        std::fs::write(&sidecar, b"sidecar")?;
+        let other_history = "rs-commands-v4-potion-othermodel-d2.taladb";
+        let other_commands = "rs-examples-v1-potion-shell-16m-othermodel-stub@1-d2.taladb";
+        for filename in [other_history, other_commands] { std::fs::write(directory.join(filename), b"other")?; }
+        let sources = crate::commands::bundled_sources().unwrap();
+        let refs = crate::commands::source_refs(&sources);
+        let commands = crate::commands::CommandIndex::reader(&directory, model.clone(), &refs).path();
+        std::fs::write(&commands, b"current examples")?;
+        let bytes_before_inspection = path.metadata()?.len() + sidecar.metadata()?.len();
+        let built = inspect(&directory, &model, &corpus);
+        assert!(built.healthy && built.built, "{:?}", built.problems);
+        assert_eq!(built.path, path.to_string_lossy());
+        assert_eq!((built.indexed, built.missing, built.stale), (1, 0, 0));
+        assert_eq!(built.bytes, bytes_before_inspection);
+        assert!(built.last_updated.is_some());
+        assert_eq!(built.other_indexes, [other_history, other_commands]);
+        assert_eq!(inspect(&directory, &model, &HashMap::new()).stale, 1);
+        let enlarged = HashMap::from([
+            ("git status".into(), entry.clone()),
+            ("git log".into(), SearchEntry::new("git log", 1, "native")),
+        ]);
+        assert_eq!(inspect(&directory, &model, &enlarged).missing, 1);
+        let lock = lock_index_directory(&directory, 1)?.unwrap();
+        let busy = inspect(&directory, &model, &corpus);
+        assert!(!busy.healthy);
+        assert_eq!(busy.problems, ["Another smcli owns the index; check again when it finishes."]);
+        drop(lock);
+        std::fs::write(&path, b"broken cache")?;
+        let broken = inspect(&directory, &model, &corpus);
+        assert!(!broken.healthy && broken.built);
+        assert!(broken.problems[0].contains("Index is unreadable"));
+        assert_eq!(std::fs::read(&path)?, b"broken cache", "inspection must not repair a corrupt cache");
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_checks_private_directory_and_regular_owned_files() -> Result<()> {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = tempfile::tempdir()?;
+        let directory = root.path().join("index");
+        let model = report_model();
+        drop(lock_index_directory(&directory, 1)?);
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))?;
+        let public = inspect(&directory, &model, &HashMap::new());
+        assert!(!public.healthy && public.problems[0].contains("private directory owned by you"));
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+        let outside = root.path().join("outside");
+        std::fs::write(&outside, b"keep")?;
+        let path = directory.join(format!("{}.taladb", index_name(&model)));
+        symlink(&outside, &path)?;
+        let linked = inspect(&directory, &model, &HashMap::new());
+        assert!(!linked.healthy && linked.problems[0].contains("regular files owned by you"));
+        assert_eq!(std::fs::read(&outside)?, b"keep");
+        let link_dir = root.path().join("linked-index");
+        symlink(&directory, &link_dir)?;
+        assert!(!inspect(&link_dir, &model, &HashMap::new()).healthy);
+        Ok(())
+    }
+
+    #[test]
+    fn indexes_prune_respects_lock_and_keeps_current_typed() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let directory = root.path().join("index");
+        let model = report_model();
+        let name = index_name(&model);
+        let typed = format!("{name}-typed");
+        let examples = crate::commands::CommandIndex::reader(&directory, model, &[]).index_name();
+        let current = vec![name.clone(), typed.clone(), examples.clone()];
+        assert!(list_indexes(&directory, &current, false)?.is_empty());
+        assert!(!directory.exists());
+        let lock = lock_index_directory(&directory, 1)?.unwrap();
+        let normal = directory.join(format!("{name}.taladb"));
+        let sidecar = directory.join(format!("{name}.sidecar"));
+        let typed_path = directory.join(format!("{typed}.taladb"));
+        let command_path = directory.join(format!("{examples}.taladb"));
+        let old = directory.join("rs-commands-v3-old.taladb");
+        let old_tldr = directory.join("tldr-old.vec");
+        let other_commands = directory.join("rs-examples-v1-potion-othermodel-stub@1-d2.taladb");
+        let legacy_commands = directory.join("rs-commands-potion-shell-16m-bundled-old.taladb");
+        let unrelated = directory.join("keep.txt");
+        for path in [&normal, &sidecar, &typed_path, &command_path, &old, &old_tldr, &other_commands, &legacy_commands, &unrelated] {
+            std::fs::write(path, b"index")?;
+        }
+        let listed = list_indexes(&directory, &current, false)?;
+        assert_eq!(listed.iter().find(|info| info.name == name).unwrap().bytes, 10);
+        assert_eq!(listed.iter().filter(|info| info.current).count(), 3);
+        assert!(listed.windows(2).all(|pair| pair[0].name < pair[1].name));
+        assert!(list_indexes(&directory, &current, true).is_err());
+        assert!(old.exists() && legacy_commands.exists());
+        drop(lock);
+        let pruned = list_indexes(&directory, &current, true)?;
+        assert!(pruned.iter().any(|info| info.name == "rs-commands-v3-old" && !info.current));
+        assert!(!pruned.iter().any(|info| info.name.starts_with("rs-commands-potion-shell-16m-")));
+        for path in [&normal, &sidecar, &typed_path, &command_path, &unrelated] { assert!(path.exists()); }
+        for path in [&old, &old_tldr, &other_commands, &legacy_commands] { assert!(!path.exists()); }
+        Ok(())
+    }
+
+    #[test]
+    fn prune_removes_index_directories_without_loading_model() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir()?;
+        let directory = root.path().join("index");
+        let lock = lock_index_directory(&directory, 1)?.unwrap();
+        let old = directory.join("rs-commands-v1-old");
+        std::fs::create_dir(&old)?;
+        std::fs::write(old.join("secret"), b"secret-cmd")?;
+        let current = directory.join("rs-commands-v4-current.taladb");
+        let commands = directory.join("rs-examples-v1-potion-shell-16m-test-stub@1-d2.taladb");
+        let legacy_commands = directory.join("rs-commands-potion-shell-16m-bundled-old.taladb");
+        let unrelated = directory.join("keep.txt");
+        for path in [&current, &commands, &legacy_commands, &unrelated] { std::fs::write(path, b"keep")?; }
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside)?;
+        std::fs::write(outside.join("keep"), b"keep")?;
+        let link = directory.join("rs-commands-v1-link");
+        symlink(&outside, &link)?;
+        remove_history_indexes(&directory)?;
+        assert!(!old.exists() && !current.exists() && !link.exists());
+        assert!(outside.join("keep").exists());
+        for path in [&commands, &legacy_commands, &unrelated] { assert!(path.exists()); }
+        assert!(remove_history_indexes(&root.path().join("missing")).is_err());
+        drop(lock);
+        Ok(())
+    }
 
     #[test]
     fn vector_intent_uses_no_grep_expansion_and_keeps_absolute_cosine() {
