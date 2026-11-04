@@ -22,7 +22,6 @@ Open work, not scheduled. macOS and Linux are supported today; search is include
 ## Capture
 
 - **Fish:** start times are whole seconds (Fish has no clock builtin).
-- **Bash:** record `pipestatus` like Zsh and Fish do.
 
 ## Known limits (accepted, documented in code)
 

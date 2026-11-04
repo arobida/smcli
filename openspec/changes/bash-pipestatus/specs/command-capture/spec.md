@@ -8,7 +8,7 @@ Defines what smcli's shell hooks record about each command a user runs, so the s
 
 ### Requirement: Pipeline status capture
 
-Bash, Zsh and Fish hooks SHALL record the exit status of every stage of the command's pipeline, in order, alongside the final exit code. Reading it SHALL NOT change `$?` or the pipeline status seen by the user's own prompt hooks. When the shell cannot report it, the hook SHALL record no pipeline status rather than a guessed one.
+Bash, Zsh and Fish hooks SHALL record the exit status of every stage of the command's pipeline, in order, alongside the final exit code. Reading it SHALL NOT change `$?` or introduce a regression in the pipeline status seen by the user's own prompt hooks. When the shell cannot report it, the hook SHALL record no pipeline status rather than a guessed one.
 
 #### Scenario: Failing first stage in Bash
 
@@ -30,4 +30,4 @@ Bash, Zsh and Fish hooks SHALL record the exit status of every stage of the comm
 
 - **GIVEN** a user `PROMPT_COMMAND` entry that prints `${PIPESTATUS[*]}`
 - **WHEN** a user runs `false | true`
-- **THEN** that entry prints the same value as without smcli's hook
+- **THEN** that entry prints the same value as with the hook before this change (no regression)

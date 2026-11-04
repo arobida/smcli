@@ -38,7 +38,8 @@ pub fn render_with_keys(
     let template = match shell {
         "bash" => {
             r###"# smcli: opt-in metadata capture. Native HISTFILE is left untouched. Records commands Bash retains in history;
-# pipeline status is unavailable. In PS0/bash-preexec mode, an unchanged history number is ambiguous with
+# pipeline status is recorded in PS0/DEBUG mode and bash-preexec >= 0.4.0 (BP_PIPESTATUS); older versions omit it.
+# In PS0/bash-preexec mode, an unchanged history number is ambiguous with
 # ignoredups, so when HISTCONTROL/HISTIGNORE exclusions are configured that command is conservatively omitted.
 # HISTIGNORE's bare & pattern is not interpreted. Hook: bash-preexec when loaded, else PS0 (Bash 4.4+),
 # else a DEBUG trap (SMCLI_BASH_HOOK=debug forces it).
@@ -58,6 +59,7 @@ if [[ ${_smcli_installed-} != 1 ]]; then
         _smcli_installed=1
         _smcli_pending=0
         _smcli_armed=0
+        _smcli_debug_pipe=
         _smcli_nul=
         _smcli_history_number=
         _smcli_directory=$PWD
@@ -127,7 +129,9 @@ if [[ ${_smcli_installed-} != 1 ]]; then
             local -a args
             args=(record)
             _smcli_safe "${_smcli_expanded-}" && args+=(--expanded "$_smcli_expanded")
-            args+=(bash "$_smcli_session" "$_smcli_directory" "$1" "$_smcli_started" "$2" "${HISTFILE-}" "$_smcli_command")
+            args+=(bash "$_smcli_session" "$_smcli_directory" "$1")
+            [[ -n ${3-} ]] && args+=("$3")
+            args+=("$_smcli_started" "$2" "${HISTFILE-}" "$_smcli_command")
             "$_smcli_bin" "${args[@]}" || printf 'smcli: command metadata was not saved.\n' >&2
         }
         # Whether $1 matches one of the user's HISTIGNORE patterns (a bare & means "the previous line": not checked).
@@ -159,7 +163,8 @@ if [[ ${_smcli_installed-} != 1 ]]; then
             _smcli_history_number=$number
         }
         _smcli_preexec() {
-            local prior_status=$2 entry
+            local prior_status=$2 pipe="${PIPESTATUS[*]}" entry
+            _smcli_debug_pipe=$pipe
             if [[ $_smcli_armed == 1 && $1 != _smcli_prompt && $1 != _smcli_ready && $1 != _smcli_pick && $1 != _smcli_pick_left && $1 != _smcli_pick_right && $1 != _smcli_pick_files && $1 != _smcli_pick_grep && $1 != _smcli_tab ]]; then
                 _smcli_started=${EPOCHREALTIME:-$((_smcli_epoch + SECONDS))}
                 _smcli_armed=0
@@ -194,7 +199,14 @@ if [[ ${_smcli_installed-} != 1 ]]; then
             _smcli_set_expanded "$1"
         }
         _smcli_prompt() {
-            local status=$? ended=${EPOCHREALTIME:-$((_smcli_epoch + SECONDS))} entry keep=1
+            local status=$? pipe="${PIPESTATUS[*]}" ended=${EPOCHREALTIME:-$((_smcli_epoch + SECONDS))} entry keep=1
+            if [[ ${1-} == exit ]]; then
+                pipe=
+            elif [[ $_smcli_mode == bash-preexec ]]; then
+                if [[ ${BP_PIPESTATUS+x} ]]; then pipe=${BP_PIPESTATUS[*]}; else pipe=; fi
+            elif [[ $_smcli_mode == debug ]]; then
+                pipe=$_smcli_debug_pipe
+            fi
             _smcli_armed=0
             if [[ $_smcli_pending == 1 ]]; then
                 _smcli_pending=0
@@ -211,9 +223,9 @@ if [[ ${_smcli_installed-} != 1 ]]; then
                     export SMCLI_DB="${SMCLI_DB:-$HOME/.local/share/smcli/history.db}"
                     # Record in a detached process so the prompt never waits; at exit, finish first.
                     if [[ -n ${SMCLI_SYNC-} || ${1-} == exit ]]; then
-                        _smcli_record "$status" "$ended"
+                        _smcli_record "$status" "$ended" "$pipe"
                     else
-                        ( _smcli_record "$status" "$ended" & )
+                        ( _smcli_record "$status" "$ended" "$pipe" & )
                     fi
                 fi
             else

@@ -167,9 +167,11 @@ def eventually(test, what, timeout=10):
 BASH_PREEXEC = r"""
 bash_preexec_imported=defined; __bp_imported=defined
 preexec_functions=(); precmd_functions=()
+BP_PIPESTATUS=()
 __bp_interactive=0
 __bp_precmd_invoke_cmd() {
-    local last=$? cmd
+    local last=$? pipe="${PIPESTATUS[*]}" cmd
+    BP_PIPESTATUS=($pipe)
     for cmd in "${precmd_functions[@]}"; do
         (exit "$last"); "$cmd"
     done
@@ -211,7 +213,8 @@ def variants():
         version = ".".join(map(str, bash_version(modern)))
         found.append(Variant(f"bash {version} (PS0)", "bash", modern, bash_args))
         found.append(Variant(f"bash {version} (DEBUG fallback)", "bash", modern, bash_args, env={"SMCLI_BASH_HOOK": "debug"}))
-        found.append(Variant(f"bash {version} (bash-preexec)", "bash", modern, bash_args, prelude=BASH_PREEXEC))
+        found.append(Variant(f"bash {version} (bash-preexec BP_PIPESTATUS)", "bash", modern, bash_args, prelude=BASH_PREEXEC))
+        found.append(Variant(f"bash {version} (bash-preexec without BP_PIPESTATUS)", "bash", modern, bash_args, prelude=BASH_PREEXEC.replace("    BP_PIPESTATUS=($pipe)\n", "")))
     else:
         skipped.append("bash >= 4.4 (PS0 and bash-preexec variants)")
     if os.path.exists("/bin/bash") and not modern:
@@ -276,6 +279,12 @@ def run_variant(variant, scenario="base"):
             shutil.rmtree(runtime, ignore_errors=True)
 
 
+def last_prompt_status(variant, home):
+    if variant.kind == "bash" and not variant.prelude:
+        return (home / "prompt-pipe").read_text().splitlines()[-1].rsplit("STATUS:", 1)[1]
+    return (home / "prompt-status").read_text().splitlines()[-1]
+
+
 def check(t, variant, env, home, directory):
     kind = variant.kind
     log = home / "prompt-status"
@@ -284,7 +293,7 @@ def check(t, variant, env, home, directory):
         # Under bash-preexec, user code belongs in its arrays (a PROMPT_COMMAND added after it runs after $? is gone).
         t.send("_user_precmd() { printf '%s\\n' \"$?\" >> \"$HOME/prompt-status\"; }; precmd_functions+=(_user_precmd)")
     elif kind == "bash":
-        t.send("PROMPT_COMMAND=\"${PROMPT_COMMAND:+$PROMPT_COMMAND; }printf '%s\\n' \\\"\\$?\\\" >> \\\"\\$HOME/prompt-status\\\"\"")
+        t.send('PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }printf \'PIPE:%s STATUS:%s\\n\' \\"\\${PIPESTATUS[*]}\\" \\"\\$?\\" >> \\"$HOME/prompt-pipe\\""')
     elif kind == "zsh":
         t.send("precmd() { printf '%s\\n' \"$?\" >> \"$HOME/prompt-status\"; }")
     else:
@@ -298,7 +307,7 @@ def check(t, variant, env, home, directory):
     t.send("printf repeat")
     t.send("printf repeat")
     t.send("false")
-    assert log.read_text().splitlines()[-1] == "1", "existing prompt lost exit status"
+    assert last_prompt_status(variant, home) == "1", "existing prompt lost exit status"
     t.send("cd sub")
     t.send("pwd")
     t.send("sleep 1.1")
@@ -313,7 +322,11 @@ def check(t, variant, env, home, directory):
     assert records[3]["directory"] == directory, "cd captured destination, not starting directory"
     assert records[4]["directory"] == str(home / "sub")
     assert all(r["shell"] == kind and r["user"] for r in records)
-    if kind in ("zsh", "fish"):
+    if kind in ("zsh", "fish") or (kind == "bash" and not variant.prelude and (bash_version(variant.path) or (0, 0))[0] >= 4):
+        assert records[2]["pipestatus"] == [1], records[2]
+    elif kind == "bash" and variant.prelude and "without BP_PIPESTATUS" in variant.label:
+        assert records[2].get("pipestatus") in (None, []), records[2]
+    elif kind == "bash":
         assert records[2]["pipestatus"] == [1], records[2]
     else:
         assert all("pipestatus" not in r for r in records)
@@ -336,11 +349,18 @@ def check(t, variant, env, home, directory):
         lines = t.send("functions --handlers | string match -r 'fish_p\\w+exec\\s+_smcli_\\w+' | count").splitlines()
         assert [line for line in lines if line.strip().isdigit()] == ["2"], lines
 
-    # Pipelines: Zsh and Fish keep every stage's status.
-    if kind in ("zsh", "fish"):
-        t.send("false | true | false")
+    # Pipelines keep every stage's status.
+    if kind in ("zsh", "fish", "bash"):
+        t.send("false | true")
         records = read_records(env)
-        assert records[-1]["exitCode"] == 1 and records[-1]["pipestatus"] == [1, 0, 1], records[-1]
+        if kind != "bash" or not variant.prelude or "without BP_PIPESTATUS" not in variant.label:
+            assert records[-1]["exitCode"] == 0 and records[-1]["pipestatus"] == [1, 0], (variant.label, records[-1])
+        else:
+            assert records[-1]["exitCode"] == 0 and records[-1].get("pipestatus") in (None, []), (variant.label, records[-1])
+        if kind == "bash" and not variant.prelude:
+            seen = (home / "prompt-pipe").read_text().splitlines()
+            # Main prints PIPE:0 STATUS:0 in these hook modes; this change preserves that baseline.
+            assert seen[-1] == "PIPE:0 STATUS:0", (variant.label, seen[-1])
 
     # A recording error must be visible without changing the command's status.
     # (The service would keep working on its open file, so this goes straight to the database.)
@@ -348,7 +368,7 @@ def check(t, variant, env, home, directory):
     os.chmod(home / "captured.db", 0o644)
     output = t.send("false")
     assert "metadata was not saved" in output, output
-    assert log.read_text().splitlines()[-1] == "1"
+    assert last_prompt_status(variant, home) == "1"
     os.chmod(home / "captured.db", 0o600)
     t.send("set -e SMCLI_SERVICE" if kind == "fish" else "unset SMCLI_SERVICE")
 
@@ -417,7 +437,7 @@ def rest(t, variant, env, home, log):
     t.send("unset SMCLI_SYNC" if kind != "fish" else "set -e SMCLI_SYNC")
     t.send("printf async")
     eventually(lambda: any(r["command"] == "printf async" for r in read_records(env)), "background record")
-    assert log.read_text().splitlines()[-1] == "0"
+    assert last_prompt_status(variant, home) == "0"
     # The service is the default, and it took the records.
     status = subprocess.run([binary, "service", "status"], env=dict(env, SMCLI_SERVICE="connect"), capture_output=True, text=True)
     assert status.returncode == 0, ("service was not started by default", status.stdout, status.stderr)
@@ -496,6 +516,8 @@ def exit_status(t, variant, env, home):
     t.wait_exit(7)
     records = read_records(env)
     assert len(records) == before + 1 and records[-1]["command"] == "exit 7" and records[-1]["exitCode"] == 7, records[-2:]
+    if kind == "bash":
+        assert "pipestatus" not in records[-1], records[-1]
     if variant.exit_trap:
         assert (home / "exit-trap").read_text() == "bye", "the existing EXIT trap did not run"
 
@@ -1054,7 +1076,8 @@ def run_alias_capture(variant):
                 assert hits, (variant.label, command, rows[-6:])
                 got, fields, argv = hits[-1]
                 assert got == expansion, (variant.label, command, got, argv)
-                assert len(fields) == (8 if kind == "bash" else 9), (variant.label, command, fields)
+                expected_fields = 8 if kind == "bash" and variant.prelude and "without BP_PIPESTATUS" in variant.label else 9
+                assert len(fields) == (expected_fields if kind == "bash" else 9), (variant.label, command, fields)
                 assert fields[0] == kind and "--expanded" not in fields, (variant.label, fields)
                 if expansion is None:
                     assert argv[1] != "--expanded", (variant.label, argv)
