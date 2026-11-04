@@ -83,19 +83,19 @@ pub struct RankingContext {
 }
 
 impl RankingContext {
-    /// From directory context; `off` names come from the environment.
-    pub fn new(project: &ProjectContext, session: Option<String>, environment: &HashMap<String, String>) -> Self {
+    /// From directory context. `ranking_off` is the caller's `SMCLI_RANKING_OFF`, not the process environment.
+    pub fn new(project: &ProjectContext, session: Option<String>, ranking_off: Option<&str>) -> Self {
         Self {
             project_root: project.projects.first().map(|p| p.root.clone()),
             project_kind: project.projects.first().map(|p| p.kind.clone()),
             session,
             candidates: candidates(project),
-            off: Self::disabled(environment),
+            off: Self::disabled(ranking_off),
         }
     }
 
-    pub fn disabled(environment: &HashMap<String, String>) -> HashSet<Signal> {
-        environment.get("SMCLI_RANKING_OFF").map_or("", |s| s).split(',').filter_map(Signal::parse).collect()
+    pub fn disabled(ranking_off: Option<&str>) -> HashSet<Signal> {
+        ranking_off.unwrap_or("").split(',').filter_map(Signal::parse).collect()
     }
 
     pub fn uses(&self, signal: Signal) -> bool {
@@ -455,12 +455,12 @@ mod tests {
             projects: vec![Project { root: "/r".into(), kind: kind.into(), ..Default::default() }],
             ..Default::default()
         };
-        let on = RankingContext::new(&project("rust"), None, &HashMap::new());
+        let on = RankingContext::new(&project("rust"), None, None);
         assert_eq!(on.project_kind.as_deref(), Some("rust"));
         assert!(on.same_kind(Some("rust")) && !on.same_kind(Some("node")) && !on.same_kind(None));
-        let off = RankingContext::new(&project("rust"), None, &HashMap::from([("SMCLI_RANKING_OFF".into(), "project,kind".into())]));
+        let off = RankingContext::new(&project("rust"), None, Some("project,kind"));
         assert!(off.off.contains(&Signal::Kind) && !off.same_kind(Some("rust")));
-        let none = RankingContext::new(&ProjectContext::default(), None, &HashMap::new());
+        let none = RankingContext::new(&ProjectContext::default(), None, None);
         assert!(none.project_kind.is_none() && !none.same_kind(None));
         assert_eq!(suggestion_why(0, 0, 2, Some("rust"), None), Some(vec!["used in a rust project".to_string()]));
         assert_eq!(suggestion_why(0, 1, 2, Some("rust"), None), Some(vec!["used in this project".to_string()]));
@@ -477,7 +477,7 @@ mod tests {
 
     #[test]
     fn evidence_switch_parses() {
-        let off = RankingContext::disabled(&HashMap::from([("SMCLI_RANKING_OFF".into(), "evidence".into())]));
+        let off = RankingContext::disabled(Some("evidence"));
         assert!(off.contains(&Signal::Evidence));
         assert!(!RankingContext { off, ..Default::default() }.uses(Signal::Evidence));
     }

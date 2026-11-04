@@ -465,8 +465,7 @@ mod tests {
         let here = format!("{root}/here");
         let project = crate::context::ProjectContext::discover(&here);
         let ranked = |off: &str| -> anyhow::Result<(Vec<String>, Vec<String>, Option<Vec<String>>)> {
-            let env = std::collections::HashMap::from([("SMCLI_RANKING_OFF".to_string(), off.to_string())]);
-            let context = RankingContext::new(&project, None, &env);
+            let context = RankingContext::new(&project, None, Some(off));
             let scan = history.suggestions(&user_name(), &here, "kt ", 10, now, Some(&context))?;
             let index = SuggestionIndex::new(history.runs(&user_name(), &db)?, history.picks(100, &db)?)
                 .suggestions_at(&here, "kt ", 10, now, Some(&context));
@@ -501,8 +500,7 @@ mod tests {
         history.append(&run, "", Some(&db))?;
         let here = format!("{root}/repo/crate/src");
         let project = crate::context::ProjectContext::discover(&here);
-        let env = std::collections::HashMap::new();
-        let context = RankingContext::new(&project, None, &env);
+        let context = RankingContext::new(&project, None, None);
         let scan = history.suggestions(&user_name(), &here, "kt ", 10, now, Some(&context))?;
         let index = SuggestionIndex::new(history.runs(&user_name(), &db)?, history.picks(100, &db)?)
             .suggestions_at(&here, "kt ", 10, now, Some(&context));
@@ -535,7 +533,7 @@ mod tests {
             }
         }
         let here = format!("{root}/here");
-        let context = RankingContext::new(&crate::context::ProjectContext::discover(&here), None, &Default::default());
+        let context = RankingContext::new(&crate::context::ProjectContext::discover(&here), None, None);
         let index = SuggestionIndex::new(history.runs(&user_name(), &db)?, history.picks(100, &db)?);
         let first = |v: Vec<crate::history::Suggestion>| (v[0].command.clone(), v.iter().find(|s| s.command == "kt nextest").unwrap().why.clone());
         let boosted = Some(vec!["used in a rust project".to_string()]);

@@ -60,7 +60,17 @@ def rows():
 def raw(payload: bytes | dict, timeout=10):
     """Sends a request or raw bytes and returns its parsed reply, or None if it closed silently."""
     if isinstance(payload, dict):
+        payload = dict(payload)
+        payload.setdefault("config", env["SMCLI_CONFIG"])
         payload = (json.dumps(payload) + "\n").encode()
+    elif isinstance(payload, (bytes, bytearray)):
+        try:
+            message = json.loads(payload)
+        except json.JSONDecodeError:
+            message = None
+        if isinstance(message, dict) and "op" in message and "config" not in message:
+            message["config"] = env["SMCLI_CONFIG"]
+            payload = (json.dumps(message) + "\n").encode()
     with socket.socket(socket.AF_UNIX) as connection:
         connection.settimeout(timeout)
         connection.connect(socket_path())
@@ -496,6 +506,11 @@ try:
     assert sum(r.get("expandedCommand") == "git diff --stat" for r in exported) == 2, exported
 
     # Search signals use the requesting CLI's PATH/cwd, not the service environment, and agree in fallback.
+    run("service", "stop", check=False)
+    launch_home = f"{root}/service-home"
+    os.makedirs(launch_home, exist_ok=True)
+    run("service", "start", HOME=launch_home, PATH="/usr/bin:/bin", SMCLI_RANKING_OFF="path,files",
+        SMCLI_FFF_MAX="2", SMCLI_FFF_IDLE="3")
     signal_bin = Path(root) / "signal-bin"
     signal_bin.mkdir()
     tool = signal_bin / "txbuild"
@@ -708,6 +723,12 @@ try:
     open(f"{plain}/loose.txt", "w").write("x")
     assert ask("files", plain, "loose")["root"] == os.path.realpath(plain)
     assert raw((json.dumps({"v": V, "op": "files", "directory": "/", "query": "x"}) + "\n").encode())["ok"] is False
+    if sys.platform.startswith("linux"):
+        run("service", "stop", check=False)
+        run("service", "start", SMCLI_TEST_SECRET="x")
+        secret_pid = service_pid()
+        launched = Path(f"/proc/{secret_pid}/environ").read_bytes().split(b"\0")
+        assert all(not item.startswith(b"SMCLI_TEST_SECRET=") for item in launched), launched
     run("service", "stop", check=False)
 
     print("smcli-service tests passed.")

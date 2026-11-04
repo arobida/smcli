@@ -1,6 +1,7 @@
 use anyhow::{Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use smcli_core::{
+    caller::CallerContext,
     config::{CaptureFilter, SmcliConfig, home_dir},
     context::ProjectContext,
     history::{CapturedHistory, NewRun, parse_pipestatus, user_name},
@@ -308,22 +309,24 @@ pub fn run() -> Result<()> {
             {
                 Some(hits) => hits,
                 None => {
+                    let caller = CallerContext::from_env(&env);
                     let context = RankingContext::new(
-                        &ProjectContext::discover(&working_directory(&env)),
-                        env.get("SMCLI_SESSION").cloned(),
-                        &env,
+                        &ProjectContext::discover(&caller.cwd),
+                        caller.session.clone(),
+                        caller.ranking_off.as_deref(),
                     );
                     eprintln!("smcli: search service unavailable; showing keyword matches only.");
+                    let native = caller.native_env();
                     let corpus = corpus(
                         &captured,
-                        &home,
-                        &env,
+                        caller.home(),
+                        &native,
                         context.project_root.as_deref(),
                         context.kind(),
                         now(),
                     )?;
                     lexical_search(&query, &corpus, a.limit, &filter,
-                        &search_signals(&captured, Some(context), &env)?, now())?
+                        &search_signals(&captured, Some(context), &native)?, now())?
                 }
             };
             if a.json {
@@ -351,7 +354,9 @@ pub fn run() -> Result<()> {
                 .and_then(|r| r.suggestions)
             {
                 Some(s) => s,
-                None => captured.suggestions(
+                None => {
+                    let caller = CallerContext::from_env(&env);
+                    captured.suggestions(
                     &user_name(),
                     &d,
                     &prefix,
@@ -359,10 +364,11 @@ pub fn run() -> Result<()> {
                     now(),
                     Some(&RankingContext::new(
                         &ProjectContext::discover(&d),
-                        request.session,
-                        &env,
+                        caller.session.clone(),
+                        caller.ranking_off.as_deref(),
                     )),
-                )?,
+                )?
+                }
             };
             if json {
                 print_json(&suggestions)?;
@@ -879,11 +885,12 @@ fn pick(
     query: String,
 ) -> Result<()> {
     use crate::picker::{Choice, FileResults, Mode, Picker};
+    let caller = CallerContext::from_env(env);
     let d = working_directory(env);
     let context = RankingContext::new(
         &ProjectContext::discover(&d),
-        env.get("SMCLI_SESSION").cloned(),
-        env,
+        caller.session.clone(),
+        caller.ranking_off.as_deref(),
     );
     let mut request = ServiceRequest::new(Operation::Pick);
     request.directory = Some(d.clone());
@@ -904,7 +911,7 @@ fn pick(
         Some(r) => r.into_iter().map(|entry| entry.key()).collect(),
         None => c.recent_distinct(&user)?,
     };
-    let native = smcli_search::native::history_files(home, env)?
+    let native = smcli_search::native::history_files(caller.home(), &caller.native_env())?
         .iter()
         .filter_map(|f| f.read().ok())
         .flat_map(|s| s.lines().map(String::from).collect::<Vec<_>>())
@@ -938,19 +945,19 @@ fn pick(
     picker.scope = Some(root.clone());
     let search = {
         let c = CapturedHistory::new(c.path.clone());
-        let home = home.to_owned();
         let env = env.clone();
         let d = d.clone();
         let context = context.clone();
+        let caller = caller.clone();
         let service = ServiceClient::new(&c.path, &env, &std::env::current_exe()?);
         move |q: &str, _: bool| -> Result<Vec<String>> {
         let mut r = ServiceRequest::new(Operation::Search);
         r.query = Some(q.into());
         r.directory = Some(d.clone());
         r.limit = Some(100);
-        r.session = env.get("SMCLI_SESSION").cloned();
-        r.histfile = env.get("HISTFILE").cloned();
-        r.login_shell = env.get("SHELL").cloned();
+        r.session = caller.session.clone();
+        r.histfile = caller.histfile.clone();
+        r.login_shell = caller.shell.clone();
         let hits = match service
             .send(&r, None, Duration::from_secs(600))
             .filter(|r| r.ok)
@@ -958,8 +965,9 @@ fn pick(
         {
             Some(h) => h,
             None => {
-                let entries = corpus(&c, &home, &env, context.project_root.as_deref(), context.kind(), now())?;
-                let signals = search_signals(&c, Some(context.clone()), &env)?;
+                let native = caller.native_env();
+                let entries = corpus(&c, caller.home(), &native, context.project_root.as_deref(), context.kind(), now())?;
+                let signals = search_signals(&c, Some(context.clone()), &native)?;
                 lexical_search(q, &entries, 100, &SearchFilter::default(), &signals, now())?
             }
         };

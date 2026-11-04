@@ -5,8 +5,8 @@ mod service;
 use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::time::Duration;
 
+use smcli_core::caller::LaunchSettings;
 use smcli_core::history::CapturedHistory;
 use smcli_core::service_location::ServiceLocation;
 
@@ -50,8 +50,7 @@ fn start(database: &str, environment: HashMap<String, String>) -> anyhow::Result
     // Never open (and so create or write) the database when it is the starting shell's native history.
     let history = CapturedHistory::new(database);
     history.check_separate(environment.get("HISTFILE").map_or("", String::as_str))?;
-    let idle = environment.get("SMCLI_SERVICE_IDLE").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(1800.0);
-    let service = Service::new(history, location, Duration::from_secs_f64(idle), environment)?;
+    let service = Service::new(history, location, LaunchSettings::from_env(&environment))?;
     let result = service.run();
     drop(lock);
     result

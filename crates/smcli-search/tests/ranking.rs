@@ -396,8 +396,11 @@ impl World {
 
     /// `SMCLI_RANKING_OFF=project,transition,...` switches signals off, to measure each one.
     fn context(&self, item: &Case) -> RankingContext {
-        let environment: HashMap<String, String> = std::env::vars().collect();
-        RankingContext::new(&ProjectContext::discover(&self.path(item.directory)), item.session.map(String::from), &environment)
+        RankingContext::new(
+            &ProjectContext::discover(&self.path(item.directory)),
+            item.session.map(String::from),
+            std::env::var("SMCLI_RANKING_OFF").ok().as_deref(),
+        )
     }
 
     fn suggest(&self, item: &Case) -> Vec<(String, Vec<String>)> {

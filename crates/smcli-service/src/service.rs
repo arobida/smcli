@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use rusqlite::Connection;
+use smcli_core::caller::{CallerContext, LaunchSettings};
 use smcli_core::command_source::CommandSource;
 use smcli_core::config::{CaptureFilter, SmcliConfig};
 use smcli_core::context_cache::ContextCache;
@@ -31,7 +32,7 @@ use smcli_search::{HistorySearch, ModelId, Potion};
 use smcli_search::commands::CommandIndex;
 use smcli_search::corpus::{CorpusState, SearchSignals};
 use smcli_search::native::history_files;
-use smcli_search::setup::search_engine;
+use smcli_search::setup::index_directory;
 
 use crate::file_search::FileSearch;
 
@@ -78,7 +79,7 @@ pub struct Service {
     user: String,
     /// Stamped on every response so clients can tell this service is from an older build.
     build: Option<String>,
-    environment: HashMap<String, String>,
+    launch: LaunchSettings,
     state: Mutex<State>,
     model_ids: Mutex<HashMap<PathBuf, (FileStats, ModelId)>>,
     /// Searches run one at a time, outside `state`, so records aren't held up by one.
@@ -118,18 +119,16 @@ fn recorded_program(command: &str, expanded: Option<&str>) -> Option<String> {
 }
 
 impl Service {
-    pub fn new(history: CapturedHistory, location: ServiceLocation, idle: Duration, environment: HashMap<String, String>) -> Result<Arc<Self>> {
+    pub fn new(history: CapturedHistory, location: ServiceLocation, launch: LaunchSettings) -> Result<Arc<Self>> {
         let db = history.open_connection()?;
         let version = data_version(&db)?;
-        let capacity = environment.get("SMCLI_FFF_MAX").and_then(|v| v.parse().ok()).unwrap_or(4);
-        let fff_idle = Duration::from_secs_f64(environment.get("SMCLI_FFF_IDLE").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(600.0));
-        let home = PathBuf::from(environment.get("HOME").cloned().unwrap_or_else(|| "/".into()));
+        let home = launch.home.clone();
         // The file search reaches back into `state` through a weak handle, set once the service exists.
         let service = Arc::new_cyclic(|weak: &std::sync::Weak<Service>| {
             let (scores_handle, record_handle) = (weak.clone(), weak.clone());
             let file_search = FileSearch::new(
-                capacity,
-                fff_idle,
+                launch.fff_max,
+                launch.fff_idle,
                 Box::new(move |root| {
                     let Some(service) = scores_handle.upgrade() else { return HashMap::new() };
                     let state = service.lock();
@@ -137,7 +136,8 @@ impl Service {
                 }),
                 Box::new(move |root, path, mode, query, request| {
                     let Some(service) = record_handle.upgrade() else { return Ok(()) };
-                    let filter = CaptureFilter::new(&SmcliConfig::load(&service.config_path(request))?)?;
+                    let config = service.config_path(request)?;
+                    let filter = CaptureFilter::new(&(SmcliConfig::load(&config)?))?;
                     let directory = request.directory.as_deref().unwrap_or("");
                     if !filter.allows(query, directory) {
                         return Ok(());
@@ -152,9 +152,9 @@ impl Service {
                 build: std::env::current_exe().ok().and_then(|exe| build(&exe)),
                 history,
                 location,
-                idle,
+                idle: launch.idle,
                 user: user_name(),
-                environment,
+                launch,
                 state: Mutex::new(State { db, index: None, data_version: version, history_revision: 0, last_activity: Instant::now(), engine: None, corpus: None, model_lock: None }),
                 model_ids: Mutex::new(HashMap::new()),
                 searching: Mutex::new(()),
@@ -277,6 +277,9 @@ impl Service {
             // A rejected version must not refresh idle time, or an old service never exits.
             return ServiceResponse::failure("version", format!("Protocol version {VERSION} required."));
         }
+        if Self::needs_config(request.op) && request.config.as_deref().filter(|p| !p.is_empty()).is_none() {
+            return ServiceResponse::failure("bad_request", "config is required");
+        }
         let result = match request.op {
             Operation::Search => return self.search(request),
             Operation::Embed => return self.embed(request),
@@ -317,12 +320,13 @@ impl Service {
         response
     }
 
+    fn needs_config(op: Operation) -> bool {
+        matches!(op, Operation::Record | Operation::Select | Operation::Search | Operation::Suggest | Operation::Pick | Operation::Embed)
+    }
+
     fn ranking_context(&self, request: &ServiceRequest, directory: &str) -> RankingContext {
-        let mut environment = self.environment.clone();
-        if let Some(off) = request.ranking_off.as_ref().filter(|s| s.len() <= 256) {
-            environment.insert("SMCLI_RANKING_OFF".into(), off.clone());
-        }
-        RankingContext::new(&self.contexts.context(directory), request.session.clone(), &environment)
+        let off = request.ranking_off.as_deref().filter(|s| s.len() <= 256);
+        RankingContext::new(&self.contexts.context(directory), request.session.clone(), off)
     }
 
     /// Another process (a fallback record, an import, prune) changed the database: rebuild on next use.
@@ -353,7 +357,8 @@ impl Service {
         ) else {
             return Ok(ServiceResponse::failure("bad_request", "record needs event, command, shell, session, directory and exitCode."));
         };
-        let filter = CaptureFilter::new(&SmcliConfig::load(&self.config_path(request))?)?;
+        let config = self.config_path(request)?;
+        let filter = CaptureFilter::new(&(SmcliConfig::load(&config)?))?;
         if !filter.allows_run(command, request.expanded_command.as_deref(), directory) {
             let mut response = ServiceResponse::new(true);
             response.event = Some(event.clone());
@@ -557,7 +562,8 @@ impl Service {
         state.last_activity = Instant::now();
         let result = (|| -> Result<()> {
             // An unreadable config records nothing rather than skipping the filter.
-            let filter = CaptureFilter::new(&SmcliConfig::load(&self.config_path(request))?)?;
+            let config = self.config_path(request)?;
+            let filter = CaptureFilter::new(&(SmcliConfig::load(&config)?))?;
             Self::refresh(&mut state)?;
             let time = now();
             if self.history.record_pick(&query, &command, mode, directory, &filter, time, &state.db)? {
@@ -574,16 +580,9 @@ impl Service {
         }
     }
 
-    fn home(&self) -> PathBuf {
-        PathBuf::from(self.environment.get("HOME").cloned().unwrap_or_else(|| "/".into()))
-    }
-
-    /// The caller's config file; requests from older clients fall back to the one this service started with.
-    fn config_path(&self, request: &ServiceRequest) -> PathBuf {
-        match request.config.as_deref().filter(|p| p.starts_with('/')) {
-            Some(path) => PathBuf::from(path),
-            None => SmcliConfig::location(&self.home(), &self.environment),
-        }
+    /// The caller's config file. Missing config is rejected before handlers that read it.
+    fn config_path(&self, request: &ServiceRequest) -> Result<PathBuf> {
+        request.config.as_deref().filter(|p| !p.is_empty()).map(PathBuf::from).ok_or_else(|| anyhow::anyhow!("config is required"))
     }
 
     fn current_engine(&self, request: &ServiceRequest) -> Result<Arc<HistorySearch>> {
@@ -610,7 +609,7 @@ impl Service {
     }
 
     fn load_engine(&self, request: &ServiceRequest, before_build: impl FnOnce()) -> Result<Arc<HistorySearch>> {
-        let path = self.config_path(request);
+        let path = self.config_path(request)?;
         let config = SmcliConfig::load(&path)?;
         let model = self.model_id(&config)?;
         {
@@ -631,10 +630,12 @@ impl Service {
             // Free the old model before loading the new one, so two are never resident; callers hold `searching`.
             state.engine = None;
         }
-        let mut environment = self.environment.clone();
-        environment.insert("SMCLI_CONFIG".into(), path.to_string_lossy().into_owned());
         before_build();
-        let engine = Arc::new(search_engine(&self.history, &self.home(), &environment)?);
+        let potion = match &config.potion_path {
+            Some(path) => Potion::from_dir(Path::new(path))?,
+            None => Potion::bundled()?,
+        };
+        let engine = Arc::new(HistorySearch::new(index_directory(&self.history), potion));
         if engine.potion.model_id() == model {
             self.lock().engine = Some((model, Arc::clone(&engine)));
         }
@@ -712,12 +713,8 @@ impl Service {
 
     fn build_corpus(&self, request: &ServiceRequest, directory: &str, project: Option<&str>, kind: Option<&str>, before_publish: impl FnOnce())
         -> Result<(HashMap<String, SearchEntry>, HashMap<String, HashSet<String>>)> {
-        let mut environment = self.environment.clone();
-        environment.remove("HISTFILE");
-        environment.remove("SHELL");
-        environment.extend(request.histfile.clone().map(|h| ("HISTFILE".to_string(), h)));
-        environment.extend(request.login_shell.clone().map(|s| ("SHELL".to_string(), s)));
-        let files = history_files(&self.home(), &environment)?;
+        let caller = CallerContext::from_request(request, &self.launch);
+        let files = history_files(caller.home(), &caller.native_env())?;
         let stamp: Vec<String> = files
             .iter()
             .map(|f| {
@@ -767,12 +764,16 @@ mod tests {
             let history = CapturedHistory::new(home.join("history.db"));
             let environment = HashMap::from([("HOME".into(), home.to_string_lossy().into_owned()), ("SMCLI_CONFIG".into(), home.join("config.toml").to_string_lossy().into_owned())]);
             let location = ServiceLocation::new(&history.path, &environment);
-            let service = Service::new(history, location, idle, environment).unwrap();
+            let mut launch = LaunchSettings::from_env(&environment);
+            launch.idle = idle;
+            let service = Service::new(history, location, launch).unwrap();
             Self { service, home }
         }
         fn request(&self, op: Operation) -> ServiceRequest {
             let mut r = ServiceRequest::new(op);
             r.directory = Some(self.home.to_string_lossy().into_owned());
+            r.config = Some(self.home.join("config.toml").to_string_lossy().into_owned());
+            r.home = Some(self.home.to_string_lossy().into_owned());
             r
         }
         fn copy_model(&self, name: &str) -> PathBuf {
@@ -836,6 +837,46 @@ mod tests {
         assert!(!response.ok);
         assert_eq!(response.error.unwrap().code, "bad_request");
         assert!(f.service.lock().engine.is_none());
+    }
+
+    #[test]
+    fn missing_config_is_bad_request() {
+        let f = Fixture::new();
+        for op in [Operation::Record, Operation::Select, Operation::Search, Operation::Suggest, Operation::Pick, Operation::Embed] {
+            let mut request = ServiceRequest::new(op);
+            request.directory = Some("/tmp".into());
+            request.query = Some("x".into());
+            request.command = Some("ls".into());
+            request.shell = Some("zsh".into());
+            request.session = Some("s".into());
+            request.exit_code = Some(0);
+            request.event = Some("e".into());
+            request.mode = Some("suggest".into());
+            let response = f.service.dispatch(&request);
+            assert_eq!(response.error.unwrap().code, "bad_request", "{op:?}");
+        }
+    }
+
+    #[test]
+    fn service_uses_caller_home_and_histfile() {
+        let f = Fixture::new();
+        let caller = std::env::temp_dir().join(format!("smcli-caller-home-{}", std::process::id()));
+        std::fs::create_dir_all(&caller).unwrap();
+        let histfile = caller.join("caller.zsh_history");
+        std::fs::write(&histfile, "zzcaller-only-hist\n").unwrap();
+        std::fs::write(f.home.join(".zsh_history"), "zzlaunch-only-hist\n").unwrap();
+        let mut request = f.request(Operation::Search);
+        request.query = Some("zzcaller-only-hist".into());
+        request.home = Some(caller.to_string_lossy().into_owned());
+        request.histfile = Some(histfile.to_string_lossy().into_owned());
+        request.login_shell = Some("/bin/zsh".into());
+        request.limit = Some(10);
+        let response = f.service.dispatch(&request);
+        assert!(response.ok, "{response:?}");
+        let commands: Vec<_> = response.hits.unwrap().iter().map(|hit| hit.command.clone()).collect();
+        assert!(commands.iter().any(|command| command == "zzcaller-only-hist"), "{commands:?}");
+        assert!(commands.iter().all(|command| command != "zzlaunch-only-hist"), "{commands:?}");
+        let _ = std::fs::remove_dir_all(caller);
     }
 
     #[test]
@@ -1294,7 +1335,7 @@ mod tests {
         r.query = Some("list files".into());
         let response = f.service.dispatch(&r);
         assert!(response.ok, "{response:?}");
-        let model = smcli_search::configured_model(&f.home, &f.service.environment).unwrap();
+        let model = smcli_search::configured_model(&f.home, &HashMap::from([("SMCLI_CONFIG".into(), f.home.join("config.toml").to_string_lossy().into_owned())])).unwrap();
         let reader = CommandIndex::reader(smcli_search::setup::index_directory(&f.service.history), model, &refs);
         assert_eq!(response.model, Some(reader.index_name()));
     }

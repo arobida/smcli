@@ -3,7 +3,7 @@ use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::config::{SmcliConfig, home_dir};
+use crate::caller::CallerContext;
 use crate::service_location::{ServiceLocation, build};
 use crate::service_protocol::{self, Operation, ServiceRequest, ServiceResponse, encode_line, decode_line};
 use crate::unix_socket::{SocketConnection, connect_unix};
@@ -26,8 +26,7 @@ pub struct ServiceClient {
     mode: Mode,
     executable: PathBuf,
     environment: HashMap<String, String>,
-    /// Sent with every request: the service reads this caller's config, not the one it was started with.
-    config: String,
+    caller: CallerContext,
 }
 impl ServiceClient {
     pub fn socket(&self) -> &std::path::Path {
@@ -38,7 +37,6 @@ impl ServiceClient {
     /// The mode comes from `SMCLI_SERVICE`: unset (or `1`/`on`) starts the service as needed, `connect` only uses a
     /// running one, and `0`/`off` keeps every command in-process.
     pub fn new(database: &Path, environment: &HashMap<String, String>, cli: &Path) -> Self {
-        let home = home_dir(environment);
         let mode = match environment.get("SMCLI_SERVICE").map(|s| s.to_lowercase()).as_deref() {
             Some("0" | "off" | "false" | "no") => Mode::Off,
             Some("connect") => Mode::Connect,
@@ -50,7 +48,7 @@ impl ServiceClient {
             executable: environment.get("SMCLI_SERVICE_BIN").filter(|p| p.starts_with('/'))
                 .map(PathBuf::from).unwrap_or_else(|| Self::service_executable(cli)),
             environment: environment.clone(),
-            config: SmcliConfig::location(&home, environment).to_string_lossy().into_owned(),
+            caller: CallerContext::from_env(environment),
         }
     }
 
@@ -106,18 +104,10 @@ impl ServiceClient {
     /// Requests the old service's answer can be replaced by the new one's without a second effect.
     fn repeatable(op: Operation) -> bool { !matches!(op, Operation::Select | Operation::Shutdown) }
 
-    /// Fills fields the service reads from this caller's environment (ranking switches, search PATH).
+    /// Fills the caller fields this operation carries. The service does not read the rest of the environment.
     fn prepare_request(&self, request: &ServiceRequest) -> ServiceRequest {
         let mut request = request.clone();
-        if request.config.is_none() { request.config = Some(self.config.clone()); }
-        if request.home.is_none() { request.home = Some(home_dir(&self.environment).to_string_lossy().into_owned()); }
-        if matches!(request.op, Operation::Search | Operation::Embed) {
-            request.shell_path = service_protocol::shell_path_snapshot(self.environment.get("PATH").map(String::as_str));
-        }
-        if matches!(request.op, Operation::Search | Operation::Suggest | Operation::Pick) {
-            request.ranking_off = Some(self.environment.get("SMCLI_RANKING_OFF")
-                .filter(|s| s.len() <= 256).cloned().unwrap_or_default());
-        }
+        self.caller.apply(&mut request);
         request
     }
 
@@ -167,7 +157,8 @@ impl ServiceClient {
         if unsafe { libc::access(executable.as_ptr(), libc::X_OK) } != 0 || self.location.prepare().is_err() { return false; }
         let Ok(database) = CString::new(self.database.as_os_str().as_bytes()) else { return false; };
         let arguments = [executable.clone(), CString::new("--db").unwrap(), database];
-        let Ok(environment): Result<Vec<_>, _> = self.environment.iter().map(|(k,v)| CString::new(format!("{k}={v}"))).collect() else { return false; };
+        let allowed = Self::launch_environment(&self.environment);
+        let Ok(environment): Result<Vec<_>, _> = allowed.iter().map(|(k,v)| CString::new(format!("{k}={v}"))).collect() else { return false; };
         let pointers = |strings: &[CString]| strings.iter().map(|s| s.as_ptr() as *mut libc::c_char).chain(std::iter::once(std::ptr::null_mut())).collect::<Vec<_>>();
         let argv = pointers(&arguments);
         let envp = pointers(&environment);
@@ -204,6 +195,22 @@ impl ServiceClient {
             libc::posix_spawnattr_destroy(&mut attributes);
             status == 0
         }
+    }
+
+    /// The service process gets this allowlist, not the caller's tokens or ranking switches.
+    /// `PATH` stays because directory context runs `git` through `/usr/bin/env`. `HISTFILE` stays so
+    /// startup can refuse to open the shell's own history file.
+    fn launch_environment(env: &HashMap<String, String>) -> HashMap<String, String> {
+        env.iter().filter(|(key, _)| Self::launch_key_allowed(key)).map(|(key, value)| (key.clone(), value.clone())).collect()
+    }
+
+    fn launch_key_allowed(key: &str) -> bool {
+        matches!(key,
+            "HOME" | "USER" | "LOGNAME" | "PATH" | "TMPDIR" | "LANG"
+            | "XDG_RUNTIME_DIR" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "XDG_CACHE_HOME"
+            | "HISTFILE" | "SMCLI_DB" | "SMCLI_CONFIG" | "SMCLI_RUNTIME_DIR"
+            | "SMCLI_SERVICE_IDLE" | "SMCLI_FFF_MAX" | "SMCLI_FFF_IDLE"
+        ) || key.starts_with("LC_")
     }
 
     /// Descriptors above stdio open in this process. The listing's own fd is included but closed by
@@ -250,6 +257,48 @@ mod tests {
         assert!(client.prepare_request(&ServiceRequest::new(Operation::Ping)).ranking_off.is_none());
         let bare = ServiceClient::new(Path::new("/missing/db"), &HashMap::from([("SMCLI_SERVICE".into(), "0".into())]), Path::new("/missing/smcli"));
         assert_eq!(bare.prepare_request(&ServiceRequest::new(Operation::Suggest)).ranking_off.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn launch_environment_is_allowlisted() {
+        let mut env = HashMap::from([
+            ("HOME".into(), "/home/me".into()),
+            ("USER".into(), "me".into()),
+            ("LOGNAME".into(), "me".into()),
+            ("PATH".into(), "/usr/bin".into()),
+            ("TMPDIR".into(), "/tmp".into()),
+            ("LANG".into(), "en_US.UTF-8".into()),
+            ("LC_ALL".into(), "C".into()),
+            ("XDG_RUNTIME_DIR".into(), "/run/user/1".into()),
+            ("XDG_CONFIG_HOME".into(), "/home/me/.config".into()),
+            ("XDG_DATA_HOME".into(), "/home/me/.local/share".into()),
+            ("XDG_CACHE_HOME".into(), "/home/me/.cache".into()),
+            ("HISTFILE".into(), "/home/me/.zsh_history".into()),
+            ("SMCLI_DB".into(), "/home/me/history.db".into()),
+            ("SMCLI_CONFIG".into(), "/home/me/config.json".into()),
+            ("SMCLI_RUNTIME_DIR".into(), "/run/user/1/smcli".into()),
+            ("SMCLI_SERVICE_IDLE".into(), "30".into()),
+            ("SMCLI_FFF_MAX".into(), "2".into()),
+            ("SMCLI_FFF_IDLE".into(), "10".into()),
+            ("SHELL".into(), "/bin/zsh".into()),
+            ("SMCLI_RANKING_OFF".into(), "path".into()),
+            ("SMCLI_TEST_SECRET".into(), "x".into()),
+            ("AWS_SECRET_ACCESS_KEY".into(), "secret".into()),
+        ]);
+        let launched = ServiceClient::launch_environment(&env);
+        for key in [
+            "HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG", "LC_ALL",
+            "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+            "HISTFILE", "SMCLI_DB", "SMCLI_CONFIG", "SMCLI_RUNTIME_DIR",
+            "SMCLI_SERVICE_IDLE", "SMCLI_FFF_MAX", "SMCLI_FFF_IDLE",
+        ] {
+            assert_eq!(launched.get(key), env.get(key), "{key} must be kept");
+        }
+        for key in ["SHELL", "SMCLI_RANKING_OFF", "SMCLI_TEST_SECRET", "AWS_SECRET_ACCESS_KEY"] {
+            assert!(!launched.contains_key(key), "{key} must be dropped");
+        }
+        env.insert("LC_CTYPE".into(), "UTF-8".into());
+        assert_eq!(ServiceClient::launch_environment(&env).get("LC_CTYPE").map(String::as_str), Some("UTF-8"));
     }
 
     #[test]

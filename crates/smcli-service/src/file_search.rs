@@ -21,7 +21,7 @@ pub(crate) type Index = Arc<OwnedIndex>;
 type Pending = Arc<(Mutex<Option<Result<Index, String>>>, Condvar)>;
 struct Entry { id: i64, index: Index, used: Instant }
 #[derive(Default)]
-struct Pool { entries: HashMap<String, Entry>, pending: HashMap<String, Pending>, building: usize, next: i64 }
+struct Pool { entries: HashMap<(String, bool), Entry>, pending: HashMap<(String, bool), Pending>, building: usize, next: i64 }
 
 /// `files`, `grep` and `select` of a file: fff searches over one instance per root, with the root and Git worktree taken
 /// from the directory context. Runs on the caller's connection thread, never on the state queue.
@@ -51,16 +51,7 @@ impl FileSearch {
     }
 
     pub(crate) fn ready(&self, root: &str) -> Option<Index> {
-        let mut pool = self.pool.lock().unwrap();
-        let entry = pool.entries.get_mut(root)?;
-        if entry.used.elapsed() > self.idle { return None; }
-        entry.used = Instant::now();
-        let index = entry.index.clone();
-        drop(pool);
-        let guard = index.read().ok()?;
-        if guard.as_ref()?.is_scan_active() { return None; }
-        drop(guard);
-        Some(index)
+        self.ready_with_id(root, true).or_else(|| self.ready_with_id(root, false)).map(|(index, _)| index)
     }
 
     /// The instance for `root`, created (and the least recently used one evicted) when needed.
@@ -70,11 +61,12 @@ impl FileSearch {
     }
 
     fn index_with_content(&self, root: &str, enable_content_indexing: bool) -> Result<(Index, i64)> {
+        let key = (root.to_string(), enable_content_indexing);
         loop {
             let mut pool = self.pool.lock().unwrap();
             pool.entries.retain(|_, e| e.used.elapsed() <= self.idle);
-            if let Some(e) = pool.entries.get_mut(root) { e.used = Instant::now(); return Ok((e.index.clone(), e.id)); }
-            if let Some(pending) = pool.pending.get(root).cloned() {
+            if let Some(e) = pool.entries.get_mut(&key) { e.used = Instant::now(); return Ok((e.index.clone(), e.id)); }
+            if let Some(pending) = pool.pending.get(&key).cloned() {
                 drop(pool);
                 let (lock, ready) = &*pending;
                 let mut result = lock.lock().unwrap();
@@ -84,7 +76,7 @@ impl FileSearch {
             }
             if pool.building >= self.capacity { drop(self.available.wait(pool).unwrap()); continue; }
             let pending = Arc::new((Mutex::new(None), Condvar::new()));
-            pool.pending.insert(root.into(), pending.clone());
+            pool.pending.insert(key.clone(), pending.clone());
             pool.building += 1;
             drop(pool);
             // No LMDB stores: frecency lives in smcli's own database. The watcher keeps the index current.
@@ -100,7 +92,7 @@ impl FileSearch {
             .map_err(|e| e.to_string());
             let mut pool = self.pool.lock().unwrap();
             pool.building -= 1;
-            pool.pending.remove(root);
+            pool.pending.remove(&key);
             let answer = result.clone().map(|index| {
                 while pool.entries.len() >= self.capacity {
                     let oldest = pool.entries.iter().min_by_key(|(_, e)| e.used).unwrap().0.clone();
@@ -108,7 +100,7 @@ impl FileSearch {
                 }
                 pool.next += 1;
                 let id = pool.next;
-                pool.entries.insert(root.into(), Entry { id, index: index.clone(), used: Instant::now() });
+                pool.entries.insert(key.clone(), Entry { id, index: index.clone(), used: Instant::now() });
                 (index, id)
             });
             *pending.0.lock().unwrap() = Some(result);
@@ -118,9 +110,9 @@ impl FileSearch {
         }
     }
 
-    fn ready_with_id(&self, root: &str) -> Option<(Index, i64)> {
+    fn ready_with_id(&self, root: &str, content: bool) -> Option<(Index, i64)> {
         let mut pool = self.pool.lock().unwrap();
-        let entry = pool.entries.get_mut(root)?;
+        let entry = pool.entries.get_mut(&(root.to_string(), content))?;
         if entry.used.elapsed() > self.idle { return None; }
         entry.used = Instant::now();
         let index = entry.index.clone();
@@ -135,25 +127,30 @@ impl FileSearch {
     pub fn files(&self, request: &ServiceRequest) -> ServiceResponse { self.search(request, false) }
     pub fn grep(&self, request: &ServiceRequest) -> ServiceResponse { self.search(request, true) }
 
-    fn content_indexing_enabled(&self, scope: &str) -> bool {
+    fn resolved_home(&self, request: &ServiceRequest) -> PathBuf {
+        request.home.as_deref().filter(|p| !p.is_empty()).map(PathBuf::from).unwrap_or_else(|| self.home.clone())
+    }
+
+    fn content_indexing_enabled(home: &std::path::Path, scope: &str) -> bool {
         let in_repo = ProjectContext::discover(scope).repository.is_some();
         if in_repo { return true; }
         let Ok(scope) = std::fs::canonicalize(scope) else { return true };
-        let home = std::fs::canonicalize(&self.home).unwrap_or_else(|_| self.home.clone());
+        let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
         let Some(rest) = scope.strip_prefix(&home).ok().and_then(|p| p.to_str()) else { return false };
         rest.contains('/')
     }
 
-    fn scoped_index(&self, scope: &str) -> Result<(Index, i64, Option<String>)> {
+    fn scoped_index(&self, scope: &str, home: &std::path::Path) -> Result<(Index, i64, Option<String>)> {
+        let content = Self::content_indexing_enabled(home, scope);
         let pool = self.pool.lock().unwrap();
         let mut roots: Vec<String> = pool.entries.keys()
-            .filter(|root| *root == scope || scope.starts_with(&format!("{root}/")))
-            .cloned()
+            .filter(|(root, enabled)| *enabled == content && (*root == scope || scope.starts_with(&format!("{root}/"))))
+            .map(|(root, _)| root.clone())
             .collect();
         drop(pool);
         roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
         for root in roots {
-            if let Some((index, id)) = self.ready_with_id(&root) {
+            if let Some((index, id)) = self.ready_with_id(&root, content) {
                 let prefix = if root == scope { None } else {
                     let rest = scope.strip_prefix(&root).unwrap().trim_start_matches('/');
                     if rest.is_empty() { None } else { Some(format!("{rest}/")) }
@@ -161,7 +158,7 @@ impl FileSearch {
                 return Ok((index, id, prefix));
             }
         }
-        let (index, id) = self.index_with_content(scope, self.content_indexing_enabled(scope))?;
+        let (index, id) = self.index_with_content(scope, content)?;
         Ok((index, id, None))
     }
 
@@ -175,14 +172,15 @@ impl FileSearch {
         if grep && query.is_empty() { return ServiceResponse::failure("bad_request", "grep needs a query."); }
         let scoped = request.scope == Some(true);
         let cwd = request.cwd.as_deref().unwrap_or(directory);
-        let home_str = self.home.to_string_lossy().into_owned();
+        let home = self.resolved_home(request);
+        let home_str = home.to_string_lossy().into_owned();
         let result = (|| -> Result<ServiceResponse> {
             let (scope, (index, id, prefix)) = if scoped {
                 let scope = std::fs::canonicalize(directory)
                     .map_err(|e| anyhow!("Cannot resolve {directory}: {e}"))?
                     .to_string_lossy()
                     .into_owned();
-                (scope.clone(), self.scoped_index(&scope)?)
+                (scope.clone(), self.scoped_index(&scope, &home)?)
             } else {
                 let root = Self::root(directory).ok_or_else(|| anyhow!("Cannot resolve {directory}."))?;
                 let (index, id) = self.index_with_content(&root, true)?;
@@ -305,6 +303,7 @@ impl FileSearch {
         if !(1..=500).contains(&limit) { return ServiceResponse::failure("bad_request", "limit must be 1 to 500."); }
         let Some(root) = Self::root(directory) else { return ServiceResponse::failure("failed", format!("Cannot resolve {directory}.")); };
         let result = (|| -> Result<ServiceResponse> {
+            let home = self.resolved_home(request);
             let (index, id) = self.index(&root)?;
             let picked = (self.scores)(&root);
             if query.contains('\0') { return Err(anyhow!("NUL in query")); }
@@ -359,7 +358,7 @@ impl FileSearch {
             };
             let mut order: Vec<_> = (0..paths.len()).collect();
             order.sort_by(|&a, &b| key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
-            let home_str = self.home.to_string_lossy().into_owned();
+            let home_str = home.to_string_lossy().into_owned();
             let hits = order.into_iter().take(limit as usize).map(|i| FileHit {
                 insert: relative_insert(&paths[i].0, &root, directory, Some(&home_str)),
                 path: paths[i].0.clone(),
@@ -403,7 +402,7 @@ impl FileSearch {
     pub fn evict_idle(&self) { self.pool.lock().unwrap().entries.retain(|_, e| e.used.elapsed() <= self.idle); }
     /// Live instances, oldest id first.
     pub fn instances(&self) -> Vec<FileIndexInfo> {
-        let mut entries: Vec<_> = self.pool.lock().unwrap().entries.iter().map(|(root, e)| FileIndexInfo { id: e.id, root: root.clone() }).collect();
+        let mut entries: Vec<_> = self.pool.lock().unwrap().entries.iter().map(|((root, _), e)| FileIndexInfo { id: e.id, root: root.clone() }).collect();
         entries.sort_by_key(|e| e.id); entries
     }
 }
@@ -969,21 +968,44 @@ mod tests {
 
     #[test]
     fn content_indexing_disabled_at_or_above_home_direct_children() {
-        let old_home = std::env::var("HOME").ok();
         let home = std::env::temp_dir().join(format!("smcli-content-home-{}", std::process::id()));
         std::fs::create_dir_all(home.join("Dev/Apps/project")).unwrap();
-        unsafe { std::env::set_var("HOME", &home); }
-        let search = search(1);
         let home_str = home.to_string_lossy();
-        assert!(search.content_indexing_enabled(&format!("{home_str}/Dev/Apps/project")));
-        assert!(!search.content_indexing_enabled(&format!("{home_str}/Dev")));
-        assert!(!search.content_indexing_enabled(&home_str));
-        assert!(!search.content_indexing_enabled("/"));
-        unsafe {
-            match old_home {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
-            }
-        }
+        assert!(FileSearch::content_indexing_enabled(&home, &format!("{home_str}/Dev/Apps/project")));
+        assert!(!FileSearch::content_indexing_enabled(&home, &format!("{home_str}/Dev")));
+        assert!(!FileSearch::content_indexing_enabled(&home, &home_str));
+        assert!(!FileSearch::content_indexing_enabled(&home, "/"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn file_index_follows_caller_home() {
+        let base = std::env::temp_dir().join(format!("smcli-caller-index-{}", std::process::id()));
+        let project = base.join("wide/near/project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("note.txt"), "caller-home-marker").unwrap();
+        let wide = base.join("wide");
+        let near = base.join("wide/near");
+        let launch = base.join("launch");
+        std::fs::create_dir_all(&launch).unwrap();
+        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(|_, _, _, _, _| Ok(())), launch);
+        let scope = std::fs::canonicalize(&project).unwrap();
+        assert!(FileSearch::content_indexing_enabled(&wide, scope.to_str().unwrap()));
+        assert!(!FileSearch::content_indexing_enabled(&near, scope.to_str().unwrap()));
+        let mut first = ServiceRequest::new(Operation::Files);
+        first.directory = Some(scope.to_string_lossy().into_owned());
+        first.query = Some("note".into());
+        first.scope = Some(true);
+        first.home = Some(wide.to_string_lossy().into_owned());
+        let wide_hit = search.files(&first);
+        assert!(wide_hit.ok, "{:?}", wide_hit.error);
+        let mut second = first.clone();
+        second.home = Some(near.to_string_lossy().into_owned());
+        let near_hit = search.files(&second);
+        assert!(near_hit.ok, "{:?}", near_hit.error);
+        assert_ne!(wide_hit.instance, near_hit.instance, "different content policies must not share an index");
+        let again = search.files(&first);
+        assert_eq!(again.instance, wide_hit.instance, "the same caller home reuses its own index");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
