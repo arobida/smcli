@@ -27,7 +27,7 @@ use smcli_core::service_protocol::{
 use smcli_core::suggestion_index::SuggestionIndex;
 use smcli_core::time::now;
 use smcli_core::unix_socket::{SocketConnection, SocketError, listen_unix};
-use smcli_search::HistorySearch;
+use smcli_search::{HistorySearch, ModelId, Potion};
 use smcli_search::commands::CommandIndex;
 use smcli_search::corpus::{CorpusState, SearchSignals};
 use smcli_search::native::history_files;
@@ -43,6 +43,20 @@ struct SearchCorpus {
     state: CorpusState,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileStats([(u64, u64, u64, i64, i64, i64, i64); 3]);
+
+impl FileStats {
+    fn read(files: &[PathBuf; 3]) -> Result<Self> {
+        let mut stats = [(0, 0, 0, 0, 0, 0, 0); 3];
+        for (stamp, path) in stats.iter_mut().zip(files) {
+            let m = std::fs::metadata(path)?;
+            *stamp = (m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec());
+        }
+        Ok(Self(stats))
+    }
+}
+
 /// All history state, behind one lock.
 struct State {
     db: Connection,
@@ -51,8 +65,8 @@ struct State {
     data_version: i64,
     history_revision: u64,
     last_activity: Instant,
-    /// The corpus is rebuilt after any outside write, the engine when the config changes.
-    engine: Option<(SmcliConfig, Arc<HistorySearch>)>,
+    /// The corpus follows history writes; the engine follows model content only.
+    engine: Option<(ModelId, Arc<HistorySearch>)>,
     corpus: Option<SearchCorpus>,
     model_lock: Option<std::fs::File>,
 }
@@ -66,6 +80,7 @@ pub struct Service {
     build: Option<String>,
     environment: HashMap<String, String>,
     state: Mutex<State>,
+    model_ids: Mutex<HashMap<PathBuf, (FileStats, ModelId)>>,
     /// Searches run one at a time, outside `state`, so records aren't held up by one.
     searching: Mutex<()>,
     active: AtomicUsize,
@@ -141,6 +156,7 @@ impl Service {
                 user: user_name(),
                 environment,
                 state: Mutex::new(State { db, index: None, data_version: version, history_revision: 0, last_activity: Instant::now(), engine: None, corpus: None, model_lock: None }),
+                model_ids: Mutex::new(HashMap::new()),
                 searching: Mutex::new(()),
                 active: AtomicUsize::new(0),
                 contexts: ContextCache::new(),
@@ -574,13 +590,33 @@ impl Service {
         self.load_engine(request, || {})
     }
 
+    fn model_id(&self, config: &SmcliConfig) -> Result<ModelId> {
+        let files = Potion::model_files(config.potion_path.as_deref().map(Path::new))?;
+        let directory = std::fs::canonicalize(files[2].parent().unwrap())?;
+        let before = FileStats::read(&files)?;
+        let mut ids = self.model_ids.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((stats, model)) = ids.get(&directory)
+            && *stats == before
+        {
+            return Ok(model.clone());
+        }
+        let model = Potion::describe(config.potion_path.as_deref().map(Path::new))?;
+        if FileStats::read(&files)? == before {
+            ids.insert(directory, (before, model.clone()));
+        } else {
+            ids.remove(&directory);
+        }
+        Ok(model)
+    }
+
     fn load_engine(&self, request: &ServiceRequest, before_build: impl FnOnce()) -> Result<Arc<HistorySearch>> {
         let path = self.config_path(request);
         let config = SmcliConfig::load(&path)?;
+        let model = self.model_id(&config)?;
         {
             let mut state = self.lock();
             if let Some((current, engine)) = &state.engine
-                && *current == config
+                && *current == model
             {
                 return Ok(Arc::clone(engine));
             }
@@ -599,8 +635,8 @@ impl Service {
         environment.insert("SMCLI_CONFIG".into(), path.to_string_lossy().into_owned());
         before_build();
         let engine = Arc::new(search_engine(&self.history, &self.home(), &environment)?);
-        if SmcliConfig::load(&path)? == config {
-            self.lock().engine = Some((config, Arc::clone(&engine)));
+        if engine.potion.model_id() == model {
+            self.lock().engine = Some((model, Arc::clone(&engine)));
         }
         Ok(engine)
     }
@@ -739,6 +775,25 @@ mod tests {
             r.directory = Some(self.home.to_string_lossy().into_owned());
             r
         }
+        fn copy_model(&self, name: &str) -> PathBuf {
+            let directory = self.home.join(name);
+            std::fs::create_dir(&directory).unwrap();
+            let files = Potion::model_files(None).unwrap();
+            for (source, name) in files.iter().zip(["config.json", "tokenizer.json", "model.safetensors"]) {
+                std::fs::copy(source, directory.join(name)).unwrap();
+            }
+            directory
+        }
+        fn use_model(&self, directory: &Path) {
+            std::fs::write(self.home.join("config.toml"), format!("{{\"potionPath\":\"{}\"}}", directory.display())).unwrap();
+        }
+        fn search(&self) -> ServiceResponse {
+            let mut r = self.request(Operation::Search);
+            r.query = Some("list files".into());
+            let response = self.service.dispatch(&r);
+            assert!(response.ok, "{response:?}");
+            response
+        }
         fn command_index(&self, sources: &[&dyn CommandSource]) -> Arc<CommandIndex> {
             let _searching = self.service.searching.lock().unwrap();
             let engine = self.service.current_engine(&self.request(Operation::Embed)).unwrap();
@@ -870,8 +925,11 @@ mod tests {
         let first = f.service.dispatch(&r);
         assert!(first.ok, "{first:?}");
         let old = Arc::downgrade(f.service.command_sync.lock().unwrap().index.as_ref().unwrap());
-        let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Models/potion-shell-16m");
-        std::fs::write(f.home.join("config.toml"), format!("{{\"potionPath\":\"{}\"}}", model.display())).unwrap();
+        let model = f.copy_model("other-model");
+        let tokenizer = model.join("tokenizer.json");
+        let text = std::fs::read_to_string(&tokenizer).unwrap();
+        std::fs::write(&tokenizer, text.replace("\"max_length\":512", "\"max_length\":513")).unwrap();
+        f.use_model(&model);
         {
             let mut sync = f.service.command_sync.lock().unwrap();
             sync.known.insert("stale".into());
@@ -1155,6 +1213,109 @@ mod tests {
     }
 
     #[test]
+    fn capture_filter_edit_keeps_engine() {
+        let f = Fixture::new();
+        f.search();
+        let old = f.service.lock().engine.as_ref().unwrap().1.clone();
+        std::fs::write(f.home.join("config.toml"), "{\"historyFilter\":[\"secret\"]}").unwrap();
+        f.search();
+        let current = f.service.load_engine(&f.request(Operation::Search), || panic!("unnecessary reload")).unwrap();
+        assert!(Arc::ptr_eq(&old, &current));
+    }
+
+    #[test]
+    fn model_file_change_reloads_engine() {
+        let f = Fixture::new();
+        let model = f.copy_model("model");
+        f.use_model(&model);
+        f.search();
+        let old = Arc::downgrade(&f.service.lock().engine.as_ref().unwrap().1);
+        let identity = f.service.lock().engine.as_ref().unwrap().0.clone();
+        let sources = smcli_search::commands::bundled_sources().unwrap();
+        let refs = smcli_search::commands::source_refs(&sources);
+        let index = f.command_index(&refs);
+        let old_index = Arc::downgrade(&index);
+        drop(index);
+        let tokenizer = model.join("tokenizer.json");
+        let mut text = std::fs::read_to_string(&tokenizer).unwrap();
+        text.push('\n');
+        std::fs::write(&tokenizer, text).unwrap();
+        f.search();
+        assert!(old.upgrade().is_none());
+        assert!(old_index.upgrade().is_none());
+        assert_ne!(f.service.lock().engine.as_ref().unwrap().0, identity);
+    }
+
+    #[test]
+    fn same_content_new_path_keeps_engine() {
+        let f = Fixture::new();
+        f.search();
+        let old = f.service.lock().engine.as_ref().unwrap().1.clone();
+        let model = f.copy_model("same-model");
+        f.use_model(&model);
+        f.search();
+        assert!(Arc::ptr_eq(&old, &f.service.lock().engine.as_ref().unwrap().1));
+    }
+
+    #[test]
+    fn same_length_rewrite_with_restored_mtime_reloads() {
+        let f = Fixture::new();
+        let model = f.copy_model("model");
+        f.use_model(&model);
+        f.search();
+        let old = Arc::downgrade(&f.service.lock().engine.as_ref().unwrap().1);
+        let identity = f.service.lock().engine.as_ref().unwrap().0.clone();
+        let sources = smcli_search::commands::bundled_sources().unwrap();
+        let refs = smcli_search::commands::source_refs(&sources);
+        let index = f.command_index(&refs);
+        let old_index = Arc::downgrade(&index);
+        drop(index);
+        let files = Potion::model_files(Some(&model)).unwrap();
+        let before = FileStats::read(&files).unwrap();
+        let tokenizer = model.join("tokenizer.json");
+        let modified = std::fs::metadata(&tokenizer).unwrap().modified().unwrap();
+        let text = std::fs::read_to_string(&tokenizer).unwrap();
+        let changed = text.replace("\"max_length\":512", "\"max_length\":513");
+        assert_ne!(changed, text);
+        assert_eq!(changed.len(), text.len());
+        std::thread::sleep(Duration::from_millis(10));
+        std::fs::write(&tokenizer, changed).unwrap();
+        std::fs::File::options().write(true).open(&tokenizer).unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
+        let after = FileStats::read(&files).unwrap();
+        assert_eq!(before.0[1].2, after.0[1].2);
+        assert_eq!((before.0[1].3, before.0[1].4), (after.0[1].3, after.0[1].4));
+        assert_ne!(before, after);
+        f.search();
+        assert!(old.upgrade().is_none());
+        assert!(old_index.upgrade().is_none());
+        assert_ne!(f.service.lock().engine.as_ref().unwrap().0, identity);
+        let mut r = f.request(Operation::Embed);
+        r.query = Some("list files".into());
+        let response = f.service.dispatch(&r);
+        assert!(response.ok, "{response:?}");
+        let model = smcli_search::configured_model(&f.home, &f.service.environment).unwrap();
+        let reader = CommandIndex::reader(smcli_search::setup::index_directory(&f.service.history), model, &refs);
+        assert_eq!(response.model, Some(reader.index_name()));
+    }
+
+    #[test]
+    fn model_changed_during_load_is_not_cached() {
+        let f = Fixture::new();
+        let model = f.copy_model("model");
+        f.use_model(&model);
+        f.service.load_engine(&f.request(Operation::Search), || {
+            let tokenizer = model.join("tokenizer.json");
+            let mut text = std::fs::read_to_string(&tokenizer).unwrap();
+            text.push('\n');
+            std::fs::write(tokenizer, text).unwrap();
+        }).unwrap();
+        assert!(f.service.lock().engine.is_none());
+        f.search();
+        assert!(f.service.lock().engine.is_some());
+    }
+
+    #[test]
     fn engine_reload_does_not_hold_state_lock() {
         let f = Fixture::new();
         let r = f.request(Operation::Search);
@@ -1170,7 +1331,7 @@ mod tests {
         let f = Fixture::new();
         let r = f.request(Operation::Search);
         let old = f.service.current_engine(&r).unwrap();
-        f.service.lock().engine.as_mut().unwrap().0.ctrl_r_key = Some(false);
+        f.service.lock().engine.as_mut().unwrap().0.identity = "stale".into();
         f.service.load_engine(&r, || assert!(f.service.lock().engine.is_none())).unwrap();
         assert!(!Arc::ptr_eq(&old, &f.service.lock().engine.as_ref().unwrap().1));
     }

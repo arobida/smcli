@@ -1,4 +1,4 @@
-use std::{collections::HashSet, hash::{Hash, Hasher}, path::{Path, PathBuf}};
+use std::{collections::HashSet, path::{Path, PathBuf}};
 
 use anyhow::{Context, Result};
 use model2vec_rs::model::StaticModel;
@@ -24,9 +24,8 @@ impl Potion {
         ModelId { identity: self.identity.clone(), dimension: self.dimension }
     }
 
-    /// Inspect only the layout and safetensors header, without loading weights.
-    pub fn describe(potion_path: Option<&Path>) -> Result<ModelId> {
-        use std::io::Read;
+    /// Resolved config, tokenizer and weights, in identity-hash order; also used by the service's stat memo.
+    pub fn model_files(potion_path: Option<&Path>) -> Result<[PathBuf; 3]> {
         let bundled;
         let directory = match potion_path {
             Some(directory) => directory,
@@ -35,14 +34,44 @@ impl Potion {
                 &bundled
             }
         };
-        let (_, model_dir) = layout(directory)?;
-        let mut file = std::fs::File::open(model_dir.join("model.safetensors"))?;
-        let mut length = [0; 8];
-        file.read_exact(&mut length).context("missing safetensors header length")?;
-        let length = u64::from_le_bytes(length);
-        anyhow::ensure!(length <= 1024 * 1024, "safetensors header exceeds 1 MiB");
-        let mut header = vec![0; length as usize];
-        file.read_exact(&mut header).context("missing safetensors header")?;
+        let (config, model_dir) = layout(directory)?;
+        Ok([config, model_dir.join("tokenizer.json"), model_dir.join("model.safetensors")])
+    }
+
+    /// Stream the model's content identity and inspect its header without constructing the embedding matrix.
+    pub fn describe(potion_path: Option<&Path>) -> Result<ModelId> {
+        let [config, tokenizer, weights] = Self::model_files(potion_path)?;
+        Self::describe_open_files([std::fs::File::open(config)?, std::fs::File::open(tokenizer)?, std::fs::File::open(weights)?])
+    }
+
+    fn describe_open_files(files: [std::fs::File; 3]) -> Result<ModelId> {
+        use std::io::Read;
+        let mut header = Vec::new();
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = vec![0; 1024 * 1024];
+        for (index, mut file) in files.into_iter().enumerate() {
+            let length = file.metadata()?.len();
+            hasher.update(&length.to_le_bytes());
+            let mut read = 0u64;
+            if index == 2 {
+                let mut prefix = [0; 8];
+                file.read_exact(&mut prefix).context("missing safetensors header length")?;
+                let header_length = u64::from_le_bytes(prefix);
+                anyhow::ensure!(header_length <= 1024 * 1024, "safetensors header exceeds 1 MiB");
+                header.resize(header_length as usize, 0);
+                file.read_exact(&mut header).context("missing safetensors header")?;
+                hasher.update(&prefix);
+                hasher.update(&header);
+                read = 8 + header_length;
+            }
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 { break; }
+                hasher.update(&buffer[..count]);
+                read += count as u64;
+            }
+            anyhow::ensure!(read == length, "model file changed while hashing");
+        }
         let header: serde_json::Value = serde_json::from_slice(&header)?;
         let tensor = ["embeddings", "0", "embedding.weight"].into_iter()
             .find_map(|name| header.get(name)).ok_or_else(|| anyhow::anyhow!("embeddings tensor not found"))?;
@@ -50,9 +79,7 @@ impl Potion {
         anyhow::ensure!(shape.len() == 2, "invalid embeddings shape");
         let dimension = shape[1].as_u64().and_then(|n| usize::try_from(n).ok())
             .filter(|n| *n > 0).ok_or_else(|| anyhow::anyhow!("invalid embedding dimension"))?;
-        let identity = if potion_path.is_none() { "bundled".into() } else {
-            model_identity(&std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf()))
-        };
+        let identity = finish_identity(hasher);
         Ok(ModelId { identity, dimension })
     }
 
@@ -64,7 +91,7 @@ impl Potion {
         let directory = Self::bundled_dir().ok_or_else(|| {
             anyhow::anyhow!("{} model not found beside the smcli executable; reinstall, or point `smcli init --potion DIR` at a model", Self::NAME)
         })?;
-        Self::load(&directory, "bundled".into())
+        Self::load(&directory)
     }
 
     fn bundled_dir() -> Option<PathBuf> {
@@ -82,22 +109,27 @@ impl Potion {
 
     /// A model directory (`potionPath` in the config).
     pub fn from_dir(directory: &Path) -> Result<Self> {
-        let canonical = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
-        Self::load(directory, model_identity(&canonical))
+        Self::load(directory)
     }
 
-    fn load(directory: &Path, identity: String) -> Result<Self> {
-        let (config, model_dir) = layout(directory)?;
-        let tokenizer = std::fs::read(model_dir.join("tokenizer.json")).context("failed to read tokenizer.json")?;
+    fn load(directory: &Path) -> Result<Self> {
+        let [config_path, tokenizer_path, weights_path] = Self::model_files(Some(directory))?;
+        let config = std::fs::read(config_path).context("failed to read model config")?;
+        let tokenizer = std::fs::read(tokenizer_path).context("failed to read tokenizer.json")?;
+        let weights = std::fs::read(weights_path).context("failed to read model.safetensors")?;
+        let mut hasher = blake3::Hasher::new();
+        for bytes in [&config, &tokenizer, &weights] {
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        let identity = finish_identity(hasher);
         let json: serde_json::Value = serde_json::from_slice(&tokenizer)?;
         let vocabulary = match &json["model"]["vocab"] {
             serde_json::Value::Object(words) => words.keys().cloned().collect(),
             serde_json::Value::Array(words) => words.iter().filter_map(|word| word[0].as_str().map(str::to_owned)).collect(),
             _ => HashSet::new(),
         };
-        let model = StaticModel::from_bytes(tokenizer,
-            std::fs::read(model_dir.join("model.safetensors")).context("failed to read model.safetensors")?,
-            std::fs::read(config).context("failed to read model config")?, None)?;
+        let model = StaticModel::from_bytes(tokenizer, weights, config, None)?;
         let dimension = model.encode_single("smcli").len();
         Ok(Self { model, vocabulary, identity, dimension })
     }
@@ -131,14 +163,8 @@ fn layout(directory: &Path) -> Result<(PathBuf, PathBuf)> {
         .ok_or_else(|| anyhow::anyhow!("no valid model layout found in '{}'", directory.display()))
 }
 
-/// Last path component (short) plus a hash of the full canonical path, so index filenames stay bounded.
-fn model_identity(canonical: &Path) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    canonical.hash(&mut hasher);
-    let hash = format!("{:016x}", hasher.finish());
-    let slug: String = canonical.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
-        .chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).take(32).collect();
-    format!("{}-{hash}", if slug.is_empty() { "model" } else { &slug })
+fn finish_identity(hasher: blake3::Hasher) -> String {
+    format!("b3{}", &hasher.finalize().to_hex()[..16])
 }
 
 #[cfg(test)]
@@ -146,7 +172,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn describe_matches_loaded_model() {
+    fn loaded_identity_matches_describe() {
         let potion = Potion::bundled().unwrap();
         let model = Potion::describe(None).unwrap();
         assert_eq!(model, potion.model_id());
@@ -196,15 +222,72 @@ mod tests {
         assert_eq!(crate::corpus::prepare_intent_query("suite", &history, None).embedding_query(), "site");
     }
 
+    fn copy_model(destination: &Path) {
+        let files = Potion::model_files(None).unwrap();
+        for (source, name) in files.iter().zip(["config.json", "tokenizer.json", "model.safetensors"]) {
+            std::fs::copy(source, destination.join(name)).unwrap();
+        }
+    }
+
     #[test]
-    fn identity_stays_short_for_a_long_model_path() {
-        let last = "m".repeat(245);
-        let path = PathBuf::from("/").join("a".repeat(200)).join(&last);
-        let id = model_identity(&path);
-        assert_eq!(id.len(), 32 + 1 + 16);
-        assert!(id.starts_with(&"m".repeat(32)));
-        let name = format!("rs-commands-v3-potion-shell-16m-{id}-d256-typed");
-        assert!(name.len() <= 255, "{name}");
-        assert_ne!(id, model_identity(&PathBuf::from("/").join("b".repeat(200)).join(&last)));
+    fn identity_changes_with_any_model_file() {
+        let root = tempfile::tempdir().unwrap();
+        copy_model(root.path());
+        let original = Potion::describe(Some(root.path())).unwrap().identity;
+        let mut identities = HashSet::from([original]);
+        for file in ["config.json", "tokenizer.json", "model.safetensors"] {
+            let path = root.path().join(file);
+            let mut bytes = std::fs::read(&path).unwrap();
+            let offset = bytes.len() - 1;
+            bytes[offset] ^= 1;
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(identities.insert(Potion::describe(Some(root.path())).unwrap().identity), "{file}");
+            bytes[offset] ^= 1;
+            std::fs::write(path, bytes).unwrap();
+        }
+        assert_eq!(identities.len(), 4);
+    }
+
+    #[test]
+    fn identity_is_path_independent() {
+        let root = tempfile::tempdir().unwrap();
+        copy_model(root.path());
+        assert_eq!(Potion::describe(None).unwrap(), Potion::describe(Some(root.path())).unwrap());
+        assert_eq!(Potion::bundled().unwrap().model_id(), Potion::from_dir(root.path()).unwrap().model_id());
+    }
+
+    #[test]
+    fn describe_keeps_header_and_hash_on_the_same_open_file() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("config.json"), "{}").unwrap();
+        std::fs::write(root.path().join("tokenizer.json"), "{}").unwrap();
+        let weights = |dimension| {
+            let header = serde_json::to_vec(&serde_json::json!({"embeddings": {"shape": [1, dimension]}})).unwrap();
+            [(header.len() as u64).to_le_bytes().as_slice(), &header].concat()
+        };
+        let path = root.path().join("model.safetensors");
+        std::fs::write(&path, weights(2)).unwrap();
+        let original = Potion::describe(Some(root.path())).unwrap();
+        let files = Potion::model_files(Some(root.path())).unwrap().map(|path| std::fs::File::open(path).unwrap());
+        let replacement = root.path().join("replacement");
+        std::fs::write(&replacement, weights(3)).unwrap();
+        std::fs::rename(replacement, path).unwrap();
+        assert_eq!(Potion::describe_open_files(files).unwrap(), original);
+        let replaced = Potion::describe(Some(root.path())).unwrap();
+        assert_eq!(replaced.dimension, 3);
+        assert_ne!(replaced.identity, original.identity);
+    }
+
+    #[test]
+    fn identity_is_stable() {
+        assert_eq!(Potion::describe(None).unwrap().identity, "b328dc29a5ea20ee6c");
+    }
+
+    #[test]
+    #[ignore = "manual release measurement of streaming model identity"]
+    fn describe_timing() {
+        let start = std::time::Instant::now();
+        let model = Potion::describe(None).unwrap();
+        eprintln!("bundled describe: {:.3} ms ({})", start.elapsed().as_secs_f64() * 1000.0, model.identity);
     }
 }

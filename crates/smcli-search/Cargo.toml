@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+blake3 = "1.8.7"
 libc = "0.2.191"
 model2vec-rs = "0.3.0"
 serde = { version = "1.0.229", features = ["derive"] }

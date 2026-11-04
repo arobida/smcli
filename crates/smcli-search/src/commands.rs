@@ -94,7 +94,7 @@ pub struct IndexedExample {
 }
 
 /// The persistent index of command examples, one TalaDB file named
-/// `rs-commands-{model}-{sources}-d{dim}` next to the history search index.
+/// `rs-examples-v1-{model}-{sources}-d{dim}` next to the history search index.
 pub struct CommandIndex {
     pub directory: PathBuf,
     pub model: ModelId,
@@ -129,7 +129,7 @@ impl CommandIndex {
 
     pub fn index_name(&self) -> String {
         format!(
-            "rs-commands-{}-{}-{}-d{}",
+            "rs-examples-v1-{}-{}-{}-d{}",
             Potion::NAME,
             self.model.identity,
             self.sources.join("_"),
@@ -341,8 +341,13 @@ pub fn ensure(index: &CommandIndex, sources: &[&dyn CommandSource], platform: &s
 pub fn prepare(index: &CommandIndex, sources: &[&dyn CommandSource], platform: &str, path: &str,
                captured_programs: &HashSet<String>, rebuild: bool, program: Option<&str>) -> Result<()> {
     index.writable()?;
-    if rebuild && index.path().exists() {
-        std::fs::remove_file(index.path())?;
+    {
+        let _lock = crate::index::lock_index_directory(&index.directory, 20)?
+            .ok_or_else(|| anyhow::anyhow!("command index is busy; try again"))?;
+        crate::index::remove_old_indexes(&index.directory)?;
+        if rebuild && index.path().exists() {
+            std::fs::remove_file(index.path())?;
+        }
     }
     if !index.path().exists() {
         let mut programs = os_programs(&system_dirs(), path);
@@ -578,6 +583,43 @@ mod tests {
         assert!(index.examples("noexamples").unwrap().is_none());
         assert!(index.examples("onlylinux").unwrap().is_none());
         assert_eq!(index.programs().unwrap(), HashSet::from(["tar".to_owned()]));
+    }
+
+    #[test]
+    fn legacy_indexes_removed_on_build() {
+        for command_build in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join("index");
+            drop(crate::index::lock_index_directory(&directory, 1).unwrap());
+            let legacy_history = directory.join("rs-commands-v3-potion-shell-16m-bundled-d256.taladb");
+            let legacy_command = directory.join("rs-commands-potion-shell-16m-bundled-stub@1-d256.taladb");
+            let legacy_sidecar = legacy_command.with_extension("building");
+            let other_history = directory.join("rs-commands-v4-potion-othermodel-d256.taladb");
+            let other_command = directory.join("rs-examples-v1-potion-shell-16m-othermodel-stub@1-d256.taladb");
+            for path in [&legacy_history, &legacy_command, &legacy_sidecar, &other_history, &other_command] {
+                std::fs::write(path, b"fixture").unwrap();
+            }
+            let legacy_dir = directory.join("rs-commands-potion-shell-16m-old-directory");
+            std::fs::create_dir(&legacy_dir).unwrap();
+            std::fs::write(legacy_dir.join("index"), b"fixture").unwrap();
+            let potion = Potion::bundled().unwrap();
+            if command_build {
+                let source = PlatformSource;
+                let sources: Vec<&dyn CommandSource> = vec![&source];
+                let index = CommandIndex::new(&directory, potion, &sources);
+                let bin = root.path().join("bin");
+                std::fs::create_dir(&bin).unwrap();
+                exe(&bin, "tar");
+                prepare(&index, &sources, "osx", bin.to_str().unwrap(), &HashSet::new(), false, Some("tar")).unwrap();
+                assert!(index.path().exists());
+            } else {
+                crate::HistorySearch::new(&directory, potion).reindex(&std::collections::HashMap::new()).unwrap();
+            }
+            for path in [&legacy_history, &legacy_command, &legacy_sidecar, &legacy_dir] {
+                assert!(!path.exists(), "obsolete cache remained: {}", path.display());
+            }
+            assert!(other_history.exists() && other_command.exists(), "other current-format models must stay");
+        }
     }
 
     #[test]

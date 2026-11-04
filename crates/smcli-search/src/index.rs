@@ -95,7 +95,7 @@ pub struct HistorySearch {
 }
 
 /// Swift's `commands-v*` files live in the same directory; this prefix keeps the two from deleting each other's index.
-const VERSION: &str = "rs-commands-v3";
+const VERSION: &str = "rs-commands-v4";
 
 #[cfg(test)]
 thread_local! { pub(crate) static VECTOR_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(true) }; }
@@ -479,7 +479,7 @@ impl HistorySearch {
 
     /// `setup` is injected so a test can fail setup without corrupting the file.
     fn open_cached(&self, name: &str, setup: impl Fn(&Database) -> Result<()>) -> Result<Database> {
-        self.remove_old_indexes();
+        remove_old_indexes(&self.directory)?;
         let path = self.directory.join(format!("{name}.taladb"));
         let open = || -> Result<Database> {
             let db = taladb::open(&path)?;
@@ -516,23 +516,37 @@ impl HistorySearch {
         }
     }
 
-    /// Indexes from earlier document formats are never read again.
-    fn remove_old_indexes(&self) {
-        let Ok(entries) = std::fs::read_dir(&self.directory) else { return };
-        for entry in entries.filter_map(|e| e.ok()) {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with("rs-commands-v") && !name.starts_with(&format!("{VERSION}-")) {
-                let path = entry.path();
-                let _ = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
-            }
-        }
-    }
-
     /// Serializes index writers with the same `lock` file (flock) the Swift build uses. Tries `attempts` times,
     /// 50 ms apart; `None` when another process still holds it.
     pub fn lock_index(&self, attempts: u32) -> Result<Option<File>> {
         lock_index_directory(&self.directory, attempts)
     }
+}
+
+/// Remove unversioned command-example caches without touching any history index.
+pub fn remove_legacy_indexes(directory: &Path) -> Result<()> {
+    remove_indexes_matching(directory, |name| name.starts_with("rs-commands-potion-shell-16m-"))
+}
+
+pub(crate) fn remove_old_indexes(directory: &Path) -> Result<()> {
+    remove_legacy_indexes(directory)?;
+    remove_indexes_matching(directory, |name| name.starts_with("rs-commands-v") && !name.starts_with(&format!("{VERSION}-")))
+}
+
+fn remove_indexes_matching(directory: &Path, obsolete: impl Fn(&str) -> bool) -> Result<()> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if obsolete(&entry.file_name().to_string_lossy()) {
+            if entry.file_type()?.is_dir() { std::fs::remove_dir_all(entry.path())?; }
+            else { std::fs::remove_file(entry.path())?; }
+        }
+    }
+    Ok(())
 }
 
 /// Locks the shared index directory without loading an embedding model.

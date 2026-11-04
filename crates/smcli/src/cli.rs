@@ -1464,7 +1464,7 @@ struct IndexInfo {
     current: bool,
 }
 
-/// Every `rs-commands-*` index next to the history database, grouped by index name; `prune` deletes all but the current model's.
+/// History and command-example indexes next to the database; `prune` keeps only the current model's.
 fn indexes(captured: &CapturedHistory, home: &Path, env: &HashMap<String, String>, prune: bool, json: bool) -> Result<()> {
     let model = configured_model(home, env)?;
     let directory = index_directory(captured);
@@ -1475,6 +1475,7 @@ fn indexes(captured: &CapturedHistory, home: &Path, env: &HashMap<String, String
         smcli_search::commands::CommandIndex::reader(directory.clone(), model.clone(), &refs).index_name()
     });
     let _lock = if prune { Some(lock_index_directory(&directory, 20)?.ok_or_else(|| anyhow::anyhow!("Search index is busy; try again."))?) } else { None };
+    if prune { smcli_search::index::remove_legacy_indexes(&directory)?; }
     let mut found: std::collections::BTreeMap<String, IndexInfo> = Default::default();
     let entries = match std::fs::read_dir(&directory) {
         Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
@@ -1486,7 +1487,7 @@ fn indexes(captured: &CapturedHistory, home: &Path, env: &HashMap<String, String
         // Index names hold no dots, so everything before the first one groups the index with its side files.
         // Index names hold no dots, so everything before the first one groups the index with its side files.
         // Old `tldr-*.vec` vector caches predate the command index; they are never current and prune deletes them.
-        let name = if filename.starts_with("rs-commands-") {
+        let name = if filename.starts_with("rs-commands-") || filename.starts_with("rs-examples-") {
             filename.split_once('.').map(|(name, _)| name.to_string())
         } else if filename.starts_with("tldr-") && filename.ends_with(".vec") {
             Some(filename.clone())
@@ -1540,6 +1541,10 @@ fn index_health(
         let model = configured_model(home, env)?;
         let index_dir = index_directory(captured);
         let name = smcli_search::index_name(&model);
+        let command_current = smcli_search::commands::bundled_sources().map(|sources| {
+            let refs = smcli_search::commands::source_refs(&sources);
+            smcli_search::commands::CommandIndex::reader(index_dir.clone(), model.clone(), &refs).index_name()
+        });
         report.embedder = format!("{} ({} dimensions), {}", smcli_search::Potion::NAME, model.dimension, model.identity);
         let path = index_dir.join(format!("{name}.taladb"));
         report.path = path.to_string_lossy().into_owned();
@@ -1562,9 +1567,10 @@ fn index_health(
         for entry in std::fs::read_dir(&index_dir)? {
             let entry = entry?;
             let filename = entry.file_name().to_string_lossy().into_owned();
-            if filename.starts_with("rs-commands-v")
+            if (filename.starts_with("rs-commands-v") || filename.starts_with("rs-examples-"))
                 && filename.ends_with(".taladb")
                 && filename != format!("{name}.taladb")
+                && command_current.as_ref().is_none_or(|current| filename != format!("{current}.taladb"))
             {
                 report.other_indexes.push(filename.clone());
             }
@@ -1993,6 +1999,12 @@ mod tests {
         let length = u64::from_le_bytes(weights[..8].try_into().unwrap()) as usize;
         std::fs::write(model.join("model.safetensors"), &weights[..8 + length])?;
         assert!(smcli_search::Potion::from_dir(&model).is_err(), "health must work with header-only weights");
+        let header_model = configured_model(&dir, &env)?;
+        assert_ne!(header_model, engine.potion.model_id(), "truncating weights changes content identity");
+        assert!(!index_health(&captured, &dir, &env, &corpus).built);
+        // Keep the coverage fixture under the header-only model's content-derived name.
+        std::fs::rename(engine.directory.join(format!("{}.taladb", engine.index_name())),
+            engine.directory.join(format!("{}.taladb", smcli_search::index_name(&header_model))))?;
         let built = index_health(&captured, &dir, &env, &corpus);
         assert!(built.healthy, "{:?}", built.problems);
         assert!(built.built);
@@ -2024,7 +2036,12 @@ mod tests {
         let typed = engine.directory.join(format!("{}-typed.db", engine.index_name()));
         let old = engine.directory.join("rs-commands-v1-old.db");
         let old_tldr = engine.directory.join("tldr-old.vec");
-        for path in [&normal, &typed, &old, &old_tldr] { std::fs::write(path, b"index")?; }
+        let sources = smcli_search::commands::bundled_sources().unwrap();
+        let refs = smcli_search::commands::source_refs(&sources);
+        let commands = smcli_search::commands::CommandIndex::reader(&engine.directory, engine.potion.model_id(), &refs).path();
+        let other_commands = engine.directory.join("rs-examples-v1-potion-shell-16m-othermodel-test@1-d256.taladb");
+        let legacy_commands = engine.directory.join("rs-commands-potion-shell-16m-bundled-old.taladb");
+        for path in [&normal, &typed, &old, &old_tldr, &commands, &other_commands, &legacy_commands] { std::fs::write(path, b"index")?; }
         let c = captured.clone();
         let home = dir.clone();
         let attempt = std::thread::spawn(move || indexes(&c, &home, &HashMap::new(), true, false));
@@ -2032,7 +2049,8 @@ mod tests {
         assert!(old.exists());
         drop(lock);
         indexes(&captured, &dir, &HashMap::new(), true, false)?;
-        assert!(normal.exists() && typed.exists() && !old.exists() && !old_tldr.exists());
+        assert!(normal.exists() && typed.exists() && commands.exists());
+        assert!(!old.exists() && !old_tldr.exists() && !other_commands.exists() && !legacy_commands.exists());
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -2077,6 +2095,8 @@ mod tests {
         let old = index.join("rs-commands-v1-old");
         std::fs::create_dir(&old)?;
         std::fs::write(old.join("secret"), b"secret-cmd")?;
+        let command_examples = index.join("rs-examples-v1-potion-shell-16m-test-stub@1-d256.taladb");
+        std::fs::write(&command_examples, b"command examples")?;
         let outside = dir.join("outside");
         std::fs::create_dir(&outside)?;
         std::fs::write(outside.join("keep"), b"keep")?;
@@ -2085,6 +2105,7 @@ mod tests {
         prune(&captured, &filter, false)?;
         assert!(!old.exists());
         assert!(!index.join("rs-commands-v1-link").exists());
+        assert!(command_examples.exists(), "history prune must leave command examples alone");
         assert!(outside.join("keep").exists());
         assert_eq!(captured.open_connection()?.query_row("SELECT count(*) FROM commands", [], |r| r.get::<_, i64>(0))?, 0);
         std::fs::remove_dir_all(dir)?;

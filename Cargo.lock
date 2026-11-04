@@ -2487,6 +2487,7 @@ name = "smcli-search"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "libc",
  "model2vec-rs",
  "rusqlite",

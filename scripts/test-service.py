@@ -32,7 +32,8 @@ env.update(SMCLI_DB=f"{root}/history.db", SMCLI_RUNTIME_DIR=f"{root}/run", SMCLI
 
 
 def run(*args, check=True, cli=None, **overrides):
-    result = subprocess.run([cli or smcli, *args], env=dict(env, **overrides), capture_output=True, text=True, timeout=30)
+    timeout = 600 if args and args[0] in ("search", "reindex") else 30
+    result = subprocess.run([cli or smcli, *args], env=dict(env, **overrides), capture_output=True, text=True, timeout=timeout)
     if check and result.returncode != 0:
         raise AssertionError(f"smcli {' '.join(args)} failed: {result.stderr}")
     return result
@@ -552,19 +553,24 @@ try:
     search_dir = env["SMCLI_DB"] + ".search"
     os.makedirs(f"{search_dir}/rs-commands-v0-potion-old-d256")
     open(f"{search_dir}/rs-commands-v0-potion-old-d256/index.pxkt", "w").write("old")
-    open(f"{search_dir}/rs-commands-v3-potion-othermodel-d256.taladb", "w").write("other")
+    open(f"{search_dir}/rs-commands-v4-potion-othermodel-d256.taladb", "w").write("other")
+    legacy_command = Path(search_dir) / "rs-commands-potion-shell-16m-bundled-tldr@old-d256.taladb"
+    legacy_history = Path(search_dir) / "rs-commands-v3-potion-shell-16m-bundled-d256.taladb"
+    legacy_command.write_text("legacy command examples")
+    legacy_history.write_text("legacy history")
     run("reindex", SMCLI_SERVICE="0")
+    assert not legacy_command.exists() and not legacy_history.exists(), "reindex removes legacy caches"
     left = sorted(n for n in os.listdir(search_dir) if n.startswith("rs-commands-v"))
-    assert "rs-commands-v0-potion-old-d256" not in left and "rs-commands-v3-potion-othermodel-d256.taladb" in left, left
-    assert "rs-commands-v3-potion-othermodel-d256" in run("health", SMCLI_SERVICE="0").stdout
+    assert "rs-commands-v0-potion-old-d256" not in left and "rs-commands-v4-potion-othermodel-d256.taladb" in left, left
+    assert "rs-commands-v4-potion-othermodel-d256" in run("health", SMCLI_SERVICE="0").stdout
     current = next(n for n in left if "othermodel" not in n)
     assert run("health", SMCLI_SERVICE="0", check=False).returncode == 0
     # The index manager lists both, marks the current one, and --prune deletes only the other model's.
     listed = {i["name"]: i["current"] for i in json.loads(run("indexes", "--json", SMCLI_SERVICE="0").stdout)}
     # The command-completion index (named by its bundled sources) is listed too, and is current.
-    bundled = [name for name in listed if "-bundled-tldr@" in name]
+    bundled = [name for name in listed if name.startswith("rs-examples-v1-potion-shell-16m-b3")]
     assert len(bundled) == 1, listed
-    assert listed == {"rs-commands-v3-potion-othermodel-d256": False, current.split(".")[0]: True, bundled[0]: True}, listed
+    assert listed == {"rs-commands-v4-potion-othermodel-d256": False, current.split(".")[0]: True, bundled[0]: True}, listed
     run("indexes", "--prune", SMCLI_SERVICE="0")
     assert not any("othermodel" in n for n in os.listdir(search_dir)) and os.path.exists(f"{search_dir}/{current}")
     # Served @@ prepare builds a missing command index and returns embeddings for its exact name.
