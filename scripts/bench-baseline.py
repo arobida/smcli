@@ -278,7 +278,7 @@ def repository_search(binary, files, samples):
             with socket.socket(socket.AF_UNIX) as connection:
                 connection.settimeout(120)
                 connection.connect(path)
-                connection.sendall((_json.dumps({"v": 1, "op": op, "directory": str(repo / "pkg0" / "dir0"), "query": query}) + "\n").encode())
+                connection.sendall((_json.dumps({"v": 3, "op": op, "directory": str(repo / "pkg0" / "dir0"), "query": query}) + "\n").encode())
                 reply = b""
                 while not reply.endswith(b"\n"):
                     reply += connection.recv(1 << 20)
