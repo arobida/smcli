@@ -2,12 +2,12 @@
 
 Build the four changes in `openspec/changes/` with the ateam. The orchestrator (Claude, via the kero skill) starts each agent, hands it the brief below, reviews the result and merges. Agents implement; they do not redesign. When a change's spec, design and tasks disagree with the code, the agent stops and reports instead of guessing.
 
-| ID  | Change                          | Builder | Reviewer | Wave | Size  |
-| --- | ------------------------------- | ------- | -------- | ---- | ----- |
-| A   | `bash-pipestatus`               | piluna  | piterra  | 1    | small |
-| B   | `file-picker-middle-truncation` | pikcode | piterra  | 1    | small |
-| C   | `cheat-command-source`          | pikcode | piterra  | 1    | mid   |
-| D   | `project-kind-ranking`          | pisol   | piterra  | 2    | mid   |
+| ID  | Change                          | Builder             | Reviewer                    | Wave | Size  |
+| --- | ------------------------------- | ------------------- | --------------------------- | ---- | ----- |
+| A   | `bash-pipestatus`               | piluna              | piterra                     | 1    | small |
+| B   | `file-picker-middle-truncation` | piluna              | piterra                     | 1    | small |
+| C   | `cheat-command-source`          | piluna              | piterra                     | 1    | mid   |
+| D   | `project-kind-ranking`          | coder (Claude Code) | code-reviewer (Claude Code) | 2    | mid   |
 
 Commit messages: pigrok45, following `agents/reference/commits.md`.
 
@@ -50,7 +50,7 @@ Goal: Bash records `pipestatus` like Zsh and Fish.
 - Tests: `scripts/test-shells.py` currently asserts Bash has no `pipestatus` (around line 316). Flip it and add the cases in task group 2.
 - Verify: `make build`, then `make test-shells`.
 
-### Brief B: `file-picker-middle-truncation` (pikcode)
+### Brief B: `file-picker-middle-truncation` (piluna)
 
 Goal: long paths in file and grep picker rows keep the file name, shortened in the middle with `…`.
 
@@ -60,7 +60,7 @@ Goal: long paths in file and grep picker rows keep the file name, shortened in t
 - Display only: the inserted path must not change.
 - Verify: `make build`, `make test-rust PKG=smcli`, `make test-picker`.
 
-### Brief C: `cheat-command-source` (pikcode)
+### Brief C: `cheat-command-source` (piluna)
 
 Goal: cheat/cheatsheets as a second bundled `@@` source; sources tried in priority order per program (tldr first, cheat only when tldr has nothing).
 
@@ -78,17 +78,17 @@ Goal: cheat/cheatsheets as a second bundled `@@` source; sources tried in priori
 ### Wave 1 review and merge (orchestrator + piterra)
 
 1. For each finished branch, piterra reviews `git diff main...<change>` against that change's spec and design: spec scenarios covered by a test, no files outside the brief, no hand edits to generated files. piterra reads the builder's test report and does not rerun those slices unless the diff changed after them.
-2. Fixes go back to the original builder in the same session.
+2. Fixes go back to the original builder in the same session. If a re-review still says FIX, the next round goes to piluna instead of pikcode.
 3. Merge in order A, B, C into `main` (A and B can't conflict with C; C last because it's largest). pigrok45 writes each commit message. Commit and push only with the user's go-ahead, per `agents/reference/commits.md`.
 4. Once, on merged `main`: `make test`. If it fails, the orchestrator finds the branch responsible and sends it back.
 
-## Wave 2: D `project-kind-ranking` (pisol)
+## Wave 2: D `project-kind-ranking` (Claude Code agents)
 
-D starts only after wave 1 is merged and `make test` passes on `main`, because its gate compares against that tree, and it shares `service.rs` with C. Branch the worktree from the merged `main`.
+Wave 2 uses the project's Claude Code agents (`.claude/agents/`), run by the orchestrator through its Agent tool: `coder` implements Brief D, `tester` runs `make ranking` and `make baseline` for the gate, `code-reviewer` reviews. D starts only after wave 1 is merged and `make test` passes on `main`, because its gate compares against that tree, and it shares `service.rs` with C. Branch the worktree from the merged `main`.
 
 The baseline benchmark is timing-sensitive: while D runs `make baseline`, no other agent builds or tests on this machine. The orchestrator holds other work for that window.
 
-### Brief D: `project-kind-ranking` (pisol)
+### Brief D: `project-kind-ranking` (coder; tester runs the gate)
 
 Goal: a same-kind project tier in suggest and search, shipped only if the benchmark proves it.
 
@@ -111,7 +111,7 @@ Goal: a same-kind project tier in suggest and search, shipped only if the benchm
 
 ### Wave 2 review and merge
 
-piterra reviews the diff and the gate numbers (MRR, top-1 and top-3 per cohort, before and after; baseline medians). Merge only if the gate passed. pigrok45 writes the commit message; commit with the user's go-ahead.
+`code-reviewer` reviews the diff and the gate numbers (MRR, top-1 and top-3 per cohort, before and after; baseline medians). Merge only if the gate passed. pigrok45 writes the commit message; commit with the user's go-ahead.
 
 ## After all four
 
