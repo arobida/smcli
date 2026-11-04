@@ -20,7 +20,7 @@
 
 - [x] 4.1 Verify with `make fresh` that `@@` for a program with only a cheat sheet shows cheat examples, `@@ tar` shows only tldr examples, and `make tldr-ranking` scores are unchanged.
 - [x] 4.2 Update `crates/smcli-search/README.md` and the "later cheat.sh" note in `command_source.rs` to describe the priority order; run `make docs`.
-- [ ] 4.3 Run `make test`; verify it passes.
+- [x] 4.3 Run `make test`; verify it passes.
 
 ## Workflow follow-up
 

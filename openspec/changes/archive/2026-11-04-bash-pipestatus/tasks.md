@@ -13,7 +13,7 @@
 ## 3. Docs
 
 - [x] 3.1 Remove `Bash: record pipestatus` from `agents/plans/roadmap.md`; run `make docs`.
-- [ ] 3.2 Run `make test`; verify it passes.
+- [x] 3.2 Run `make test`; verify it passes.
 
 ## Workflow follow-up
 
