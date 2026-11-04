@@ -4,8 +4,8 @@
 
 `smcli-service` is the long-lived daemon for one history database. It holds the captured-history SQLite
 connection and the in-memory suggestion index, serves `smcli` clients over a private Unix-domain socket,
-and is the only crate that links `fff-search` (the file/grep picker). Both executables use
-`smcli-search` for hybrid BM25 + embedding search with the potion-shell-16m model. It is started on demand by `smcli-core`'s client and
+and is the only crate that links `fff-search` (the file/grep picker). `smcli-service` owns runtime model loading and
+embedding through `smcli-search`, including protocol-v4 `embed` requests for `@@` query vectors and command-index preparation. It is started on demand by `smcli-core`'s client and
 exits when idle. CLI fallbacks may also write the database; `service.rs:Service::refresh` invalidates caches on external writes.
 
 ## Interface
@@ -19,7 +19,7 @@ ownership of file search stays here.
 ## Subdirectories & System Boundaries
 
 - [src](src/README.md) — daemon loop, request dispatch, fff file/grep search, evidence, test discovery.
-- tests/ — `tests/client.rs` integration tests exercising `Service` in-process (no contract file).
+- tests/ — `tests/client.rs` integration tests exercising the real service over its Unix socket.
 
 ## Invariants
 
@@ -29,8 +29,10 @@ ownership of file search stays here.
   `smcli_core::service_client`): only the same uid may use the socket.
 - The search index and corpus are rebuildable caches: `service.rs:Service::refresh` invalidates history caches after external database writes;
   `Service::build_corpus` checks native-history stamps and a five-minute corpus lifetime.
-- `service.rs:Service::load_engine` drops the old engine before building the new one; callers serialize
-  search/model loading through `Service::searching`.
+- `service.rs:Service::load_engine` drops the old engine and cached command index before building the new one, and clears the synced program/PATH cache. Command indexes are keyed by their index name.
+- Search, `embed` and background command sync hold `Service::searching` for their whole model-using operation. Background sync skips busy work and retries on a later capture; command-index preparation can block searches, whose clients may time out and degrade.
+- The service takes `<db>.search/model.lock` before its first model load and retains the same descriptor until exit, including across model switches. If init/reindex holds it, search and `embed` fail without loading; background warmup ignores that failure and later requests retry.
+- Protocol-v4 `embed` requires `query` (empty means prepare only). `mode:"commands"` prepares the index on the caller’s `shellPath` and ensures an optional `command`; nonempty queries return finite vectors with the matching command-index name in `model`.
 
 ## Side Effects
 

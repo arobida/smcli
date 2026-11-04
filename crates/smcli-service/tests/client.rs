@@ -135,6 +135,20 @@ fn client_talks_to_real_service() -> Result<()> {
     let response = service.request(&search);
     assert!(response.hits.as_ref().is_some_and(|items| items.iter().any(|s| s.command == command)), "{response:?}");
 
+    let mut embed = ServiceRequest::new(Operation::Embed);
+    embed.query = Some("list files".into());
+    let response = service.request(&embed);
+    let vector = response.embedding.as_ref().expect("embed vector over socket");
+    assert!(!vector.is_empty());
+    assert!(vector.iter().all(|value| value.is_finite()));
+    let model = smcli_search::configured_model(&home, &environment)?;
+    assert_eq!(vector.len(), model.dimension);
+    let sources = smcli_search::commands::bundled_sources().expect("bundled examples");
+    let refs = smcli_search::commands::source_refs(&sources);
+    let index = smcli_search::commands::CommandIndex::reader(
+        smcli_search::setup::index_directory(&smcli_core::history::CapturedHistory::new(database.clone())), model, &refs);
+    assert_eq!(response.model, Some(index.index_name()));
+
     let mut context = ServiceRequest::new(Operation::Context);
     context.directory = Some(directory.clone());
     let response = service.request(&context);

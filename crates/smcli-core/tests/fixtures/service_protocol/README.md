@@ -2,12 +2,16 @@
 
 These fixtures were generated from the Swift DTOs before the Swift sources were removed, and are now the frozen wire format: a protocol change edits them by hand and bumps the protocol version.
 
-- `requests.jsonl`: frozen protocol-v1 requests for all ten operations, Unicode/escaped newlines, and finite double extremes.
+- `requests.jsonl`: frozen protocol-v1 requests (the combined request fixtures cover all twelve operations), Unicode/escaped newlines, and finite double extremes.
 - `alias-records-v2.jsonl`: record-time expansion requests, including unsafe input, UUID retry and historical redefinition.
 - `alias-results-v2.jsonl`: explicit expansion provenance in suggestions/search and distinct `recentEntries` variants.
 - `requests-v2.jsonl`: protocol-v2 search requests with present, absent and empty `shellPath`, plus request-scoped `rankingOff` ablation. Neither field is persisted.
-- `responses.jsonl`: all response fields, nested suggestion/search/context/GitStatus/file DTOs, empty collections, omitted nils, and open-ended failure codes.
+- `requests-v3.jsonl`: protocol-v3 selection requests with scope and cwd.
+- `requests-v4.jsonl`: protocol-v4 embed requests (query-only and command-index preparation) and caller `home`.
+- `responses.jsonl`: all response fields, including protocol-v4 `embedding` and `model`, nested suggestion/search/context/GitStatus/file DTOs, empty collections, omitted nils, and open-ended failure codes.
 - `decoding.jsonl`: Swift JSONDecoder's acceptance of missing/null/unknown fields, required nested keys (including initializer-defaulted properties), malformed JSON, version mismatches, and numeric boundaries.
+
+The v1–v3 request files prove decoding only; E1 tests rejection of old versions by the service.
 
 `make test` runs these with the rest of the workspace.
 

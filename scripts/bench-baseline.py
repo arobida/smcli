@@ -25,6 +25,8 @@ import tempfile
 import termios
 import time
 
+V = 4
+
 
 def positive(text):
     value = int(text)
@@ -286,7 +288,7 @@ def repository_search(binary, files, samples):
             with socket.socket(socket.AF_UNIX) as connection:
                 connection.settimeout(120)
                 connection.connect(path)
-                connection.sendall((_json.dumps({"v": 3, "op": op, "directory": str(repo / "pkg0" / "dir0"), "query": query}) + "\n").encode())
+                connection.sendall((_json.dumps({"v": V, "op": op, "directory": str(repo / "pkg0" / "dir0"), "query": query}) + "\n").encode())
                 reply = b""
                 while not reply.endswith(b"\n"):
                     reply += connection.recv(1 << 20)
@@ -342,7 +344,7 @@ def main():
         "samples": args.samples, "fixtures": [], "service": args.service,
         "notes": [
             f"Service mode: {args.service}. " + ("Every command goes through a smcli-service started for the fixture (record, suggest, search, picker)."
-                                                 if args.service == "on" else "SMCLI_SERVICE=0: every command works in-process."),
+                                                 if args.service == "on" else "SMCLI_SERVICE=0: search uses keyword matching and command examples use word ranking."),
             "Synthetic captured history: 20 directories, repeated commands, Unicode, 1/7 failures; native lines = rows/10.",
             "First = first invocation for this fixture, NOT a flushed filesystem/model cache.",
             "Warm = repeated one-shot processes with OS caches warm, NOT a persistent backend or in-process search.",

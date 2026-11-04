@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `smcli` executable source tree: CLI dispatch, the ratatui picker and menu, shell hooks, and communication with `smcli-service` (with in-process fallback). This crate does not link `fff-search`; it links `smcli-search` for in-process history and tldr search and the bundled Potion model.
+The `smcli` executable source tree: CLI dispatch, the ratatui picker and menu, shell hooks, and communication with `smcli-service` (with in-process fallback). This crate does not link `fff-search`; it links `smcli-search` for keyword fallback and model-free index readers. Only `initialize.rs` loads Potion, for model-changing init and reindex, after stopping the service and acquiring the model lock.
 
 ## Interface
 
@@ -12,6 +12,9 @@ The `smcli` executable source tree: CLI dispatch, the ratatui picker and menu, s
 - `context.rs:run` prints repository/project context.
 - `picker.rs:Mode`, `Choice`, and `Picker` implement the interactive history, files, grep, and tldr views.
 - `shell_integration.rs` generates Bash, Zsh, and Fish hooks.
+- `initialize.rs:run` describes an unchanged model without loading it; a changed model and `initialize.rs:reindex` stop the service and refuse if its model lock stays held for five seconds. Reindex also prepares command examples.
+- `cli.rs:index_health` and `indexes` use `configured_model` and model-free index naming; health never embeds a probe.
+- `cli.rs:tldr_ranker` requests service embeddings with a two-second timeout, accepts only the current command-index model name and matching vector dimensions, and latches word ranking after the first unusable reply.
 
 ## Natural-language command help
 
@@ -21,10 +24,12 @@ Choose an example to replace the prompt text; smcli does not execute it. tldr pl
 
 For a program without a bundled page, the picker offers Ctrl-A to search all installed programs. `smcli indexes` includes the tldr vector cache; `--prune` removes stale caches as well as old history indexes.
 
+The CLI reads the command-example index without loading Potion. It asks the service to prepare only a missing index (up to 600 seconds) or a missing program (up to 10 seconds); a complete index opens immediately. Per-query service embeddings are bounded to two seconds. An unavailable service, failed request, timeout, or model mismatch latches word ranking for the picker session. If the index is missing, the status asks for smcli-service or `smcli reindex`. `SMCLI_SERVICE=0` uses keyword history search and word-ranked examples, never runtime model loading.
+
 ## Invariants
 
 - `Cli` requires a subcommand; no args on a terminal enters the menu first.
-- History picker/search falls back locally when the service is unavailable; fff-specific evidence remains service-only.
+- History picker/search falls back to keyword matching without opening the index or loading Potion when the service is unusable; only the search command prints the degradation notice. fff-specific evidence remains service-only.
 - Native shell history is read-only. Configuration, database, and cache writes are separate.
 - `SMCLI_DB` must not be the same file or hard link as the native `HISTFILE`.
 

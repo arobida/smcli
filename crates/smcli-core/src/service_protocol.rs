@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const VERSION: i64 = 3;
+pub const VERSION: i64 = 4;
 pub const MAX_SHELL_PATH_BYTES: usize = 8_192;
 
 /// Oversized snapshots are unknown, never truncated into a different PATH.
@@ -28,6 +28,7 @@ pub enum Operation {
     Complete,
     Select,
     Shutdown,
+    Embed,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -106,6 +107,8 @@ pub struct ServiceRequest {
     pub scope: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
 }
 
 impl ServiceRequest {
@@ -138,6 +141,7 @@ impl ServiceRequest {
             config: None,
             scope: None,
             cwd: None,
+            home: None,
         }
     }
 }
@@ -186,6 +190,14 @@ pub struct ServiceResponse {
     pub indexes: Option<Vec<FileIndexInfo>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "numbers::optional_finite_embedding"
+    )]
+    pub embedding: Option<Vec<f32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl ServiceResponse {
@@ -208,6 +220,8 @@ impl ServiceResponse {
             pid: None,
             indexes: None,
             build: None,
+            embedding: None,
+            model: None,
         }
     }
 
@@ -500,6 +514,13 @@ mod numbers {
     pub fn finite<S: Serializer>(value: &f64, s: S) -> Result<S::Ok, S::Error> {
         if !value.is_finite() {
             return Err(serde::ser::Error::custom("nonfinite double"));
+        }
+        value.serialize(s)
+    }
+
+    pub fn optional_finite_embedding<S: Serializer>(value: &Option<Vec<f32>>, s: S) -> Result<S::Ok, S::Error> {
+        if value.as_ref().is_some_and(|values| values.iter().any(|v| !v.is_finite())) {
+            return Err(serde::ser::Error::custom("nonfinite embedding"));
         }
         value.serialize(s)
     }

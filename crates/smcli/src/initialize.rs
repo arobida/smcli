@@ -22,7 +22,7 @@ fn ask(question: &str, default: bool) -> Result<bool> {
         }
     }
 }
-pub fn run(args: Init, path: &Path, service: &ServiceClient) -> Result<()> {
+pub fn run(args: Init, path: &Path, service: &ServiceClient, captured: &smcli_core::history::CapturedHistory) -> Result<()> {
     let mut config = SmcliConfig::load(path)?;
     if let Some(keys) = &args.keys {
         if !keys.is_empty() {
@@ -65,18 +65,20 @@ pub fn run(args: Init, path: &Path, service: &ServiceClient) -> Result<()> {
         } else {
             config.potion_path.clone()
         };
-        // The service holds the old model; stop it before loading the new one so they never share memory.
-        if wanted != config.potion_path && crate::cli::stop_service(service) {
-            println!("Stopped smcli-service to free the old model.");
-        }
-        let model = match wanted.as_deref() {
-            Some(p) => smcli_search::Potion::from_dir(Path::new(p))?,
-            None => smcli_search::Potion::bundled()?,
+        let model = if wanted == config.potion_path {
+            smcli_search::Potion::describe(wanted.as_deref().map(Path::new))?
+        } else {
+            if crate::cli::stop_service(service) {
+                println!("Stopped smcli-service to free the old model.");
+            }
+            let _lock = model_lock(captured)?;
+            let potion = match wanted.as_deref() {
+                Some(p) => smcli_search::Potion::from_dir(Path::new(p))?,
+                None => smcli_search::Potion::bundled()?,
+            };
+            anyhow::ensure!(!potion.embed(&["smcli".into()])[0].is_empty(), "Potion returned an empty embedding");
+            potion.model_id()
         };
-        anyhow::ensure!(
-            !model.embed(&["smcli".into()])[0].is_empty(),
-            "Potion returned an empty embedding"
-        );
         if wanted != config.potion_path {
             println!("Changing the model rebuilds the search index with it on the next search; that search can take a while on a large history.");
             println!("The old model's index stays on disk; `smcli indexes --prune` deletes it.");
@@ -89,12 +91,39 @@ pub fn run(args: Init, path: &Path, service: &ServiceClient) -> Result<()> {
         println!(
             "Search will use {} ({} dimensions). Saved {}.",
             smcli_search::Potion::NAME,
-            model.dimension(),
+            model.dimension,
             path.display()
         );
     }
     Ok(())
 }
+fn model_lock(captured: &smcli_core::history::CapturedHistory) -> Result<std::fs::File> {
+    smcli_search::model_lock(captured, std::time::Duration::from_secs(5))?
+        .ok_or_else(|| anyhow::anyhow!("smcli-service still holds the model; run `smcli service stop` and retry."))
+}
+
+pub fn reindex(captured: &smcli_core::history::CapturedHistory, home: &Path,
+               env: &std::collections::HashMap<String, String>, service: &ServiceClient) -> Result<()> {
+    let stopped = crate::cli::stop_service(service);
+    let _model_lock = model_lock(captured)?;
+    let engine = smcli_search::setup::search_engine(captured, home, env)?;
+    let lock = engine.lock_index(u32::MAX)?.ok_or_else(|| anyhow::anyhow!("Another smcli is updating the index."))?;
+    let entries = smcli_search::setup::corpus(captured, home, env, None, None, smcli_core::time::now())?;
+    let count = engine.reindex_using_lock(&entries, &lock)?;
+    drop(lock); // CommandIndex takes the same directory lock.
+    let sources = smcli_search::commands::bundled_sources()
+        .ok_or_else(|| anyhow::anyhow!("tldr data not found beside the smcli executable or in Data/tldr"))?;
+    let refs = smcli_search::commands::source_refs(&sources);
+    let index = smcli_search::commands::CommandIndex::new(engine.directory.clone(), engine.potion.clone(), &refs);
+    let path = smcli_core::service_protocol::shell_path_snapshot(env.get("PATH").map(String::as_str)).unwrap_or_default();
+    smcli_search::commands::prepare(&index, &refs, smcli_search::tldr::current_platform(), &path,
+        &crate::cli::captured_programs(captured)?, true, None)?;
+    let programs = index.programs()?.len();
+    println!("{}Reindexed {count} commands and {programs} programs' examples.",
+        if stopped { "Stopped smcli-service to free its model. " } else { "" });
+    Ok(())
+}
+
 /// A local directory is stored canonical, so a later command from another cwd finds it. An id is not a directory and is kept as given.
 fn persisted_potion(value: &str) -> std::io::Result<String> {
     if Path::new(value).is_dir() {
@@ -136,6 +165,44 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     #[test]
+    fn init_unchanged_model_does_not_load() -> anyhow::Result<()> {
+        let root = Path::new("/tmp").join(format!("smcli-init-header-{}", uuid::Uuid::new_v4()));
+        let _cleanup = Tmp(root.clone());
+        let model = root.join("model");
+        std::fs::create_dir_all(&model)?;
+        let model = std::fs::canonicalize(model)?;
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Models/potion-shell-16m");
+        for file in ["config.json", "tokenizer.json"] { std::fs::copy(source.join(file), model.join(file))?; }
+        let bytes = std::fs::read(source.join("model.safetensors"))?;
+        let length = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        std::fs::write(model.join("model.safetensors"), &bytes[..8 + length])?;
+        assert!(smcli_search::Potion::from_dir(&model).is_err());
+        let config_path = root.join("config.json");
+        SmcliConfig { potion_path: Some(model.to_string_lossy().into_owned()), ..Default::default() }.save(&config_path)?;
+        let captured = CapturedHistory::new(root.join("history.db"));
+        let env = HashMap::from([("SMCLI_SERVICE".into(), "0".into())]);
+        let service = ServiceClient::new(&captured.path, &env, Path::new("/missing/smcli"));
+        // Holding the lock also proves an unchanged model never tries to acquire it.
+        let _lock = smcli_search::model_lock(&captured, std::time::Duration::ZERO)?.unwrap();
+        run(init(Some(model.to_str().unwrap())), &config_path, &service, &captured)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reindex_refuses_while_model_lock_held() -> anyhow::Result<()> {
+        let root = Path::new("/tmp").join(format!("smcli-init-lock-{}", uuid::Uuid::new_v4()));
+        let _cleanup = Tmp(root.clone());
+        std::fs::create_dir_all(&root)?;
+        let captured = CapturedHistory::new(root.join("history.db"));
+        let env = HashMap::from([("SMCLI_SERVICE".into(), "0".into())]);
+        let service = ServiceClient::new(&captured.path, &env, Path::new("/missing/smcli"));
+        let _lock = smcli_search::model_lock(&captured, std::time::Duration::ZERO)?.unwrap();
+        let error = super::reindex(&captured, &root, &env, &service).unwrap_err();
+        assert_eq!(error.to_string(), "smcli-service still holds the model; run `smcli service stop` and retry.");
+        Ok(())
+    }
+
+    #[test]
     fn init_keeps_custom_model_and_stores_absolute_or_id() {
         let root = std::env::temp_dir().join(format!("smcli-init-{}", uuid::Uuid::new_v4()));
         let _cleanup = Tmp(root.clone());
@@ -155,7 +222,7 @@ mod tests {
         let abs = model.to_string_lossy().into_owned();
 
         let abs_cfg = home.join("abs.json");
-        run(init(Some(&abs)), &abs_cfg, &service).unwrap();
+        run(init(Some(&abs)), &abs_cfg, &service, &CapturedHistory::new(&database)).unwrap();
         // Re-init without a model flag must keep the custom path; pass --keys so a TTY cannot enter the questionnaire.
         run(
             Init {
@@ -164,13 +231,14 @@ mod tests {
             },
             &abs_cfg,
             &service,
+            &CapturedHistory::new(&database),
         )
         .unwrap();
         assert_eq!(SmcliConfig::load(&abs_cfg).unwrap().potion_path.as_deref(), Some(abs.as_str()));
 
         let rel = relative_from_cwd(&model);
         let rel_cfg = home.join("rel.json");
-        run(init(Some(&rel)), &rel_cfg, &service).unwrap();
+        run(init(Some(&rel)), &rel_cfg, &service, &CapturedHistory::new(&database)).unwrap();
         let saved = SmcliConfig::load(&rel_cfg).unwrap().potion_path.unwrap();
         assert_eq!(saved, std::fs::canonicalize(&rel).unwrap().to_string_lossy());
         assert_ne!(saved, rel);

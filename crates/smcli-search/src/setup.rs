@@ -59,6 +59,53 @@ pub fn index_directory(captured: &CapturedHistory) -> std::path::PathBuf {
     directory.into()
 }
 
+/// Describe the configured model without constructing it.
+pub fn configured_model(home: &Path, environment: &HashMap<String, String>) -> Result<crate::ModelId> {
+    let config = SmcliConfig::load(&SmcliConfig::location(home, environment))?;
+    Potion::describe(config.potion_path.as_deref().map(Path::new))
+}
+
+/// Hold while model weights are resident; separate from the index writer lock.
+pub fn model_lock(captured: &CapturedHistory, wait: std::time::Duration) -> Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let directory = index_directory(captured);
+    crate::index::prepare_directory(&directory)?;
+    let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(directory.join("model.lock"))?;
+    let start = std::time::Instant::now();
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(Some(lock)),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let remaining = wait.saturating_sub(start.elapsed());
+                if remaining.is_zero() { return Ok(None); }
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(50)));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn model_lock_is_exclusive_and_waits() {
+    use std::time::{Duration, Instant};
+    let root = tempfile::tempdir().unwrap();
+    let captured = CapturedHistory::new(root.path().join("history.db"));
+    let lock = model_lock(&captured, Duration::ZERO).unwrap().unwrap();
+    assert!(model_lock(&captured, Duration::ZERO).unwrap().is_none());
+    let start = Instant::now();
+    assert!(model_lock(&captured, Duration::from_millis(60)).unwrap().is_none());
+    assert!(start.elapsed() >= Duration::from_millis(60));
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(60));
+        drop(lock);
+    });
+    assert!(model_lock(&captured, Duration::from_secs(2)).unwrap().is_some());
+    release.join().unwrap();
+    assert!(model_lock(&captured, Duration::ZERO).unwrap().is_some());
+}
+
 /// The search index next to the history database: `potionPath` from `smcli init`, otherwise the built-in model.
 // shortcut: Ollama and Apple (`builtin`) configs fall back to the built-in Potion; port an embedder when someone asks.
 pub fn search_engine(captured: &CapturedHistory, home: &Path, environment: &HashMap<String, String>) -> Result<HistorySearch> {

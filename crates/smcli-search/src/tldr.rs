@@ -189,6 +189,47 @@ pub fn rank(potion: &Potion, query: &str, entries: &[Entry], prefix_words: &[Str
     rank_with_vectors(&query, entries, &embedded, prefix_words)
 }
 
+/// Model-free ranking by lowercase word overlap, retaining the template-prefix bonus.
+pub fn rank_words(query: &str, entries: &[Entry], prefix_words: &[String]) -> Vec<(usize, f32)> {
+    let words: HashSet<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let mut ranked = entries.iter().enumerate().map(|(index, entry)| {
+        let text = format!("{} {}", entry.description, entry.template).to_lowercase();
+        let entry_words: HashSet<&str> = text.split_whitespace().collect();
+        let overlap = words.iter().filter(|word| entry_words.contains(word.as_str())).count() as f32;
+        (index, overlap + prefix_bonus(entry, prefix_words))
+    }).collect::<Vec<_>>();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+}
+
+#[cfg(test)]
+#[test]
+fn rank_words_orders_by_overlap_and_prefix() {
+    let entries = [
+        Entry { program: "git".into(), description: "Show changes".into(), template: "git diff @".into() },
+        Entry { program: "git".into(), description: "Show changes".into(), template: "git status".into() },
+        Entry { program: "git".into(), description: "Commit changes".into(), template: "git commit @".into() },
+    ];
+    let ranked = rank_words("SHOW changes", &entries, &["status".into()]);
+    assert_eq!(ranked.iter().map(|r| r.0).collect::<Vec<_>>(), [1, 0, 2]);
+    assert!((ranked[0].1 - 2.05).abs() < 0.0001);
+    assert_eq!(rank_words("", &entries, &[]), vec![(0, 0.0), (1, 0.0), (2, 0.0)]);
+    assert_eq!(rank_words("commit", &entries, &[])[0].0, 2);
+    assert_eq!(rank_words("", &entries, &["git".into(), "diff".into()])[0].0, 0);
+}
+
+fn prefix_bonus(entry: &Entry, prefix_words: &[String]) -> f32 {
+    let words = entry.template.split_whitespace().collect::<Vec<_>>();
+    let words = if prefix_words.first().is_some_and(|word| word == &entry.program) {
+        words.as_slice()
+    } else {
+        words.get(1..).unwrap_or_default()
+    };
+    let matches = words.len() >= prefix_words.len()
+        && words.iter().zip(prefix_words).all(|(word, prefix)| word == prefix);
+    if matches && !prefix_words.is_empty() { 0.05 } else { 0.0 }
+}
+
 /// Rank with page vectors already in memory; used by the picker on every query change.
 pub fn rank_with_vectors(
     query: &[f32],
@@ -203,15 +244,7 @@ pub fn rank_with_vectors(
         .enumerate()
         .map(|(index, (entry, vector))| {
             let similarity = query.iter().zip(vector).map(|(a, b)| a * b).sum::<f32>();
-            let words = entry.template.split_whitespace().collect::<Vec<_>>();
-            let words = if prefix_words.first().is_some_and(|word| word == &entry.program) {
-                words.as_slice()
-            } else {
-                words.get(1..).unwrap_or_default()
-            };
-            let matches = words.len() >= prefix_words.len()
-                && words.iter().zip(prefix_words).all(|(word, prefix)| word == prefix);
-            (index, similarity + if matches && !prefix_words.is_empty() { 0.05 } else { 0.0 })
+            (index, similarity + prefix_bonus(entry, prefix_words))
         })
         .collect::<Vec<_>>();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));

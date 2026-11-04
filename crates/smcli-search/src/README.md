@@ -17,6 +17,10 @@ No subdirectories: all modules sit directly in this path.
 - `native.rs`: `Shell`, `HistoryFile` (`read`), `history_files`.
 - `evidence.rs`: `IdentifierEvidence`, `command_flags`, trait `ProjectEvidence` (`exists`, `git_activity`, `find_identifiers`, `grep_terms`, the last three defaulting to empty results).
 - `identifiers.rs`: `identifiers`, private `CAP`.
+- Model-free APIs: `ModelId` and `Potion::describe` inspect the shared model layout and bounded safetensors header without loading weights; `setup::configured_model` resolves the configured model, and `index::index_name` names its history index. These are re-exported from `lib.rs`.
+- `index::lexical_search` shares query planning with hybrid search but uses only keyword matching and project additions, never TalaDB or Potion. `tldr::rank_words` supplies lowercase word-overlap ranking with the existing template-prefix bonus.
+- `commands::CommandIndex::reader` reads examples using a `ModelId` without a Potion; all mutation paths refuse with `command index is read-only here`. `commands::prepare` builds a missing index from OS and captured programs on PATH and ensures an installed requested program.
+- `setup::model_lock` (also re-exported) opens the private index directory’s `model.lock` with mode `0600`, no symlink following, and close-on-exec; it retries for the requested duration. Callers retain the returned file while model weights are resident.
 
 ## Invariants
 

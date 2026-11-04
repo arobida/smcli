@@ -10,7 +10,8 @@ use smcli_core::{
     service_protocol::{Operation, SearchEntry, SearchFilter, ServiceRequest},
     time::{format_iso8601, now, parse_iso8601},
 };
-use smcli_search::setup::{corpus, index_directory, search_engine, search_signals, working_directory};
+use smcli_search::setup::{configured_model, corpus, index_directory, search_signals, working_directory};
+use smcli_search::{lexical_search, index::lock_index_directory};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
@@ -225,7 +226,7 @@ pub fn run() -> Result<()> {
         std::process::exit(2)
     });
     match cli.command {
-        Command::Init(args) => crate::initialize::run(args, &config_path, &service)?,
+        Command::Init(args) => crate::initialize::run(args, &config_path, &service, &captured)?,
         Command::ShellInit { shell } => {
             let c = match SmcliConfig::load(&config_path) {
                 Ok(c) => c,
@@ -312,8 +313,7 @@ pub fn run() -> Result<()> {
                         env.get("SMCLI_SESSION").cloned(),
                         &env,
                     );
-                    let engine = search_engine(&captured, &home, &env)?;
-                    let lock = engine.lock_index(20)?;
+                    eprintln!("smcli: search service unavailable; showing keyword matches only.");
                     let corpus = corpus(
                         &captured,
                         &home,
@@ -322,17 +322,8 @@ pub fn run() -> Result<()> {
                         context.kind(),
                         now(),
                     )?;
-                    engine.search_with_evidence_using_lock(
-                        &query,
-                        &corpus,
-                        a.limit,
-                        &filter,
-                        None,
-                        &search_signals(&captured, Some(context), &env)?,
-                        now(),
-                        None,
-                        lock.as_ref(),
-                    )?
+                    lexical_search(&query, &corpus, a.limit, &filter,
+                        &search_signals(&captured, Some(context), &env)?, now())?
                 }
             };
             if a.json {
@@ -381,17 +372,7 @@ pub fn run() -> Result<()> {
                 }
             }
         }
-        Command::Reindex => {
-            let stopped = stop_service(&service);
-            let engine = search_engine(&captured, &home, &env)?;
-            let lock = engine.lock_index(u32::MAX)?.ok_or_else(|| anyhow::anyhow!("Another smcli is updating the index."))?;
-            let entries = corpus(&captured, &home, &env, None, None, now())?;
-            let count = engine.reindex_using_lock(&entries, &lock)?;
-            drop(lock); // CommandIndex::add takes the same directory lock per program
-            let programs = command_index(&captured, &env, &engine, true, None)?.programs()?.len();
-            println!("{}Reindexed {count} commands and {programs} programs' examples.",
-                if stopped { "Stopped smcli-service to free its model. " } else { "" });
-        },
+        Command::Reindex => crate::initialize::reindex(&captured, &home, &env, &service)?,
         Command::Indexes { prune, json } => indexes(&captured, &home, &env, prune, json)?,
         Command::Health { json } => {
             let corpus = corpus(&captured, &home, &env, None, None, now())?;
@@ -482,7 +463,7 @@ pub fn run() -> Result<()> {
             query,
         } => {
             if tldr {
-                pick_tldr(&captured, &home, &env)?;
+                pick_tldr(&captured, &service, &home, &env)?;
                 return Ok(());
             }
             pick(
@@ -1013,45 +994,30 @@ fn tldr_context(line: &str) -> TldrContext {
     TldrContext { leading, program, prefix_words }
 }
 
-fn pick_tldr(c: &CapturedHistory, home: &Path, env: &HashMap<String, String>) -> Result<()> {
-    use crate::picker::{Choice, Mode, Picker};
-    use smcli_search::tldr;
+/// A failed prepare latches word ranking too; a complete index needs no service round trip.
+fn prepare_tldr(index: &smcli_search::commands::CommandIndex, service: &ServiceClient, program: Option<&str>) -> Result<bool> {
+    let timeout = if !index.path().exists() {
+        Duration::from_secs(600)
+    } else if let Some(program) = program {
+        if index.examples(program)?.is_some() { return Ok(true); }
+        Duration::from_secs(10)
+    } else {
+        return Ok(true);
+    };
+    let mut request = ServiceRequest::new(Operation::Embed);
+    request.mode = Some("commands".into());
+    request.command = program.map(str::to_owned);
+    request.query = Some(String::new());
+    Ok(service.send(&request, None, timeout).is_some_and(|response| response.ok))
+}
 
-    let context = tldr_context(env.get("SMCLI_LBUFFER").map(String::as_str).unwrap_or(""));
-    let engine = search_engine(c, home, env)?;
-    // Normally built at install (`smcli reindex`); built here only if missing.
-    let index = command_index(c, env, &engine, false, context.program.as_deref())?;
-    let potion = engine.potion;
-    let program = context.program.clone();
-    let prefix = context.prefix_words.clone();
-    // `@@` only reads: the service syncs the index on capture; without one, the build above stands.
-    // The picker owns every indexed row; the closure ranks a view's subset and returns global row indices.
-    let rows: Vec<(smcli_search::Entry, Vec<f32>, String)> = index
-        .all()?
-        .into_iter()
-        .map(|example| {
-            (
-                smcli_search::Entry { program: example.program, description: example.description, template: example.template },
-                example.embedding,
-                example.source,
-            )
-        })
-        .collect();
-    let query = env.get("SMCLI_TLDR_QUERY").map(|query| query.trim_start().to_owned()).unwrap_or_default();
-    let mut picker = Picker::new(Vec::new(), Vec::new(), Vec::new(), query);
-    picker.mode = Mode::Tldr;
-    picker.tldr_all = context.program.is_none();
-    picker.tldr_program = context.program.clone();
-    picker.title = Some(if picker.tldr_all { "all installed".into() } else { context.program.clone().unwrap_or_default() });
-    picker.tldr_status = context.program.as_ref().filter(|program| !rows.iter().any(|(entry, _, _)| &entry.program == *program))
-        .map(|program| format!("no examples for {program}; Ctrl-A searches all installed"));
-    picker.tldr_entries = rows.iter().map(|(entry, _, _)| entry.clone()).collect();
-    picker.tldr_sources = rows.iter().map(|(_, _, source)| source.clone()).collect();
-    let entries: Vec<smcli_search::Entry> = rows.iter().map(|(entry, _, _)| entry.clone()).collect();
-    let vectors: Vec<Vec<f32>> = rows.into_iter().map(|(_, vector, _)| vector).collect();
+fn tldr_ranker(mut service: Option<ServiceClient>, expected_model: String, entries: Vec<smcli_search::Entry>,
+               vectors: Vec<Vec<f32>>, prefix: Vec<String>)
+    -> impl FnMut(&str, bool) -> Result<Vec<String>> {
+    let program = prefix.first().cloned();
     let mut page_subset: Option<Vec<usize>> = None;
     let mut all_subset: Option<Vec<usize>> = None;
-    let search = move |query: &str, all: bool| -> Result<Vec<String>> {
+    move |query: &str, all: bool| -> Result<Vec<String>> {
         let subset: &mut Vec<usize> = if all {
             if all_subset.is_none() {
                 all_subset = Some((0..entries.len()).collect());
@@ -1072,14 +1038,70 @@ fn pick_tldr(c: &CapturedHistory, home: &Path, env: &HashMap<String, String>) ->
         };
         let subset_entries: Vec<smcli_search::Entry> = subset.iter().map(|index| entries[*index].clone()).collect();
         let subset_vectors: Vec<Vec<f32>> = subset.iter().map(|index| vectors[*index].clone()).collect();
-        let query_vector = potion.embed(&[query.to_owned()]).remove(0);
+        // Empty embed queries prepare only, so they must not latch away later semantic queries.
+        let query_vector = service.as_ref().filter(|_| !query.trim().is_empty()).and_then(|service| {
+            let mut request = ServiceRequest::new(Operation::Embed);
+            request.query = Some(query.to_owned());
+            let response = service.send(&request, None, Duration::from_secs(2))?;
+            if !response.ok || response.model.as_deref() != Some(expected_model.as_str()) { return None; }
+            response.embedding.filter(|vector| !vector.is_empty() && vector.iter().all(|x| x.is_finite())
+                && subset_vectors.iter().all(|stored| stored.len() == vector.len()))
+        });
+        if !query.trim().is_empty() && query_vector.is_none() { service = None; }
         let empty = Vec::new();
         let prefix = if all { &empty } else { &prefix };
-        Ok(tldr::rank_with_vectors(&query_vector, &subset_entries, &subset_vectors, prefix)
+        let ranked = match query_vector {
+            Some(vector) => smcli_search::tldr::rank_with_vectors(&vector, &subset_entries, &subset_vectors, prefix),
+            None => smcli_search::tldr::rank_words(query, &subset_entries, prefix),
+        };
+        Ok(ranked
             .into_iter()
             .map(|(position, _)| subset[position].to_string())
             .collect())
+    }
+}
+
+fn pick_tldr(c: &CapturedHistory, service: &ServiceClient, home: &Path, env: &HashMap<String, String>) -> Result<()> {
+    use crate::picker::{Choice, Mode, Picker};
+
+    let context = tldr_context(env.get("SMCLI_LBUFFER").map(String::as_str).unwrap_or(""));
+    let sources = smcli_search::commands::bundled_sources()
+        .ok_or_else(|| anyhow::anyhow!("tldr data not found beside the smcli executable or in Data/tldr"))?;
+    let refs = smcli_search::commands::source_refs(&sources);
+    let index = smcli_search::commands::CommandIndex::reader(index_directory(c), configured_model(home, env)?, &refs);
+    let prepared = prepare_tldr(&index, service, context.program.as_deref())?;
+    let prefix = context.prefix_words.clone();
+    // `@@` only reads: the service prepares and syncs the index.
+    // The picker owns every indexed row; the closure ranks a view's subset and returns global row indices.
+    let rows: Vec<(smcli_search::Entry, Vec<f32>, String)> = index
+        .all()?
+        .into_iter()
+        .map(|example| {
+            (
+                smcli_search::Entry { program: example.program, description: example.description, template: example.template },
+                example.embedding,
+                example.source,
+            )
+        })
+        .collect();
+    let query = env.get("SMCLI_TLDR_QUERY").map(|query| query.trim_start().to_owned()).unwrap_or_default();
+    let mut picker = Picker::new(Vec::new(), Vec::new(), Vec::new(), query);
+    picker.mode = Mode::Tldr;
+    picker.tldr_all = context.program.is_none();
+    picker.tldr_program = context.program.clone();
+    picker.title = Some(if picker.tldr_all { "all installed".into() } else { context.program.clone().unwrap_or_default() });
+    picker.tldr_status = if !index.path().exists() {
+        Some("command examples need smcli-service or `smcli reindex`".into())
+    } else {
+        context.program.as_ref().filter(|program| !rows.iter().any(|(entry, _, _)| &entry.program == *program))
+            .map(|program| format!("no examples for {program}; Ctrl-A searches all installed"))
     };
+    picker.tldr_entries = rows.iter().map(|(entry, _, _)| entry.clone()).collect();
+    picker.tldr_sources = rows.iter().map(|(_, _, source)| source.clone()).collect();
+    let entries: Vec<smcli_search::Entry> = rows.iter().map(|(entry, _, _)| entry.clone()).collect();
+    let vectors: Vec<Vec<f32>> = rows.into_iter().map(|(_, vector, _)| vector).collect();
+    let service = if prepared { Some(ServiceClient::new(&c.path, env, &std::env::current_exe()?)) } else { None };
+    let search = tldr_ranker(service, index.index_name(), entries, vectors, prefix);
     let config = SmcliConfig::load(&SmcliConfig::location(home, env)).unwrap_or_default();
     if let Some(Choice::Command { command, .. }) = crate::picker::run(picker, Some(Box::new(search)), None, config.at_completion_inline != Some(false))? {
         println!("{}{}", context.leading, command);
@@ -1087,33 +1109,8 @@ fn pick_tldr(c: &CapturedHistory, home: &Path, env: &HashMap<String, String>) ->
     Ok(())
 }
 
-/// The command-completion index for this engine, built from OS-shipped programs plus programs seen in
-/// captured history (both ∩ PATH) when missing, or rebuilt from scratch when `rebuild`. `program`, when on PATH
-/// and missing from the index, is added now: without the service an interrupted build never fills in otherwise.
-fn command_index(c: &CapturedHistory, env: &HashMap<String, String>, engine: &smcli_search::HistorySearch, rebuild: bool, program: Option<&str>) -> Result<smcli_search::commands::CommandIndex> {
-    use smcli_search::commands::{CommandIndex, build, bundled_sources, ensure, os_programs, source_refs, system_dirs};
-    use smcli_search::tldr;
-    let platform = tldr::current_platform();
-    let sources = bundled_sources().ok_or_else(|| anyhow::anyhow!("tldr data not found beside the smcli executable or in Data/tldr"))?;
-    let refs = source_refs(&sources);
-    let index = CommandIndex::new(engine.directory.clone(), engine.potion.clone(), &refs);
-    if rebuild && index.path().exists() {
-        std::fs::remove_file(index.path())?;
-    }
-    let path = smcli_core::service_protocol::shell_path_snapshot(env.get("PATH").map(String::as_str)).unwrap_or_default();
-    if !index.path().exists() {
-        let mut programs = os_programs(&system_dirs(), &path);
-        programs.extend(tldr::installed(&captured_programs(c)?, &path));
-        build(&index, &refs, platform, &programs)?;
-    }
-    if let Some(program) = program.filter(|p| !tldr::installed(&std::collections::HashSet::from([p.to_string()]), &path).is_empty()) {
-        ensure(&index, &refs, platform, program)?;
-    }
-    Ok(index)
-}
-
 /// First words of captured commands (smcli's own history, distinct).
-fn captured_programs(c: &CapturedHistory) -> Result<HashSet<String>> {
+pub(crate) fn captured_programs(c: &CapturedHistory) -> Result<HashSet<String>> {
     let stats = c.command_stats(None, None, None, now())?;
     Ok(stats
         .keys()
@@ -1196,8 +1193,6 @@ fn pick(
         let d = d.clone();
         let context = context.clone();
         let service = ServiceClient::new(&c.path, &env, &std::env::current_exe()?);
-        // The model is reused, but each fallback reads history while holding the index lock.
-        let fallback = std::cell::OnceCell::new();
         move |q: &str, _: bool| -> Result<Vec<String>> {
         let mut r = ServiceRequest::new(Operation::Search);
         r.query = Some(q.into());
@@ -1213,17 +1208,9 @@ fn pick(
         {
             Some(h) => h,
             None => {
-                let engine = match fallback.get() {
-                    Some(engine) => engine,
-                    None => {
-                        let engine = search_engine(&c, &home, &env)?;
-                        fallback.get_or_init(|| engine)
-                    },
-                };
-                let lock = engine.lock_index(20)?;
                 let entries = corpus(&c, &home, &env, context.project_root.as_deref(), context.kind(), now())?;
                 let signals = search_signals(&c, Some(context.clone()), &env)?;
-                engine.search_with_evidence_using_lock(q, &entries, 100, &SearchFilter::default(), None, &signals, now(), None, lock.as_ref())?
+                lexical_search(q, &entries, 100, &SearchFilter::default(), &signals, now())?
             }
         };
         Ok(hits.into_iter().map(|h| h.key()).collect())
@@ -1479,16 +1466,17 @@ struct IndexInfo {
 
 /// Every `rs-commands-*` index next to the history database, grouped by index name; `prune` deletes all but the current model's.
 fn indexes(captured: &CapturedHistory, home: &Path, env: &HashMap<String, String>, prune: bool, json: bool) -> Result<()> {
-    let engine = search_engine(captured, home, env)?;
-    let current = engine.index_name();
+    let model = configured_model(home, env)?;
+    let directory = index_directory(captured);
+    let current = smcli_search::index_name(&model);
     // The command-completion index (bundled sources in priority order); absent tldr data just means it is not current.
     let command_current = smcli_search::commands::bundled_sources().map(|sources| {
         let refs = smcli_search::commands::source_refs(&sources);
-        smcli_search::commands::CommandIndex::new(engine.directory.clone(), engine.potion.clone(), &refs).index_name()
+        smcli_search::commands::CommandIndex::reader(directory.clone(), model.clone(), &refs).index_name()
     });
-    let _lock = if prune { Some(engine.lock_index(20)?.ok_or_else(|| anyhow::anyhow!("Search index is busy; try again."))?) } else { None };
+    let _lock = if prune { Some(lock_index_directory(&directory, 20)?.ok_or_else(|| anyhow::anyhow!("Search index is busy; try again."))?) } else { None };
     let mut found: std::collections::BTreeMap<String, IndexInfo> = Default::default();
-    let entries = match std::fs::read_dir(&engine.directory) {
+    let entries = match std::fs::read_dir(&directory) {
         Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>()?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e.into()),
@@ -1521,7 +1509,7 @@ fn indexes(captured: &CapturedHistory, home: &Path, env: &HashMap<String, String
     if json {
         return print_json(&list);
     }
-    println!("Index directory: {}", engine.directory.display());
+    println!("Index directory: {}", directory.display());
     if list.is_empty() {
         println!("No indexes yet; the next search or `smcli reindex` builds {current}.");
     }
@@ -1548,24 +1536,14 @@ fn index_health(
     };
     let result = (|| -> Result<()> {
         use std::collections::HashSet;
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        let engine = search_engine(captured, home, env)?;
-        report.embedder = format!(
-            "{} ({} dimensions), {}",
-            smcli_search::Potion::NAME,
-            engine.potion.dimension(),
-            engine.potion.identity
-        );
-        let vector = engine.potion.embed(&["smcli health check".into()]);
-        ensure!(
-            vector.len() == 1
-                && vector[0].len() == engine.potion.dimension()
-                && vector[0].iter().all(|x| x.is_finite()),
-            "Embedding model returned an invalid vector; rerun `smcli init`."
-        );
-        let path = engine.directory.join(format!("{}.taladb", engine.index_name()));
+        use std::os::unix::fs::MetadataExt;
+        let model = configured_model(home, env)?;
+        let index_dir = index_directory(captured);
+        let name = smcli_search::index_name(&model);
+        report.embedder = format!("{} ({} dimensions), {}", smcli_search::Potion::NAME, model.dimension, model.identity);
+        let path = index_dir.join(format!("{name}.taladb"));
         report.path = path.to_string_lossy().into_owned();
-        let directory = match std::fs::symlink_metadata(&engine.directory) {
+        let directory = match std::fs::symlink_metadata(&index_dir) {
             Ok(metadata) => metadata,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 report.missing = corpus.len();
@@ -1578,11 +1556,10 @@ fn index_health(
                 && directory.uid() == unsafe { libc::getuid() }
                 && directory.mode() & 0o077 == 0,
             "Search index must be a private directory owned by you (chmod 700): {}",
-            engine.directory.display()
+            index_dir.display()
         );
         let mut latest = None;
-        let name = engine.index_name();
-        for entry in std::fs::read_dir(&engine.directory)? {
+        for entry in std::fs::read_dir(&index_dir)? {
             let entry = entry?;
             let filename = entry.file_name().to_string_lossy().into_owned();
             if filename.starts_with("rs-commands-v")
@@ -1615,21 +1592,8 @@ fn index_health(
             return Ok(());
         }
         report.built = true;
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(engine.directory.join("lock"))?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => {
-                bail!("Another smcli owns the index; check again when it finishes.")
-            }
-            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
-        }
+        let _lock = lock_index_directory(&index_dir, 1)?
+            .ok_or_else(|| anyhow::anyhow!("Another smcli owns the index; check again when it finishes."))?;
         // Never use HistorySearch::open_index here: it deletes unreadable caches instead of reporting them.
         let db = taladb::open(&path)
             .map_err(|e| anyhow::anyhow!("Index is unreadable ({e}); run `smcli reindex`."))?;
@@ -1698,6 +1662,157 @@ mod tests {
     }
 
     use super::*;
+    use smcli_search::setup::search_engine;
+
+    #[test]
+    fn only_initialize_loads_the_model() -> Result<()> {
+        fn scan(directory: &Path) -> Result<()> {
+            for file in std::fs::read_dir(directory)? {
+                let path = file?.path();
+                if path.is_dir() { scan(&path)?; }
+                else if path.extension().is_some_and(|ext| ext == "rs") && path.file_name().unwrap() != "initialize.rs" {
+                    let text = std::fs::read_to_string(&path)?;
+                    let production = text.split("#[cfg(test)]").next().unwrap();
+                    for forbidden in ["search_engine(", "Potion::bundled(", "Potion::from_dir(", ".embed("] {
+                        assert!(!production.contains(forbidden), "{} loads the model via {forbidden}", path.display());
+                    }
+                }
+            }
+            Ok(())
+        }
+        scan(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+    }
+
+    fn tldr_entries() -> Vec<smcli_search::Entry> {
+        vec![
+            smcli_search::Entry { program: "git".into(), description: "Show status".into(), template: "git status".into() },
+            smcli_search::Entry { program: "git".into(), description: "Commit changes".into(), template: "git commit @".into() },
+        ]
+    }
+
+    fn tldr_service(mode: &str) -> (PathBuf, CapturedHistory, ServiceClient) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Path::new("/tmp").join(format!("smcli-a4-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let captured = CapturedHistory::new(dir.join("history.db"));
+        let env = HashMap::from([
+            ("HOME".into(), dir.to_string_lossy().into_owned()),
+            ("SMCLI_RUNTIME_DIR".into(), dir.to_string_lossy().into_owned()),
+            ("SMCLI_SERVICE".into(), mode.into()),
+        ]);
+        let service = ServiceClient::new(&captured.path, &env, Path::new("/missing/smcli"));
+        (dir, captured, service)
+    }
+
+    #[test]
+    fn tldr_ranker_falls_back_to_words_without_service() -> Result<()> {
+        let (dir, _, service) = tldr_service("0");
+        let mut rank = tldr_ranker(Some(service), "expected".into(), tldr_entries(), vec![vec![0.0, 1.0], vec![1.0, 0.0]], vec!["git".into()]);
+        assert_eq!(rank("status", false)?, ["0", "1"]);
+        assert_eq!(rank("commit", true)?, ["1", "0"]);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tldr_ranker_rejects_vectors_for_another_model() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        for (model, expected) in [("other", ["0", "1"]), ("expected", ["1", "0"])] {
+            let (dir, _, service) = tldr_service("connect");
+            let listener = std::os::unix::net::UnixListener::bind(service.socket())?;
+            let worker = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+                let request: ServiceRequest = serde_json::from_str(&line).unwrap();
+                assert_eq!(request.op, Operation::Embed);
+                let reply = serde_json::json!({"v": smcli_core::service_protocol::VERSION, "ok": true,
+                    "embedding": [1.0, 0.0], "model": model});
+                writeln!(stream, "{reply}").unwrap();
+            });
+            let mut rank = tldr_ranker(Some(service), "expected".into(), tldr_entries(), vec![vec![0.0, 1.0], vec![1.0, 0.0]], vec!["git".into()]);
+            assert_eq!(rank("status", false)?, expected);
+            worker.join().unwrap();
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tldr_ranker_latches_after_stalled_service() -> Result<()> {
+        use std::time::Instant;
+        let (dir, _, service) = tldr_service("connect");
+        let listener = std::os::unix::net::UnixListener::bind(service.socket())?;
+        let mut rank = tldr_ranker(Some(service), "expected".into(), tldr_entries(), vec![vec![1.0], vec![1.0]], vec!["git".into()]);
+        let start = Instant::now();
+        assert_eq!(rank("", false)?, ["0", "1"]);
+        assert!(start.elapsed() < Duration::from_millis(50));
+        listener.set_nonblocking(true)?;
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        listener.set_nonblocking(false)?;
+        let start = Instant::now();
+        assert_eq!(rank("status", false)?, ["0", "1"]);
+        assert!(start.elapsed() >= Duration::from_millis(1800));
+        assert!(start.elapsed() < Duration::from_secs(3));
+        let (first, _) = listener.accept()?;
+        for _ in 0..5 {
+            let start = Instant::now();
+            assert_eq!(rank("commit", false)?, ["1", "0"]);
+            assert!(start.elapsed() < Duration::from_millis(50));
+        }
+        listener.set_nonblocking(true)?;
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        drop(first);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn pick_tldr_prepares_while_index_is_unpublished() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        let (dir, captured, service) = tldr_service("connect");
+        let listener = std::os::unix::net::UnixListener::bind(service.socket())?;
+        let index = smcli_search::commands::CommandIndex::reader(index_directory(&captured),
+            smcli_search::ModelId { identity: "test".into(), dimension: 2 }, &[]);
+        std::fs::create_dir_all(&index.directory)?;
+        let path = index.path();
+        let pending = path.with_extension("building");
+        std::fs::write(&pending, b"unpublished build")?;
+        let worker = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+            let request: ServiceRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.op, Operation::Embed);
+            assert_eq!(request.mode.as_deref(), Some("commands"));
+            assert_eq!(request.query.as_deref(), Some(""));
+            std::fs::rename(pending, path).unwrap();
+            let reply = serde_json::json!({"v": smcli_core::service_protocol::VERSION, "ok": true});
+            writeln!(stream, "{reply}").unwrap();
+        });
+        assert!(prepare_tldr(&index, &service, None)?);
+        worker.join().unwrap();
+        assert!(index.path().exists());
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn pick_tldr_skips_prepare_when_index_has_program() -> Result<()> {
+        use smcli_core::command_source::CommandExample;
+        let (dir, captured, service) = tldr_service("connect");
+        let listener = std::os::unix::net::UnixListener::bind(service.socket())?;
+        let index = smcli_search::commands::CommandIndex::new(index_directory(&captured), smcli_search::Potion::bundled()?, &[]);
+        index.add("git", &[CommandExample { program: "git".into(), description: "Show status".into(), template: "git status".into(), source: "test".into() }])?;
+        let reader = smcli_search::commands::CommandIndex::reader(index_directory(&captured), index.model.clone(), &[]);
+        assert!(prepare_tldr(&reader, &service, Some("git"))?);
+        assert!(prepare_tldr(&reader, &service, None)?);
+        listener.set_nonblocking(true)?;
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
     #[test]
     fn fallback_walker_skips_directory_symlink_cycles_within_budget() -> Result<()> {
         let root = std::env::temp_dir().join(format!("smcli-walk-cycle-{}", uuid::Uuid::new_v4()));
@@ -1866,8 +1981,18 @@ mod tests {
         assert!(missing.healthy && !missing.built);
         assert_eq!(missing.missing, 1);
         assert!(!Path::new(&missing.path).exists());
+        let model = dir.join("model");
+        std::fs::create_dir(&model)?;
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Models/potion-shell-16m");
+        for file in ["config.json", "tokenizer.json", "model.safetensors"] { std::fs::copy(bundled.join(file), model.join(file))?; }
+        SmcliConfig { potion_path: Some(model.to_string_lossy().into_owned()), ..Default::default() }
+            .save(&dir.join("config.json"))?;
         let engine = search_engine(&captured, &dir, &env)?;
         engine.reindex(&corpus)?;
+        let weights = std::fs::read(model.join("model.safetensors"))?;
+        let length = u64::from_le_bytes(weights[..8].try_into().unwrap()) as usize;
+        std::fs::write(model.join("model.safetensors"), &weights[..8 + length])?;
+        assert!(smcli_search::Potion::from_dir(&model).is_err(), "health must work with header-only weights");
         let built = index_health(&captured, &dir, &env, &corpus);
         assert!(built.healthy, "{:?}", built.problems);
         assert!(built.built);

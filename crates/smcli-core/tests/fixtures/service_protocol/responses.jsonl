@@ -16,3 +16,4 @@
 {"error":{"code":"failed","message":"Example failed."},"ok":false,"v":1}
 {"error":{"code":"future_error","message":"Example future_error."},"ok":false,"v":1}
 {"duplicate":false,"files":[],"hits":[],"indexes":[],"ok":true,"partial":false,"recent":[],"suggestions":[],"v":1}
+{"v":4,"ok":true,"embedding":[0.25,-0.5,1.0],"model":"rs-commands-potion-shell-16m-bundled-tldr@1-d3"}

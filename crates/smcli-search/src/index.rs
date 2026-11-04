@@ -106,6 +106,95 @@ fn vector_first() -> bool {
     { true }
 }
 
+struct QueryPlan<'a> {
+    corpus: std::borrow::Cow<'a, HashMap<String, SearchEntry>>,
+    stripped: String,
+    parsed_filter: SearchFilter,
+    has_markers: bool,
+    literal: bool,
+    alias_query: bool,
+    merged_filter: SearchFilter,
+    parsed_any: bool,
+    alias_off: bool,
+}
+
+fn plan_query<'a>(query: &str, corpus: &'a HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter,
+              programs: Option<&HashMap<String, HashSet<String>>>, signals: &SearchSignals)
+    -> Result<Result<QueryPlan<'a>, Vec<SearchEntry>>> {
+    let alias_off = !uses(signals.context.as_ref(), Signal::Alias);
+    let typed_only = alias_off.then(|| corpus.iter().map(|(key, entry)| {
+        let mut entry = entry.clone();
+        entry.alias_off = true;
+        entry.flags = smcli_core::parse::command_flags(&entry.command);
+        (key.clone(), entry)
+    }).collect::<HashMap<_, _>>());
+    let original = corpus;
+    let corpus = typed_only.as_ref().unwrap_or(original);
+    let programs = if alias_off { None } else { programs };
+    if query.trim().is_empty() && !filter.is_empty() {
+        let mut matches: Vec<&SearchEntry> = corpus.values().filter(|e| filter.allows(e)).collect();
+        matches.sort_by(|a, b| {
+            b.last_run_epoch().unwrap_or(0.0).total_cmp(&a.last_run_epoch().unwrap_or(0.0))
+                .then(b.runs.cmp(&a.runs))
+                .then_with(|| a.command.cmp(&b.command))
+        });
+        return Ok(Err(matches.into_iter().take(limit).cloned().collect()));
+    }
+    if query.trim().is_empty() {
+        bail!("Search query is empty.");
+    }
+
+    let computed;
+    let programs = match programs {
+        Some(p) => p,
+        None => {
+            computed = program_arguments(corpus);
+            &computed
+        }
+    };
+    // Explicit `$word` markers take priority over automatic parsing. A marker that resolves to a
+    // program, subcommand, or directory is strict; unresolved marker text (`$HOME`) is ordinary query text.
+    let directories: HashSet<String> = corpus.values().filter_map(|e| e.last_directory.clone()).collect();
+    let (stripped, marked_filter, has_markers) = parse_markers(query, programs, &directories);
+    let parsed_filter = if has_markers { marked_filter } else { query_filter(query, programs, &directories) };
+    // Interpret stripped text so `$word` markers do not accidentally make intent literal.
+    let literal = is_literal_query(&stripped, programs);
+    // An exact typed alias is an explicit spelling, even when only its expansion is a known program.
+    let alias_query = corpus.values().any(|e| e.secondary().is_some_and(|s| s.eq_ignore_ascii_case(stripped.trim())));
+    let parsed_any = has_constraint(&parsed_filter);
+    let mut merged_filter = filter.clone();
+    if parsed_any {
+        merged_filter.merge_parsed(&parsed_filter);
+    }
+
+    let corpus = match typed_only {
+        Some(corpus) => std::borrow::Cow::Owned(corpus),
+        None => std::borrow::Cow::Borrowed(original),
+    };
+    Ok(Ok(QueryPlan { corpus, stripped, parsed_filter, has_markers, literal, alias_query,
+        merged_filter, parsed_any, alias_off }))
+}
+
+/// Keyword-only search: never opens an index or loads an embedding model.
+pub fn lexical_search(query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter,
+                      signals: &SearchSignals, now: f64) -> Result<Vec<SearchEntry>> {
+    let plan = match plan_query(query, corpus, limit, filter, None, signals)? {
+        Ok(plan) => plan,
+        Err(matches) => return Ok(matches),
+    };
+    let QueryPlan { corpus, stripped, parsed_filter, has_markers, literal, merged_filter, parsed_any, .. } = plan;
+    if corpus.is_empty() {
+        let active = addition_filter(filter, &merged_filter, has_markers, parsed_any, false);
+        let hits = signals.additions(&stripped, &corpus, &HashSet::new(), active, now);
+        return Ok(crate::corpus::rerank_with_evidence(hits, literal, &stripped, now, signals, None).into_iter().take(limit).collect());
+    }
+    Ok(text_fallback_with_evidence(&stripped, &corpus, limit, filter, literal, signals, now, &parsed_filter, has_markers, None))
+}
+
+pub fn index_name(model: &crate::ModelId) -> String {
+    format!("{VERSION}-{}-{}-d{}", Potion::NAME, model.identity, model.dimension)
+}
+
 impl HistorySearch {
     pub fn new(directory: impl Into<PathBuf>, potion: Potion) -> Self {
         Self { directory: directory.into(), potion }
@@ -113,7 +202,7 @@ impl HistorySearch {
 
     /// Embedding model, tokenizer, or document format changes need a fresh index; the name pins all three.
     pub fn index_name(&self) -> String {
-        format!("{VERSION}-{}-{}-d{}", Potion::NAME, self.potion.identity, self.potion.dimension())
+        index_name(&self.potion.model_id())
     }
 
     /// Brings the index up to date with `corpus`, then returns the best `limit` matches that pass `filter`.
@@ -135,49 +224,12 @@ impl HistorySearch {
     pub fn search_with_evidence_using_lock(&self, query: &str, corpus: &HashMap<String, SearchEntry>, limit: usize, filter: &SearchFilter,
                   programs: Option<&HashMap<String, HashSet<String>>>, signals: &SearchSignals, now: f64,
                   evidence: Option<&dyn crate::ProjectEvidence>, lock: Option<&File>) -> Result<Vec<SearchEntry>> {
-        let alias_off = !uses(signals.context.as_ref(), Signal::Alias);
-        let typed_only = alias_off.then(|| corpus.iter().map(|(key, entry)| {
-            let mut entry = entry.clone();
-            entry.alias_off = true;
-            entry.flags = smcli_core::parse::command_flags(&entry.command);
-            (key.clone(), entry)
-        }).collect::<HashMap<_, _>>());
-        let corpus = typed_only.as_ref().unwrap_or(corpus);
-        let programs = if alias_off { None } else { programs };
-        if query.trim().is_empty() && !filter.is_empty() {
-            let mut matches: Vec<&SearchEntry> = corpus.values().filter(|e| filter.allows(e)).collect();
-            matches.sort_by(|a, b| {
-                b.last_run_epoch().unwrap_or(0.0).total_cmp(&a.last_run_epoch().unwrap_or(0.0))
-                    .then(b.runs.cmp(&a.runs))
-                    .then_with(|| a.command.cmp(&b.command))
-            });
-            return Ok(matches.into_iter().take(limit).cloned().collect());
-        }
-        if query.trim().is_empty() {
-            bail!("Search query is empty.");
-        }
-        let computed;
-        let programs = match programs {
-            Some(p) => p,
-            None => {
-                computed = program_arguments(corpus);
-                &computed
-            }
+        let plan = match plan_query(query, corpus, limit, filter, programs, signals)? {
+            Ok(plan) => plan,
+            Err(matches) => return Ok(matches),
         };
-        // Explicit `$word` markers take priority over automatic parsing. A marker that resolves to a
-        // program, subcommand, or directory is strict; unresolved marker text (`$HOME`) is ordinary query text.
-        let directories: HashSet<String> = corpus.values().filter_map(|e| e.last_directory.clone()).collect();
-        let (stripped, marked_filter, has_markers) = parse_markers(query, programs, &directories);
-        let parsed_filter = if has_markers { marked_filter } else { query_filter(query, programs, &directories) };
-        // Interpret stripped text so `$word` markers do not accidentally make intent literal.
-        let literal = is_literal_query(&stripped, programs);
-        // An exact typed alias is an explicit spelling, even when only its expansion is a known program.
-        let alias_query = corpus.values().any(|e| e.secondary().is_some_and(|s| s.eq_ignore_ascii_case(stripped.trim())));
-        let parsed_any = has_constraint(&parsed_filter);
-        let mut merged_filter = filter.clone();
-        if parsed_any {
-            merged_filter.merge_parsed(&parsed_filter);
-        }
+        let QueryPlan { corpus, stripped, parsed_filter, has_markers, literal, alias_query, merged_filter, parsed_any, alias_off } = plan;
+        let corpus = &corpus;
         if vector_first() && !literal && !alias_query && (corpus.is_empty() || lock.is_none()) {
             let active = if has_markers && parsed_any { &merged_filter } else { filter };
             return Ok(self.intent_search(&stripped, corpus, limit, active, signals, None));
@@ -508,7 +560,7 @@ pub fn lock_index_directory(directory: &Path, attempts: u32) -> Result<Option<Fi
 }
 
 /// The index holds command text, so it gets the same privacy as the history database.
-fn prepare_directory(directory: &Path) -> Result<()> {
+pub(crate) fn prepare_directory(directory: &Path) -> Result<()> {
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(directory)?;
     let info = std::fs::symlink_metadata(directory)?;
     // SAFETY: getuid has no preconditions.
@@ -565,6 +617,35 @@ fn index_cache_unusable(err: &anyhow::Error) -> bool {
                 )
             )
     })
+}
+
+#[cfg(test)]
+#[test]
+fn lexical_search_matches_text_fallback() {
+    let corpus: HashMap<_, _> = ["git status", "docker ps", "git log"].into_iter()
+        .map(|s| (s.into(), SearchEntry::new(s, 1, "native"))).collect();
+    let signals = SearchSignals::default();
+    for query in ["git", "show git status", "$git status"] {
+        let filter = SearchFilter::default();
+        let plan = plan_query(query, &corpus, 10, &filter, None, &signals).unwrap().unwrap_or_else(|_| panic!("expected query plan"));
+        let expected = text_fallback(&plan.stripped, &plan.corpus, 10, &filter, plan.literal, &signals, 0.0, &plan.parsed_filter, plan.has_markers);
+        let actual = lexical_search(query, &corpus, 10, &filter, &signals, 0.0).unwrap();
+        assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(expected).unwrap(), "{query}");
+    }
+    let filter = SearchFilter { program: Some("git".into()), ..Default::default() };
+    let matches = lexical_search("", &corpus, 10, &filter, &signals, 0.0).unwrap();
+    assert_eq!(matches.len(), 2);
+    assert!(matches.iter().all(|entry| filter.allows(entry)));
+    assert!(lexical_search("", &corpus, 10, &SearchFilter::default(), &signals, 0.0).is_err());
+    let mut context = smcli_core::ranking::RankingContext::default();
+    context.candidates.push(smcli_core::ranking::Candidate::new("make test".into(), smcli_core::ranking::CandidateKind::Script, "Makefile target"));
+    let signals = SearchSignals { context: Some(context), ..Default::default() };
+    let corpus = HashMap::new();
+    let filter = SearchFilter::default();
+    let expected = text_fallback("make test", &corpus, 10, &filter, true, &signals, 0.0, &filter, false);
+    let actual = lexical_search("make test", &corpus, 10, &filter, &signals, 0.0).unwrap();
+    assert_eq!(actual.first().unwrap().command, "make test");
+    assert_eq!(serde_json::to_value(actual).unwrap(), serde_json::to_value(expected).unwrap());
 }
 
 /// Search without the index: commands sharing the query's words, by how much of the query they cover.

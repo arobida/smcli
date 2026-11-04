@@ -110,7 +110,8 @@ impl ServiceClient {
     fn prepare_request(&self, request: &ServiceRequest) -> ServiceRequest {
         let mut request = request.clone();
         if request.config.is_none() { request.config = Some(self.config.clone()); }
-        if request.op == Operation::Search {
+        if request.home.is_none() { request.home = Some(home_dir(&self.environment).to_string_lossy().into_owned()); }
+        if matches!(request.op, Operation::Search | Operation::Embed) {
             request.shell_path = service_protocol::shell_path_snapshot(self.environment.get("PATH").map(String::as_str));
         }
         if matches!(request.op, Operation::Search | Operation::Suggest | Operation::Pick) {
@@ -252,12 +253,28 @@ mod tests {
     }
 
     #[test]
+    fn embed_forwards_caller_home_and_shell_path() {
+        let environment = HashMap::from([
+            ("HOME".into(), "/caller".into()),
+            ("PATH".into(), "/bin:/caller/bin".into()),
+        ]);
+        let client = ServiceClient::new(Path::new("/missing/db"), &environment, Path::new("/missing/smcli"));
+        let mut request = ServiceRequest::new(Operation::Embed);
+        let prepared = client.prepare_request(&request);
+        assert_eq!(prepared.home.as_deref(), Some("/caller"));
+        assert_eq!(prepared.shell_path.as_deref(), Some("/bin:/caller/bin"));
+        request.home = Some("/explicit".into());
+        assert_eq!(client.prepare_request(&request).home.as_deref(), Some("/explicit"));
+        assert_eq!(client.prepare_request(&ServiceRequest::new(Operation::Ping)).home.as_deref(), Some("/caller"));
+    }
+
+    #[test]
     fn modes_and_repeatable_operations() {
         for value in ["0", "OFF", "false", "no", "connect", "on"] {
             let client = ServiceClient::new(Path::new("/missing/db"), &HashMap::from([("SMCLI_SERVICE".into(), value.into())]), Path::new("/missing/smcli"));
             assert!(client.mode == match value { "connect" => Mode::Connect, "on" => Mode::Spawn, _ => Mode::Off });
         }
-        for op in [Operation::Ping, Operation::Record, Operation::Suggest, Operation::Pick, Operation::Search, Operation::Context, Operation::Files, Operation::Grep] { assert!(ServiceClient::repeatable(op)); }
+        for op in [Operation::Ping, Operation::Record, Operation::Suggest, Operation::Pick, Operation::Search, Operation::Context, Operation::Files, Operation::Grep, Operation::Embed] { assert!(ServiceClient::repeatable(op)); }
         assert!(!ServiceClient::repeatable(Operation::Select));
         assert!(!ServiceClient::repeatable(Operation::Shutdown));
     }
@@ -296,7 +313,10 @@ mod tests {
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let old = fixtures.join("old_service.py");
         if spawn {
-            let stub = fixtures.join("replacement_service.py");
+            let stub = temporary.path().join("replacement_service.py");
+            // The frozen helper predates v4; the replacement must speak the current protocol.
+            let source = std::fs::read_to_string(fixtures.join("replacement_service.py")).unwrap();
+            std::fs::write(&stub, source.replace("\"v\": 3", &format!("\"v\": {}", service_protocol::VERSION))).unwrap();
             let wrapper = temporary.path().join("smcli-service");
             std::fs::write(&wrapper, format!("#!/bin/sh\nexec {python} {stub} {socket} {marker}\n", stub = stub.display(), socket = socket.display(), marker = marker.display())).unwrap();
             std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();

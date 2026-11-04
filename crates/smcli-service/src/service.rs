@@ -54,6 +54,7 @@ struct State {
     /// The corpus is rebuilt after any outside write, the engine when the config changes.
     engine: Option<(SmcliConfig, Arc<HistorySearch>)>,
     corpus: Option<SearchCorpus>,
+    model_lock: Option<std::fs::File>,
 }
 
 pub struct Service {
@@ -139,7 +140,7 @@ impl Service {
                 idle,
                 user: user_name(),
                 environment,
-                state: Mutex::new(State { db, index: None, data_version: version, history_revision: 0, last_activity: Instant::now(), engine: None, corpus: None }),
+                state: Mutex::new(State { db, index: None, data_version: version, history_revision: 0, last_activity: Instant::now(), engine: None, corpus: None, model_lock: None }),
                 searching: Mutex::new(()),
                 active: AtomicUsize::new(0),
                 contexts: ContextCache::new(),
@@ -262,6 +263,7 @@ impl Service {
         }
         let result = match request.op {
             Operation::Search => return self.search(request),
+            Operation::Embed => return self.embed(request),
             Operation::Context => return self.context(request),
             Operation::Files => return self.files(|f| f.files(request)),
             Operation::Grep => return self.files(|f| f.grep(request)),
@@ -404,12 +406,14 @@ impl Service {
     /// programs, so nothing is remembered here and the next capture retries.
     fn finish_sync(&self, shell_path: String, request: &ServiceRequest) {
         let result = (|| -> Result<()> {
+            let Ok(_searching) = self.searching.try_lock() else { return Ok(()) };
             let platform = smcli_search::tldr::current_platform();
             let Some(sources) = smcli_search::commands::bundled_sources() else {
                 return Ok(());
             };
             let refs = smcli_search::commands::source_refs(&sources);
-            let index = self.command_index(&refs, request)?;
+            let engine = self.current_engine(request)?;
+            let index = self.command_index_locked(&engine, &refs);
             if !index.path().exists() {
                 return Ok(());
             }
@@ -431,21 +435,49 @@ impl Service {
         let _ = result;
     }
 
-    /// The command index for the current model and source, cached on first use.
-    fn command_index(&self, sources: &[&dyn CommandSource], request: &ServiceRequest) -> Result<Arc<CommandIndex>> {
-        let cached = self.command_sync.lock().unwrap_or_else(|e| e.into_inner()).index.clone();
-        if let Some(index) = cached {
-            return Ok(index);
+    /// Caller holds `searching` through every use of the returned model-owning index.
+    fn command_index_locked(&self, engine: &HistorySearch, sources: &[&dyn CommandSource]) -> Arc<CommandIndex> {
+        let index = CommandIndex::new(engine.directory.clone(), engine.potion.clone(), sources);
+        let mut sync = self.command_sync.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = &sync.index
+            && cached.index_name() == index.index_name()
+        {
+            return Arc::clone(cached);
         }
-        // The service's one engine (loaded on demand): a second model copy would hold two at once.
-        // try_lock: never make a search wait on background sync; a busy service retries on a later capture.
-        let engine = {
-            let Ok(_searching) = self.searching.try_lock() else { anyhow::bail!("search in progress; sync later") };
-            self.current_engine(request)?
+        let index = Arc::new(index);
+        sync.index = Some(Arc::clone(&index));
+        index
+    }
+
+    fn embed(&self, request: &ServiceRequest) -> ServiceResponse {
+        let _searching = self.searching.lock().unwrap_or_else(|e| e.into_inner());
+        self.touch();
+        let Some(query) = request.query.as_deref() else {
+            return ServiceResponse::failure("bad_request", "embed needs a query.");
         };
-        let index = Arc::new(CommandIndex::new(engine.directory.clone(), engine.potion.clone(), sources));
-        self.command_sync.lock().unwrap_or_else(|e| e.into_inner()).index = Some(Arc::clone(&index));
-        Ok(index)
+        let result = (|| -> Result<ServiceResponse> {
+            let engine = self.current_engine(request)?;
+            let sources = smcli_search::commands::bundled_sources()
+                .ok_or_else(|| anyhow::anyhow!("command example sources unavailable"))?;
+            let refs = smcli_search::commands::source_refs(&sources);
+            let index = self.command_index_locked(&engine, &refs);
+            if request.mode.as_deref() == Some("commands") {
+                let runs = self.history.runs(&self.user, &self.lock().db)?;
+                let programs = runs.iter()
+                    .filter_map(|run| recorded_program(&run.command, run.expanded_command.as_deref())).collect();
+                let path = smcli_core::service_protocol::shell_path_snapshot(request.shell_path.as_deref()).unwrap_or_default();
+                smcli_search::commands::prepare(&index, &refs, smcli_search::tldr::current_platform(),
+                    &path, &programs, false, request.command.as_deref())?;
+            }
+            let mut response = ServiceResponse::new(true);
+            if !query.is_empty() {
+                response.embedding = engine.potion.embed(&[query.to_owned()]).into_iter().next();
+                response.model = Some(index.index_name());
+            }
+            Ok(response)
+        })();
+        self.touch();
+        result.unwrap_or_else(|e| ServiceResponse::failure("failed", e.to_string()))
     }
 
     /// Suggest, and the picker's first draw (this directory's suggestions, then all history by last run).
@@ -552,6 +584,14 @@ impl Service {
             {
                 return Ok(Arc::clone(engine));
             }
+            if state.model_lock.is_none() {
+                state.model_lock = Some(smcli_search::model_lock(&self.history, Duration::ZERO)?
+                    .ok_or_else(|| anyhow::anyhow!("the model is in use by smcli reindex or smcli init"))?);
+            }
+            let mut sync = self.command_sync.lock().unwrap_or_else(|e| e.into_inner());
+            sync.index = None;
+            sync.known.clear();
+            sync.last_path = None;
             // Free the old model before loading the new one, so two are never resident; callers hold `searching`.
             state.engine = None;
         }
@@ -699,6 +739,11 @@ mod tests {
             r.directory = Some(self.home.to_string_lossy().into_owned());
             r
         }
+        fn command_index(&self, sources: &[&dyn CommandSource]) -> Arc<CommandIndex> {
+            let _searching = self.service.searching.lock().unwrap();
+            let engine = self.service.current_engine(&self.request(Operation::Embed)).unwrap();
+            self.service.command_index_locked(&engine, sources)
+        }
         fn record(&self) {
             let mut r = self.request(Operation::Record);
             r.event = Some("01234567-89ab-4cde-8012-3456789abcde".into());
@@ -711,6 +756,144 @@ mod tests {
         }
     }
     impl Drop for Fixture { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.home); } }
+
+    #[test]
+    fn embed_returns_vector_and_command_index_name() {
+        let f = Fixture::new();
+        let mut r = f.request(Operation::Embed);
+        r.query = Some("list files".into());
+        let response = f.service.dispatch(&r);
+        assert!(response.ok, "{response:?}");
+        let state = f.service.lock();
+        let engine = &state.engine.as_ref().unwrap().1;
+        let vector = response.embedding.unwrap();
+        assert_eq!(vector.len(), engine.potion.dimension());
+        assert!(vector.iter().all(|v| v.is_finite()));
+        let sources = smcli_search::commands::bundled_sources().unwrap();
+        let refs = smcli_search::commands::source_refs(&sources);
+        assert_eq!(response.model, Some(CommandIndex::new(engine.directory.clone(), engine.potion.clone(), &refs).index_name()));
+    }
+
+    #[test]
+    fn embed_without_query_is_bad_request() {
+        let f = Fixture::new();
+        let response = f.service.dispatch(&f.request(Operation::Embed));
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().code, "bad_request");
+        assert!(f.service.lock().engine.is_none());
+    }
+
+    #[test]
+    fn embed_commands_mode_builds_then_ensures_program() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        let bin = f.home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let mut r = f.request(Operation::Embed);
+        r.query = Some("".into());
+        r.mode = Some("commands".into());
+        r.shell_path = Some(bin.to_string_lossy().into_owned());
+        let response = f.service.dispatch(&r);
+        assert!(response.ok, "{response:?}");
+        assert!(response.embedding.is_none());
+        let index = f.service.command_sync.lock().unwrap().index.clone().unwrap();
+        assert!(index.path().exists());
+        assert!(!index.programs().unwrap().contains("jq"));
+        std::fs::write(bin.join("jq"), "").unwrap();
+        std::fs::set_permissions(bin.join("jq"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        r.command = Some("jq".into());
+        let response = f.service.dispatch(&r);
+        assert!(response.ok, "{response:?}");
+        assert!(index.examples("jq").unwrap().is_some());
+    }
+
+    #[test]
+    fn background_sync_skips_while_searching_held() {
+        let f = Fixture::new();
+        let _searching = f.service.searching.lock().unwrap();
+        f.service.command_sync.lock().unwrap().running = true;
+        f.service.finish_sync(String::new(), &f.request(Operation::Record));
+        let sync = f.service.command_sync.lock().unwrap();
+        assert!(!sync.running);
+        assert!(sync.index.is_none());
+        assert!(sync.last_path.is_none());
+        assert!(f.service.lock().engine.is_none());
+    }
+
+    #[test]
+    fn embed_does_not_deadlock_with_background_sync() {
+        let f = Fixture::new();
+        let service = Arc::clone(&f.service);
+        let mut r = f.request(Operation::Embed);
+        r.query = Some("list files".into());
+        r.mode = Some("commands".into());
+        r.shell_path = Some(f.home.to_string_lossy().into_owned());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let background = Arc::clone(&service);
+        let sync_request = r.clone();
+        let sync = std::thread::spawn(move || background.finish_sync(String::new(), &sync_request));
+        let embed = std::thread::spawn(move || { tx.send(service.dispatch(&r)).unwrap(); });
+        let response = rx.recv_timeout(Duration::from_secs(30)).expect("embed deadlocked with sync");
+        assert!(response.ok, "{response:?}");
+        embed.join().unwrap();
+        sync.join().unwrap();
+    }
+
+    #[test]
+    fn load_engine_refuses_while_model_lock_held() {
+        let f = Fixture::new();
+        let lock = smcli_search::model_lock(&f.service.history, Duration::ZERO).unwrap().unwrap();
+        let mut r = f.request(Operation::Embed);
+        r.query = Some("list files".into());
+        let response = f.service.dispatch(&r);
+        assert!(!response.ok);
+        assert!(response.error.unwrap().message.contains("model is in use"));
+        r.op = Operation::Search;
+        let response = f.service.dispatch(&r);
+        assert!(!response.ok);
+        assert!(response.error.unwrap().message.contains("model is in use"));
+        assert!(f.service.lock().engine.is_none());
+        drop(lock);
+        r.op = Operation::Embed;
+        assert!(f.service.dispatch(&r).ok);
+        assert!(smcli_search::model_lock(&f.service.history, Duration::ZERO).unwrap().is_none());
+        // A reload must reuse the process's descriptor, rather than conflict with its own lock.
+        f.service.lock().engine = None;
+        assert!(f.service.dispatch(&r).ok);
+    }
+
+    #[test]
+    fn model_switch_drops_cached_command_index() {
+        let f = Fixture::new();
+        let mut r = f.request(Operation::Embed);
+        r.query = Some("list files".into());
+        let first = f.service.dispatch(&r);
+        assert!(first.ok, "{first:?}");
+        let old = Arc::downgrade(f.service.command_sync.lock().unwrap().index.as_ref().unwrap());
+        let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Models/potion-shell-16m");
+        std::fs::write(f.home.join("config.toml"), format!("{{\"potionPath\":\"{}\"}}", model.display())).unwrap();
+        {
+            let mut sync = f.service.command_sync.lock().unwrap();
+            sync.known.insert("stale".into());
+            sync.last_path = Some("stale".into());
+        }
+        f.service.load_engine(&r, || {
+            assert!(old.upgrade().is_none(), "old command index retains its model");
+            let sync = f.service.command_sync.lock().unwrap();
+            assert!(sync.known.is_empty());
+            assert!(sync.last_path.is_none());
+        }).unwrap();
+        let second = f.service.dispatch(&r);
+        assert!(second.ok, "{second:?}");
+        assert_ne!(first.model, second.model);
+        assert_eq!(second.model, Some(f.service.command_sync.lock().unwrap().index.as_ref().unwrap().index_name()));
+        let old = Arc::downgrade(f.service.command_sync.lock().unwrap().index.as_ref().unwrap());
+        std::fs::write(f.home.join("config.toml"), "{}").unwrap();
+        let third = f.service.dispatch(&r);
+        assert!(third.ok, "{third:?}");
+        assert_eq!(third.model, first.model);
+        assert!(old.upgrade().is_none());
+    }
 
     #[test]
     fn busy_response_includes_service_build() {
@@ -786,7 +969,7 @@ mod tests {
         let sources = smcli_search::commands::bundled_sources().expect("bundled tldr data");
         let refs = smcli_search::commands::source_refs(&sources);
         // Pre-existing index with one program, so discovery adds incrementally instead of waiting for a full build.
-        let index = f.service.command_index(&refs, &f.request(Operation::Record)).unwrap();
+        let index = f.command_index(&refs);
         index.add("tar", &CommandIndex::gather(&refs, "tar", platform).expect("tar examples")).unwrap();
         // A fake jq executable on the request's PATH.
         let bin = f.home.join("bin");
@@ -827,7 +1010,7 @@ mod tests {
         let platform = smcli_search::tldr::current_platform();
         let sources = smcli_search::commands::bundled_sources().expect("bundled tldr data");
         let refs = smcli_search::commands::source_refs(&sources);
-        let index = f.service.command_index(&refs, &f.request(Operation::Record)).unwrap();
+        let index = f.command_index(&refs);
         index.add("tar", &CommandIndex::gather(&refs, "tar", platform).expect("tar examples")).unwrap();
         let bin = f.home.join("bin");
         std::fs::create_dir(&bin).unwrap();
@@ -878,7 +1061,7 @@ mod tests {
         let platform = smcli_search::tldr::current_platform();
         let sources = smcli_search::commands::bundled_sources().expect("bundled tldr data");
         let refs = smcli_search::commands::source_refs(&sources);
-        let index = f.service.command_index(&refs, &f.request(Operation::Record)).unwrap();
+        let index = f.command_index(&refs);
         index.add("tar", &CommandIndex::gather(&refs, "tar", platform).expect("tar examples")).unwrap();
         assert!(CommandIndex::gather(&refs, "zzz-smcli-noexamples", platform).is_none());
         let bin = f.home.join("bin");

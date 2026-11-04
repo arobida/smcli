@@ -23,10 +23,11 @@ pub mod setup;
 pub mod tldr;
 mod tokenizer;
 
-pub use index::HistorySearch;
-pub use potion::Potion;
+pub use index::{HistorySearch, index_name, lexical_search};
+pub use potion::{ModelId, Potion};
+pub use setup::{configured_model, model_lock};
 pub use cheat::CheatSource;
-pub use tldr::{Corpus, Entry, TldrSource, rank};
+pub use tldr::{Corpus, Entry, TldrSource, rank, rank_words};
 pub use tokenizer::ShellTokenizer;
 
 #[cfg(test)]
