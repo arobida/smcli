@@ -130,7 +130,7 @@ impl ServiceClient {
             return Err(ExchangeError::Mismatch(response));
         }
         // Same version refusing our request is not a stale service; do not replace it.
-        if response.error.as_ref().is_some_and(|e| e.code == "version") {
+        if response.error.as_ref().is_some_and(|e| e.code() == Some(service_protocol::FailureCode::Version)) {
             return Err(ExchangeError::Unavailable);
         }
         Ok(response)

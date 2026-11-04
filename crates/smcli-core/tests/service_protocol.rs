@@ -238,3 +238,106 @@ fn service_protocol_nonfinite_doubles_cannot_be_encoded() {
         assert!(encode_line(&response).is_err());
     }
 }
+
+#[test]
+fn every_v4_fixture_request_converts() {
+    for line in REQUESTS_V4.lines() {
+        let mut request = decode_line::<ServiceRequest>(line.as_bytes()).unwrap();
+        // These lines are field examples, not full client requests. A live client always sends config,
+        // and the search example only carries home. Fill just those so the typed variant is proven.
+        if request.config.is_none() {
+            request.config = Some("/tmp/config.json".into());
+        }
+        if request.op == Operation::Search && request.directory.as_deref().filter(|d| d.starts_with('/')).is_none() {
+            request.directory = Some("/tmp".into());
+        }
+        smcli_core::request::Request::try_from(&request).unwrap_or_else(|error| panic!("{line}: {error:?}"));
+    }
+}
+
+#[test]
+fn validation_table() {
+    let reject = |mut request: ServiceRequest, message: &str| {
+        let error = smcli_core::request::Request::try_from(&request).unwrap_err();
+        assert_eq!(error.0, FailureCode::BadRequest);
+        assert_eq!(error.1, message);
+        request.config = Some("/tmp/config.json".into());
+        let _ = request;
+    };
+    let mut record = ServiceRequest::new(Operation::Record);
+    record.config = Some("/tmp/config.json".into());
+    reject(record, "record needs event, command, shell, session, directory and exitCode.");
+    reject(ServiceRequest::new(Operation::Record), "config is required");
+    reject(ServiceRequest::new(Operation::Search), "config is required");
+    let mut search = ServiceRequest::new(Operation::Search);
+    search.config = Some("/tmp/config.json".into());
+    reject(search, "search needs a query and an absolute directory.");
+    let mut limited = ServiceRequest::new(Operation::Search);
+    limited.config = Some("/tmp/config.json".into());
+    limited.query = Some("git".into());
+    limited.directory = Some("/tmp".into());
+    limited.limit = Some(0);
+    reject(limited, "limit must be 1 to 1000.");
+    let mut suggest = ServiceRequest::new(Operation::Suggest);
+    suggest.config = Some("/tmp/config.json".into());
+    suggest.directory = Some("relative".into());
+    reject(suggest, "suggest needs an absolute directory.");
+    let mut pick = ServiceRequest::new(Operation::Pick);
+    pick.config = Some("/tmp/config.json".into());
+    pick.directory = Some("/tmp".into());
+    pick.limit = Some(1001);
+    reject(pick, "limit must be 1 to 1000.");
+    reject(ServiceRequest::new(Operation::Embed), "config is required");
+    let mut embed = ServiceRequest::new(Operation::Embed);
+    embed.config = Some("/tmp/config.json".into());
+    reject(embed, "embed needs a query.");
+    reject(ServiceRequest::new(Operation::Context), "context needs an absolute directory.");
+    reject(ServiceRequest::new(Operation::Files), "files needs a query and an absolute directory.");
+    reject(ServiceRequest::new(Operation::Grep), "grep needs a query and an absolute directory.");
+    let mut grep = ServiceRequest::new(Operation::Grep);
+    grep.directory = Some("/tmp".into());
+    grep.query = Some(String::new());
+    reject(grep, "grep needs a query.");
+    let mut wide = ServiceRequest::new(Operation::Complete);
+    wide.directory = Some("/tmp".into());
+    wide.query = Some("a".into());
+    wide.limit = Some(501);
+    reject(wide, "limit must be 1 to 500.");
+    reject(ServiceRequest::new(Operation::Complete), "complete needs a query and an absolute directory.");
+    let mut select = ServiceRequest::new(Operation::Select);
+    select.config = Some("/tmp/config.json".into());
+    select.mode = Some("suggest".into());
+    reject(select, "select needs a command, a directory and a mode of suggest or search.");
+    let mut expanded = ServiceRequest::new(Operation::Select);
+    expanded.config = Some("/tmp/config.json".into());
+    expanded.mode = Some("search".into());
+    expanded.command = Some("ls".into());
+    expanded.directory = Some("/tmp".into());
+    expanded.expanded_command = Some("$(ls)".into());
+    reject(expanded, "Invalid expanded command.");
+    let mut file = ServiceRequest::new(Operation::Select);
+    file.config = Some("/tmp/config.json".into());
+    file.mode = Some("files".into());
+    reject(file, "select needs a directory, a path and a mode of files or grep.");
+    let mut escaped = ServiceRequest::new(Operation::Select);
+    escaped.config = Some("/tmp/config.json".into());
+    escaped.mode = Some("grep".into());
+    escaped.directory = Some("/tmp".into());
+    escaped.path = Some("../secret".into());
+    reject(escaped, "select needs a path relative to the searched root.");
+}
+
+#[test]
+fn failure_codes_round_trip_as_strings() {
+    for code in [FailureCode::Version, FailureCode::BadRequest, FailureCode::Busy, FailureCode::Failed, FailureCode::Timeout, FailureCode::TooLarge] {
+        let response = ServiceResponse::fail(code, "example");
+        let encoded = encode_line(&response).unwrap();
+        let decoded = decode_line::<ServiceResponse>(&encoded).unwrap();
+        assert_eq!(decoded.error.as_ref().unwrap().code, code.as_str());
+        assert_eq!(decoded.error.unwrap().code(), Some(code));
+    }
+    let mut open = ServiceResponse::fail(FailureCode::Failed, "later");
+    open.error.as_mut().unwrap().code = "future_error".into();
+    let encoded = encode_line(&open).unwrap();
+    assert!(decode_line::<ServiceResponse>(&encoded).unwrap().error.unwrap().code().is_none());
+}

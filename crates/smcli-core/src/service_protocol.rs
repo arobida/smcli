@@ -233,6 +233,34 @@ impl ServiceResponse {
         });
         response
     }
+
+    pub fn fail(code: FailureCode, message: impl Into<String>) -> Self {
+        Self::failure(code.as_str(), message)
+    }
+}
+
+/// Known failure codes. The wire value stays a string, so an unknown code still decodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureCode {
+    Version,
+    BadRequest,
+    Busy,
+    Failed,
+    Timeout,
+    TooLarge,
+}
+
+impl FailureCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Version => "version",
+            Self::BadRequest => "bad_request",
+            Self::Busy => "busy",
+            Self::Failed => "failed",
+            Self::Timeout => "timeout",
+            Self::TooLarge => "too_large",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -240,6 +268,20 @@ impl ServiceResponse {
 pub struct Failure {
     pub code: String,
     pub message: String,
+}
+
+impl Failure {
+    pub fn code(&self) -> Option<FailureCode> {
+        Some(match self.code.as_str() {
+            "version" => FailureCode::Version,
+            "bad_request" => FailureCode::BadRequest,
+            "busy" => FailureCode::Busy,
+            "failed" => FailureCode::Failed,
+            "timeout" => FailureCode::Timeout,
+            "too_large" => FailureCode::TooLarge,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
