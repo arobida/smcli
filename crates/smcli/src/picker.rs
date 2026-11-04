@@ -619,19 +619,10 @@ pub fn run(
                     ListItem::new(Line::from(line))
                 }).collect()
             } else {
+                let row_width = list_block.inner(list_area).width as usize;
                 hits.iter().enumerate().map(|(i, h)| {
-                    let name = &h.path;
-                    let location = h.line.map(|n| format!(":{n}  {}", h.text.as_deref().unwrap_or(""))).unwrap_or_default();
-                    ListItem::new(Line::from(cursor(i == selected).into_iter().chain([
-                        Span::styled(if compact { String::new() } else { format!("{} ", h.git.as_deref().unwrap_or("")) }, ACCENT),
-                        Span::styled(visible(name), if compact { ls_colors.style(name) } else { Style::new() }),
-                        Span::styled(visible(&location), MUTED),
-                        // Inline: colour already tells dirs from files; git status stays and suggested (picked) rows get ✨.
-                        Span::styled(if !compact { format!("  {}", h.provenance.join("+")) } else {
-                            h.git.as_deref().map(str::trim).filter(|g| !g.is_empty()).map(|g| format!("  {g}")).unwrap_or_default()
-                        }, MUTED),
-                        Span::raw(if compact && suggested(h) { " ✨" } else { "" }),
-                    ]).collect::<Vec<_>>()))
+                    // Inline: colour already tells dirs from files; git status stays and suggested (picked) rows get ✨.
+                    ListItem::new(Line::from(cursor(i == selected).into_iter().chain(file_row_spans(h, picker.mode, compact, row_width, &ls_colors)).collect::<Vec<_>>()))
                 }).collect()
             };
             let list = List::new(items).block(list_block).highlight_style(if compact { Style::new().add_modifier(Modifier::BOLD) } else { SELECTED });
@@ -904,6 +895,71 @@ pub(crate) fn history_insert(key: &str) -> String {
     command_parts(key).0
 }
 
+/// Shorten a path for display: keep the last component whole, fill the rest of `room`
+/// from the start, join with `…`. Measured by display width, char by char, like `history_row`.
+/// Only when the last component alone does not fit is its end cut. Display only: insertion uses the full path.
+pub(crate) fn truncate_middle(path: &str, room: usize) -> String {
+    if room == 0 { return String::new(); }
+    if Span::raw(path).width() <= room { return path.to_string(); }
+    // Directory rows end in '/': the last component is the final non-empty one, slash kept.
+    let trimmed = path.trim_end_matches('/');
+    let file = trimmed.rsplit('/').next().unwrap_or(trimmed).to_string();
+    let tail = format!("/{file}{}", &path[trimmed.len()..]);
+    // The component plus the `…` join fits with room for a leading part: keep as much of the start as fits.
+    // A zero-width lead is useful when the ellipsis and component exactly fill the room.
+    if Span::raw(format!("…{tail}")).width() <= room {
+        let budget = room.saturating_sub(Span::raw(format!("…{tail}")).width());
+        let prefix_len = path.len() - tail.len(); // bytes before the last component
+        let mut lead = String::new();
+        for c in path.chars() {
+            if lead.len() >= prefix_len { break; } // never eat into the file name
+            if Span::raw(format!("{lead}{c}")).width() > budget { break; }
+            lead.push(c);
+        }
+        return format!("{lead}…{tail}");
+    }
+    // The component fits but the `…` join does not: show the whole component, no prefix.
+    if Span::raw(&file).width() <= room {
+        let slash = &path[trimmed.len()..];
+        return if Span::raw(format!("{file}{slash}")).width() <= room { format!("{file}{slash}") } else { file };
+    }
+    // End-cut the component: it alone does not fit.
+    let mut cut = String::new();
+    for c in file.chars() {
+        if Span::raw(format!("{cut}{c}…")).width() > room { break; }
+        cut.push(c);
+    }
+    if cut.is_empty() { "…".into() } else { format!("{cut}…") }
+}
+
+/// File/grep row spans: git mark, path (middle-truncated to its room), `:line text`, provenance/status.
+/// LS_COLORS style always comes from the full name; in grep mode the path gets at most half the row.
+fn file_row_spans(h: &FileHit, mode: Mode, compact: bool, row_width: usize, ls_colors: &LsColors) -> Vec<Span<'static>> {
+    let git = if compact { String::new() } else { h.git.as_deref().map(|g| format!("{g} ")).unwrap_or_default() };
+    let location = h.line.map(|n| format!(":{n}  {}", h.text.as_deref().unwrap_or(""))).unwrap_or_default();
+    let trail = if !compact {
+        format!("  {}", h.provenance.join("+"))
+    } else {
+        h.git.as_deref().map(str::trim).filter(|g| !g.is_empty()).map(|g| format!("  {g}")).unwrap_or_default()
+    };
+    let sparkle = if compact && suggested(h) { " ✨" } else { "" };
+    // The match text never eats the path's share: it is cut at the terminal's edge instead.
+    let fixed = 2 + git.len() + trail.len() + sparkle.len()
+        + if compact { 2 } else { 0 }; // inline cursor
+    let mut room = row_width.saturating_sub(fixed);
+    if mode == Mode::Grep { room /= 2; }
+    let name = &h.path;
+    // Truncate the visible() expansion (a tab is two cells, not one); style and insertion use the raw name.
+    let shown = truncate_middle(&visible(name), room);
+    vec![
+        Span::styled(git, ACCENT),
+        Span::styled(shown, if compact { ls_colors.style(name) } else { Style::new() }),
+        Span::styled(visible(&location), MUTED),
+        Span::styled(visible(&trail), MUTED),
+        Span::raw(sparkle),
+    ]
+}
+
 /// An alias row: the typed alias, a `↦` (maps to) mark, then its expansion dimmed and cut to fit `width`. The alias is never cut first.
 fn history_row(key: &str, width: usize) -> Vec<Span<'static>> {
     let (typed, expanded) = command_parts(key);
@@ -1137,6 +1193,157 @@ mod tests {
     }
 
     use super::*;
+
+    fn width(s: &str) -> usize { Span::raw(s).width() }
+
+    #[test]
+    fn truncate_middle_fits_unchanged() {
+        assert_eq!(truncate_middle("src/main.rs", 40), "src/main.rs");
+        assert_eq!(truncate_middle("a/b", 3), "a/b");
+    }
+
+    #[test]
+    fn truncate_middle_deep_path_keeps_start_and_file() {
+        let shown = truncate_middle("services/backend/internal/handlers/user_profile.go", 40);
+        assert!(shown.starts_with("services/"), "{shown}");
+        assert!(shown.contains('…'), "{shown}");
+        assert!(shown.ends_with("/user_profile.go"), "{shown}");
+        assert!(width(&shown) <= 40, "{shown}");
+    }
+
+    #[test]
+    fn truncate_middle_end_cuts_long_last_component() {
+        let shown = truncate_middle("dir/a_very_long_file_name.go", 12);
+        assert!(shown.ends_with('…'), "{shown}");
+        assert!(shown.starts_with('a'), "{shown}");
+        assert!(width(&shown) <= 12, "{shown}");
+    }
+
+    #[test]
+    fn truncate_middle_double_width_never_exceeds_room() {
+        let shown = truncate_middle("日本語/ディレクトリ/ファイル名.rs", 10);
+        assert!(width(&shown) <= 10, "{shown}");
+        let shown = truncate_middle("日本語の長い名前のファイル.rs", 5);
+        assert!(width(&shown) <= 5, "{shown}");
+        assert!(shown.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_middle_tiny_rooms() {
+        assert_eq!(truncate_middle("abc/def", 0), "");
+        assert!(width(&truncate_middle("abc/def", 1)) <= 1);
+        assert_eq!(truncate_middle("abc/de", 2), "de");
+    }
+
+    #[test]
+    fn truncate_middle_fitting_component_shows_whole_without_prefix() {
+        // "abc/de" is 6 wide; room 4 exactly fits the ellipsis and final component.
+        assert_eq!(truncate_middle("abc/de", 4), "…/de");
+        assert_eq!(truncate_middle("abc/de", 3), "de");
+    }
+
+    #[test]
+    fn truncate_middle_directory_keeps_last_component_and_slash() {
+        let shown = truncate_middle("very/long/directory/", 16);
+        assert!(shown.starts_with("very"), "{shown}");
+        assert!(shown.contains('…'), "{shown}");
+        assert!(shown.ends_with("/directory/"), "{shown}");
+        assert!(width(&shown) <= 16, "{shown}");
+        // Whole component when the join does not fit.
+        assert_eq!(truncate_middle("very/long/directory/", 10), "directory/");
+    }
+
+    #[test]
+    fn truncate_middle_directory_component_fits_without_slash() {
+        assert_eq!(truncate_middle("long/path/file/", 4), "file");
+    }
+
+    fn hit(path: &str, line: Option<u32>, text: Option<&str>) -> FileHit {
+        FileHit { insert: path.into(), path: path.into(), git: None, line: line.map(i64::from), column: None, text: text.map(str::to_string), provenance: vec![], definition: None }
+    }
+
+    #[test]
+    fn file_row_truncates_path_to_room() {
+        let ls = LsColors::parse("");
+        let h = hit("services/backend/internal/handlers/user_profile.go", None, None);
+        let spans = file_row_spans(&h, Mode::Files, false, 40, &ls);
+        let path = spans[1].content.clone();
+        assert!(path.ends_with("/user_profile.go"), "{path}");
+        assert!(path.contains('…'), "{path}");
+        assert!(width(&path) <= 38, "{path}");
+        // The inserted path is untouched.
+        assert_eq!(h.insert, "services/backend/internal/handlers/user_profile.go");
+    }
+
+    #[test]
+    fn grep_row_caps_path_at_half_row() {
+        let ls = LsColors::parse("");
+        let h = hit("services/backend/internal/handlers/user_profile.go", Some(42), Some("func main()"));
+        let spans = file_row_spans(&h, Mode::Grep, false, 80, &ls);
+        let path = spans[1].content.clone();
+        assert!(path.contains('…'), "{path}");
+        assert!(width(&path) <= (80 - 2) / 2, "{path}");
+        // Match text stays visible.
+        assert!(spans[2].content.contains(":42"), "{}", spans[2].content);
+        assert!(spans[2].content.contains("func main()"), "{}", spans[2].content);
+    }
+
+    #[test]
+    fn grep_row_long_match_keeps_path_share() {
+        // A match longer than the row must not shrink the path below its half-row share.
+        let ls = LsColors::parse("");
+        let long = "x".repeat(500);
+        let h = hit("services/backend/internal/handlers/user_profile.go", Some(7), Some(&long));
+        let spans = file_row_spans(&h, Mode::Grep, false, 80, &ls);
+        let path = spans[1].content.clone();
+        assert!(path.ends_with("/user_profile.go"), "{path}");
+        assert!(width(&path) <= (80 - 2) / 2, "{path}");
+    }
+
+    #[test]
+    fn file_row_truncates_visible_expansion_not_raw_path() {
+        // A tab is two display cells; the raw path must never reach the terminal or shrink the room wrongly.
+        let ls = LsColors::parse("");
+        let h = hit("services/backend\tinternal/handlers/user_profile.go", None, None);
+        let spans = file_row_spans(&h, Mode::Files, false, 40, &ls);
+        let path = spans[1].content.clone();
+        assert!(!path.contains('\t'), "{path:?}");
+        assert!(path.ends_with("/user_profile.go"), "{path}");
+        assert!(width(&path) <= 38, "{path}");
+        assert_eq!(h.insert, "services/backend\tinternal/handlers/user_profile.go");
+    }
+
+    fn render_row(spans: Vec<Span>, width: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| {
+            frame.render_widget(Paragraph::new(Line::from(spans)), frame.area());
+        }).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..width as usize).map(|x| buffer[(x as u16, 0)].symbol()).collect()
+    }
+
+    #[test]
+    fn rendered_file_row_shortens_middle_at_fixed_width() {
+        let ls = LsColors::parse("");
+        let h = hit("services/backend/internal/handlers/user_profile.go", None, None);
+        let row = render_row(file_row_spans(&h, Mode::Files, false, 40, &ls), 40);
+        assert!(row.contains("user_profile.go"), "{row:?}");
+        assert!(row.contains('…'), "{row:?}");
+        assert!(row.trim_end().len() <= 40, "{row:?}");
+        assert!(!row.contains("handlers/user_profile.go"), "{row:?}");
+    }
+
+    #[test]
+    fn rendered_grep_row_keeps_path_and_line_at_fixed_width() {
+        let ls = LsColors::parse("");
+        let h = hit("services/backend/internal/handlers/user_profile.go", Some(42), Some(&"y".repeat(200)));
+        let row = render_row(file_row_spans(&h, Mode::Grep, false, 60, &ls), 60);
+        assert!(row.contains("user_profile.go"), "{row:?}");
+        assert!(row.contains('…'), "{row:?}");
+        assert!(row.contains(":42"), "{row:?}");
+    }
+
     #[test]
     fn picker_keeps_full_and_suggested_lists_separate() {
         let p = Picker::new(vec!["suggested".into(), "shared".into()], vec!["shared".into(), "recent".into()], vec!["native".into()], String::new());

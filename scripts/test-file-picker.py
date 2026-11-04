@@ -29,6 +29,8 @@ NAMES = {
 }
 # Not in NAMES: used only by the quote-context and cursor checks below.
 INJECT = "t16 $(touch PWNED)"
+# Deeper than any terminal row: the picker must shorten it in the middle and still insert it whole.
+DEEP = "/".join(["verylongdirectoryname"] * 8 + ["t17 deepest file.txt"])
 root = tempfile.mkdtemp(prefix="smcli-fp.", dir="/tmp")
 
 
@@ -76,6 +78,8 @@ def run(shell, path):
     Path(repo, "t00 decoy").write_text("x\n")
     Path(repo, INJECT).write_text("x\n")
     Path(repo, "a b.md").write_text("x\n")
+    Path(repo, DEEP).parent.mkdir(parents=True, exist_ok=True)
+    Path(repo, DEEP).write_text("x\n")
     for cmd in (["init", "-q"], ["add", "."], ["-c", "user.name=t", "-c", "user.email=t@e.x", "commit", "-q", "-m", "one"]):
         subprocess.run(["git", "-C", repo, *cmd], check=True, capture_output=True)
     args, extra = shell_setup(shell, home)
@@ -131,6 +135,29 @@ def run(shell, path):
             want = "./" + name if name.startswith("-") else name
             assert got == want, f"{shell}: {name!r}: shell received {got!r}, wanted {want!r}"
         print(f"{shell}: {len(NAMES)} awkward names inserted as one word each, none executed.")
+
+        # A path longer than the row is visibly shortened in the middle; the full path is inserted.
+        buffer = b""
+        os.write(fd, b"printf 'GOT<%s>END\\n' ")
+        os.write(fd, b"\x1b[A")  # Up opens the picker with the typed text as its history query
+        until(lambda t: "esc cancel" in t, "picker")
+        os.write(fd, b"\x14")  # Ctrl-T: files
+        until(lambda t: "files" in t and "^T dirs/files" in t, "files mode", render=screen)
+        os.write(fd, b"t17\x01")  # Ctrl-A: search the whole project
+        until(lambda t: "files results" in t, "results", render=screen)
+        seen = screen(buffer)
+        assert "…" in seen and "t17 deepest file.txt" in seen, f"{shell}: deep path not shortened: {seen!r}"
+        os.write(fd, b"\r")
+        while select.select([fd], [], [], 0.5)[0]:
+            buffer += os.read(fd, 65536)
+        before = CSI.sub(b"", buffer).decode(errors="replace")
+        assert not printed(before), f"{shell}: deep path ran: {before!r}"
+        buffer = b""
+        os.write(fd, b"\r")
+        out = until(lambda t: printed(t), "deep path output")
+        got = printed(out)[0]
+        assert got == DEEP, f"{shell}: deep path inserted {got!r}, wanted {DEEP!r}"
+        print(f"{shell}: long path visibly shortened, full path inserted.")
 
         def choose(token):
             os.write(fd, b"\x14")  # Ctrl-T at the prompt opens files mode directly
