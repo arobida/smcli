@@ -54,7 +54,7 @@ kik31pro=kimi -m kimi-code/k3.1-pro --auto
 kik3-256=kimi -m kimi-code/k3-256k --auto
 ```
 
-Effort is pinned per model by `[models."<alias>".overrides] default_effort` in `~/.kimi-code/config.toml` (`k3.1-pro` low, the rest high). Do not set global `[thinking].effort` — it overrides the main agent's model default. The Orchestrator opens each as a Kero session and drives it; it uses `-p "<prompt>"` instead of `--auto` only for a throwaway one-shot.
+Effort is pinned per model by `[models."<alias>".overrides] default_effort` in `~/.kimi-code/config.toml` (`k3.1-pro` low, the rest high). Do not set global `[thinking].effort` — it overrides the main agent's model default. The Orchestrator opens each as a Kero session and drives it; for a throwaway one-shot it runs `kimi -m <model> -p "<prompt>"` without `--auto`: kimi rejects `-p` combined with `--auto` (`Cannot combine --prompt with --auto`).
 
 ### Other
 
