@@ -18,6 +18,12 @@ Open work, not scheduled. macOS and Linux are supported today; search is include
   next search rebuild the corpus (about 760 ms at 100k runs). Today only the service's own records update
   it in place.
 - **Optional, only if profiling asks for it:** a persistent Zsh transport and async suggestions.
+- **Command-index bridge follow-ups** (from the review of `f06152c`):
+  - `CommandIndex::description_matches` opens the command-index TalaDB file on every service search; cache the handle beside the cached `CommandIndex` (needs a lifetime and locking design).
+  - The bridge's search-time cost with the service on is unmeasured; `make baseline` ran service-off only.
+  - Flagless templates (tldr `tar xvf`) score 0 on flags, so affinity can't separate `tar -xzf` from `tar -czf`.
+  - `bridge_template` keeps the long option (`--patch`), so history using the short form (`-p`) gets no flag credit.
+  - `rank_natural_language_eval` in `tests/ranking.rs` hits `unreachable!()` when a new NL cohort is added; report it instead.
 
 ## Capture
 
