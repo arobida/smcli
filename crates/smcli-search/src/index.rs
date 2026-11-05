@@ -533,7 +533,7 @@ impl HistorySearch {
 
     fn setup_index(&self, db: &Database) -> Result<()> {
         let commands = db.typed::<IndexedCommand>("commands")?;
-        for field in ["doc", "program", "subcommand", "author", "lastRun"] {
+        for field in ["command", "doc", "program", "subcommand", "author", "lastRun"] {
             commands.create_index(field)?;
         }
         let indexes = commands.raw().list_indexes()?;
@@ -1312,7 +1312,7 @@ mod tests {
         let db = engine.open_index(&name).unwrap();
         let commands = db.typed::<IndexedCommand>("commands").unwrap();
         let info = commands.raw().list_indexes().unwrap();
-        for field in ["doc", "program", "subcommand", "author", "lastRun"] {
+        for field in ["command", "doc", "program", "subcommand", "author", "lastRun"] {
             assert!(info.btree.contains(&field.to_string()), "missing btree index on {field}");
         }
         assert!(info.fts.contains(&"terms".to_string()), "missing fts index on terms");
@@ -1336,6 +1336,8 @@ mod tests {
         let commands = first.typed::<IndexedCommand>("commands").unwrap();
         let info = commands.raw().list_indexes().unwrap();
         let count = commands.count(json!({})).unwrap();
+        // Simulate an index built before `command` was indexed; reopening must add it back.
+        commands.raw().drop_index("command").unwrap();
         drop(commands);
         drop(first);
 

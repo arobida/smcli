@@ -105,7 +105,7 @@ fn tldr_ranker(mut service: Option<ServiceClient>, expected_model: String, entri
 /// First words of captured commands (smcli's own history, distinct).
 pub(crate) fn captured_programs(c: &CapturedHistory) -> Result<HashSet<String>> {
     let stats = c.command_stats(None, None, None, now())?;
-    Ok(stats.keys().filter_map(|key| key.split_whitespace().next().map(|word| word.rsplit('/').next().unwrap_or(word).to_owned())).collect())
+    Ok(stats.keys().filter_map(|key| smcli_core::entry::SearchEntry::from_key(key).program()).collect())
 }
 
 pub(super) fn pick_tldr(c: &CapturedHistory, service: &ServiceClient, home: &Path, env: &HashMap<String, String>) -> Result<()> {
@@ -181,6 +181,17 @@ mod tests {
         ]);
         let service = ServiceClient::new(&captured.path, &env, Path::new("/missing/smcli"));
         (dir, captured, service)
+    }
+
+    #[test]
+    fn captured_programs_uses_expanded_alias() -> Result<()> {
+        let (dir, captured, _) = tldr_service("0");
+        let mut run = smcli_core::history::NewRun::new("j", "bash", "/tmp", 0);
+        run.expanded_command = Some("jq . f.json");
+        captured.append(&run, "", None)?;
+        assert_eq!(captured_programs(&captured)?, HashSet::from(["jq".to_owned()]));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]
