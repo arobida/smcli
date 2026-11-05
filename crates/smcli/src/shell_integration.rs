@@ -672,7 +672,7 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
         if (( \#(keyH) )); then
             case "$_smcli_erase" in
                 *'erase = ^H'*|*'erase ^H'*) _smcli_kept+=('^H') ;;
-                *) _smcli_bind $_smcli_keymap '^H' _smcli_pick_commands 'backward-delete-char|vi-backward-delete-char' ;;
+                *) _smcli_bind $_smcli_keymap '^H' _smcli_pick_commands 'backward-delete-char|vi-backward-delete-char|autopair-delete' ;;
             esac
         fi
         if [[ -n ${SMCLI_EXTRA_KEYS-} ]] || (( \#(keyLeft) )); then
@@ -1236,7 +1236,7 @@ mod tests {
 
         let zsh_on = render_with_keys("zsh", "smcli", false, false, false, false, false, false, true).unwrap();
         let zsh_off = render_with_keys("zsh", "smcli", false, false, false, false, false, false, false).unwrap();
-        let zsh_bind = "_smcli_bind $_smcli_keymap '^H' _smcli_pick_commands 'backward-delete-char|vi-backward-delete-char'";
+        let zsh_bind = "_smcli_bind $_smcli_keymap '^H' _smcli_pick_commands 'backward-delete-char|vi-backward-delete-char|autopair-delete'";
         assert!(zsh_on.contains(zsh_bind) && zsh_off.contains(zsh_bind));
         assert!(zsh_on.contains("(( 1 )) && _smcli_erase=$(stty -a"));
         assert!(zsh_off.contains("(( 0 )) && _smcli_erase=$(stty -a"));
