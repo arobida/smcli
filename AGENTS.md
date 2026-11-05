@@ -68,6 +68,12 @@ pidflash=pi --model opencode-go/deepseek-v4.1-flash --thinking high
 
 <-- End of do not edit -->
 
+## Testing rules
+
+- Tests run only after the code for them is written. Only Kimi Team (kteam) agents run tests; coders, reviewers and other teams do not.
+- The full suite (`make test`, `make linux`) runs once, only after every slice of the work is complete and reviewed. Before that, only the focused slice for the change (see "Building").
+- When a test fails: send the failing test output and the code under test for review, fix it from the review, then rerun that test (kteam). Run the full suite again only when everything is fixed.
+
 ## Git
 
 Stage, write commit messages, and push using [Stage, commit, and push](agents/reference/commits.md). Only commit or push when asked; follow that runbook for staging, caveman-commit message format, and remote push rules.

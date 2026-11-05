@@ -38,11 +38,15 @@ Exit status 3 means no such target, 4 that Kero is not running.
 ## Workflow
 
 1. Split the task into independent slices. Name what depends on what.
-2. Open one session per slice at once, each with `kero new`, then `kero send ... --enter` its prompt. Give every prompt the goal, the files involved, the `make` target that verifies it (see AGENTS.md "Building"), and "reply with a short summary ending in DONE".
+2. Open one session per slice at once, each with `kero new`, then `kero send ... --enter` its prompt. Give every prompt the goal, the files involved, the `make` target that will verify it (see AGENTS.md "Building"; a kteam agent runs it, per step 6), and "reply with a short summary ending in DONE".
 3. Slices that edit overlapping files go in separate worktrees (`--worktree`) or run one after another; never let two agents edit the same file in one checkout.
 4. Watch with `kero events` (or `kero wait` per target). When an agent goes idle, `kero read` its result and hand it the next slice or pass the output to the agent that needs it. Keep no agent idle while work remains.
 5. An agent in `waiting` needs approval or input: answer it if the answer is in the task or AGENTS.md, otherwise `kero report blocked` and ask the caller. An agent in `error`, rate-limited, or stuck: switch to its fallback row (e.g. `pigrok46` for `pigrok47`).
-6. Run each verification once, by the agent that owns it. Do not repeat tests another agent already passed.
+6. Testing follows AGENTS.md "Testing rules":
+   - Coders write code only. Once a slice's code is written, a kteam agent runs that slice's focused `make` target. No other team runs tests.
+   - A failure goes back as failing output plus the code to a reviewer, then to the coder to fix, then to kteam to rerun.
+   - The full suite (`make test`, `make linux`) runs once, by kteam, only after every slice is written, reviewed and passing. Never earlier.
+   - Do not repeat a test that already passed.
 7. Commits only when the caller asked, routed per AGENTS.md (commit messages to `pigrok45`), following `agents/reference/commits.md`.
 8. Close every session you opened (`kero close`), then return: what each agent did, what passed, what is left, and any risk.
 
