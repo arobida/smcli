@@ -383,7 +383,7 @@ def check(t, variant, env, home, directory):
     # Cancelling a half-typed line records nothing; Ctrl-C of a running command records the interrupt.
     count = len(read_records(env))
     t.type("echo never-run")
-    time.sleep(0.2)
+    t.until_text("echo never-run")
     t.type("\x03")
     t.until_prompt(redrawn=True)
     assert len(read_records(env)) == count, "a cancelled line was recorded"
@@ -425,10 +425,10 @@ def picker(t, env):
     t.until_text("esc cancel")
     t.type("\r")
     t.until_text("echo picked-marker")
-    time.sleep(0.3)
-    assert len(read_records(env)) == count, "selecting from the picker ran the command"
     t.type(" # tail\n")
     t.until_prompt()
+    # Exactly one new record: selecting from the picker did not also run the command.
+    assert len(read_records(env)) == count + 1, "selecting from the picker ran the command"
     assert commands(env)[-1] == "echo picked-marker # tail", commands(env)[-2:]
 
 
@@ -615,8 +615,7 @@ def run_zsh_plugins(variant):
             t.type("\x1b[A")
             t.until_text("esc cancel")
             t.type("\x03")
-            time.sleep(0.3)
-            assert "wrapped:_smcli_pick_up" in plugin_log.read_text(), "the wrapper never saw smcli's widget"
+            eventually(lambda: "wrapped:_smcli_pick_up" in plugin_log.read_text(), "the wrapper to see smcli's widget")
             t.type("\x15")  # kill the line
             t.type("echo plugin")
             t.type("\x1b[A")
@@ -730,10 +729,10 @@ def run_fish_plugins(variant):
             t.until_text("esc cancel")
             t.type("\r")
             t.until_text("echo fish-marker")
-            time.sleep(0.3)
-            assert len(read_records(env)) == count, "selecting from the picker ran the command"
             t.type("\x03")
             t.until_prompt(redrawn=True)
+            # The prompt has redrawn, so any record the selection would have written has landed.
+            assert len(read_records(env)) == count, "selecting from the picker ran the command"
             assert "forward-char" in t.send("bind \\e\\[C") or "right" in t.send("bind right"), "autosuggestion accept key changed"
             t.wait_exit(4)
             assert read_records(env)[-1]["command"] == "exit 4"
@@ -1322,40 +1321,58 @@ found, skipped = variants()
 # SMCLI_TEST_ONLY=<substring of a variant label> narrows a run while debugging.
 only = os.environ.get("SMCLI_TEST_ONLY", "")
 found = [v for v in found if only in v.label]
+# Every job owns its home, database and service runtime, so they run side by side; a failure is reported after all finish.
+jobs = []
 for variant in found:
-    run_variant(variant)
-    run_alias_capture(variant)
-    run_at_completion(variant)
-    run_tldr(variant)
-    run_custom_tab(variant)
-by_label = {v.label: v for v in found}
+    jobs += [(run_variant, variant), (run_alias_capture, variant), (run_at_completion, variant), (run_tldr, variant),
+             (run_custom_tab, variant)]
 zsh_variant = next((v for v in found if v.kind == "zsh"), None)
 if zsh_variant:
-    run_zsh_plugins(zsh_variant)
+    jobs.append((run_zsh_plugins, zsh_variant))
 for v in found:
     # (The DEBUG-trap hook refuses to install over the EXIT trap this scenario starts with.)
     if v.kind == "bash" and v.exit_trap:
-        run_bash_plugins(v)
+        jobs.append((run_bash_plugins, v))
 fish_variant = next((v for v in found if v.kind == "fish"), None)
 if fish_variant:
-    run_fish_plugins(fish_variant)
+    jobs.append((run_fish_plugins, fish_variant))
 for v in found:
     if v.keys and v.kind in ("zsh", "bash") and "fallback" not in v.label and "bash-preexec" not in v.label:
-        run_extra_keys(v)
+        jobs.append((run_extra_keys, v))
     if v.keys and v.kind == "bash" and "PS0" in v.label:
-        run_bash_up_keys(v)
+        jobs.append((run_bash_up_keys, v))
     if v.keys and (v.kind != "bash" or "PS0" in v.label):
-        run_no_keys(v)
-        run_init_keys(v)
-for name in skipped:
-    print(f"SKIPPED (not installed): {name}")
-
+        jobs += [(run_no_keys, v), (run_init_keys, v)]
 # One live shell of each kind plus a second zsh, sharing a service that is killed while they work.
 shared = [next((v for v in found if v.kind == kind and (kind != "bash" or "PS0" in v.label)), None) for kind in ("zsh", "bash", "fish")]
 shared = [v for v in shared if v] or [next((v for v in found if v.kind == "bash"), None)]
 shared = [v for v in shared if v]
 if shared:
-    run_shared_service(shared + [v for v in shared if v.kind == "zsh"])
+    jobs.append((run_shared_service, shared + [v for v in shared if v.kind == "zsh"]))
+
+from concurrent.futures import ThreadPoolExecutor
+import traceback
+
+
+def run_job(job):
+    function, argument = job
+    try:
+        function(argument)
+        return None
+    except BaseException:
+        label = getattr(argument, "label", None) or ", ".join(v.label for v in argument)
+        return f"{function.__name__}({label}):\n{traceback.format_exc()}"
+
+
+# SMCLI_TEST_JOBS=1 runs one job at a time while debugging.
+workers = int(os.environ.get("SMCLI_TEST_JOBS", "0")) or min(8, os.cpu_count() or 4)
+with ThreadPoolExecutor(workers) as pool:
+    failures = [f for f in pool.map(run_job, jobs) if f]
+if failures:
+    print("\n".join(["FAILED:"] + failures), file=sys.stderr)
+    sys.exit(1)
+for name in skipped:
+    print(f"SKIPPED (not installed): {name}")
 
 
 # --- Without shells ---------------------------------------------------------------------------------------------------
