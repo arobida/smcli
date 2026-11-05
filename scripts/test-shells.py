@@ -794,6 +794,30 @@ def run_init_keys(variant):
     print(f"{variant.label}: Ctrl-R and Left follow the keys chosen in smcli init.")
 
 
+def run_bash_up_keys(variant):
+    for enabled in (True, False):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            if not enabled:
+                (home / "config.json").write_text(json.dumps({"upKey": False}))
+            runtime = tempfile.mkdtemp(prefix="smcli-sh.", dir="/tmp")
+            env = new_environment(home, runtime, variant)
+            t = Terminal(variant.path, variant.args, env, str(home))
+            try:
+                t.drain()
+                setup_prompt(t, "bash")
+                t.send(init_line("bash"))
+                bound = t.send("bind -X")
+                assert '"\\C-r" "_smcli_pick"' in bound, bound
+                for key in (r'\e[A', r'\eOA'):
+                    assert bool(re.search(re.escape(key) + r'"\s+"_smcli_pick"', bound)) == enabled, (enabled, key, bound)
+            finally:
+                t.close()
+                stop_services(env)
+                shutil.rmtree(runtime, ignore_errors=True)
+    print(f"{variant.label}: both Up bindings follow upKey configuration.")
+
+
 def run_no_keys(variant):
     with tempfile.TemporaryDirectory() as directory:
         home = Path(directory).resolve()
@@ -1318,6 +1342,8 @@ if fish_variant:
 for v in found:
     if v.keys and v.kind in ("zsh", "bash") and "fallback" not in v.label and "bash-preexec" not in v.label:
         run_extra_keys(v)
+    if v.keys and v.kind == "bash" and "PS0" in v.label:
+        run_bash_up_keys(v)
     if v.keys and (v.kind != "bash" or "PS0" in v.label):
         run_no_keys(v)
         run_init_keys(v)

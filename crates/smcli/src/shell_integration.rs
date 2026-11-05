@@ -366,7 +366,7 @@ elif [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
     # From `smcli init`: Ctrl-R, and Left and Right on an empty line.
     (( \#(keyR) )) && _smcli_bind '\C-r' _smcli_pick 'reverse-search-history history-search-backward'
     (( \#(keyUp) )) && _smcli_bind '\e[A' _smcli_pick 'previous-history history-search-backward'
-    _smcli_bind '\eOA' _smcli_pick 'previous-history history-search-backward'
+    (( \#(keyUp) )) && _smcli_bind '\eOA' _smcli_pick 'previous-history history-search-backward'
     if (( \#(keyT) )); then
         _smcli_bind '\C-t' _smcli_pick_files transpose-chars
         # BSD and macOS ttys send Ctrl-T to the kernel as STATUS (load report) before readline sees it.
