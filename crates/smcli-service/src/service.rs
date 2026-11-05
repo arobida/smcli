@@ -142,7 +142,7 @@ impl Service {
                     }
                     let mut state = service.lock();
                     state.last_activity = Instant::now();
-                    service.history.record_selection(root, path, mode, query, now(), &state.db)
+                    service.history.record_selection(root, path, mode, query, cwd, now(), &state.db)
                 }),
                 home.clone(),
             );

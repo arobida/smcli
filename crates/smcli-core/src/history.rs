@@ -23,7 +23,7 @@ pub const INTERRUPTED_EXIT_CODES: [i64; 2] = [130, 141];
 const ANSWERING_PROGRAMS: [&str; 16] =
     ["grep", "egrep", "fgrep", "rg", "ag", "ack", "pgrep", "diff", "cmp", "colordiff", "test", "[", "which", "type", "command", "false"];
 
-pub const VERSION: i64 = 8;
+pub const VERSION: i64 = 9;
 /// A short-lived build stored usage scores in a `usage` table at version 4. Usage is now computed when read,
 /// so such databases are taken back to version 3, which every binary since flags can open.
 /// Real schema changes therefore start at version 5.
@@ -84,6 +84,11 @@ const MIGRATION_TO_V7: &str = "
 const MIGRATION_TO_V8: &str = "
     ALTER TABLE commands ADD COLUMN expanded_command TEXT;
     PRAGMA user_version = 8;
+    ";
+/// Directory the pick was made from, so prune can re-check cwdFilter; NULL for picks before v9.
+const MIGRATION_TO_V9: &str = "
+    ALTER TABLE file_selections ADD COLUMN cwd TEXT;
+    PRAGMA user_version = 9;
     ";
 
 pub fn answers_with_exit_code(command: &str) -> bool {
@@ -297,10 +302,10 @@ impl CapturedHistory {
     }
 
     /// Records one explicit file selection.
-    pub fn record_selection(&self, root: &str, path: &str, mode: &str, query: &str, time: f64, db: &Connection) -> Result<()> {
+    pub fn record_selection(&self, root: &str, path: &str, mode: &str, query: &str, cwd: Option<&str>, time: f64, db: &Connection) -> Result<()> {
         db.execute(
-            "INSERT INTO file_selections (root, path, mode, query, selected_at) VALUES (?, ?, ?, ?, ?)",
-            params![root, path, mode, query, time],
+            "INSERT INTO file_selections (root, path, mode, query, cwd, selected_at) VALUES (?, ?, ?, ?, ?, ?)",
+            params![root, path, mode, query, cwd, time],
         )?;
         Ok(())
     }
@@ -744,7 +749,7 @@ impl CapturedHistory {
                     let tables: i64 = db.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
                     version = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
                     if tables == 0 {
-                        db.execute_batch(&[SCHEMA_V1, MIGRATION_TO_V2, MIGRATION_TO_V3, MIGRATION_TO_V5, MIGRATION_TO_V6, MIGRATION_TO_V7, MIGRATION_TO_V8].concat())?;
+                        db.execute_batch(&[SCHEMA_V1, MIGRATION_TO_V2, MIGRATION_TO_V3, MIGRATION_TO_V5, MIGRATION_TO_V6, MIGRATION_TO_V7, MIGRATION_TO_V8, MIGRATION_TO_V9].concat())?;
                     } else {
                         if version == 1 { db.execute_batch(MIGRATION_TO_V2)?; }
                         if version <= 2 {
@@ -758,6 +763,7 @@ impl CapturedHistory {
                         if version < 6 { db.execute_batch(MIGRATION_TO_V6)?; }
                         if version < 7 { db.execute_batch(MIGRATION_TO_V7)?; }
                         if version < 8 { db.execute_batch(MIGRATION_TO_V8)?; }
+                        if version < 9 { db.execute_batch(MIGRATION_TO_V9)?; }
                     }
                     Ok(())
                 })();
@@ -1026,6 +1032,21 @@ mod tests {
     }
 
     #[test]
+    fn migration_9_keeps_selections_with_null_cwd() {
+        let (_dir, log) = temp_db();
+        std::fs::create_dir_all(log.path.parent().unwrap()).unwrap();
+        let old = Connection::open(&log.path).unwrap();
+        old.execute_batch(&[SCHEMA_V1, MIGRATION_TO_V2, MIGRATION_TO_V3, MIGRATION_TO_V5, MIGRATION_TO_V6, MIGRATION_TO_V7, MIGRATION_TO_V8].concat()).unwrap();
+        old.execute_batch("INSERT INTO file_selections(root,path,mode,query,selected_at) VALUES('/r','p','files','q',1.0);").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&log.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let db = log.open_connection().unwrap();
+        assert_eq!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 9);
+        let row = db.query_row("SELECT path, cwd FROM file_selections", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))).unwrap();
+        assert_eq!(row, ("p".into(), None));
+    }
+
+    #[test]
     fn migration_8_preserves_nulls_and_retry_expansion() {
         let (_dir, log) = temp_db();
         std::fs::create_dir_all(log.path.parent().unwrap()).unwrap();
@@ -1035,7 +1056,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&log.path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let db = log.open_connection().unwrap();
-        assert_eq!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 8);
+        assert_eq!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), VERSION);
         let backup_path = PathBuf::from(format!("{}.v7.bak", log.path.display()));
         assert_eq!(std::fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777, 0o600);
         let backup_bytes = std::fs::read(&backup_path).unwrap();

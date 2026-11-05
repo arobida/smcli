@@ -429,7 +429,7 @@ try:
     ask("select", src, "util", path="src/util.swift", mode="files")
     with sqlite3.connect(env["SMCLI_DB"]) as db:
         assert db.execute("SELECT root, path, mode, query FROM file_selections").fetchall() == [(repo_a, "src/util.swift", "files", "util")]
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 9
     assert "picked" in ask("files", repo_a, "util")["files"][0]["provenance"]
 
     # The real CLI picker searches the repository scope, but must respect its private caller cwd.

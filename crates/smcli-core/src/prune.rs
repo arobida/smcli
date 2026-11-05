@@ -79,17 +79,18 @@ impl CapturedHistory {
         }
         let mut file_picks = vec![];
         {
-            let mut s = tx.prepare("SELECT id,query,root FROM file_selections")?;
+            let mut s = tx.prepare("SELECT id,query,root,cwd FROM file_selections")?;
             for row in s.query_map([], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
                 ))
             })? {
-                let (id, query, root) = row?;
-                // Blank-query picks still carry a root; cwd filters must remove them too.
-                if !filter.allows(&query, &root) {
+                let (id, query, root, cwd) = row?;
+                // Blank-query picks still carry a root; cwd filters must remove them too. NULL cwd predates v9.
+                if !filter.allows(&query, &root) || cwd.is_some_and(|cwd| !filter.allows(&query, &cwd)) {
                     file_picks.push(id);
                 }
             }
@@ -298,6 +299,22 @@ mod tests {
             0
         );
         std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prune_removes_file_selection_from_excluded_cwd() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let c = CapturedHistory::new(temporary.path().join("history.db"));
+        c.open_connection()?.execute_batch(
+            "INSERT INTO file_selections(root,path,mode,query,cwd,selected_at) VALUES
+               ('/ok','a','files','q','/private',1.0), ('/ok','b','files','q','/ok',2.0), ('/ok','c','files','q',NULL,3.0)",
+        )?;
+        let filter = CaptureFilter::new(&SmcliConfig { cwd_filter: Some(vec!["/private".into()]), ..Default::default() })?;
+        c.prune(&filter, false, || Ok(()))?;
+        let paths: Vec<String> = c.open_connection()?.prepare("SELECT path FROM file_selections ORDER BY id")?
+            .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        assert_eq!(paths, ["b", "c"]);
         Ok(())
     }
 
