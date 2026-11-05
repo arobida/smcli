@@ -25,7 +25,11 @@ run service      python3 scripts/test-service.py "$bin_dir/smcli"
 run file-picker  python3 scripts/test-file-picker.py "$bin_dir/smcli"
 run alias-picker python3 scripts/test-alias-picker.py "$bin_dir/smcli"
 run gen-cheat    python3 scripts/test-gen-cheat.py
-run install      bash scripts/test-install.sh "$bin_dir"
+if [[ "$(uname)" == Darwin ]]; then
+    run install bash scripts/test-install.sh "$bin_dir"
+else
+    printf 'skip install (macOS-only)\n'
+fi
 
 failed=()
 for i in "${!pids[@]}"; do
