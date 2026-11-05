@@ -235,18 +235,29 @@ def run(shell, path):
         subprocess.run([binary, "service", "stop"], env=env, capture_output=True, timeout=30)
 
 
+def find_shell(shell):
+    path = next((p for p in (f"/opt/homebrew/bin/{shell}", f"/usr/local/bin/{shell}", f"/bin/{shell}", f"/usr/bin/{shell}")
+                 if os.access(p, os.X_OK)), None)
+    if shell == "bash" and path:
+        version = subprocess.run([path, "-c", "echo ${BASH_VERSINFO[0]}"], capture_output=True, text=True).stdout.strip()
+        if not version.isdigit() or int(version) < 4:
+            path = next((p for p in ("/opt/homebrew/bin/bash", "/usr/local/bin/bash") if os.access(p, os.X_OK)), None)
+    return path
+
+
 try:
+    from concurrent.futures import ThreadPoolExecutor
+    shells = []
     for shell in ("bash", "zsh", "fish"):
-        path = next((p for p in (f"/opt/homebrew/bin/{shell}", f"/usr/local/bin/{shell}", f"/bin/{shell}", f"/usr/bin/{shell}")
-                     if os.access(p, os.X_OK)), None)
-        if shell == "bash" and path:
-            version = subprocess.run([path, "-c", "echo ${BASH_VERSINFO[0]}"], capture_output=True, text=True).stdout.strip()
-            if not version.isdigit() or int(version) < 4:
-                path = next((p for p in ("/opt/homebrew/bin/bash", "/usr/local/bin/bash") if os.access(p, os.X_OK)), None)
+        path = find_shell(shell)
         if path is None:
             print(f"{shell}: not installed, skipped.")
-            continue
-        run(shell, path)
+        else:
+            shells.append((shell, path))
+    # Each shell has its own home, repo, database and service runtime, so they run side by side.
+    with ThreadPoolExecutor(len(shells) or 1) as pool:
+        for future in [pool.submit(run, shell, path) for shell, path in shells]:
+            future.result()
     print("File picker tests passed.")
 finally:
     shutil.rmtree(root, ignore_errors=True)
