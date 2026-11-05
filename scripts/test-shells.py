@@ -405,6 +405,12 @@ def check(t, variant, env, home, directory):
 
 
 def picker(t, env):
+    t.type("\x08")
+    t.until_text("tldr results")
+    t.type("\x1b")
+    time.sleep(1)
+    t.send("echo ctrl-h-cancel")
+    assert commands(env)[-1] == "echo ctrl-h-cancel", commands(env)[-2:]
     count = len(read_records(env))
     t.type("echo abc")
     t.type("\x1b[A")
@@ -568,6 +574,29 @@ precmd() { print -r -- "global-precmd:$?" >> $HOME/plugin-log }
 preexec() { print -r -- "global-preexec:$1" >> $HOME/plugin-log }
 zshexit() { print -r -- "global-zshexit" >> $HOME/plugin-log }
 """
+
+
+def run_erase_ctrl_h(variant):
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory).resolve()
+        runtime = tempfile.mkdtemp(prefix="smcli-sh.", dir="/tmp")
+        env = new_environment(home, runtime, variant)
+        t = Terminal(variant.path, variant.args, env, str(home))
+        try:
+            t.drain()
+            setup_prompt(t, variant.kind)
+            t.send("stty erase '^H'")
+            output = t.send(init_line(variant.kind))
+            key = {"bash": "\\C-h", "zsh": "^H", "fish": "\\ch"}[variant.kind]
+            assert "kept existing key bindings" in output and key in output, (variant.label, output)
+            t.type("echo erasedX\x08\n")
+            t.until_prompt()
+            assert commands(env)[-1] == "echo erased", (variant.label, commands(env)[-2:])
+            print(f"{variant.label}: Ctrl-H preserves erase and is reported as kept.")
+        finally:
+            t.close()
+            stop_services(env)
+            shutil.rmtree(runtime, ignore_errors=True)
 
 
 def run_zsh_plugins(variant):
@@ -1298,6 +1327,8 @@ for variant in found:
     run_at_completion(variant)
     run_tldr(variant)
     run_custom_tab(variant)
+    if variant.keys:
+        run_erase_ctrl_h(variant)
 by_label = {v.label: v for v in found}
 zsh_variant = next((v for v in found if v.kind == "zsh"), None)
 if zsh_variant:

@@ -23,6 +23,8 @@ pub struct SmcliConfig {
     pub builtin: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ctrl_g_key: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ctrl_h_key: Option<bool>,
     /// Picker keys bound by shell-init, chosen in `smcli init`: Ctrl-R and Ctrl-T file search (on unless false).
     /// On an empty line, Left opens that same history search and Right opens directory suggestions (Bash and Zsh;
     /// each off unless true). Up opens history too (on unless false); SMCLI_NO_KEYS=1 still skips them all.
@@ -205,6 +207,9 @@ mod tests {
             serde_json::to_string(&arrows).unwrap(),
             r#"{"leftKey":false,"rightKey":true}"#
         );
+        let picker: SmcliConfig = serde_json::from_str(r#"{"ctrlHKey":false}"#).unwrap();
+        assert_eq!(picker.ctrl_h_key, Some(false));
+        assert_eq!(serde_json::to_string(&picker).unwrap(), r#"{"ctrlHKey":false}"#);
         let environment = HashMap::from([("XDG_CONFIG_HOME".to_string(), "/x".to_string())]);
         assert_eq!(SmcliConfig::location(Path::new("/h"), &environment), PathBuf::from("/x/smcli/config.json"));
         assert_eq!(SmcliConfig::location(Path::new("/h"), &HashMap::new()), PathBuf::from("/h/.config/smcli/config.json"));

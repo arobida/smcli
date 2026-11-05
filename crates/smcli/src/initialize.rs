@@ -33,10 +33,10 @@ pub fn run(args: Init, path: &Path, service: &ServiceClient, captured: &smcli_co
                 .collect();
             if names
                 .iter()
-                .any(|s| !["up", "ctrl-r", "left", "right", "ctrl-t", "ctrl-g", "none"].contains(&s.as_str()))
+                .any(|s| !["up", "ctrl-r", "left", "right", "ctrl-t", "ctrl-g", "ctrl-h", "none"].contains(&s.as_str()))
                 || (names.iter().any(|s| s == "none") && names.len() > 1)
             {
-                bail!("--keys takes up,ctrl-r,left,right,ctrl-t,ctrl-g or none.");
+                bail!("--keys takes up,ctrl-r,left,right,ctrl-t,ctrl-g,ctrl-h or none.");
             }
             config.up_key = Some(names.iter().any(|s| s == "up"));
             config.ctrl_r_key = Some(names.iter().any(|s| s == "ctrl-r"));
@@ -44,9 +44,10 @@ pub fn run(args: Init, path: &Path, service: &ServiceClient, captured: &smcli_co
             config.right_key = Some(names.iter().any(|s| s == "right"));
             config.ctrl_t_key = Some(names.iter().any(|s| s == "ctrl-t"));
             config.ctrl_g_key = Some(names.iter().any(|s| s == "ctrl-g"));
+            config.ctrl_h_key = Some(names.iter().any(|s| s == "ctrl-h"));
         } else {
             if !io::stdin().is_terminal() {
-                bail!("smcli init --keys needs a terminal; pass --keys up,ctrl-r,left,right,ctrl-t,ctrl-g.");
+                bail!("smcli init --keys needs a terminal; pass --keys up,ctrl-r,left,right,ctrl-t,ctrl-g,ctrl-h.");
             }
             choose(&mut config)?;
         }
@@ -146,12 +147,14 @@ fn choose(c: &mut SmcliConfig) -> Result<()> {
     )?;
     let t = ask("Open files with Ctrl-T?", c.ctrl_t_key.unwrap_or(true))?;
     let g = ask("Open grep with Ctrl-G?", c.ctrl_g_key.unwrap_or(true))?;
+    let h = ask("Open command examples with Ctrl-H?", c.ctrl_h_key.unwrap_or(true))?;
     c.up_key = Some(up);
     c.ctrl_r_key = Some(r);
     c.left_key = Some(l);
     c.right_key = Some(right);
     c.ctrl_t_key = Some(t);
     c.ctrl_g_key = Some(g);
+    c.ctrl_h_key = Some(h);
     Ok(())
 }
 
@@ -226,7 +229,7 @@ mod tests {
         // Re-init without a model flag must keep the custom path; pass --keys so a TTY cannot enter the questionnaire.
         run(
             Init {
-                keys: Some("up,ctrl-r,ctrl-t,ctrl-g".into()),
+                keys: Some("up,ctrl-r,ctrl-t,ctrl-g,ctrl-h".into()),
                 ..init(None)
             },
             &abs_cfg,
