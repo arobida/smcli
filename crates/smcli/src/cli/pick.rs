@@ -19,6 +19,9 @@ use crate::picker::{FileResults, Mode};
 
 const DIRECTORY_COMMANDS: &[&str] = &["cd", "pushd", "popd", "z", "rmdir", "mkdir"];
 
+/// Fallback grep skips files past the 10 MiB cap the service's grep enforces (`grep_options`).
+const MAX_GREP_FILE_BYTES: u64 = 10 << 20;
+
 pub(super) fn is_directory_command(command: &str) -> bool {
     DIRECTORY_COMMANDS.contains(&command)
 }
@@ -308,8 +311,17 @@ impl LocalFileSearch {
                 };
                 for file in sources {
                     let rel = file.strip_prefix(&scope).unwrap().to_string_lossy().into_owned();
-                    let text = match std::fs::read_to_string(&file) {
-                        Ok(t) => t,
+                    if file.metadata().map(|m| m.len() > MAX_GREP_FILE_BYTES).unwrap_or(true) { continue; }
+                    let text = match std::fs::File::open(&file) {
+                        Ok(f) => {
+                            use std::io::Read as _;
+                            let mut text = String::new();
+                            // One byte past the cap detects a file that grew after the size check; skip it whole.
+                            match f.take(MAX_GREP_FILE_BYTES + 1).read_to_string(&mut text) {
+                                Ok(n) if n as u64 <= MAX_GREP_FILE_BYTES => text,
+                                _ => continue,
+                            }
+                        }
                         Err(_) => continue,
                     };
                     for (i, line) in text.lines().enumerate() {
@@ -465,6 +477,21 @@ mod walker_tests {
         let mixed = search.search(Mode::Files, "", 0, root.to_str().unwrap(), None)?;
         assert!(mixed.hits.iter().any(|hit| hit.path == "visible.txt"));
         assert!(mixed.hits.iter().any(|hit| hit.path == "empty/"));
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_grep_skips_files_over_the_size_limit() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("smcli-grep-limit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("small.txt"), "needle")?;
+        std::fs::write(root.join("big.txt"), "needle")?;
+        std::fs::File::options().write(true).open(root.join("big.txt"))?.set_len(MAX_GREP_FILE_BYTES + (1 << 20))?;
+        let search = LocalFileSearch { cwd: root.clone() };
+        let result = search.search(Mode::Grep, "needle", 0, root.to_str().unwrap(), None)?;
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].path, "small.txt");
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
