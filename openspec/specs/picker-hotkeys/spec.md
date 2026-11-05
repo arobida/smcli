@@ -1,6 +1,7 @@
 # picker-hotkeys Specification
 
 ## Purpose
+
 Defines the shell keys that open smcli pickers from the command line and how they coexist with bindings the user or terminal already relies on.
 
 ## Requirements

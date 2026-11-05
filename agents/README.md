@@ -19,6 +19,8 @@ Working notes, reviews and reference material for agents. Nothing here is built 
 
 ## reviews/
 
+[Codebase review — 2026-11-05](reviews/codebase-review-2026-11-05.md)
+
 [Current codebase review after semantic-accuracy merge (2026-11-02)](reviews/codebase-review-2026-11-02.md)
 
 [Codebase review and fff investigation (2026-10-30)](reviews/codebase-review-2026-10-30.md)
