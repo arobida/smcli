@@ -40,6 +40,12 @@ smcli="$prefix/smcli"
 # Explicit SMCLI_DB is used as given (no canonicalize). Default matches Path::join (no // if HOME ends in /).
 if [[ -n ${SMCLI_DB:-} ]]; then db=$SMCLI_DB; else db="${HOME%/}/.local/share/smcli/history.db"; fi
 config="${SMCLI_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/smcli/config.json}"
+# A directory at any data path means misconfiguration; refuse before step 4 deletes anything.
+if [[ -z $keep_data ]]; then
+    for path in "$db" "$db-wal" "$db-shm" "$db-journal" "$db.v7.bak" "$db.migration.lock" "$config"; do
+        [[ ! -d $path ]] || die "refusing to remove $path: it is a directory"
+    done
+fi
 begin='# >>> smcli >>>'
 end='# <<< smcli <<<'
 rc_files=("${ZDOTDIR:-$HOME}/.zshrc" "$HOME/.bashrc" "${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish")
@@ -140,7 +146,8 @@ done
 
 # 4. Data: database (with its WAL and shared-memory files), search index, settings, service socket.
 if [[ -z $keep_data ]]; then
-    rm -rf "$db" "$db-wal" "$db-shm" "$db-journal" "$db.search" "$db.v7.bak" "$db.migration.lock"
+    rm -f "$db" "$db-wal" "$db-shm" "$db-journal" "$db.v7.bak" "$db.migration.lock"
+    rm -rf "$db.search"
     rmdir "$(dirname "$db")" 2>/dev/null || true
     rm -f "$config"
     rmdir "$(dirname "$config")" 2>/dev/null || true

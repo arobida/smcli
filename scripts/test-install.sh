@@ -163,6 +163,19 @@ grep -q 'sqlite3 is needed to export history' "$home/out" || fail "missing sqlit
 [[ -x $home/bin/smcli && -f $home/.local/share/smcli/history.db && ! -e $home/export ]] || fail "refused uninstall changed files"
 grep -q '^# >>> smcli >>>$' "$home/.zshrc" || fail "refused uninstall removed hooks"
 
+# A directory at the database, its WAL or the config path must be refused, not rm -rf'd.
+mkdir "$home/db-dir" "$home/wal-test.db-wal" "$home/config-dir"
+touch "$home/db-dir/inside" "$home/wal-test.db-wal/inside" "$home/config-dir/inside"
+for spec in "SMCLI_DB=$home/db-dir:$home/db-dir" \
+            "SMCLI_DB=$home/wal-test.db:$home/wal-test.db-wal" \
+            "SMCLI_CONFIG=$home/config-dir:$home/config-dir"; do
+    assignment=${spec%%:*}; dir=${spec##*:}
+    env "$assignment" "$home/bin/smcli-uninstall" --yes --prefix "$home/bin" > "$home/out" 2>&1 \
+        && fail "uninstall should refuse a directory at ${assignment%%=*}"
+    grep -q 'is a directory' "$home/out" || fail "missing directory diagnostic"
+    [[ -d $dir && -f $dir/inside ]] || fail "uninstall deleted a directory path"
+done
+
 # Uninstalling database A must leave database B's runtime files alone (finding #8).
 db_a=$home/.local/share/smcli/history.db
 db_b=$home/other-history.db
