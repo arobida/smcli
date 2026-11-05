@@ -70,9 +70,10 @@ pidflash=pi --model opencode-go/deepseek-v4.1-flash --thinking high
 
 ## Testing rules
 
-- Tests run only after the code for them is written. Only Kimi Team (kteam) agents run tests; coders, reviewers and other teams do not.
-- The full suite (`make test`, `make linux`) runs once, only after every slice of the work is complete and reviewed. Before that, only the focused slice for the change (see "Building").
-- When a test fails: send the failing test output and the code under test for review, fix it from the review, then rerun that test (kteam). Run the full suite again only when everything is fixed.
+1. **Never run the full suite while work is in progress.** `make test` and `make linux` run once, and only after *all* the work is complete: every slice written, reviewed, and passing its own checks. This applies to everyone, including the main agent.
+2. **During the work, verify with modular tests only.** Use unit tests (`make test-rust PKG=<crate> FILTER=<test>`) or the one focused slice that covers the change (`make test-picker`, `make test-shells`, and so on; see "Building").
+3. **Tests run only after the code is written, and only Kimi Team (kteam) runs them.** Coders, reviewers and other teams do not run tests.
+4. **When a test fails:** send the failing output and the code under test for review, fix it from the review, then have kteam rerun only that modular test. The full suite runs again only when all work is fixed and passing.
 
 ## Git
 

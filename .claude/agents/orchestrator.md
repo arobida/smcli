@@ -43,9 +43,10 @@ Exit status 3 means no such target, 4 that Kero is not running.
 4. Watch with `kero events` (or `kero wait` per target). When an agent goes idle, `kero read` its result and hand it the next slice or pass the output to the agent that needs it. Keep no agent idle while work remains.
 5. An agent in `waiting` needs approval or input: answer it if the answer is in the task or AGENTS.md, otherwise `kero report blocked` and ask the caller. An agent in `error`, rate-limited, or stuck: switch to its fallback row (e.g. `pigrok46` for `pigrok47`).
 6. Testing follows AGENTS.md "Testing rules":
-   - Coders write code only. Once a slice's code is written, a kteam agent runs that slice's focused `make` target. No other team runs tests.
-   - A failure goes back as failing output plus the code to a reviewer, then to the coder to fix, then to kteam to rerun.
-   - The full suite (`make test`, `make linux`) runs once, by kteam, only after every slice is written, reviewed and passing. Never earlier.
+   - Never run the full suite (`make test`, `make linux`) while any work remains. It runs once, by kteam, after every slice is written, reviewed and passing.
+   - During the work, verify each slice with modular tests only: its unit tests (`make test-rust PKG=... FILTER=...`) or its one focused `make` slice.
+   - Coders write code only. Once a slice's code is written, a kteam agent runs its modular tests. No other team runs tests.
+   - A failure goes back as failing output plus the code to a reviewer, then to the coder to fix, then to kteam to rerun that modular test.
    - Do not repeat a test that already passed.
 7. Commits only when the caller asked, routed per AGENTS.md (commit messages to `pigrok45`), following `agents/reference/commits.md`.
 8. Close every session you opened (`kero close`), then return: what each agent did, what passed, what is left, and any risk.
