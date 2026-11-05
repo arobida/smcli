@@ -97,6 +97,7 @@ pub enum Select {
         config: PathBuf,
     },
     File {
+        cwd: Option<String>,
         directory: String,
         path: String,
         mode: String,
@@ -296,6 +297,7 @@ fn select(request: &ServiceRequest) -> Result<Select, (FailureCode, String)> {
         return Err(reject("select needs a path relative to the searched root."));
     }
     Ok(Select::File {
+        cwd: request.cwd.clone(),
         directory: directory.to_owned(),
         path: path.to_owned(),
         mode: mode.to_owned(),

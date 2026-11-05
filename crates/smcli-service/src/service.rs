@@ -134,10 +134,10 @@ impl Service {
                     let state = service.lock();
                     service.history.selection_scores(root, now(), &state.db).unwrap_or_default()
                 }),
-                Box::new(move |root, path, mode, query, directory, config| {
+                Box::new(move |root, path, mode, query, directory, cwd, config| {
                     let Some(service) = record_handle.upgrade() else { return Ok(()) };
                     let filter = CaptureFilter::new(&(SmcliConfig::load(config)?))?;
-                    if !filter.allows(query, directory) {
+                    if !filter.allows(query, directory) || cwd.is_some_and(|cwd| !filter.allows(query, cwd)) {
                         return Ok(());
                     }
                     let mut state = service.lock();
@@ -1087,8 +1087,13 @@ mod tests {
         r.query = Some("ordinary".into());
         f.service.file_search.select(&r);
         assert_eq!(count(), 0);
-        std::fs::write(f.home.join("config.toml"), "{}").unwrap();
-        f.service.file_search.select(&r);
+        std::fs::write(f.home.join("config.toml"), r#"{"cwdFilter":["/private$"]}"#).unwrap();
+        r.cwd = Some(format!("{}/private", r.directory.as_deref().unwrap()));
+        r.scope = Some(true);
+        assert!(f.service.file_search.select(&r).ok);
+        assert_eq!(count(), 0);
+        r.cwd = None; // Older clients still filter the search directory.
+        assert!(f.service.file_search.select(&r).ok);
         assert_eq!(count(), 1);
     }
 
@@ -1115,7 +1120,10 @@ mod tests {
         r.shell = Some("zsh".into());
         r.session = Some("test".into());
         r.exit_code = Some(0);
-        r.shell_path = Some(bin.to_string_lossy().into_owned());
+        smcli_core::caller::CallerContext::from_env(&HashMap::from([
+            ("HOME".into(), f.home.to_string_lossy().into_owned()),
+            ("PATH".into(), bin.to_string_lossy().into_owned()),
+        ])).apply(&mut r);
         f.service.record(f.as_record(&r)).unwrap();
         // The sync thread finishes: jq examples land in the index (what bare `@@` reads).
         let deadline = Instant::now() + Duration::from_secs(30);

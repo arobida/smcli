@@ -10,7 +10,7 @@ use smcli_core::{context::ProjectContext, paths::relative_insert, service_protoc
 use smcli_core::service_protocol::ServiceRequest;
 
 type Scores = Box<dyn Fn(&str) -> HashMap<String, f64> + Send + Sync>;
-type Record = Box<dyn Fn(&str, &str, &str, &str, &str, &std::path::Path) -> Result<()> + Send + Sync>;
+type Record = Box<dyn Fn(&str, &str, &str, &str, &str, Option<&str>, &std::path::Path) -> Result<()> + Send + Sync>;
 /// Owns one fff instance for one root. An evicted index lives until its last request ends.
 pub(crate) struct OwnedIndex(SharedFilePicker);
 impl std::ops::Deref for OwnedIndex {
@@ -410,7 +410,7 @@ impl FileSearch {
     }
 
     pub(crate) fn select_file(&self, parsed: SelectQuery) -> ServiceResponse {
-        let SelectQuery::File { directory, path, mode, query, scope, config } = parsed else {
+        let SelectQuery::File { cwd, directory, path, mode, query, scope, config } = parsed else {
             return ServiceResponse::fail(FailureCode::BadRequest, "select needs a directory, a path and a mode of files or grep.");
         };
         let root = if scope {
@@ -419,7 +419,7 @@ impl FileSearch {
             Self::root(&directory)
         };
         let Some(root) = root else { return ServiceResponse::failure("failed", format!("Cannot resolve {directory}.")); };
-        match (self.record)(&root, &path, &mode, &query, &directory, &config) {
+        match (self.record)(&root, &path, &mode, &query, &directory, cwd.as_deref(), &config) {
             Ok(()) => { let mut response = ServiceResponse::new(true); response.root = Some(root); response }
             Err(e) => ServiceResponse::failure("failed", e.to_string()),
         }
@@ -483,7 +483,7 @@ mod tests {
     impl Drop for Repo { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
     fn search(capacity: usize) -> FileSearch {
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-        FileSearch::new(capacity, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(|_, _, _, _, _, _| Ok(())), home)
+        FileSearch::new(capacity, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(|_, _, _, _, _, _, _| Ok(())), home)
     }
     #[test]
     fn grep_budget_applies_before_the_first_match() {
@@ -614,7 +614,7 @@ mod tests {
     fn selection_records_and_rejects_escape() {
         let repo = Repo::new(); let recorded = Arc::new(Mutex::new(Vec::new())); let out = recorded.clone();
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(move |r, p, m, q, _, _| { out.lock().unwrap().push((r.to_string(), p.to_string(), m.to_string(), q.to_string())); Ok(()) }), home);
+        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(move |r, p, m, q, _, _, _| { out.lock().unwrap().push((r.to_string(), p.to_string(), m.to_string(), q.to_string())); Ok(()) }), home);
         let mut request = repo.request(Operation::Select, "example"); request.path = Some("src/example.txt".into()); request.mode = Some("files".into());
         assert!(search.select(&request).ok);
         assert_eq!(recorded.lock().unwrap()[0], (repo.0.to_string_lossy().into_owned(), "src/example.txt".into(), "files".into(), "example".into()));
@@ -630,7 +630,7 @@ mod tests {
         std::fs::write(repo.0.join("src/needle.rs"), "").unwrap();
         let recorded = Arc::new(Mutex::new(Vec::new())); let out = recorded.clone();
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(move |r, p, m, q, _, _| { out.lock().unwrap().push((r.to_string(), p.to_string(), m.to_string(), q.to_string())); Ok(()) }), home);
+        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(move |r, p, m, q, _, _, _| { out.lock().unwrap().push((r.to_string(), p.to_string(), m.to_string(), q.to_string())); Ok(()) }), home);
         let mut request = repo.request(Operation::Select, "needle.rs");
         request.path = Some("needle.rs".into()); request.mode = Some("files".into()); request.scope = Some(true);
         let response = search.select(&request);
@@ -648,7 +648,7 @@ mod tests {
         let scores = Arc::new(Mutex::new(HashMap::<String, f64>::new()));
         let s = scores.clone();
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(move |_| s.lock().unwrap().clone()), Box::new(|_, _, _, _, _, _| Ok(())), home);
+        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(move |_| s.lock().unwrap().clone()), Box::new(|_, _, _, _, _, _, _| Ok(())), home);
         let blank = |search: &FileSearch| {
             let r = search.files(&repo.request(Operation::Files, ""));
             assert!(r.ok, "{:?}", r.error);
@@ -676,7 +676,7 @@ mod tests {
         let scores = Arc::new(Mutex::new(HashMap::<String, f64>::new()));
         let s = scores.clone();
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(move |_| s.lock().unwrap().clone()), Box::new(|_, _, _, _, _, _| Ok(())), home);
+        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(move |_| s.lock().unwrap().clone()), Box::new(|_, _, _, _, _, _, _| Ok(())), home);
         let mut r = repo.request(Operation::Complete, "lib");
         r.dirs_only = Some(true);
         let before = search.complete(&r);
@@ -715,7 +715,7 @@ mod tests {
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
         let search = FileSearch::new(4, Duration::from_secs(600), Box::new(move |root| {
             if root == src_for_cb { s.lock().unwrap().clone() } else { HashMap::new() }
-        }), Box::new(|_, _, _, _, _, _| Ok(())), home);
+        }), Box::new(|_, _, _, _, _, _, _| Ok(())), home);
         let mut base = repo.request(Operation::Files, "example.txt");
         base.directory = Some(repo.0.to_string_lossy().into_owned());
         assert!(search.files(&base).ok, "warm parent");
@@ -777,7 +777,7 @@ mod tests {
         let scores = Arc::new(Mutex::new(HashMap::<String, f64>::new()));
         let s = scores.clone();
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(move |_| s.lock().unwrap().clone()), Box::new(|_, _, _, _, _, _| Ok(())), home);
+        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(move |_| s.lock().unwrap().clone()), Box::new(|_, _, _, _, _, _, _| Ok(())), home);
         let mut wide_req = repo.request(Operation::Files, "");
         wide_req.limit = Some(50);
         let wide = search.files(&wide_req);
@@ -1017,7 +1017,7 @@ mod tests {
         let near = base.join("wide/near");
         let launch = base.join("launch");
         std::fs::create_dir_all(&launch).unwrap();
-        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(|_, _, _, _, _, _| Ok(())), launch);
+        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(|_, _, _, _, _, _, _| Ok(())), launch);
         let scope = std::fs::canonicalize(&project).unwrap();
         assert!(FileSearch::content_indexing_enabled(&wide, scope.to_str().unwrap()));
         assert!(!FileSearch::content_indexing_enabled(&near, scope.to_str().unwrap()));

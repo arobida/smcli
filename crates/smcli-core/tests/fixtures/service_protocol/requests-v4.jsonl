@@ -1,3 +1,5 @@
 {"v":4,"op":"embed","query":"list files"}
 {"v":4,"op":"embed","query":"","mode":"commands","command":"git","shellPath":"/bin:/usr/bin"}
 {"v":4,"op":"search","query":"git","home":"/home/caller"}
+{"v":4,"op":"select","directory":"/r","cwd":"/r/private","path":"example.txt","mode":"files","query":"example","scope":true,"config":"/h/config.json"}
+{"v":4,"op":"record","shellPath":"/bin:/caller/bin","config":"/h/config.json","event":"capture-path","command":"jq .","shell":"zsh","session":"s","directory":"/r","exitCode":0}

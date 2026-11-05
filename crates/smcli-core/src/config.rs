@@ -67,7 +67,14 @@ pub struct SmcliConfig {
 impl SmcliConfig {
     pub fn location(home: &Path, environment: &HashMap<String, String>) -> PathBuf {
         if let Some(path) = environment.get("SMCLI_CONFIG").filter(|p| !p.is_empty()) {
-            return PathBuf::from(path);
+            let path = PathBuf::from(path);
+            if path.is_absolute() {
+                return path;
+            }
+            // No usable cwd (e.g. deleted directory): keep the relative path rather than panic.
+            let cwd = environment.get("PWD").map(PathBuf::from).filter(|p| p.is_absolute())
+                .or_else(|| std::env::current_dir().ok());
+            return cwd.map_or(path.clone(), |cwd| cwd.join(&path));
         }
         let base = environment
             .get("XDG_CONFIG_HOME")
@@ -213,6 +220,17 @@ mod tests {
         let environment = HashMap::from([("XDG_CONFIG_HOME".to_string(), "/x".to_string())]);
         assert_eq!(SmcliConfig::location(Path::new("/h"), &environment), PathBuf::from("/x/smcli/config.json"));
         assert_eq!(SmcliConfig::location(Path::new("/h"), &HashMap::new()), PathBuf::from("/h/.config/smcli/config.json"));
+    }
+
+    #[test]
+    fn relative_config_uses_caller_working_directory() {
+        let mut environment = HashMap::from([
+            ("SMCLI_CONFIG".into(), "config.json".into()),
+            ("PWD".into(), "/a".into()),
+        ]);
+        assert_eq!(SmcliConfig::location(Path::new("/h"), &environment), PathBuf::from("/a/config.json"));
+        environment.insert("PWD".into(), "relative".into());
+        assert_eq!(SmcliConfig::location(Path::new("/h"), &environment), std::env::current_dir().unwrap().join("config.json"));
     }
 
     #[test]

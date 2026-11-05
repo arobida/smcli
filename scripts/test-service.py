@@ -9,13 +9,17 @@ import fcntl
 import json
 from pathlib import Path
 import os
+import pty
+import select
 import shutil
 import signal
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -427,6 +431,49 @@ try:
         assert db.execute("SELECT root, path, mode, query FROM file_selections").fetchall() == [(repo_a, "src/util.swift", "files", "util")]
         assert db.execute("PRAGMA user_version").fetchone()[0] == 8
     assert "picked" in ask("files", repo_a, "util")["files"][0]["provenance"]
+
+    # The real CLI picker searches the repository scope, but must respect its private caller cwd.
+    private = f"{repo_a}/private"
+    os.makedirs(private)
+    private_config = f"{root}/private-config.json"
+    Path(private_config).write_text(json.dumps({"cwdFilter": ["/private$"], "atCompletionInline": False}))
+    pid, master = pty.fork()
+    if pid == 0:
+        os.chdir(private)
+        os.execve(smcli, [smcli, "pick", "--files", "util"],
+                  dict(env, PWD=private, SMCLI_CONFIG=private_config, TERM="xterm-256color",
+                       SMCLI_LBUFFER="", SMCLI_RBUFFER="", SMCLI_SHELL="bash"))
+    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 180, 0, 0))
+    screen = b""
+    reaped = False
+    accepted = False
+    try:
+        time.sleep(0.2)
+        os.write(master, b"util")
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if select.select([master], [], [], 0.05)[0]:
+                try:
+                    screen += os.read(master, 65536)
+                except OSError:
+                    pass
+            if not accepted and b"util.swift" in screen:
+                os.write(master, b"\r")
+                accepted = True
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                reaped = True
+                assert os.waitstatus_to_exitcode(status) == 10, screen.decode(errors="replace")
+                break
+            time.sleep(0.05)
+        assert reaped, "private-cwd picker timed out"
+    finally:
+        os.close(master)
+        if not reaped:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+    with sqlite3.connect(env["SMCLI_DB"]) as db:
+        assert db.execute("SELECT count(*) FROM file_selections").fetchone()[0] == 1
 
     # Ranking signals through the service: a command that follows the session's last one, then explicit picks.
     plain_dir = os.path.realpath(root)

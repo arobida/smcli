@@ -29,7 +29,9 @@ impl Operation {
             Suggest | Pick => &[Home, Config, Session, RankingOff],
             Embed => &[Home, Config, Path],
             Files | Grep | Complete => &[Home, Config, Cwd],
-            Record | Select | Context | Ping | Shutdown => &[Home, Config],
+            Record => &[Home, Config, Path],
+            Select => &[Home, Config, Cwd],
+            Context | Ping | Shutdown => &[Home, Config],
         }
     }
 }

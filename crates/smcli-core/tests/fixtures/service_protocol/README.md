@@ -7,7 +7,7 @@ These fixtures were generated from the Swift DTOs before the Swift sources were 
 - `alias-results-v2.jsonl`: explicit expansion provenance in suggestions/search and distinct `recentEntries` variants.
 - `requests-v2.jsonl`: protocol-v2 search requests with present, absent and empty `shellPath`, plus request-scoped `rankingOff` ablation. Neither field is persisted.
 - `requests-v3.jsonl`: protocol-v3 selection requests with scope and cwd.
-- `requests-v4.jsonl`: protocol-v4 embed requests (query-only and command-index preparation) and caller `home`.
+- `requests-v4.jsonl`: protocol-v4 embed requests (query-only and command-index preparation), caller `home`, a file selection carrying caller `cwd`, and a record carrying `shellPath`.
 - `responses.jsonl`: all response fields, including protocol-v4 `embedding` and `model`, nested suggestion/search/context/GitStatus/file DTOs, empty collections, omitted nils, and open-ended failure codes.
 - `decoding.jsonl`: Swift JSONDecoder's acceptance of missing/null/unknown fields, required nested keys (including initializer-defaulted properties), malformed JSON, version mismatches, and numeric boundaries.
 
