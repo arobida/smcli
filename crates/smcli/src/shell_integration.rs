@@ -14,7 +14,7 @@ pub fn render_config(shell: &str, binary_path: &str, config: &SmcliConfig) -> Re
         config.ctrl_t_key.unwrap_or(true),
         config.ctrl_g_key.unwrap_or(true),
         config.up_key.unwrap_or(true),
-        config.ctrl_h_key.unwrap_or(true),
+        config.ctrl_o_key.unwrap_or(true),
     )
 }
 
@@ -27,7 +27,7 @@ pub fn render_with_keys(
     ctrl_t: bool,
     ctrl_g: bool,
     up: bool,
-    ctrl_h: bool,
+    ctrl_o: bool,
 ) -> Result<String> {
     let binary = if shell == "fish" {
         format!(
@@ -339,7 +339,7 @@ elif [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
     _smcli_pick_files() { _smcli_pick --files; }
     # Ctrl-G searches file contents.
     _smcli_pick_grep() { _smcli_pick --grep; }
-    # Ctrl-H opens command examples for the text left of the cursor. Empty output (Esc) leaves the line.
+    # Ctrl-O opens command examples for the text left of the cursor. Empty output (Esc) leaves the line.
     _smcli_pick_commands() {
         (( BASH_VERSINFO[0] >= 5 )) || local LC_ALL=C
         local chosen
@@ -373,12 +373,10 @@ elif [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
         [[ $_smcli_kept == *'\C-t'* ]] || stty status undef 2>/dev/null
     fi
     (( \#(keyG) )) && _smcli_bind '\C-g' _smcli_pick_grep abort
-    # Ctrl-H is Backspace when the tty erase character is ^H; keep that binding.
-    if (( \#(keyH) )); then
-        case $(stty -a 2>/dev/null | tr '\n' ' ') in
-            *'erase = ^H'*|*'erase ^H'*) _smcli_kept+=' \C-h' ;;
-            *) _smcli_bind '\C-h' _smcli_pick_commands backward-delete-char ;;
-        esac
+    if (( \#(keyO) )); then
+        _smcli_bind '\C-o' _smcli_pick_commands operate-and-get-next
+        # BSD and macOS ttys take Ctrl-O as DISCARD (flush output) before readline sees it.
+        [[ $_smcli_kept == *'\C-o'* ]] || stty discard undef 2>/dev/null
     fi
     if [[ -n ${SMCLI_EXTRA_KEYS-} ]] || (( \#(keyLeft) )); then
         _smcli_bind '\e[D' _smcli_pick_left backward-char
@@ -639,7 +637,7 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
     # Ctrl-G searches file contents.
     _smcli_pick_grep() { _smcli_pick --grep; }
     zle -N _smcli_pick_grep
-    # Ctrl-H opens command examples for the text left of the cursor. Empty output (Esc) leaves the line.
+    # Ctrl-O opens command examples for the text left of the cursor. Empty output (Esc) leaves the line.
     _smcli_pick_commands() {
         local chosen
         chosen=$(env SMCLI_SHELL=zsh SMCLI_LBUFFER="$LBUFFER" SMCLI_TLDR_QUERY="" "$_smcli_pick_bin" pick --tldr </dev/tty)
@@ -660,7 +658,6 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
         fi
     }
     _smcli_kept=()
-    (( \#(keyH) )) && _smcli_erase=$(stty -a 2>/dev/null | tr '\n' ' ')
     for _smcli_keymap in emacs viins; do
         # From `smcli init`: Ctrl-R, and Left and Right on an empty line.
         (( \#(keyR) )) && _smcli_bind $_smcli_keymap '^R' _smcli_pick 'redisplay|history-incremental-(pattern-|)search-backward|history-search-backward'
@@ -668,13 +665,7 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
         (( \#(keyUp) )) && _smcli_bind $_smcli_keymap '^[OA' _smcli_pick_up 'up-line-or-(history|beginning-search)'
         (( \#(keyT) )) && _smcli_bind $_smcli_keymap '^T' _smcli_pick_files 'transpose-chars|self-insert'
         (( \#(keyG) )) && _smcli_bind $_smcli_keymap '^G' _smcli_pick_grep 'send-break|list-expand|self-insert'
-        # Ctrl-H is Backspace when the tty erase character is ^H; keep that binding.
-        if (( \#(keyH) )); then
-            case "$_smcli_erase" in
-                *'erase = ^H'*|*'erase ^H'*) _smcli_kept+=('^H') ;;
-                *) _smcli_bind $_smcli_keymap '^H' _smcli_pick_commands 'backward-delete-char|vi-backward-delete-char|autopair-delete' ;;
-            esac
-        fi
+        (( \#(keyO) )) && _smcli_bind $_smcli_keymap '^O' _smcli_pick_commands 'accept-line-and-down-history|self-insert'
         if [[ -n ${SMCLI_EXTRA_KEYS-} ]] || (( \#(keyLeft) )); then
             _smcli_bind $_smcli_keymap '^[[D' _smcli_pick_left 'backward-char|vi-backward-char'
             _smcli_bind $_smcli_keymap '^[OD' _smcli_pick_left 'backward-char|vi-backward-char'
@@ -691,13 +682,15 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
     done
     # BSD and macOS ttys send Ctrl-T to the kernel as STATUS (load report) before zle sees it.
     (( \#(keyT) )) && [[ ${(j: :)_smcli_kept} != *'^T ('* ]] && stty status undef 2>/dev/null
+    # They also take Ctrl-O as DISCARD (flush output).
+    (( \#(keyO) )) && [[ ${(j: :)_smcli_kept} != *'^O ('* ]] && stty discard undef 2>/dev/null
     # Told once per change, not in every new shell.
     typeset _smcli_seen=${XDG_STATE_HOME:-$HOME/.local/state}/smcli/kept-keys-zsh _smcli_list=${(j:, :)${(u)_smcli_kept}}
     if [[ $_smcli_list != "$(cat $_smcli_seen 2>/dev/null)" ]]; then
         (( $#_smcli_kept )) && print -u2 "smcli: kept existing key bindings: $_smcli_list (bindkey them to _smcli_pick to switch)."
         mkdir -p ${_smcli_seen:h} 2>/dev/null && print -rn -- $_smcli_list >| $_smcli_seen 2>/dev/null
     fi
-    unset _smcli_keymap _smcli_kept _smcli_seen _smcli_list _smcli_erase
+    unset _smcli_keymap _smcli_kept _smcli_seen _smcli_list
 fi
 # smcli: @ path completion. Typed text is unchanged unless completion is invoked.
 if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
@@ -944,7 +937,7 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
     function _smcli_pick_grep
         _smcli_pick --grep
     end
-    # Ctrl-H opens command examples for the text left of the cursor. Empty output (Esc) leaves the line.
+    # Ctrl-O opens command examples for the text left of the cursor. Empty output (Esc) leaves the line.
     function _smcli_pick_commands
         set -l before (commandline -c | string collect)
         set -l chosen (env SMCLI_SHELL=fish SMCLI_LBUFFER="$before" SMCLI_TLDR_QUERY="" $_smcli_bin pick --tldr </dev/tty | string collect)
@@ -958,14 +951,10 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
     test \#(keyR) = 1; and _smcli_bind \cr _smcli_pick
     test \#(keyT) = 1; and _smcli_bind \ct _smcli_pick_files
     test \#(keyG) = 1; and _smcli_bind \cg _smcli_pick_grep
-    # Ctrl-H is Backspace when the tty erase character is ^H; keep that binding.
-    if test \#(keyH) = 1
-        set -l _smcli_erase (stty -a 2>/dev/null | tr '\n' ' ')
-        if string match -q -- '*erase = ^H*' -- "$_smcli_erase"; or string match -q -- '*erase ^H*' -- "$_smcli_erase"
-            set -a _smcli_kept '\ch'
-        else
-            _smcli_bind \ch _smcli_pick_commands
-        end
+    if test \#(keyO) = 1
+        _smcli_bind \co _smcli_pick_commands
+        # BSD and macOS ttys take Ctrl-O as DISCARD (flush output).
+        stty discard undef 2>/dev/null
     end
     test \#(keyUp) = 1; and _smcli_bind \e\[A _smcli_pick_up
     test \#(keyUp) = 1; and _smcli_bind \eOA _smcli_pick_up
@@ -1041,7 +1030,7 @@ end"###
         .replace(r"\#(keyLeft)", if left { "1" } else { "0" })
         .replace(r"\#(keyT)", if ctrl_t { "1" } else { "0" })
         .replace(r"\#(keyG)", if ctrl_g { "1" } else { "0" })
-        .replace(r"\#(keyH)", if ctrl_h { "1" } else { "0" })
+        .replace(r"\#(keyO)", if ctrl_o { "1" } else { "0" })
         .replace(r"\#(keyUp)", if up { "1" } else { "0" })
         .replace(
             if shell == "fish" {
@@ -1214,50 +1203,25 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_h_renders_bind_and_erase_guard() {
+    fn ctrl_o_renders_bind() {
         for shell in ["bash", "zsh", "fish"] {
             let on = render_with_keys(shell, "smcli", false, false, false, false, false, false, true).unwrap();
-            let off = render_with_keys(shell, "smcli", false, false, false, false, false, false, false).unwrap();
             assert!(!on.contains("#(key"), "{shell} left a placeholder");
-            assert!(!off.contains("#(key"), "{shell} left a placeholder");
-            assert!(on.contains("_smcli_pick_commands") && on.contains("pick --tldr"), "{shell}");
-            assert!(on.contains("SMCLI_TLDR_QUERY=\"\""), "{shell}");
-            assert!(on.contains("erase = ^H") && off.contains("erase = ^H"), "{shell} missing erase guard");
+            assert!(on.contains("_smcli_pick_commands") && on.contains("pick --tldr") && on.contains("SMCLI_TLDR_QUERY=\"\""), "{shell}");
+            assert!(on.contains("stty discard undef"), "{shell}");
         }
-
         let bash_on = render_with_keys("bash", "smcli", false, false, false, false, false, false, true).unwrap();
-        let bash_off = render_with_keys("bash", "smcli", false, false, false, false, false, false, false).unwrap();
-        let bash_bind = "_smcli_bind '\\C-h' _smcli_pick_commands backward-delete-char";
-        assert!(bash_on.contains(bash_bind) && bash_off.contains(bash_bind));
-        assert!(bash_on.contains("if (( 1 )); then\n        case $(stty -a"));
-        assert!(bash_off.contains("if (( 0 )); then\n        case $(stty -a"));
-        assert!(bash_on.contains("_smcli_kept+=' \\C-h'"));
+        assert!(bash_on.contains("if (( 1 )); then\n        _smcli_bind '\\C-o' _smcli_pick_commands operate-and-get-next"));
         assert!(bash_on.contains("READLINE_LINE:0:READLINE_POINT"));
-
         let zsh_on = render_with_keys("zsh", "smcli", false, false, false, false, false, false, true).unwrap();
-        let zsh_off = render_with_keys("zsh", "smcli", false, false, false, false, false, false, false).unwrap();
-        let zsh_bind = "_smcli_bind $_smcli_keymap '^H' _smcli_pick_commands 'backward-delete-char|vi-backward-delete-char|autopair-delete'";
-        assert!(zsh_on.contains(zsh_bind) && zsh_off.contains(zsh_bind));
-        assert!(zsh_on.contains("(( 1 )) && _smcli_erase=$(stty -a"));
-        assert!(zsh_off.contains("(( 0 )) && _smcli_erase=$(stty -a"));
+        assert!(zsh_on.contains("(( 1 )) && _smcli_bind $_smcli_keymap '^O' _smcli_pick_commands"));
         assert!(zsh_on.contains("SMCLI_LBUFFER=\"$LBUFFER\""));
-        assert!(zsh_on.contains("_smcli_kept+=('^H')"));
-        assert!(zsh_on.contains("for _smcli_keymap in emacs viins"));
-
         let fish_on = render_with_keys("fish", "smcli", false, false, false, false, false, false, true).unwrap();
-        let fish_off = render_with_keys("fish", "smcli", false, false, false, false, false, false, false).unwrap();
-        assert!(fish_on.contains("_smcli_bind \\ch _smcli_pick_commands"));
-        assert!(fish_off.contains("_smcli_bind \\ch _smcli_pick_commands"));
-        assert!(fish_on.contains("if test 1 = 1\n        set -l _smcli_erase (stty -a"));
-        assert!(fish_off.contains("if test 0 = 1\n        set -l _smcli_erase (stty -a"));
+        assert!(fish_on.contains("if test 1 = 1\n        _smcli_bind \\co _smcli_pick_commands"));
         assert!(fish_on.contains("commandline -c"));
-        assert!(fish_on.contains("set -a _smcli_kept '\\ch'"));
-
-        let on = render_config("bash", "smcli", &SmcliConfig::default()).unwrap();
-        assert!(on.contains("if (( 1 )); then\n        case $(stty -a"), "unset ctrlHKey stays on");
-        let off = SmcliConfig { ctrl_h_key: Some(false), ..Default::default() };
-        assert!(render_config("zsh", "smcli", &off).unwrap().contains("(( 0 )) && _smcli_erase=$(stty -a"));
-        assert!(render_config("fish", "smcli", &off).unwrap().contains("if test 0 = 1\n        set -l _smcli_erase (stty -a"));
+        let off = SmcliConfig { ctrl_o_key: Some(false), ..Default::default() };
+        assert!(render_config("zsh", "smcli", &off).unwrap().contains("(( 0 )) && _smcli_bind $_smcli_keymap '^O'"));
+        assert!(render_config("bash", "smcli", &SmcliConfig::default()).unwrap().contains("if (( 1 )); then\n        _smcli_bind '\\C-o'"), "unset ctrlOKey stays on");
 
         for (shell, hooks) in [("bash", &bash_on), ("zsh", &zsh_on), ("fish", &fish_on)] {
             let parsed = std::process::Command::new(shell)

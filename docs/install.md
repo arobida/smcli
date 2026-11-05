@@ -188,9 +188,7 @@ Then continue with [Set up your shell](#set-up-your-shell).
 
 Key choices take effect in new shells. To change them later, run `smcli init --keys` (it asks) or pass a list.
 
-Ctrl-H opens the command-example picker, like `@@` followed by Tab. It is on by default and controlled by `ctrlHKey` in the config or `smcli init --keys` (include `ctrl-h` to enable it; omit it to disable it). The installer also accepts `--keys ctrl-h`.
-
-When `stty` reports erase as `^H`, smcli does not bind Ctrl-H and lists it as kept in the existing key bindings notice; custom bindings are also kept. If your terminal sends `^H` for Backspace but `stty` reports erase as `^?`, disable Ctrl-H with `smcli init --keys` to preserve Backspace.
+Ctrl-O opens the command-example picker, like `@@` followed by Tab. It is on by default and controlled by `ctrlOKey` in the config or `smcli init --keys` (include `ctrl-o` to enable it; omit it to disable it). The installer also accepts `--keys ctrl-o`.
 
 ## Upgrade
 
