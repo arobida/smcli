@@ -136,7 +136,6 @@ pub(super) fn pick_tldr(c: &CapturedHistory, service: &ServiceClient, home: &Pat
     picker.mode = Mode::Tldr;
     picker.tldr_all = context.program.is_none();
     picker.tldr_program = context.program.clone();
-    picker.title = Some(if picker.tldr_all { "all installed".into() } else { context.program.clone().unwrap_or_default() });
     picker.tldr_status = if !index.path().exists() {
         Some("command examples need smcli-service or `smcli reindex`".into())
     } else {

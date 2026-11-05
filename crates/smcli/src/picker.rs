@@ -541,7 +541,7 @@ pub fn run(
                 format!("{}  →  {}", abbreviate(&cwd, &home), displayed)
             };
             let header = if picker.mode == Mode::Tldr {
-                Line::from(vec![Span::styled(" tldr ", ACCENT), Span::styled(picker.title.clone().unwrap_or_default(), ACCENT.add_modifier(Modifier::BOLD))])
+                command_helper_header(tldr_ranked.get(selected).map(|&i| picker.tldr_entries[i].template.as_str()).unwrap_or(""), true)
             } else if let Some(line) = edit_files_header(picker.mode, picker.files_line.as_deref(), true) {
                 line
             } else if compact && (!history || (picker.suggested_view && picker.title.is_some())) {
@@ -771,7 +771,6 @@ pub fn run(
             }
             KeyCode::Char('a') if ctrl && picker.mode == Mode::Tldr && picker.tldr_program.is_some() => {
                 picker.tldr_all = !picker.tldr_all;
-                picker.title = Some(if picker.tldr_all { "all installed".into() } else { picker.tldr_program.clone().unwrap() });
                 tldr_ranked.clear();
                 selected = 0;
                 status = "indexing tldr…".into();
@@ -1154,6 +1153,27 @@ impl Drop for TerminalSession {
     }
 }
 
+/// `cmd ? <selected template>`; `ok` colors the `?` and every `{{param}}` green, red on failure.
+fn command_helper_header(template: &str, ok: bool) -> Line<'static> {
+    let status = Style::new().fg(if ok { Color::Green } else { Color::Red }).add_modifier(Modifier::BOLD);
+    let mut spans = vec![Span::styled(" cmd ", ACCENT), Span::styled("? ", status)];
+    let mut depth = 0;
+    for span in highlight(&visible(template)) {
+        // Split each highlighted span at `{{`/`}}` so params take the status color.
+        let text = span.content.into_owned();
+        let mut rest = text.as_str();
+        while !rest.is_empty() {
+            let style = if depth == 0 { span.style } else { status };
+            let found = if depth == 0 { rest.find("{{") } else { rest.find("}}").map(|i| i + 2) };
+            let cut = found.unwrap_or(rest.len());
+            if cut > 0 { spans.push(Span::styled(rest[..cut].to_string(), style)); }
+            if found.is_some() { depth = 1 - depth; }
+            rest = &rest[cut..];
+        }
+    }
+    Line::from(spans)
+}
+
 /// `ok` picks the arrow and placeholder color: green now, red once edits can fail.
 fn edit_files_header(mode: Mode, line: Option<&str>, ok: bool) -> Option<Line<'static>> {
     let line = visible(line.filter(|_| mode == Mode::Files)?);
@@ -1180,6 +1200,14 @@ fn edit_files_header(mode: Mode, line: Option<&str>, ok: bool) -> Option<Line<'s
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn command_helper_header() {
+        let line = super::command_helper_header("mise plugins add {{name}}", true);
+        assert_eq!(line.to_string(), " cmd ? mise plugins add {{name}}");
+        let param: Vec<_> = line.spans.iter().filter(|s| s.content.contains("name")).collect();
+        assert!(param.iter().all(|s| s.style.fg == Some(ratatui::style::Color::Green)) && !param.is_empty());
+    }
+
     #[test]
     fn files_edit_header() {
         let text = |line| super::edit_files_header(super::Mode::Files, Some(line), true).map(|l| l.to_string());
