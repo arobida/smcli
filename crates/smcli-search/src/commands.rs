@@ -290,8 +290,8 @@ impl CommandIndex {
     }
 }
 
-/// Sync the index to the wanted program set: add programs with examples that are missing,
-/// delete indexed programs no longer wanted. Returns (indexed, example-less) wanted programs,
+/// Add wanted programs with examples that are missing. Never deletes: each capture brings its
+/// own shell's PATH, so one narrow or empty PATH would otherwise wipe every other program. Returns (indexed, example-less) wanted programs,
 /// so the caller can remember example-less programs without another lookup.
 pub fn sync(
     index: &CommandIndex,
@@ -317,9 +317,6 @@ pub fn sync(
                 empty.insert(program.clone());
             }
         }
-    }
-    for program in current.difference(wanted) {
-        index.remove(program)?;
     }
     Ok((indexed, empty))
 }
@@ -571,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_adds_missing_and_removes_unwanted_programs() {
+    fn sync_adds_missing_and_keeps_unwanted_programs() {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let potion = Potion::bundled().unwrap();
@@ -585,11 +582,10 @@ mod tests {
         assert_eq!(indexed, HashSet::from(["tar".to_owned()]));
         assert_eq!(empty, HashSet::from(["noexamples".to_owned()]));
         assert!(index.examples("tar").unwrap().is_some());
-        // tar falls out of the wanted set: its examples are deleted.
+        // An empty wanted set (a capture without PATH) keeps tar.
         let (indexed, empty) = sync(&index, &sources, "osx", &HashSet::new()).unwrap();
         assert!(indexed.is_empty() && empty.is_empty());
-        assert!(index.examples("tar").unwrap().is_none());
-        assert!(index.programs().unwrap().is_empty());
+        assert!(index.examples("tar").unwrap().is_some());
     }
 
     #[test]

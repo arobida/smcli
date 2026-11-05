@@ -410,7 +410,7 @@ impl Service {
     }
 
     /// Compute the wanted set — (OS-shipped ∪ captured-history programs) ∩ this PATH — and sync
-    /// the index to it: add missing programs with examples, delete no-longer-wanted ones, and
+    /// the index to it: add missing programs with examples (never delete), and
     /// remember example-less programs so repeat captures skip the lookup.
     /// A missing index means no `@@` build has happened yet; that build covers history-seen
     /// programs, so nothing is remembered here and the next capture retries.
@@ -1134,9 +1134,9 @@ mod tests {
         assert!(examples.iter().all(|example| example.source == "tldr"));
     }
 
-    /// An indexed program that no longer resolves on the synced PATH loses its examples.
+    /// A capture whose PATH lacks indexed programs keeps them: one shell's PATH must not wipe the index.
     #[test]
-    fn record_sync_removes_examples_for_an_uninstalled_program() {
+    fn record_sync_keeps_examples_missing_from_a_capture_path() {
         use std::os::unix::fs::PermissionsExt;
         let f = Fixture::new();
         let platform = smcli_search::tldr::current_platform();
@@ -1179,10 +1179,10 @@ mod tests {
             if f.service.command_sync.lock().unwrap().last_path.as_deref() == Some(changed.as_str()) {
                 break;
             }
-            assert!(Instant::now() < deadline, "sync did not remove jq");
+            assert!(Instant::now() < deadline, "sync did not run");
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(index.examples("jq").unwrap().is_none());
+        assert!(index.examples("jq").unwrap().is_some() && index.examples("tar").unwrap().is_some());
     }
 
     /// A program no source has examples for is remembered: a repeat capture writes nothing to the index.
