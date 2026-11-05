@@ -714,11 +714,18 @@ try:
     open(f"{big}/pkg3/dir150/unique_zebra_marker.swift", "w").write("let marker = 1 // quokka_token_9137\n")
     open(f"{big}/pkg3/package.json", "w").write('{"name":"big","scripts":{"build":"x"}}')
     begin = time.time()
-    g = lambda *a: subprocess.run(["git", "-C", big, "-c", "user.name=t", "-c", "user.email=t@e.x", "-c", "gc.auto=0", *a],
-                                  check=True, capture_output=True)
+    g = lambda *a, **k: subprocess.run(["git", "-C", big, "-c", "user.name=t", "-c", "user.email=t@e.x", "-c", "gc.auto=0", *a],
+                                       check=True, capture_output=True, **k)
     g("init", "-q", "-b", "main")
-    g("add", ".")
-    g("commit", "-q", "-m", "big")
+    # One fast-import pack instead of 50k loose objects from `git add` (~25 s -> ~2 s); reset + refresh leave a clean index.
+    stream = [b"commit refs/heads/main\ncommitter t <t@e.x> 0 +0000\ndata 3\nbig\n"]
+    for path in sorted(Path(big).rglob("*")):
+        if path.is_file() and ".git" not in path.relative_to(big).parts:
+            body = path.read_bytes()
+            stream.append(f"M 100644 inline {path.relative_to(big)}\ndata {len(body)}\n".encode() + body + b"\n")
+    g("fast-import", "--quiet", input=b"".join(stream))
+    g("reset", "-q")
+    g("update-index", "-q", "--refresh")
     print(f"  big repo: 50002 files committed in {time.time() - begin:.1f} s")
     for n in range(5):
         open(f"{big}/pkg0/dir0/untracked{n}.txt", "w").write("u")
