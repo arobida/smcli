@@ -205,8 +205,41 @@ This version includes a Codex second opinion (job `task-mw7t5rcg-ge65gv`). Each 
 - **Fix:** Count a definition only for the declared name. Other names on the line count as mentions.
 - **If we skip it:** Stale commands rank slightly too high.
 
+### 28. **A blocked search embeds your whole history** — `crates/smcli-search/src/index.rs:459-465,793-804`
+
+- **What this is:** A natural-language search needs the index lock.
+- **Problem:** If `prune` or another smcli holds that lock after 20 tries, the search embeds every matching command in memory, while holding the service's one-at-a-time search lock. At 100,000 commands that is a large batch for one query. The 2026-11-02 results recorded this as a trade-off with timing still to be checked, and it was never measured.
+- **Fix:** Measure it first. If it is slow, use the keyword fallback that already exists for this case.
+- **If we skip it:** Searches made during a long index operation can stall.
+
+### 29. **The semantic search plan still says Draft** — `agents/plans/semantic-search-accuracy.md:4`
+
+- **What this is:** The design plan for natural-language search.
+- **Problem:** Its status is "Draft", though vector-first search shipped. The 2026-11-03 removal audit asked for this label to be corrected.
+- **Fix:** Mark what shipped, and what the document no longer describes.
+- **If we skip it:** Agents can treat finished work as still proposed.
+
+## Older reports
+
+All earlier reports in this folder were checked against the current code, then removed. Their text remains in Git history.
+
+| Report                     | Items | Result                                                                                           |
+| -------------------------- |------:| ------------------------------------------------------------------------------------------------ |
+| Codebase review 2026-10-30 |    16 | All fixed.                                                                                       |
+| Codebase review 2026-11-02 |    11 | All fixed. The search quality floor is now enforced by `rank_natural_language_eval`.             |
+| Codebase review 2026-11-05 |    10 | All fixed. The Linux test item was fixed; further Linux work is on the roadmap.                  |
+| Removal audit 2026-11-03   |     9 | All done, except the status label in finding 29. Linux acceptance is on the roadmap.             |
+| Semantic search results    |     — | One unmeasured trade-off carried over as finding 28. The remaining items are accepted decisions. |
+
+Accepted decisions and measurements worth keeping:
+
+- **Config boost:** `INTENT_CONFIG_WEIGHT` ships at 0.48, not the 0.18 chosen under a no-loss rule. It accepts `run the tests` moving from rank 1 to 2 for a better overall score (private history benchmark: 8 of 13 in the top three, MRR 0.558, against 6 of 13 and 0.406). The benchmark was not rerun afterwards.
+- **Known misses:** `start pi with sol` stays fourth, and is marked as an acknowledged miss in the ranking tests.
+- **File grep cost (2026-10-30, 50,000 near-identical files):** rare-word grep took about 780 ms and used about 573% of one core. On varied files of the same count it took about 24 ms. Opening resumable results and choosing an interactive budget are on the roadmap.
+- **File search memory:** fff's content cache is limited per index, not per process. Four cached indexes held 159.5 MiB of physical memory in that test.
+
 **Verdict:** Fix 1 and 21 first because they can run code, then 2 and 3 for private history.
 
 **Lean:** about -25 lines, -0 dependencies possible.
 
-**Not checked:** Project tests were not run, and Linux is out of scope. The concurrent races in 22 and 23 and the full Tab flow in 21 were not reproduced. Performance findings are unmeasured. Codex reviewed the files this audit had skipped with focused reading, not line by line, and neither audit read the internals of `fff-search` or TalaDB. Dependency vulnerabilities were not checked because `cargo audit` is not installed. Clippy reported only style and complexity warnings, which are not listed here.
+**Not checked:** Project tests were not run, and Linux is out of scope. Older findings were confirmed fixed by reading the current code, not by rerunning their original reproductions. The concurrent races in 22 and 23 and the full Tab flow in 21 were not reproduced. Performance findings are unmeasured. Codex reviewed the files this audit had skipped with focused reading, not line by line, and neither audit read the internals of `fff-search` or TalaDB. Dependency vulnerabilities were not checked because `cargo audit` is not installed. Clippy reported only style and complexity warnings, which are not listed here.

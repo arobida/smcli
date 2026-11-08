@@ -1,6 +1,6 @@
 # Plan: fix the 2026-11-05 review findings (commit 37a7f7b)
 
-Source: [Codebase review — 2026-11-05](../reviews/codebase-review-2026-11-05.md)
+Source: Codebase review — 2026-11-05
 
 ## Fix per finding
 
