@@ -47,3 +47,16 @@ fn project_config_comparison() {
 fn vector_first_comparison() {
     ranking::compare_vector_first(|enabled| index::VECTOR_FIRST.with(|v| v.set(enabled)));
 }
+
+#[cfg(test)]
+#[test]
+#[ignore = "measurement report; run with `make ranking-ablation`"]
+fn ranking_ablation() {
+    ranking::ablation_report(
+        |enabled| index::VECTOR_FIRST.with(|v| v.set(enabled)),
+        |potion, query, corpus, signals| {
+            let vocabulary = corpus::query_vocabulary(corpus, signals);
+            corpus::prepare_intent_query(query, &vocabulary, Some(&potion.vocabulary)).embedding_query()
+        },
+    );
+}

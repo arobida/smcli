@@ -2,7 +2,7 @@ PYTHON ?= python3
 DIST := dist
 STAMP := $(shell date +%Y%m%d-%H%M%S)-$(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)
 
-.PHONY: build release fresh install uninstall tldr cheat test test-rust test-cli test-picker test-shells test-service test-install clean run baseline ranking tldr-ranking linux docs notices
+.PHONY: build release fresh install uninstall tldr cheat test test-rust test-cli test-picker test-shells test-service test-install clean run baseline ranking tldr-ranking ranking-ablation linux docs notices
 
 PKG ?=
 FILTER ?=
@@ -82,6 +82,10 @@ ranking:
 
 tldr-ranking:
 	cargo test --release -p smcli-search --test tldr tldr_ranking_evaluation -- --nocapture
+
+# Per-cohort ablation of the search legs and rerank stages (synthetic worlds); measurement only.
+ranking-ablation:
+	cargo test --release -p smcli-search --lib ranking_ablation -- --ignored --nocapture
 
 # Black-box baseline of the current CLI and generated hooks; never reads real history.
 baseline:

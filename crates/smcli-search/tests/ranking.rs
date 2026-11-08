@@ -422,6 +422,10 @@ impl World {
     }
 
     fn search(&self, item: &Case) -> Vec<(String, Vec<String>)> {
+        self.search_with_index(item, true)
+    }
+
+    fn search_with_index(&self, item: &Case, bundled_command_index: bool) -> Vec<(String, Vec<String>)> {
         let directory = self.path(item.directory);
         let context = self.context(item);
         let stats = self.log.command_stats(Some(&directory), context.project_root.as_deref(), context.kind(), NOW).unwrap();
@@ -437,7 +441,7 @@ impl World {
         }
         let lock = self.engine.lock_index(20).unwrap();
         self.engine
-            .search_with_command_index(item.query, &corpus, 10, &SearchFilter::default(), None, &signals, NOW, None, lock.as_ref(), Some(&command_index))
+            .search_with_command_index(item.query, &corpus, 10, &SearchFilter::default(), None, &signals, NOW, None, lock.as_ref(), bundled_command_index.then_some(&command_index))
             .unwrap()
             .into_iter()
             .map(|e| (e.command, e.why.unwrap_or_default()))
@@ -999,5 +1003,156 @@ fn rank_filesystem_signal_cohorts() {
     for (cohort, score) in totals {
         println!("  {cohort:<12} search  TOTAL                    {}", score.line());
         println!("  {cohort:<12} search  signal-off               {}", off_totals[cohort].line());
+    }
+}
+
+#[derive(Clone)]
+struct Probe {
+    labels: Vec<String>,
+    case: Case,
+}
+
+const ABLATION_VARIANTS: [&str; 8] = [
+    "1 bm25-only (raw)",
+    "2 embedding-only (raw cosine)",
+    "3 fused raw: RRF k=60",
+    "4 fused raw: 0.7 bm25 + 0.3 dense",
+    "5 fused+rerank, vector-first off, history-only",
+    "6 fused+rerank, vector-first off, +command index",
+    "7 production default, history-only",
+    "8 production default, +command index",
+];
+
+/// Raw retrieval legs from the history index with no usage rerank, mirroring the pools `index.rs` builds
+/// (k = 40, parsed query filters for the keyword and fused legs, strict markers only for the vector-first leg).
+fn raw_legs(world: &World, item: &Case, corrected: &impl Fn(&Potion, &str, &HashMap<String, SearchEntry>, &smcli_search::corpus::SearchSignals) -> String)
+    -> [Vec<String>; 4]
+{
+    use smcli_search::corpus::{SearchSignals, parse_markers, program_arguments, query_filter};
+    use taladb::fts::HybridQuery;
+    use taladb::json::filter_from_json;
+    let directory = world.path(item.directory);
+    let context = world.context(item);
+    let stats = world.log.command_stats(Some(&directory), context.project_root.as_deref(), context.kind(), NOW).unwrap();
+    let corpus = search_corpus(stats, &[]);
+    let signals: SearchSignals = search_signals(&world.log, Some(context), &HashMap::from([("PWD".into(), directory)])).unwrap();
+    let programs = program_arguments(&corpus);
+    let directories = corpus.values().filter_map(|e| e.last_directory.clone()).collect();
+    let (stripped, marked, has_markers) = parse_markers(item.query, &programs, &directories);
+    let parsed = if has_markers { marked } else { query_filter(item.query, &programs, &directories) };
+    let parsed_any = !parsed.is_empty();
+    let mut merged = SearchFilter::default();
+    if parsed_any { merged.merge_parsed(&parsed); }
+    let vector_first_filter = if has_markers && parsed_any { merged.clone() } else { SearchFilter::default() };
+    let to_index = |filter: &SearchFilter| smcli_search::index::index_filter(filter).map(|f| filter_from_json(&f)).transpose().unwrap();
+
+    let _lock = world.engine.lock_index(20).unwrap();
+    let db = taladb::open(format!("{}/index/{}.taladb", world.root, world.engine.index_name())).unwrap();
+    let commands = db.typed::<smcli_search::index::IndexedCommand>("commands").unwrap();
+    let raw = commands.raw();
+    let command_of = |document: &taladb::Document| match document.get("command") {
+        Some(taladb::Value::Str(command)) => Some(command.clone()),
+        _ => None,
+    };
+    let k = 40;
+    let text = smcli_search::ShellTokenizer::encoded(&stripped);
+    let plain_vector = world.engine.potion.embed(&[stripped.clone()]).remove(0);
+    let corrected_vector = world.engine.potion.embed(&[corrected(&world.engine.potion, &stripped, &corpus, &signals)]).remove(0);
+    let names = |keys: Vec<String>, filter: &SearchFilter| keys.into_iter()
+        .filter_map(|key| corpus.get(&key).filter(|e| filter.allows(e)).map(|e| e.command.clone()))
+        .take(10).collect::<Vec<_>>();
+
+    let bm25: Vec<(String, f64)> = raw.search_text_with("terms", &text, k, &Default::default(), to_index(&merged))
+        .unwrap().into_iter().filter_map(|h| Some((command_of(&h.document)?, f64::from(h.score)))).collect();
+    let dense_only: Vec<String> = raw.find_nearest("embedding", &corrected_vector, k, to_index(&vector_first_filter))
+        .unwrap().into_iter().filter_map(|h| command_of(&h.document)).collect();
+    let dense: Vec<(String, f64)> = raw.find_nearest("embedding", &plain_vector, k, to_index(&merged))
+        .unwrap().into_iter().filter_map(|h| Some((command_of(&h.document)?, f64::from(h.score)))).collect();
+    let mut hybrid = HybridQuery::new("terms", &text, "embedding", &plain_vector, k);
+    hybrid.filter = to_index(&merged);
+    let rrf: Vec<String> = raw.hybrid_search(hybrid).unwrap().into_iter().filter_map(|h| command_of(&h.document)).collect();
+    let mut weighted: HashMap<String, f64> = HashMap::new();
+    for (hits, weight) in [(&bm25, 0.7), (&dense, 0.3)] {
+        let best = hits.iter().map(|h| h.1).fold(0.0, f64::max);
+        if best > 0.0 {
+            for (command, score) in hits { *weighted.entry(command.clone()).or_insert(0.0) += weight * score / best; }
+        }
+    }
+    let mut weighted: Vec<(String, f64)> = weighted.into_iter().collect();
+    weighted.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    [
+        names(bm25.into_iter().map(|h| h.0).collect(), &merged),
+        names(dense_only, &vector_first_filter),
+        names(rrf, &merged),
+        names(weighted.into_iter().map(|h| h.0).collect(), &merged),
+    ]
+}
+
+/// `make ranking-ablation`: per-cohort scores for retrieval legs and rerank stages, on the same synthetic worlds
+/// as the ranking eval. Measurement only; no production switch beyond the existing test-only `VECTOR_FIRST` flag.
+#[allow(dead_code)]
+pub(crate) fn ablation_report(set_vector_first: impl Fn(bool),
+    corrected: impl Fn(&Potion, &str, &HashMap<String, SearchEntry>, &smcli_search::corpus::SearchSignals) -> String) {
+    let labels = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+    let mut main_probes = vec![];
+    let long_tail = long_tail_cases();
+    for c in CASES.iter().chain(long_tail.iter()).filter(|c| c.kind == Search) {
+        let names: Vec<&str> = match (c.cohort, c.group) {
+            (Original, _) => vec!["original"],
+            (HeldOut, _) => vec!["held-out (fixed set)"],
+            (Adversarial, "long-tail") => vec!["adversarial", "long-tail"],
+            (Adversarial, "intent") => vec!["adversarial", "adversarial: intent"],
+            (Adversarial, _) => vec!["adversarial", "adversarial: literal/other"],
+        };
+        main_probes.push(Probe { labels: labels(&names), case: *c });
+    }
+    let mut bridge = World::new();
+    for (_, command) in BRIDGE_CASES { bridge.habit(command, "bridge", 4); }
+    for command in ["git status", "git commit -m update", "tar -czf backup.tgz .", "docker compose up -d", "ls -la"] { bridge.habit(command, "bridge", 4); }
+    let bridge_probes = BRIDGE_CASES.iter().map(|(query, expected)|
+        Probe { labels: labels(&["command-bridge"]), case: case(Original, "command-bridge", Search, "bridge", query, expected) }).collect::<Vec<_>>();
+    let natural = natural_language_world();
+    let mut natural_probes = vec![];
+    for item in NATURAL_LANGUAGE_CASES {
+        for expected in item.expected_commands {
+            natural_probes.push(Probe { labels: vec![format!("nl: {}", item.cohort)],
+                case: case(Original, "natural-language", Search, "natural", item.query, expected) });
+        }
+    }
+
+    let mut scores: BTreeMap<(String, usize), Score> = BTreeMap::new();
+    for (world, probes) in [(World::new(), main_probes), (bridge, bridge_probes), (natural, natural_probes)] {
+        for probe in probes {
+            let item = &probe.case;
+            set_vector_first(true);
+            let prod_history = world.search_with_index(item, false);
+            let prod_index = world.search_with_index(item, true);
+            set_vector_first(false);
+            let hybrid_history = world.search_with_index(item, false);
+            let hybrid_index = world.search_with_index(item, true);
+            set_vector_first(true);
+            let [bm25, dense, rrf, weighted] = raw_legs(&world, item, &corrected);
+            let names = |hits: Vec<(String, Vec<String>)>| hits.into_iter().map(|h| h.0).collect::<Vec<_>>();
+            let results = [bm25, dense, rrf, weighted, names(hybrid_history), names(hybrid_index), names(prod_history), names(prod_index)];
+            let ranks = results.iter().map(|r| r.iter().position(|c| c == item.expected).map(|i| i + 1)).collect::<Vec<_>>();
+            for label in probe.labels.iter().chain(std::iter::once(&"ALL".to_string())) {
+                for (variant, rank) in ranks.iter().enumerate() {
+                    scores.entry((label.clone(), variant)).or_default().add(*rank);
+                }
+            }
+            let short = |c: &str| c.chars().take(40).collect::<String>();
+            println!("ABLATION_CASE | {} | literal={} | {:?} | expected {:?} | ranks {:?} | prod top3 {:?}",
+                probe.labels[0], world.literal(item.query), item.query, short(item.expected),
+                ranks.iter().map(|r| r.map_or("-".to_string(), |r| r.to_string())).collect::<Vec<_>>().join(","),
+                results[7].iter().take(3).map(|c| short(c)).collect::<Vec<_>>());
+        }
+    }
+    println!("ABLATION | cohort | variant | n | top1 | top3 | MRR |");
+    let cohorts: Vec<String> = scores.keys().map(|k| k.0.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    for cohort in cohorts {
+        for (variant, name) in ABLATION_VARIANTS.iter().enumerate() {
+            let score = &scores[&(cohort.clone(), variant)];
+            println!("ABLATION | {cohort} | {name} | {} | {:.2} | {:.2} | {:.3} |", score.count, score.first_rate(), score.third_rate(), score.mrr());
+        }
     }
 }
