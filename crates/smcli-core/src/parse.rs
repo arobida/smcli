@@ -18,7 +18,10 @@ pub struct CommandBreakdown {
 
 /// A first argument that reads as a verb (`create`, `i`, `run-script`), not a path, package or value.
 fn is_subcommand(word: &str) -> bool {
-    word.starts_with(|c: char| c.is_ascii_alphabetic()) && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    word.starts_with(|c: char| c.is_ascii_alphabetic())
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 // shortcut: value options for common tools only; use complete tool schemas for semantic parsing.
@@ -31,9 +34,30 @@ fn value_options(key: &str) -> &'static [&'static str] {
         "docker build" => &["-f", "--file", "-t", "--tag"],
         "docker run" => &["--name", "-p", "--publish", "-v", "--volume", "-e", "--env"],
         "npm" => &["--prefix", "--registry"],
-        "cargo" => &["--manifest-path", "--target", "--features", "-p", "--package"],
-        "swift" => &["-c", "--configuration", "--package-path", "--target", "--product", "--filter"],
-        "kubectl" => &["-n", "--namespace", "--context", "-f", "--filename", "-o", "--output"],
+        "cargo" => &[
+            "--manifest-path",
+            "--target",
+            "--features",
+            "-p",
+            "--package",
+        ],
+        "swift" => &[
+            "-c",
+            "--configuration",
+            "--package-path",
+            "--target",
+            "--product",
+            "--filter",
+        ],
+        "kubectl" => &[
+            "-n",
+            "--namespace",
+            "--context",
+            "-f",
+            "--filename",
+            "-o",
+            "--output",
+        ],
         "ls" => &["-I", "--ignore"],
         "grep" => &["-e", "--regexp", "-f", "--file", "-A", "-B", "-C"],
         _ => &[],
@@ -53,7 +77,9 @@ impl CommandBreakdown {
             let Some(equals) = first.find('=') else { break };
             let head = first.chars().next().unwrap();
             if !(head == '_' || head.is_ascii_alphabetic())
-                || !first[..equals].chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+                || !first[..equals]
+                    .chars()
+                    .all(|c| c == '_' || c.is_ascii_alphanumeric())
             {
                 break;
             }
@@ -75,15 +101,25 @@ impl CommandBreakdown {
                 options = false;
             } else if options && word.starts_with('-') && word != "-" {
                 if let Some(equals) = word.find('=') {
-                    flags.push(CommandFlag { name: word[..equals].into(), value: Some(word[equals + 1..].into()) });
+                    flags.push(CommandFlag {
+                        name: word[..equals].into(),
+                        value: Some(word[equals + 1..].into()),
+                    });
                 } else if (value_options(&tool).contains(&word.as_str())
-                    || value_options(&format!("{tool} {}", subcommand.as_deref().unwrap_or(""))).contains(&word.as_str()))
+                    || value_options(&format!("{tool} {}", subcommand.as_deref().unwrap_or("")))
+                        .contains(&word.as_str()))
                     && index + 1 < words.len()
                 {
                     index += 1;
-                    flags.push(CommandFlag { name: word.clone(), value: Some(words[index].clone()) });
+                    flags.push(CommandFlag {
+                        name: word.clone(),
+                        value: Some(words[index].clone()),
+                    });
                 } else {
-                    flags.push(CommandFlag { name: word.clone(), value: None });
+                    flags.push(CommandFlag {
+                        name: word.clone(),
+                        value: None,
+                    });
                 }
             } else if options && subcommand.is_none() && targets.is_empty() && is_subcommand(word) {
                 subcommand = Some(word.clone());
@@ -92,7 +128,13 @@ impl CommandBreakdown {
             }
             index += 1;
         }
-        Some(Self { main_command: main, subcommand, flags, targets, arguments: words })
+        Some(Self {
+            main_command: main,
+            subcommand,
+            flags,
+            targets,
+            arguments: words,
+        })
     }
 }
 
@@ -120,7 +162,11 @@ pub fn shell_words(command: &str) -> Option<Vec<String>> {
     while index < characters.len() {
         let character = characters[index];
         if quote == Some('\'') {
-            if character == '\'' { quote = None } else { word.push(character) }
+            if character == '\'' {
+                quote = None
+            } else {
+                word.push(character)
+            }
         } else if character == '\\' {
             index += 1;
             let next = *characters.get(index)?;
@@ -134,11 +180,16 @@ pub fn shell_words(command: &str) -> Option<Vec<String>> {
         } else if character == '`'
             || (character == '$'
                 && index + 1 < characters.len()
-                && (characters[index + 1] == '(' || (quote.is_none() && ['\'', '"'].contains(&characters[index + 1]))))
+                && (characters[index + 1] == '('
+                    || (quote.is_none() && ['\'', '"'].contains(&characters[index + 1]))))
         {
             return None;
         } else if let Some(current) = quote {
-            if character == current { quote = None } else { word.push(character) }
+            if character == current {
+                quote = None
+            } else {
+                word.push(character)
+            }
         } else if character == '\'' || character == '"' {
             quote = Some(character);
             started = true;
@@ -169,30 +220,53 @@ pub fn shell_words(command: &str) -> Option<Vec<String>> {
 /// Record-time alias vocabulary: variables, quotes and `&&`, `||`, `|`, `;` are kept as text; nothing that runs code
 /// (substitution, redirection, background) or assigns (`NAME=`, `${NAME:=}`) passes.
 pub fn safe_expansion(text: &str) -> bool {
-    let assigns = |word: &str| word.split_once('=').is_some_and(|(name, _)| {
-        let name = name.strip_suffix('+').unwrap_or(name);
-        name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
-    });
+    let assigns = |word: &str| {
+        word.split_once('=').is_some_and(|(name, _)| {
+            let name = name.strip_suffix('+').unwrap_or(name);
+            name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+                && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        })
+    };
     let braces_plain = text.split("${").skip(1).all(|rest| {
-        rest.split_once('}').is_some_and(|(name, _)| !name.is_empty() && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
+        rest.split_once('}').is_some_and(|(name, _)| {
+            !name.is_empty() && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        })
     });
-    !text.is_empty() && text.len() <= 8_192 && text.trim() == text
+    !text.is_empty()
+        && text.len() <= 8_192
+        && text.trim() == text
         && text.bytes().all(|c| (b' '..=b'~').contains(&c))
         && !["$(", "`", "<", ">"].iter().any(|bad| text.contains(bad))
         && !text.replace("&&", "").contains('&')
         && braces_plain
-        && text.split(|c: char| c.is_whitespace() || ['(', '{', ';', '&', '|'].contains(&c)).all(|word| !assigns(word.trim_start_matches(['"', '\'', '(', '{', ';', '&', '|'])))
-        && text.split_whitespace().next().is_some_and(|word| !word.starts_with('-'))
+        && text
+            .split(|c: char| c.is_whitespace() || ['(', '{', ';', '&', '|'].contains(&c))
+            .all(|word| !assigns(word.trim_start_matches(['"', '\'', '(', '{', ';', '&', '|'])))
+        && text
+            .split_whitespace()
+            .next()
+            .is_some_and(|word| !word.starts_with('-'))
 }
 
 /// True when a command line runs smcli itself (`smcli …`, `/path/to/smcli …`, `swift run smcli …`),
 /// so searches and suggestions are not about the tool. Leading `VAR=value` assignments are skipped.
 /// Any segment of a compound line counts, as does `$VAR` set to an smcli path earlier in the line.
 pub fn is_smcli_command(command: &str) -> bool {
-    const SUBCOMMANDS: [&str; 7] = ["search", "suggest", "pick", "history", "reindex", "indexes", "shell-init"];
+    const SUBCOMMANDS: [&str; 7] = [
+        "search",
+        "suggest",
+        "pick",
+        "history",
+        "reindex",
+        "indexes",
+        "shell-init",
+    ];
     let mut smcli_vars: Vec<&str> = Vec::new();
     command.split(['\n', ';', '&', '|']).any(|segment| {
-        let mut words: Vec<&str> = segment.split_whitespace().map(|w| w.trim_matches(|c| c == '\'' || c == '"')).collect();
+        let mut words: Vec<&str> = segment
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c| c == '\'' || c == '"'))
+            .collect();
         while let Some(first) = words.first() {
             match first.find('=') {
                 Some(equals) if equals != 0 && !first[..equals].contains('/') => {
@@ -208,10 +282,13 @@ pub fn is_smcli_command(command: &str) -> bool {
         if words.first() == Some(&"swift") && words.get(1) == Some(&"run") {
             return words.iter().skip(2).take(5).any(|w| *w == "smcli");
         }
-        let Some(first) = words.first() else { return false };
+        let Some(first) = words.first() else {
+            return false;
+        };
         // shortcut: a `$VAR` set in an earlier line is unknown, so `$VAR search` counts by its subcommand alone.
         if let Some(var) = first.strip_prefix('$').map(|v| v.trim_matches(['{', '}'])) {
-            return smcli_vars.contains(&var) || words.get(1).is_some_and(|w| SUBCOMMANDS.contains(w));
+            return smcli_vars.contains(&var)
+                || words.get(1).is_some_and(|w| SUBCOMMANDS.contains(w));
         }
         base_name(first) == "smcli"
     })
@@ -223,7 +300,10 @@ pub fn program_of(command: &str, parsed: Option<&CommandBreakdown>) -> Option<St
     if let Some(main) = parsed.map(|p| &p.main_command) {
         return Some(base_name(main).to_string());
     }
-    command.split_whitespace().next().map(|w| base_name(w).to_string())
+    command
+        .split_whitespace()
+        .next()
+        .map(|w| base_name(w).to_string())
 }
 
 #[cfg(test)]
@@ -232,48 +312,130 @@ mod tests {
 
     #[test]
     fn path_arguments_use_placeholder_detection() {
-        assert_eq!(path_arguments("/bin/tool --out=a.txt 'some dir' | cat b.md", "bash", |p| p == "some dir"), ["a.txt", "some dir", "b.md"]);
+        assert_eq!(
+            path_arguments("/bin/tool --out=a.txt 'some dir' | cat b.md", "bash", |p| p
+                == "some dir"),
+            ["a.txt", "some dir", "b.md"]
+        );
     }
 
     #[test]
     fn last_command_segments() {
-        assert_eq!(last_command_word("echo 'a|b'; cd @", "bash").as_deref(), Some("cd"));
-        assert_eq!(last_command_word("cat \"a;b\"", "bash").as_deref(), Some("cat"));
-        assert_eq!(last_command_word("cat a && mkdir @", "bash").as_deref(), Some("mkdir"));
+        assert_eq!(
+            last_command_word("echo 'a|b'; cd @", "bash").as_deref(),
+            Some("cd")
+        );
+        assert_eq!(
+            last_command_word("cat \"a;b\"", "bash").as_deref(),
+            Some("cat")
+        );
+        assert_eq!(
+            last_command_word("cat a && mkdir @", "bash").as_deref(),
+            Some("mkdir")
+        );
         assert_eq!(last_command_word("cat a | ", "bash"), None);
     }
 
     #[test]
     fn parse_commands_and_flags() {
-        let parsed = CommandBreakdown::parse("FOO=1 /usr/bin/git commit -m 'fix it' --amend file").unwrap();
+        let parsed =
+            CommandBreakdown::parse("FOO=1 /usr/bin/git commit -m 'fix it' --amend file").unwrap();
         assert_eq!(parsed.main_command, "/usr/bin/git");
         assert_eq!(parsed.subcommand.as_deref(), Some("commit"));
-        assert_eq!(parsed.flags, [
-            CommandFlag { name: "-m".into(), value: Some("fix it".into()) },
-            CommandFlag { name: "--amend".into(), value: None },
-        ]);
+        assert_eq!(
+            parsed.flags,
+            [
+                CommandFlag {
+                    name: "-m".into(),
+                    value: Some("fix it".into())
+                },
+                CommandFlag {
+                    name: "--amend".into(),
+                    value: None
+                },
+            ]
+        );
         assert_eq!(parsed.targets, ["file"]);
-        assert_eq!(CommandBreakdown::parse("bun create cloudflare@latest").unwrap().subcommand.as_deref(), Some("create"));
-        assert_eq!(CommandBreakdown::parse("bun i -g x").unwrap().subcommand.as_deref(), Some("i"));
-        assert_eq!(CommandBreakdown::parse("cat ./notes.txt").unwrap().subcommand, None);
-        assert_eq!(CommandBreakdown::parse("npx @scope/pkg init").unwrap().subcommand, None);
+        assert_eq!(
+            CommandBreakdown::parse("bun create cloudflare@latest")
+                .unwrap()
+                .subcommand
+                .as_deref(),
+            Some("create")
+        );
+        assert_eq!(
+            CommandBreakdown::parse("bun i -g x")
+                .unwrap()
+                .subcommand
+                .as_deref(),
+            Some("i")
+        );
+        assert_eq!(
+            CommandBreakdown::parse("cat ./notes.txt")
+                .unwrap()
+                .subcommand,
+            None
+        );
+        assert_eq!(
+            CommandBreakdown::parse("npx @scope/pkg init")
+                .unwrap()
+                .subcommand,
+            None
+        );
         assert!(CommandBreakdown::parse("ls | wc -l").is_none());
         assert!(CommandBreakdown::parse("echo $(date)").is_none());
-        assert_eq!(command_flags("ls -la | grep --color=auto x"), ["-la", "--color"]);
-        assert_eq!(shell_words(r#"echo "a\$b\c" # comment"#).unwrap(), ["echo", r"a$b\c"]);
+        assert_eq!(
+            command_flags("ls -la | grep --color=auto x"),
+            ["-la", "--color"]
+        );
+        assert_eq!(
+            shell_words(r#"echo "a\$b\c" # comment"#).unwrap(),
+            ["echo", r"a$b\c"]
+        );
     }
 
     #[test]
     fn expansion_gate_keeps_text_but_rejects_code_and_assignments() {
-        for text in ["git status", "git log --oneline -20", "git reset --soft HEAD~1", "./tool plain-argument",
-            r#"$EDITOR $ZDOTDIR/conf.d/50-aliases.zsh && source "$ZDOTDIR/.zshrc""#, "git status | cat", "git status; pwd",
-            "make || true", "git 'status'", "echo $HOME", "nvim ~/.zshrc", "cd ${HOME}/x", "git log --format=%h"] {
+        for text in [
+            "git status",
+            "git log --oneline -20",
+            "git reset --soft HEAD~1",
+            "./tool plain-argument",
+            r#"$EDITOR $ZDOTDIR/conf.d/50-aliases.zsh && source "$ZDOTDIR/.zshrc""#,
+            "git status | cat",
+            "git status; pwd",
+            "make || true",
+            "git 'status'",
+            "echo $HOME",
+            "nvim ~/.zshrc",
+            "cd ${HOME}/x",
+            "git log --format=%h",
+        ] {
             assert!(safe_expansion(text), "{text}");
         }
-        for text in ["", " git status", "git status ", "TOKEN=abc123 ./deploy.sh", "a && TOKEN=x ./b", "env 'X=1' a",
-            "echo $(id)", "echo `id`", "git status > file", "cat < file", "diff <(a) b", "sleep 1 &", "echo ${X:=1}",
-            "echo ${X:-$(id)}", "echo\nsecret", "echo\tx", "-rf /", "(TOKEN=abc printf ok)",
-            "TOKEN+=abc printf ok", "printf ok;TOKEN=abc", "printf ok &&(TOKEN+=abc printf ok)"] {
+        for text in [
+            "",
+            " git status",
+            "git status ",
+            "TOKEN=abc123 ./deploy.sh",
+            "a && TOKEN=x ./b",
+            "env 'X=1' a",
+            "echo $(id)",
+            "echo `id`",
+            "git status > file",
+            "cat < file",
+            "diff <(a) b",
+            "sleep 1 &",
+            "echo ${X:=1}",
+            "echo ${X:-$(id)}",
+            "echo\nsecret",
+            "echo\tx",
+            "-rf /",
+            "(TOKEN=abc printf ok)",
+            "TOKEN+=abc printf ok",
+            "printf ok;TOKEN=abc",
+            "printf ok &&(TOKEN+=abc printf ok)",
+        ] {
             assert!(!safe_expansion(text), "{text}");
         }
         assert!(!safe_expansion(&"x".repeat(8_193)));
@@ -286,11 +448,20 @@ mod tests {
         assert!(is_smcli_command("swift run -c release smcli history"));
         assert!(!is_smcli_command("git status"));
         assert!(is_smcli_command("make fresh && dist/smcli search x"));
-        assert!(is_smcli_command("B=/repo/.build/release/smcli\n$B init --potion\n${B} history"));
+        assert!(is_smcli_command(
+            "B=/repo/.build/release/smcli\n$B init --potion\n${B} history"
+        ));
         assert!(is_smcli_command("$B search \"undo the last commit\""));
         assert!(!is_smcli_command("$EDITOR notes.md"));
         assert!(!is_smcli_command("echo a | grep smcli"));
-        assert_eq!(program_of("/usr/bin/git status", CommandBreakdown::parse("/usr/bin/git status").as_ref()).as_deref(), Some("git"));
+        assert_eq!(
+            program_of(
+                "/usr/bin/git status",
+                CommandBreakdown::parse("/usr/bin/git status").as_ref()
+            )
+            .as_deref(),
+            Some("git")
+        );
     }
 
     #[test]
@@ -302,9 +473,18 @@ mod tests {
         assert_eq!(run("vim ~/x.toml").as_deref(), Some("vim @"));
         assert_eq!(run("git log"), None);
         assert_eq!(run("ls src").as_deref(), Some("ls @"));
-        assert_eq!(run("npm i @scope/pkg ./a.md").as_deref(), Some("npm i @scope/pkg @"));
-        assert_eq!(run("FOO=./a.md cat b.txt").as_deref(), Some("FOO=./a.md cat @"));
-        assert_eq!(run("cargo build --manifest-path=x/Cargo.toml").as_deref(), Some("cargo build --manifest-path=@"));
+        assert_eq!(
+            run("npm i @scope/pkg ./a.md").as_deref(),
+            Some("npm i @scope/pkg @")
+        );
+        assert_eq!(
+            run("FOO=./a.md cat b.txt").as_deref(),
+            Some("FOO=./a.md cat @")
+        );
+        assert_eq!(
+            run("cargo build --manifest-path=x/Cargo.toml").as_deref(),
+            Some("cargo build --manifest-path=@")
+        );
         assert_eq!(run("git clone https://x.com/r.git"), None);
         assert_eq!(run("echo hi > out.log").as_deref(), Some("echo hi > @"));
         assert_eq!(run("curl --url=https://x.com/a"), None);
@@ -316,19 +496,28 @@ mod tests {
     #[test]
     fn path_placeholders_mixed_word_substitution() {
         let result = path_placeholders(r#"echo prefix"$(cat a.md)""#, "bash", |_| false);
-        assert_eq!(result.as_ref().map(|v| v.0.as_str()), Some(r#"echo prefix"$(cat @)""#));
+        assert_eq!(
+            result.as_ref().map(|v| v.0.as_str()),
+            Some(r#"echo prefix"$(cat @)""#)
+        );
     }
 
     #[test]
     fn path_placeholders_restores_outer_redirection() {
         let result = path_placeholders("echo > $(echo a.md) b.md", "bash", |_| false);
-        assert_eq!(result.as_ref().map(|v| v.0.as_str()), Some("echo > $(echo @) @"));
+        assert_eq!(
+            result.as_ref().map(|v| v.0.as_str()),
+            Some("echo > $(echo @) @")
+        );
     }
 
     #[test]
     fn path_placeholders_escaped_dollar_is_literal() {
         let result = path_placeholders(r"cat \$HOME/x.md $HOME/y.md", "bash", |_| false);
-        assert_eq!(result.as_ref().map(|v| v.0.as_str()), Some("cat @ $HOME/y.md"));
+        assert_eq!(
+            result.as_ref().map(|v| v.0.as_str()),
+            Some("cat @ $HOME/y.md")
+        );
         let result = path_placeholders(r"cmd --out=\$HOME/x.md", "bash", |_| false);
         assert_eq!(result.as_ref().map(|v| v.0.as_str()), Some("cmd --out=@"));
     }
@@ -337,24 +526,57 @@ mod tests {
     fn path_placeholders_command_substitutions_and_groups() {
         let exists = |w: &str| w == "src";
         let run = |cmd, shell| path_placeholders(cmd, shell, exists).map(|(s, _)| s);
-        assert_eq!(run(r#"eval "$(/a/b/smcli shell-init zsh)""#, "bash").as_deref(), Some(r#"eval "$(@ shell-init zsh)""#));
-        assert_eq!(run(r#"cat "$(ls notes/)""#, "bash").as_deref(), Some(r#"cat "$(ls @)""#));
-        assert_eq!(run("cat `ls notes/`", "bash").as_deref(), Some("cat `ls @`"));
-        assert_eq!(run("diff <(sort a.txt) <(sort b.txt)", "bash").as_deref(), Some("diff <(sort @) <(sort @)"));
+        assert_eq!(
+            run(r#"eval "$(/a/b/smcli shell-init zsh)""#, "bash").as_deref(),
+            Some(r#"eval "$(@ shell-init zsh)""#)
+        );
+        assert_eq!(
+            run(r#"cat "$(ls notes/)""#, "bash").as_deref(),
+            Some(r#"cat "$(ls @)""#)
+        );
+        assert_eq!(
+            run("cat `ls notes/`", "bash").as_deref(),
+            Some("cat `ls @`")
+        );
+        assert_eq!(
+            run("diff <(sort a.txt) <(sort b.txt)", "bash").as_deref(),
+            Some("diff <(sort @) <(sort @)")
+        );
         assert_eq!(run(r#"rm "old file.md""#, "bash").as_deref(), Some("rm @"));
-        assert_eq!(run("cp $HOME/x.md dir/", "bash").as_deref(), Some("cp $HOME/x.md @"));
-        assert_eq!(run("(cd src && make)", "bash").as_deref(), Some("(cd @ && make)"));
+        assert_eq!(
+            run("cp $HOME/x.md dir/", "bash").as_deref(),
+            Some("cp $HOME/x.md @")
+        );
+        assert_eq!(
+            run("(cd src && make)", "bash").as_deref(),
+            Some("(cd @ && make)")
+        );
         assert_eq!(run("./run.sh a.md", "bash").as_deref(), Some("@ @"));
         assert_eq!(run("git log", "bash"), None);
         assert_eq!(run(r#"echo "$(ls notes/""#, "bash"), None);
-        assert_eq!(run(r#"eval "$(/a/b/smcli shell-init zsh)""#, "zsh").as_deref(), Some(r#"eval "$(@ shell-init zsh)""#));
-        assert_eq!(run("cat (ls notes/)", "fish").as_deref(), Some("cat (ls @)"));
+        assert_eq!(
+            run(r#"eval "$(/a/b/smcli shell-init zsh)""#, "zsh").as_deref(),
+            Some(r#"eval "$(@ shell-init zsh)""#)
+        );
+        assert_eq!(
+            run("cat (ls notes/)", "fish").as_deref(),
+            Some("cat (ls @)")
+        );
         assert_eq!(run(r#"echo "a/b""#, "fish").as_deref(), Some("echo @"));
-        assert_eq!(run(r#"echo "(ls notes/)""#, "fish").as_deref(), Some(r#"echo "(ls @)""#));
+        assert_eq!(
+            run(r#"echo "(ls notes/)""#, "fish").as_deref(),
+            Some(r#"echo "(ls @)""#)
+        );
         assert_eq!(run("echo abc\"unfinished", "bash"), None);
         assert_eq!(run("echo a.md )", "bash"), None);
-        assert_eq!(run(r#"echo "prefix/a $(cat b.md) suffix/c""#, "bash").as_deref(), Some(r#"echo "prefix/a $(cat @) suffix/c""#));
-        assert_eq!(run(r#"eval "$(/a/b/smcli shell-init zsh)""#, "fish").as_deref(), Some(r#"eval "$(@ shell-init zsh)""#));
+        assert_eq!(
+            run(r#"echo "prefix/a $(cat b.md) suffix/c""#, "bash").as_deref(),
+            Some(r#"echo "prefix/a $(cat @) suffix/c""#)
+        );
+        assert_eq!(
+            run(r#"eval "$(/a/b/smcli shell-init zsh)""#, "fish").as_deref(),
+            Some(r#"eval "$(@ shell-init zsh)""#)
+        );
     }
 }
 
@@ -371,7 +593,9 @@ pub fn glob_match(pat: &str, text: &str) -> bool {
             if glob_match(rest, s) {
                 return true;
             }
-            let Some(c) = s.chars().next() else { return false };
+            let Some(c) = s.chars().next() else {
+                return false;
+            };
             s = &s[c.len_utf8()..];
         }
     }
@@ -398,7 +622,9 @@ pub fn glob_match(pat: &str, text: &str) -> bool {
         };
     }
     if pc == '[' {
-        let Some(tc) = text.chars().next() else { return false };
+        let Some(tc) = text.chars().next() else {
+            return false;
+        };
         if tc == '/' {
             return false;
         }
@@ -448,7 +674,11 @@ fn glob_class_eat(pat: &str, c: char) -> Option<(bool, &str)> {
 /// Replace a command's path arguments with `@` placeholders so they can be re-filled in the shell.
 /// Returns `Some((rewritten_command, first_placeholder_byte_offset))` when at least one path was
 /// found; otherwise the command is returned unchanged as `None`.
-pub fn path_placeholders<F: FnMut(&str) -> bool>(command: &str, shell: &str, exists: F) -> Option<(String, usize)> {
+pub fn path_placeholders<F: FnMut(&str) -> bool>(
+    command: &str,
+    shell: &str,
+    exists: F,
+) -> Option<(String, usize)> {
     path_placeholders_with(command, shell, exists, |_| {})
 }
 
@@ -458,7 +688,12 @@ pub fn path_arguments(command: &str, shell: &str, exists: impl FnMut(&str) -> bo
     paths
 }
 
-fn path_placeholders_with(command: &str, shell: &str, mut exists: impl FnMut(&str) -> bool, mut argument: impl FnMut(&str)) -> Option<(String, usize)> {
+fn path_placeholders_with(
+    command: &str,
+    shell: &str,
+    mut exists: impl FnMut(&str) -> bool,
+    mut argument: impl FnMut(&str),
+) -> Option<(String, usize)> {
     let tokens = tokenize(command, shell)?;
     let mut replacements: Vec<(std::ops::Range<usize>, String)> = Vec::new();
     let mut command_expected = true;
@@ -474,9 +709,16 @@ fn path_placeholders_with(command: &str, shell: &str, mut exists: impl FnMut(&st
             }
             Token::Close => {
                 (command_expected, redirection_expected) = frames.pop()?;
-                if redirection_expected { redirection_expected = false; } else { command_expected = false; }
+                if redirection_expected {
+                    redirection_expected = false;
+                } else {
+                    command_expected = false;
+                }
             }
-            Token::Opaque => { command_expected = false; redirection_expected = false; }
+            Token::Opaque => {
+                command_expected = false;
+                redirection_expected = false;
+            }
             Token::Op(range) => {
                 let op = &command[range.clone()];
                 if op != "\"" && op != "'" {
@@ -494,7 +736,10 @@ fn path_placeholders_with(command: &str, shell: &str, mut exists: impl FnMut(&st
                 let raw = &command[full.clone()];
                 let variable = |value: &str| {
                     let raw_value = raw.split_once('=').map_or(raw, |(_, value)| value);
-                    value.starts_with('$') && !raw_value.starts_with('\\') && !raw_value.starts_with('\'') && !raw_value.starts_with("\"\\$")
+                    value.starts_with('$')
+                        && !raw_value.starts_with('\\')
+                        && !raw_value.starts_with('\'')
+                        && !raw_value.starts_with("\"\\$")
                 };
                 let mut replacement = "@".to_string();
                 let candidate = if redirection_expected {
@@ -502,7 +747,13 @@ fn path_placeholders_with(command: &str, shell: &str, mut exists: impl FnMut(&st
                 } else if command_expected {
                     if is_assignment(&text) {
                         None
-                    } else if text.starts_with('-') || text.starts_with('@') || variable(&text) || is_url(&text) || is_remote(&text) || is_glob(&text) {
+                    } else if text.starts_with('-')
+                        || text.starts_with('@')
+                        || variable(&text)
+                        || is_url(&text)
+                        || is_remote(&text)
+                        || is_glob(&text)
+                    {
                         command_expected = false;
                         None
                     } else if text.contains('/') && is_path(&text, &mut exists) {
@@ -515,13 +766,25 @@ fn path_placeholders_with(command: &str, shell: &str, mut exists: impl FnMut(&st
                     }
                 } else if let Some((name_len, value)) = flag_value(&text) {
                     // Replace only the value part of `--flag=value`.
-                    if !value.starts_with('@') && !variable(value) && !is_url(value) && !is_remote(value) && !is_glob(value) && is_path(value, &mut exists) {
+                    if !value.starts_with('@')
+                        && !variable(value)
+                        && !is_url(value)
+                        && !is_remote(value)
+                        && !is_glob(value)
+                        && is_path(value, &mut exists)
+                    {
                         replacement = format!("{}=@", &text[..name_len]);
                         Some(full.clone())
                     } else {
                         None
                     }
-                } else if text.starts_with('-') || text.starts_with('@') || variable(&text) || is_url(&text) || is_remote(&text) || is_glob(&text) {
+                } else if text.starts_with('-')
+                    || text.starts_with('@')
+                    || variable(&text)
+                    || is_url(&text)
+                    || is_remote(&text)
+                    || is_glob(&text)
+                {
                     None
                 } else if is_path(&text, &mut exists) {
                     Some(full.clone())
@@ -747,7 +1010,9 @@ fn read_plain_word(
         text.push(c);
         i += c.len_utf8();
     }
-    if quote.is_some() || escaped { return None; }
+    if quote.is_some() || escaped {
+        return None;
+    }
     Some((start..i, text, i))
 }
 
@@ -810,11 +1075,7 @@ fn read_double_quoted_word(
     None
 }
 
-fn parse_double_quoted_inner(
-    command: &str,
-    shell: &str,
-    i: &mut usize,
-) -> Option<Vec<Token>> {
+fn parse_double_quoted_inner(command: &str, shell: &str, i: &mut usize) -> Option<Vec<Token>> {
     let mut tokens = Vec::new();
     while *i < command.len() {
         let c = command[*i..].chars().next()?;
@@ -869,14 +1130,17 @@ fn is_redirection(op: &str) -> bool {
 }
 
 fn is_assignment(word: &str) -> bool {
-    let Some((name, _)) = word.split_once('=') else { return false };
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
     let name = name.strip_suffix('+').unwrap_or(name);
     if name.is_empty() {
         return false;
     }
     let mut ch = name.chars();
     let first = ch.next().unwrap();
-    (first == '_' || first.is_ascii_alphabetic()) && ch.all(|c| c == '_' || c.is_ascii_alphanumeric())
+    (first == '_' || first.is_ascii_alphabetic())
+        && ch.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 fn flag_value(word: &str) -> Option<(usize, &str)> {
@@ -900,14 +1164,18 @@ fn looks_like_path(text: &str) -> bool {
 }
 
 fn has_extension(text: &str) -> bool {
-    let Some((before, after)) = text.rsplit_once('.') else { return false };
+    let Some((before, after)) = text.rsplit_once('.') else {
+        return false;
+    };
     if before.is_empty() || after.is_empty() {
         return false;
     }
     if after.chars().all(|c| c.is_ascii_digit()) {
         return false;
     }
-    after.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    after
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
 fn is_url(text: &str) -> bool {

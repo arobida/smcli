@@ -31,7 +31,7 @@ smcli = os.path.abspath(sys.argv[1])
 root = tempfile.mkdtemp(prefix="smcli-svc.", dir="/tmp")
 # Inherited SMCLI_*/XDG_* variables could change results; only this file's settings reach the CLI.
 env = {k: v for k, v in os.environ.items() if not k.startswith("SMCLI_") and k not in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME")}
-env.update(SMCLI_DB=f"{root}/history.db", SMCLI_RUNTIME_DIR=f"{root}/run", SMCLI_CONFIG=f"{root}/config.json",
+env.update(SMCLI_DB=f"{root}/.local/state/test-db/history.db", SMCLI_RUNTIME_DIR=f"{root}/run", SMCLI_CONFIG=f"{root}/config.json",
            HOME=root, HISTFILE=f"{root}/native-history")
 
 
@@ -274,7 +274,7 @@ try:
         (header_model / "model.safetensors").write_bytes(length + weights.read(int.from_bytes(length, "little")))
     header_config = Path(root) / "header-config.json"
     header_config.write_text(json.dumps({"potionPath": str(header_model)}))
-    header_env = dict(SMCLI_DB=f"{root}/header.db", SMCLI_CONFIG=str(header_config), SMCLI_SERVICE="0")
+    header_env = dict(SMCLI_DB=f"{root}/.local/state/test-db/header.db", SMCLI_CONFIG=str(header_config), SMCLI_SERVICE="0")
     record("echo header-only", **header_env)
     result = run("search", "header-only", **header_env)
     assert "echo header-only" in result.stdout and "showing keyword matches only" in result.stderr

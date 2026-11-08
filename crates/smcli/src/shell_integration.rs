@@ -29,6 +29,31 @@ pub fn render_with_keys(
     up: bool,
     ctrl_o: bool,
 ) -> Result<String> {
+    // Absolute-XDG check done here (as Xdg::dir does): a relative XDG_STATE_HOME would make the DB path per-cwd.
+    // The hook is eval'd at each shell start (install.sh does not cache it), so the literal is not frozen.
+    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    render_in(
+        shell,
+        binary_path,
+        &state_literal(&home, &env),
+        [ctrl_r, left, right, ctrl_t, ctrl_g, up, ctrl_o],
+    )
+}
+
+fn state_literal(
+    home: &std::path::Path,
+    env: &std::collections::HashMap<String, String>,
+) -> String {
+    let state = smcli_core::paths::Xdg::State.dir(home, env).join("smcli");
+    state.to_string_lossy().into_owned()
+}
+
+fn render_in(shell: &str, binary_path: &str, state: &str, keys: [bool; 7]) -> Result<String> {
+    let [ctrl_r, left, right, ctrl_t, ctrl_g, up, ctrl_o] = keys;
+    let state = state.to_string();
     let binary = if shell == "fish" {
         format!(
             "'{}'",
@@ -222,7 +247,8 @@ if [[ ${_smcli_installed-} != 1 ]]; then
                     _smcli_history_command || keep=
                 fi
                 if [[ -n $keep ]]; then
-                    export SMCLI_DB="${SMCLI_DB:-$HOME/.local/share/smcli/history.db}"
+                    _smcli_state=\#(stateDir)
+                    export SMCLI_DB="${SMCLI_DB:-$_smcli_state/history.db}"
                     # Record in a detached process so the prompt never waits; at exit, finish first.
                     if [[ -n ${SMCLI_SYNC-} || ${1-} == exit ]]; then
                         _smcli_record "$status" "$ended" "$pipe"
@@ -283,7 +309,8 @@ fi
 # keep readline's keys; SMCLI_EXTRA_KEYS=1 adds Left and Right on an empty line, Ctrl-Right and Alt-;.
 if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]] && (( BASH_VERSINFO[0] < 4 )); then
     # Warn once per database, not on every shell start.
-    _smcli_dir=${SMCLI_DB:-$HOME/.local/share/smcli/history.db}; _smcli_dir=${_smcli_dir%/*}
+    _smcli_state=\#(stateDir)
+    _smcli_dir=${SMCLI_DB:-$_smcli_state/history.db}; _smcli_dir=${_smcli_dir%/*}
     if [[ ! -e $_smcli_dir/.bash3-warned ]]; then
         echo "smcli: picker key bindings require Bash 4+; use 'smcli pick' or upgrade Bash (history recording remains active)." >&2
         mkdir -p "$_smcli_dir" && : > "$_smcli_dir/.bash3-warned"
@@ -311,14 +338,23 @@ elif [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
             _smcli_split "$chosen"
             READLINE_LINE=$_smcli_before$chosen\ $_smcli_after
             READLINE_POINT=$(( READLINE_POINT + _smcli_bytes + 1 ))
+        elif (( code == 12 )); then
+            cd -- "$chosen"
         elif (( code == 11 )); then
             # Edit paths: rewrite the command with @ placeholders and open the file picker on the first one.
-            local before=${chosen%%$'\x1f'*} after=${chosen#*$'\x1f'} picked
+            local before=${chosen%%$'\x1f'*} after=${chosen#*$'\x1f'} picked original=$READLINE_LINE point=$READLINE_POINT
             _smcli_split "$before@"
             READLINE_LINE="$before@$after"
             READLINE_POINT=$_smcli_bytes
             picked=$(SMCLI_SHELL=bash SMCLI_LBUFFER="$before@" SMCLI_FILES_LINE="$before@$after" "$_smcli_pick_bin" pick --files </dev/tty)
-            (( $? == 10 )) || return
+            code=$?
+            if (( code == 12 )); then
+                READLINE_LINE=$original
+                READLINE_POINT=$point
+                cd -- "$picked"
+                return
+            fi
+            (( code == 10 )) || return
             READLINE_LINE="$before$picked$after"
             _smcli_split "$before$picked"
             READLINE_POINT=$_smcli_bytes
@@ -392,7 +428,8 @@ elif [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
         _smcli_bind '\e;' _smcli_pick ''
     fi
     # Told once per change, not in every new shell.
-    _smcli_seen="${XDG_STATE_HOME:-$HOME/.local/state}/smcli/kept-keys-bash"
+    _smcli_state=\#(stateDir)
+    _smcli_seen="$_smcli_state/kept-keys-bash"
     if [[ $_smcli_kept != "$(cat "$_smcli_seen" 2>/dev/null)" ]]; then
         [[ -z $_smcli_kept ]] || printf 'smcli: kept existing key bindings:%s (bind -x them to _smcli_pick to switch).\n' "$_smcli_kept" >&2
         mkdir -p "${_smcli_seen%/*}" 2>/dev/null && printf '%s' "$_smcli_kept" >| "$_smcli_seen" 2>/dev/null
@@ -464,7 +501,9 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
                 if [[ $hits == *$'\n'* ]]; then
                     # Several matches: pick one in the files picker, filtered by the word.
                     hit=$(env SMCLI_SHELL=bash SMCLI_LBUFFER="$before" SMCLI_FILES_QUERY="${word#@}" "$_smcli_complete_bin" pick --files </dev/tty)
-                    (( $? == 10 )) || hit=
+                    local code=$?
+                    if (( code == 12 )); then cd -- "$hit"; fi
+                    (( code == 10 )) || hit=
                 fi
                 if [[ -n $hit ]]; then
                     READLINE_LINE=${before%"$word"}$hit$after
@@ -495,7 +534,9 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
                 # Several matches: pick one in the files picker, filtered by the word.
                 local line_before=${COMP_LINE:0:COMP_POINT}
                 line=$(env SMCLI_SHELL=bash SMCLI_LBUFFER="$line_before" SMCLI_FILES_QUERY="${cur#@}" "$_smcli_complete_bin" pick --files </dev/tty)
-                if (( $? == 10 )); then COMPREPLY=("$line"); else COMPREPLY=("$cur"); fi
+                local code=$?
+                if (( code == 12 )); then cd -- "$line"; fi
+                if (( code == 10 )); then COMPREPLY=("$line"); else COMPREPLY=("$cur"); fi
             fi
         }
         complete -o bashdefault -o default -o nospace -F _smcli_complete printf echo cd pushd z cat npm true 2>/dev/null || true
@@ -562,7 +603,8 @@ if [[ ${_smcli_installed-} != 1 ]]; then
         local exit_code=$1 pipe=$2 ended=${EPOCHREALTIME-}
         if [[ $_smcli_pending == 1 ]]; then
             _smcli_pending=0
-            export SMCLI_DB="${SMCLI_DB:-$HOME/.local/share/smcli/history.db}"
+            _smcli_state=\#(stateDir)
+            export SMCLI_DB="${SMCLI_DB:-$_smcli_state/history.db}"
             # Record in a disowned process so the prompt never waits; at exit, finish first.
             if [[ -n ${SMCLI_SYNC-} || ${3-} == exit ]]; then
                 _smcli_record "$exit_code" "$ended" "$pipe"
@@ -603,13 +645,23 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
         elif (( code == 10 )); then
             # A file or grep result: one quoted word, inserted at the cursor. Never run.
             LBUFFER+="$chosen "
+        elif (( code == 12 )); then
+            cd -- "$chosen"
         elif (( code == 11 )); then
             # Edit paths: rewrite the command with @ placeholders and open the file picker on the first one.
-            local before=${chosen%%$'\x1f'*} after=${chosen#*$'\x1f'} picked
+            local before=${chosen%%$'\x1f'*} after=${chosen#*$'\x1f'} picked original=$BUFFER point=$CURSOR
             BUFFER="$before@$after"
             CURSOR=$((${#before} + 1))
             picked=$(env SMCLI_SHELL=zsh SMCLI_LBUFFER="$before@" SMCLI_FILES_LINE="$before@$after" "$_smcli_pick_bin" pick --files </dev/tty)
-            (( $? == 10 )) || return
+            code=$?
+            if (( code == 12 )); then
+                BUFFER=$original
+                CURSOR=$point
+                cd -- "$picked"
+                zle reset-prompt
+                return
+            fi
+            (( code == 10 )) || return
             BUFFER="$before$picked$after"
             CURSOR=$((${#before} + ${#picked}))
         fi
@@ -685,7 +737,8 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
     # They also take Ctrl-O as DISCARD (flush output).
     (( \#(keyO) )) && [[ ${(j: :)_smcli_kept} != *'^O ('* ]] && stty discard undef 2>/dev/null
     # Told once per change, not in every new shell.
-    typeset _smcli_seen=${XDG_STATE_HOME:-$HOME/.local/state}/smcli/kept-keys-zsh _smcli_list=${(j:, :)${(u)_smcli_kept}}
+    typeset _smcli_state=\#(stateDir)
+    typeset _smcli_seen=$_smcli_state/kept-keys-zsh _smcli_list=${(j:, :)${(u)_smcli_kept}}
     if [[ $_smcli_list != "$(cat $_smcli_seen 2>/dev/null)" ]]; then
         (( $#_smcli_kept )) && print -u2 "smcli: kept existing key bindings: $_smcli_list (bindkey them to _smcli_pick to switch)."
         mkdir -p ${_smcli_seen:h} 2>/dev/null && print -rn -- $_smcli_list >| $_smcli_seen 2>/dev/null
@@ -759,7 +812,9 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
             # Several matches: pick one in the files picker, filtered by the word.
             local chosen
             chosen=$(env SMCLI_SHELL=zsh SMCLI_LBUFFER=$LBUFFER SMCLI_FILES_QUERY=${word#@} "$_smcli_complete_bin" pick --files </dev/tty)
-            (( $? == 10 )) && LBUFFER="${LBUFFER%$word}$chosen"
+            local code=$?
+            if (( code == 12 )); then cd -- "$chosen"
+            elif (( code == 10 )); then LBUFFER="${LBUFFER%$word}$chosen"; fi
             zle reset-prompt
         fi
     }
@@ -888,16 +943,28 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
         else if test $code -eq 10
             # A file or grep result: one quoted word, inserted at the cursor. Never run.
             commandline -i -- (string join \n -- $chosen | string collect)" "
+        else if test $code -eq 12
+            cd -- (string join \n -- $chosen | string collect)
         else if test $code -eq 11
             # Edit paths: rewrite the command with @ placeholders and open the file picker on the first one.
             set -l parts (string split \x1f --max 1 -- $chosen)
             set -l before $parts[1]
             set -l after $parts[2]
+            set -l original (commandline | string collect)
+            set -l point (commandline -C)
             commandline -r -- "$before@$after"
             commandline -C (math (string length -- $before) + 1)
             set -lx SMCLI_LBUFFER "$before@"
             set -l picked (SMCLI_SHELL=fish SMCLI_FILES_LINE="$before@$after" command $_smcli_bin pick --files </dev/tty)
-            test $status -eq 10; or return
+            set code $status
+            if test $code -eq 12
+                commandline -r -- "$original"
+                commandline -C $point
+                cd -- (string join \n -- $picked | string collect)
+                commandline -f repaint
+                return
+            end
+            test $code -eq 10; or return
             commandline -r -- "$before$picked$after"
             commandline -C (math (string length -- $before) + (string length -- $picked))
         end
@@ -963,7 +1030,7 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
         _smcli_bind \eOD _smcli_pick_left
     end
     # Told once per change, not in every new shell.
-    set -l _smcli_seen (set -q XDG_STATE_HOME; and echo $XDG_STATE_HOME; or echo $HOME/.local/state)/smcli/kept-keys-fish
+    set -l _smcli_seen \#(fishStateDir)/kept-keys-fish
     if test "$_smcli_kept" != "$(cat $_smcli_seen 2>/dev/null)"
         test (count $_smcli_kept) -eq 0; or echo "smcli: kept existing key bindings: $_smcli_kept (bind them to _smcli_pick to switch)." >&2
         mkdir -p (dirname $_smcli_seen) 2>/dev/null; and printf '%s' "$_smcli_kept" > $_smcli_seen 2>/dev/null
@@ -1008,7 +1075,12 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
                 # Several matches: pick one in the files picker, filtered by the word.
                 set -l before (commandline -c | string collect)
                 set -l chosen (env SMCLI_SHELL=fish SMCLI_LBUFFER=$before SMCLI_FILES_QUERY=(string sub -s 2 -- $token) $_smcli_complete_bin pick --files </dev/tty)
-                test $status -eq 10; and commandline -t -- (string join \n -- $chosen | string collect)
+                set -l code $status
+                if test $code -eq 12
+                    cd -- (string join \n -- $chosen | string collect)
+                else if test $code -eq 10
+                    commandline -t -- (string join \n -- $chosen | string collect)
+                end
                 commandline -f repaint
             end
         else
@@ -1033,6 +1105,11 @@ end"###
         .replace(r"\#(keyO)", if ctrl_o { "1" } else { "0" })
         .replace(r"\#(keyUp)", if up { "1" } else { "0" })
         .replace(
+            r"\#(fishStateDir)",
+            &crate::shell_quoting::quote(&state, "fish"),
+        )
+        .replace(r"\#(stateDir)", &crate::shell_quoting::quote(&state, shell))
+        .replace(
             if shell == "fish" {
                 r"\#(fishBinary)"
             } else {
@@ -1049,7 +1126,9 @@ mod tests {
     #[test]
     fn at_completion_hooks_call_smcli_complete() {
         for shell in ["bash", "zsh", "fish"] {
-            let hooks = render_with_keys(shell, "smcli", true, false, false, false, false, true, true).unwrap();
+            let hooks =
+                render_with_keys(shell, "smcli", true, false, false, false, false, true, true)
+                    .unwrap();
             assert!(hooks.contains("complete --word"), "{shell}");
             assert!(hooks.contains("_smcli_complete"), "{shell}");
             assert!(hooks.contains("SMCLI_NO_KEYS"), "{shell}");
@@ -1059,48 +1138,144 @@ mod tests {
     #[test]
     fn tldr_cursor_lands_on_first_bare_at() {
         for shell in ["bash", "zsh"] {
-            let hooks = render_with_keys(shell, "smcli", true, false, false, false, false, true, true).unwrap();
+            let hooks =
+                render_with_keys(shell, "smcli", true, false, false, false, false, true, true)
+                    .unwrap();
             let start = hooks.find("_smcli_bare_at() {").unwrap();
             let func = &hooks[start..start + hooks[start..].find("\n    }\n").unwrap() + 6];
-            let script = format!("{func}\nfor l in 'npm i @scope/pkg @' 'tar -xf @ -C @' 'ls'; do _smcli_bare_at \"$l\"; echo $_smcli_at; done");
-            let Ok(out) = std::process::Command::new(shell).arg("-c").arg(&script).output() else { continue };
-            assert_eq!(String::from_utf8_lossy(&out.stdout), "17\n8\n2\n", "{shell}");
+            let script = format!(
+                "{func}\nfor l in 'npm i @scope/pkg @' 'tar -xf @ -C @' 'ls'; do _smcli_bare_at \"$l\"; echo $_smcli_at; done"
+            );
+            let Ok(out) = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(&script)
+                .output()
+            else {
+                continue;
+            };
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                "17\n8\n2\n",
+                "{shell}"
+            );
         }
     }
 
     #[test]
     fn tldr_double_at_check_precedes_every_at_branch() {
         for shell in ["bash", "zsh", "fish"] {
-            let hooks = render_with_keys(shell, "smcli", true, false, false, false, false, true, true).unwrap();
+            let hooks =
+                render_with_keys(shell, "smcli", true, false, false, false, false, true, true)
+                    .unwrap();
             assert!(hooks.contains("pick --tldr"), "{shell} missing pick --tldr");
-            assert!(hooks.contains("SMCLI_TLDR_QUERY"), "{shell} missing the prefilled query");
-            assert!(hooks.contains("SMCLI_LBUFFER"), "{shell} missing SMCLI_LBUFFER");
+            assert!(
+                hooks.contains("SMCLI_TLDR_QUERY"),
+                "{shell} missing the prefilled query"
+            );
+            assert!(
+                hooks.contains("SMCLI_LBUFFER"),
+                "{shell} missing SMCLI_LBUFFER"
+            );
         }
-        let bash = render_with_keys("bash", "smcli", true, false, false, false, false, true, true).unwrap();
+        let bash = render_with_keys(
+            "bash", "smcli", true, false, false, false, false, true, true,
+        )
+        .unwrap();
         // Both bash completion paths (@ entry points) check @@ first; only the modern one can rewrite the line.
-        assert_eq!(bash.matches("_smcli_tldr_split \"").count(), 2, "bash has two @ completion paths");
+        assert_eq!(
+            bash.matches("_smcli_tldr_split \"").count(),
+            2,
+            "bash has two @ completion paths"
+        );
         for at in bash.match_indices("== @*") {
-            assert!(bash[..at.0].contains("_smcli_tldr_split"), "an @ branch runs before the @@ check");
+            assert!(
+                bash[..at.0].contains("_smcli_tldr_split"),
+                "an @ branch runs before the @@ check"
+            );
         }
-        let zsh = render_with_keys("zsh", "smcli", true, false, false, false, false, true, true).unwrap();
-        assert!(zsh.find("pick --tldr").unwrap() < zsh.find("!= @*").unwrap(), "zsh @ branch runs first");
-        let fish = render_with_keys("fish", "smcli", true, false, false, false, false, true, true).unwrap();
-        assert!(fish.find("pick --tldr").unwrap() < fish.find("'@*'").unwrap(), "fish @ branch runs first");
+        let zsh =
+            render_with_keys("zsh", "smcli", true, false, false, false, false, true, true).unwrap();
+        assert!(
+            zsh.find("pick --tldr").unwrap() < zsh.find("!= @*").unwrap(),
+            "zsh @ branch runs first"
+        );
+        let fish = render_with_keys(
+            "fish", "smcli", true, false, false, false, false, true, true,
+        )
+        .unwrap();
+        assert!(
+            fish.find("pick --tldr").unwrap() < fish.find("'@*'").unwrap(),
+            "fish @ branch runs first"
+        );
     }
 
     #[test]
     fn record_hooks_pass_optional_expanded_flag() {
         for shell in ["bash", "zsh", "fish"] {
-            let hooks = render_with_keys(shell, "smcli", true, false, false, false, false, true, true).unwrap();
+            let hooks =
+                render_with_keys(shell, "smcli", true, false, false, false, false, true, true)
+                    .unwrap();
             assert!(hooks.contains("--expanded"), "{shell} missing --expanded");
             assert!(hooks.contains("8192"), "{shell} missing the 8192-byte gate");
         }
-        let bash = render_with_keys("bash", "smcli", true, false, false, false, false, true, true).unwrap();
+        let bash = render_with_keys(
+            "bash", "smcli", true, false, false, false, false, true, true,
+        )
+        .unwrap();
         assert!(bash.contains("BASH_ALIASES") && bash.contains("alias --"));
-        let zsh = render_with_keys("zsh", "smcli", true, false, false, false, false, true, true).unwrap();
+        let zsh =
+            render_with_keys("zsh", "smcli", true, false, false, false, false, true, true).unwrap();
         assert!(zsh.contains("_smcli_executed=$3") && zsh.contains("_smcli_alias \"$1\" \"$3\""));
-        let fish = render_with_keys("fish", "smcli", true, false, false, false, false, true, true).unwrap();
+        let fish = render_with_keys(
+            "fish", "smcli", true, false, false, false, false, true, true,
+        )
+        .unwrap();
         assert!(fish.contains("[$]argv") && !fish.contains("abbr -"));
+    }
+
+    #[test]
+    fn shell_init_state_dir_from_env() {
+        let home = std::path::Path::new("/h");
+        let lit = |v: &str| {
+            let env = [("XDG_STATE_HOME".to_string(), v.to_string())].into();
+            render_in("zsh", "smcli", &state_literal(home, &env), [true; 7]).unwrap()
+        };
+        assert!(lit("rel").contains("/h/.local/state/smcli"));
+        assert!(lit("/x/st").contains("/x/st/smcli"));
+    }
+
+    #[test]
+    fn state_dir_literal_follows_xdg_rule_and_is_quoted() {
+        use smcli_core::paths::Xdg;
+        let home = std::path::Path::new("/h");
+        let dir = |v: &str| {
+            let env = [("XDG_STATE_HOME".to_string(), v.to_string())].into();
+            Xdg::State
+                .dir(home, &env)
+                .join("smcli")
+                .to_string_lossy()
+                .into_owned()
+        };
+        for shell in ["bash", "zsh", "fish"] {
+            let k = [true; 7];
+            let rel = render_in(shell, "smcli", &dir("state"), k).unwrap();
+            assert!(
+                rel.contains("/h/.local/state/smcli") && !rel.contains("XDG_STATE_HOME"),
+                "{shell}"
+            );
+            let abs = render_in(shell, "smcli", &dir("/x/st"), k).unwrap();
+            assert!(
+                abs.contains("/x/st/smcli") && !abs.contains(".local/state"),
+                "{shell}"
+            );
+            let odd = render_in(shell, "smcli", &dir("/a b/it's"), k).unwrap();
+            let want = if shell == "fish" {
+                "'/a b/it\\'s/smcli'"
+            } else {
+                "'/a b/it'\\''s/smcli'"
+            };
+            assert!(odd.contains(want), "{shell}");
+        }
     }
 
     #[test]
@@ -1116,7 +1291,8 @@ mod tests {
                 .unwrap()
                 .contains("set -g _smcli_bin 'a\\'\\\\b\\\\#(keyR)'")
         );
-        let hooks = render_with_keys("zsh", "smcli", false, true, false, false, false, true, true).unwrap();
+        let hooks =
+            render_with_keys("zsh", "smcli", false, true, false, false, false, true, true).unwrap();
         assert!(hooks.contains("(( 0 )) && _smcli_bind $_smcli_keymap '^R'"));
         assert!(hooks.contains("|| (( 1 )); then"));
         assert!(render_config("unknown", path, &SmcliConfig::default()).is_err());
@@ -1124,7 +1300,8 @@ mod tests {
 
     #[test]
     fn empty_prompt_arrows_open_history_and_suggestions() {
-        let bash = render_with_keys("bash", "smcli", true, true, true, true, true, true, true).unwrap();
+        let bash =
+            render_with_keys("bash", "smcli", true, true, true, true, true, true, true).unwrap();
         assert!(bash.contains("(( 1 )) && _smcli_bind '\\C-r' _smcli_pick "));
         assert!(bash.contains("if (( 1 )); then\n        _smcli_bind '\\C-t' _smcli_pick_files"));
         assert!(bash.contains("if [[ -z $READLINE_LINE ]]; then _smcli_pick\n"));
@@ -1136,68 +1313,179 @@ mod tests {
         assert!(!bash.contains("#(key"));
         assert!(!bash.contains("ight)"));
 
-        let zsh = render_with_keys("zsh", "smcli", true, true, true, true, true, true, true).unwrap();
+        let zsh =
+            render_with_keys("zsh", "smcli", true, true, true, true, true, true, true).unwrap();
         assert!(zsh.contains("(( 1 )) && _smcli_bind $_smcli_keymap '^R' _smcli_pick "));
         assert!(zsh.contains("(( 1 )) && _smcli_bind $_smcli_keymap '^T' _smcli_pick_files"));
         assert!(zsh.contains("if [[ -z $BUFFER ]]; then _smcli_pick; else zle backward-char; fi"));
-        assert!(zsh.contains("if [[ -z $BUFFER ]]; then _smcli_pick --suggest; else zle forward-char; fi"));
-        assert!(zsh.contains("|| (( 1 )); then\n            _smcli_bind $_smcli_keymap '^[[D' _smcli_pick_left"));
-        assert!(zsh.contains("|| (( 1 )); then\n            _smcli_bind $_smcli_keymap '^[[C' _smcli_pick_right"));
+        assert!(zsh.contains(
+            "if [[ -z $BUFFER ]]; then _smcli_pick --suggest; else zle forward-char; fi"
+        ));
+        assert!(zsh.contains(
+            "|| (( 1 )); then\n            _smcli_bind $_smcli_keymap '^[[D' _smcli_pick_left"
+        ));
+        assert!(zsh.contains(
+            "|| (( 1 )); then\n            _smcli_bind $_smcli_keymap '^[[C' _smcli_pick_right"
+        ));
         assert!(zsh.contains("'backward-char|vi-backward-char'"));
         assert!(zsh.contains("'forward-char|vi-forward-char'"));
 
-        let off = render_with_keys("zsh", "smcli", true, false, false, true, true, true, true).unwrap();
+        let off =
+            render_with_keys("zsh", "smcli", true, false, false, true, true, true, true).unwrap();
         assert!(off.contains("(( 1 )) && _smcli_bind $_smcli_keymap '^R'"));
         assert!(off.contains("(( 1 )) && _smcli_bind $_smcli_keymap '^T'"));
         assert!(off.contains("|| (( 0 )); then\n            _smcli_bind $_smcli_keymap '^[[D'"));
         assert!(off.contains("|| (( 0 )); then\n            _smcli_bind $_smcli_keymap '^[[C'"));
 
-        let right_only = render_with_keys("bash", "smcli", false, false, true, false, false, true, true).unwrap();
+        let right_only = render_with_keys(
+            "bash", "smcli", false, false, true, false, false, true, true,
+        )
+        .unwrap();
         assert!(right_only.contains("(( 0 )) && _smcli_bind '\\C-r'"));
-        assert!(right_only.contains("if (( 0 )); then\n        _smcli_bind '\\C-t' _smcli_pick_files"));
+        assert!(
+            right_only.contains("if (( 0 )); then\n        _smcli_bind '\\C-t' _smcli_pick_files")
+        );
         assert!(right_only.contains("|| (( 0 )); then\n        _smcli_bind '\\e[D'"));
         assert!(right_only.contains("|| (( 1 )); then\n        _smcli_bind '\\e[C'"));
 
-        let fish = render_with_keys("fish", "smcli", true, true, true, true, true, true, true).unwrap();
+        let fish =
+            render_with_keys("fish", "smcli", true, true, true, true, true, true, true).unwrap();
         assert!(fish.contains("test 1 = 1; and _smcli_bind \\cr _smcli_pick"));
         assert!(fish.contains("test 1 = 1; and _smcli_bind \\ct _smcli_pick_files"));
         assert!(!fish.contains("_smcli_pick_right"));
         assert!(!fish.contains("--suggest"));
-        assert!(fish.contains("_smcli_pick\n        else\n            commandline -f backward-char"));
+        assert!(
+            fish.contains("_smcli_pick\n        else\n            commandline -f backward-char")
+        );
     }
 
     #[test]
     fn legacy_left_key_still_binds_right_suggestions() {
         // Pre-`rightKey` configs used `leftKey` for directory suggestions on an empty line.
-        let legacy = SmcliConfig { ctrl_r_key: Some(true), left_key: Some(true), ..Default::default() };
+        let legacy = SmcliConfig {
+            ctrl_r_key: Some(true),
+            left_key: Some(true),
+            ..Default::default()
+        };
         let zsh = render_config("zsh", "smcli", &legacy).unwrap();
         assert!(zsh.contains("if [[ -z $BUFFER ]]; then _smcli_pick; else zle backward-char; fi"));
-        assert!(zsh.contains("if [[ -z $BUFFER ]]; then _smcli_pick --suggest; else zle forward-char; fi"));
-        assert!(zsh.contains("|| (( 1 )); then\n            _smcli_bind $_smcli_keymap '^[[C' _smcli_pick_right"));
+        assert!(zsh.contains(
+            "if [[ -z $BUFFER ]]; then _smcli_pick --suggest; else zle forward-char; fi"
+        ));
+        assert!(zsh.contains(
+            "|| (( 1 )); then\n            _smcli_bind $_smcli_keymap '^[[C' _smcli_pick_right"
+        ));
 
         // An explicit `rightKey: false` still wins over the legacy fallback.
-        let off = SmcliConfig { left_key: Some(true), right_key: Some(false), ..Default::default() };
+        let off = SmcliConfig {
+            left_key: Some(true),
+            right_key: Some(false),
+            ..Default::default()
+        };
         let zsh = render_config("zsh", "smcli", &off).unwrap();
-        assert!(zsh.contains("|| (( 0 )); then\n            _smcli_bind $_smcli_keymap '^[[C' _smcli_pick_right"));
+        assert!(zsh.contains(
+            "|| (( 0 )); then\n            _smcli_bind $_smcli_keymap '^[[C' _smcli_pick_right"
+        ));
+    }
+
+    #[test]
+    fn shell_init_picker_jump_changes_directory_without_editing_line() {
+        for shell in ["bash", "zsh", "fish"] {
+            let hooks =
+                render_with_keys(shell, "smcli", true, false, false, false, false, true, true)
+                    .unwrap();
+            let (start, end, body) = if shell == "fish" {
+                (
+                    "else if test $code -eq 12\n",
+                    "        else if test $code -eq 11",
+                    "            cd -- (string join \\n -- $chosen | string collect)\n",
+                )
+            } else {
+                (
+                    "elif (( code == 12 )); then\n",
+                    "        elif (( code == 11 )); then",
+                    "            cd -- \"$chosen\"\n",
+                )
+            };
+            let branch = hooks
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
+            assert_eq!(
+                branch, body,
+                "{shell} jump must leave the command line and cursor alone"
+            );
+            if shell == "zsh" {
+                assert!(hooks.contains("        zle reset-prompt"));
+            }
+            if shell == "fish" {
+                assert!(hooks.contains("        commandline -f repaint"));
+            }
+        }
+    }
+
+    #[test]
+    fn shell_init_picker_jump_handles_completion_and_restores_edit_paths() {
+        let render = |shell| {
+            render_with_keys(shell, "smcli", true, false, false, false, false, true, true).unwrap()
+        };
+        let bash = render("bash");
+        assert!(bash.contains("original=$READLINE_LINE point=$READLINE_POINT"));
+        assert!(bash.contains("if (( code == 12 )); then cd -- \"$line\"; fi\n                if (( code == 10 )); then COMPREPLY=(\"$line\"); else COMPREPLY=(\"$cur\"); fi"));
+        assert!(bash.contains("READLINE_LINE=$original\n                READLINE_POINT=$point\n                cd -- \"$picked\""));
+        assert!(bash.contains("if (( code == 12 )); then cd -- \"$hit\"; fi\n                    (( code == 10 )) || hit="));
+        assert!(bash.contains("bind '\"\\e[0n\": redraw-current-line'"));
+        let zsh = render("zsh");
+        assert!(zsh.contains("original=$BUFFER point=$CURSOR"));
+        assert!(zsh.contains("BUFFER=$original\n                CURSOR=$point\n                cd -- \"$picked\"\n                zle reset-prompt"));
+        assert!(zsh.contains("if (( code == 12 )); then cd -- \"$chosen\"\n            elif (( code == 10 )); then LBUFFER=\"${LBUFFER%$word}$chosen\"; fi\n            zle reset-prompt"));
+        let fish = render("fish");
+        assert!(fish.contains("set -l original (commandline | string collect)\n            set -l point (commandline -C)"));
+        assert!(fish.contains("commandline -r -- \"$original\"\n                commandline -C $point\n                cd -- (string join \\n -- $picked | string collect)\n                commandline -f repaint"));
+        assert!(fish.contains("if test $code -eq 12\n                    cd -- (string join \\n -- $chosen | string collect)\n                else if test $code -eq 10"));
     }
 
     #[test]
     fn edit_paths_branch_runs_file_picker_on_first_placeholder() {
         for shell in ["bash", "zsh", "fish"] {
-            let hooks = render_with_keys(shell, "smcli", true, false, false, false, false, true, true).unwrap();
-            assert!(hooks.contains("code == 11") || hooks.contains("$code -eq 11"), "{shell} missing exit-11 branch");
-            assert!(hooks.contains("pick --files"), "{shell} missing file picker call");
-            assert!(hooks.contains("SMCLI_FILES_LINE="), "{shell} missing edit header");
-            assert!(!hooks.contains("SMCLI_FILES_DIRS"), "{shell} duplicates the start filter decision");
+            let hooks =
+                render_with_keys(shell, "smcli", true, false, false, false, false, true, true)
+                    .unwrap();
+            assert!(
+                hooks.contains("code == 11") || hooks.contains("$code -eq 11"),
+                "{shell} missing exit-11 branch"
+            );
+            assert!(
+                hooks.contains("pick --files"),
+                "{shell} missing file picker call"
+            );
+            assert!(
+                hooks.contains("SMCLI_FILES_LINE="),
+                "{shell} missing edit header"
+            );
+            assert!(
+                !hooks.contains("SMCLI_FILES_DIRS"),
+                "{shell} duplicates the start filter decision"
+            );
         }
-        let bash = render_with_keys("bash", "smcli", true, false, false, false, false, true, true).unwrap();
+        let bash = render_with_keys(
+            "bash", "smcli", true, false, false, false, false, true, true,
+        )
+        .unwrap();
         assert!(bash.contains("READLINE_LINE=\"$before@$after\""));
         assert!(bash.contains("SMCLI_LBUFFER=\"$before@\""));
         assert!(bash.contains("READLINE_LINE=\"$before$picked$after\""));
-        let zsh = render_with_keys("zsh", "smcli", true, false, false, false, false, true, true).unwrap();
+        let zsh =
+            render_with_keys("zsh", "smcli", true, false, false, false, false, true, true).unwrap();
         assert!(zsh.contains("BUFFER=\"$before@$after\""));
         assert!(zsh.contains("BUFFER=\"$before$picked$after\""));
-        let fish = render_with_keys("fish", "smcli", true, false, false, false, false, true, true).unwrap();
+        let fish = render_with_keys(
+            "fish", "smcli", true, false, false, false, false, true, true,
+        )
+        .unwrap();
         assert!(fish.contains("commandline -r -- \"$before@$after\""));
         assert!(fish.contains("commandline -r -- \"$before$picked$after\""));
     }
@@ -1205,23 +1493,52 @@ mod tests {
     #[test]
     fn ctrl_o_renders_bind() {
         for shell in ["bash", "zsh", "fish"] {
-            let on = render_with_keys(shell, "smcli", false, false, false, false, false, false, true).unwrap();
+            let on = render_with_keys(
+                shell, "smcli", false, false, false, false, false, false, true,
+            )
+            .unwrap();
             assert!(!on.contains("#(key"), "{shell} left a placeholder");
-            assert!(on.contains("_smcli_pick_commands") && on.contains("pick --tldr") && on.contains("SMCLI_TLDR_QUERY=\"\""), "{shell}");
+            assert!(
+                on.contains("_smcli_pick_commands")
+                    && on.contains("pick --tldr")
+                    && on.contains("SMCLI_TLDR_QUERY=\"\""),
+                "{shell}"
+            );
             assert!(on.contains("stty discard undef"), "{shell}");
         }
-        let bash_on = render_with_keys("bash", "smcli", false, false, false, false, false, false, true).unwrap();
+        let bash_on = render_with_keys(
+            "bash", "smcli", false, false, false, false, false, false, true,
+        )
+        .unwrap();
         assert!(bash_on.contains("if (( 1 )); then\n        _smcli_bind '\\C-o' _smcli_pick_commands operate-and-get-next"));
         assert!(bash_on.contains("READLINE_LINE:0:READLINE_POINT"));
-        let zsh_on = render_with_keys("zsh", "smcli", false, false, false, false, false, false, true).unwrap();
+        let zsh_on = render_with_keys(
+            "zsh", "smcli", false, false, false, false, false, false, true,
+        )
+        .unwrap();
         assert!(zsh_on.contains("(( 1 )) && _smcli_bind $_smcli_keymap '^O' _smcli_pick_commands"));
         assert!(zsh_on.contains("SMCLI_LBUFFER=\"$LBUFFER\""));
-        let fish_on = render_with_keys("fish", "smcli", false, false, false, false, false, false, true).unwrap();
+        let fish_on = render_with_keys(
+            "fish", "smcli", false, false, false, false, false, false, true,
+        )
+        .unwrap();
         assert!(fish_on.contains("if test 1 = 1\n        _smcli_bind \\co _smcli_pick_commands"));
         assert!(fish_on.contains("commandline -c"));
-        let off = SmcliConfig { ctrl_o_key: Some(false), ..Default::default() };
-        assert!(render_config("zsh", "smcli", &off).unwrap().contains("(( 0 )) && _smcli_bind $_smcli_keymap '^O'"));
-        assert!(render_config("bash", "smcli", &SmcliConfig::default()).unwrap().contains("if (( 1 )); then\n        _smcli_bind '\\C-o'"), "unset ctrlOKey stays on");
+        let off = SmcliConfig {
+            ctrl_o_key: Some(false),
+            ..Default::default()
+        };
+        assert!(
+            render_config("zsh", "smcli", &off)
+                .unwrap()
+                .contains("(( 0 )) && _smcli_bind $_smcli_keymap '^O'")
+        );
+        assert!(
+            render_config("bash", "smcli", &SmcliConfig::default())
+                .unwrap()
+                .contains("if (( 1 )); then\n        _smcli_bind '\\C-o'"),
+            "unset ctrlOKey stays on"
+        );
 
         for (shell, hooks) in [("bash", &bash_on), ("zsh", &zsh_on), ("fish", &fish_on)] {
             let parsed = std::process::Command::new(shell)
@@ -1234,7 +1551,11 @@ mod tests {
             std::io::Write::write_all(child.stdin.as_mut().unwrap(), hooks.as_bytes()).unwrap();
             drop(child.stdin.take());
             let out = child.wait_with_output().unwrap();
-            assert!(out.status.success(), "{shell} hook syntax: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{shell} hook syntax: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
     }
 }

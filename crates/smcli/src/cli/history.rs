@@ -7,8 +7,8 @@ use smcli_core::config::{CaptureFilter, SmcliConfig};
 use smcli_core::history::{CapturedHistory, NewRun, parse_pipestatus};
 use smcli_core::service_client::ServiceClient;
 use smcli_core::service_protocol::{Operation, ServiceRequest};
-use smcli_search::setup::index_directory;
 use smcli_core::time::now;
+use smcli_search::setup::index_directory;
 
 use super::print_json;
 
@@ -35,11 +35,7 @@ pub(super) fn record(
         if filter.allows_run(&f[3], expanded, &f[1]) {
             let mut run = NewRun::new(&f[3], &f[0], &f[1], f[2].parse()?);
             run.expanded_command = expanded;
-            captured.append(
-                &run,
-                &f[4],
-                None,
-            )?;
+            captured.append(&run, &f[4], None)?;
         }
         return Ok(());
     }
@@ -135,26 +131,43 @@ pub(super) fn prune(c: &CapturedHistory, filter: &CaptureFilter, dry: bool) -> R
         return Ok(());
     }
     let directory = index_directory(c);
-    let _lock = if dry { None } else {
-        Some(smcli_search::index::lock_index_directory(&directory, u32::MAX)?
-            .ok_or_else(|| anyhow::anyhow!("Another smcli is updating the index."))?)
+    let _lock = if dry {
+        None
+    } else {
+        Some(
+            smcli_search::index::lock_index_directory(&directory, u32::MAX)?
+                .ok_or_else(|| anyhow::anyhow!("Another smcli is updating the index."))?,
+        )
     };
-    let pruned = c.prune(filter, dry, || smcli_search::index::remove_history_indexes(&directory));
+    let pruned = c.prune(filter, dry, || {
+        smcli_search::index::remove_history_indexes(&directory)
+    });
     let report = match pruned {
         Ok(report) => report,
         Err(error) => {
             if let Some(failed) = error.downcast_ref::<smcli_core::prune::PruneError>() {
-                println!("Removed {} commands and {} selections.", failed.removed_commands, failed.removed_selections);
+                println!(
+                    "Removed {} commands and {} selections.",
+                    failed.removed_commands, failed.removed_selections
+                );
                 warn_migration_backup(failed.backup.as_deref());
             }
             return Err(error);
         }
     };
     if dry {
-        for command in report.commands { println!("{command}"); }
-        println!("{} commands and {} selections would be removed.", report.removed_commands, report.removed_selections);
+        for command in report.commands {
+            println!("{command}");
+        }
+        println!(
+            "{} commands and {} selections would be removed.",
+            report.removed_commands, report.removed_selections
+        );
     } else {
-        println!("Removed {} commands and {} selections.", report.removed_commands, report.removed_selections);
+        println!(
+            "Removed {} commands and {} selections.",
+            report.removed_commands, report.removed_selections
+        );
         warn_migration_backup(report.backup.as_deref());
     }
     Ok(())
@@ -162,7 +175,10 @@ pub(super) fn prune(c: &CapturedHistory, filter: &CaptureFilter, dry: bool) -> R
 
 fn warn_migration_backup(backup: Option<&Path>) {
     if let Some(backup) = backup {
-        eprintln!("smcli: migration backup {} may still contain pruned history; remove it manually if no longer needed.", backup.display());
+        eprintln!(
+            "smcli: migration backup {} may still contain pruned history; remove it manually if no longer needed.",
+            backup.display()
+        );
     }
 }
 pub(super) fn import(
@@ -178,16 +194,18 @@ pub(super) fn import(
             .filter(|p| !p.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                env.get("XDG_DATA_HOME")
-                    .filter(|p| !p.is_empty())
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| home.join(".local/share"))
+                smcli_core::paths::Xdg::Data
+                    .dir(home, env)
                     .join("atuin/history.db")
             })
     });
-    let capture_filter = CaptureFilter::new(&SmcliConfig::load(&SmcliConfig::location(home, env))?)?;
-    let count = if atuin { c.import_atuin(&source, &capture_filter, replace)? }
-        else { c.import_legacy(&source, &capture_filter)? };
+    let capture_filter =
+        CaptureFilter::new(&SmcliConfig::load(&SmcliConfig::location(home, env))?)?;
+    let count = if atuin {
+        c.import_atuin(&source, &capture_filter, replace)?
+    } else {
+        c.import_legacy(&source, &capture_filter)?
+    };
     println!("Imported {count} records into {}.", c.path.display());
     Ok(())
 }
@@ -209,21 +227,44 @@ mod tests {
             INSERT INTO commands(session,started_at,directory,command,exit_code) VALUES('s',1,'/tmp','secret-cmd',0);")?;
         let engine = search_engine(&captured, &dir, &HashMap::new())?;
         let lock = engine.lock_index(1)?.unwrap();
-        let entries = HashMap::from([("secret-cmd".into(), SearchEntry::new("secret-cmd", 1, "captured"))]);
+        let entries = HashMap::from([(
+            "secret-cmd".into(),
+            SearchEntry::new("secret-cmd", 1, "captured"),
+        )]);
         let c = captured.clone();
         let (started, ready) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let filter = CaptureFilter::new(&SmcliConfig { history_filter: Some(vec!["^secret".into()]), ..Default::default() })?;
+            let filter = CaptureFilter::new(&SmcliConfig {
+                history_filter: Some(vec!["^secret".into()]),
+                ..Default::default()
+            })?;
             started.send(()).unwrap();
             prune(&c, &filter, false)
         });
         ready.recv()?;
-        engine.search_with_evidence_using_lock("secret", &entries, 1, &SearchFilter::default(), None,
-            &smcli_search::corpus::SearchSignals::default(), now(), None, Some(&lock))?;
-        assert_eq!(db.query_row("SELECT count(*) FROM commands", [], |r| r.get::<_, i64>(0))?, 1);
+        engine.search_with_evidence_using_lock(
+            "secret",
+            &entries,
+            1,
+            &SearchFilter::default(),
+            None,
+            &smcli_search::corpus::SearchSignals::default(),
+            now(),
+            None,
+            Some(&lock),
+        )?;
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM commands", [], |r| r.get::<_, i64>(0))?,
+            1
+        );
         drop(lock);
         worker.join().unwrap()?;
-        assert!(!std::fs::read_dir(&engine.directory)?.any(|e| e.unwrap().file_name().to_string_lossy().starts_with("rs-commands-v")));
+        assert!(!std::fs::read_dir(&engine.directory)?.any(|e| {
+            e.unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("rs-commands-v")
+        }));
         drop(db);
         std::fs::remove_dir_all(dir)?;
         Ok(())

@@ -7,7 +7,8 @@ pub const MAX_SHELL_PATH_BYTES: usize = 8_192;
 
 /// Oversized snapshots are unknown, never truncated into a different PATH.
 pub fn shell_path_snapshot(path: Option<&str>) -> Option<String> {
-    path.filter(|p| p.len() <= MAX_SHELL_PATH_BYTES && !p.contains('\0')).map(String::from)
+    path.filter(|p| p.len() <= MAX_SHELL_PATH_BYTES && !p.contains('\0'))
+        .map(String::from)
 }
 pub const MAX_MESSAGE_BYTES: usize = 1 << 20;
 pub const MAX_RESPONSE_BYTES: usize = 64 << 20;
@@ -560,8 +561,14 @@ mod numbers {
         value.serialize(s)
     }
 
-    pub fn optional_finite_embedding<S: Serializer>(value: &Option<Vec<f32>>, s: S) -> Result<S::Ok, S::Error> {
-        if value.as_ref().is_some_and(|values| values.iter().any(|v| !v.is_finite())) {
+    pub fn optional_finite_embedding<S: Serializer>(
+        value: &Option<Vec<f32>>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        if value
+            .as_ref()
+            .is_some_and(|values| values.iter().any(|v| !v.is_finite()))
+        {
             return Err(serde::ser::Error::custom("nonfinite embedding"));
         }
         value.serialize(s)

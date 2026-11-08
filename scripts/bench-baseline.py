@@ -215,7 +215,7 @@ def seed(binary, home, rows, service):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("SMCLI_", "XDG_", "OLLAMA_", "BASH_FUNC_"))
            and k not in ("HISTFILE", "BASH_ENV", "ENV", "ZDOTDIR")}
-    env.update(HOME=str(home), HISTFILE="", SMCLI_DB=str(home / "history.db"),
+    env.update(HOME=str(home), HISTFILE="", SMCLI_DB=str(home / ".local/state/test-db/history.db"),
                SMCLI_CONFIG=str(config), PWD=str(directory), TERM="dumb",
                XDG_DATA_HOME=str(home / "data"), XDG_CONFIG_HOME=str(home / "config"),
                SMCLI_SERVICE="1" if service else "0")
@@ -276,7 +276,7 @@ def repository_search(binary, files, samples):
             (repo / f"untracked{n}.txt").write_text("u")
         runtime = tempfile.mkdtemp(prefix="smcli-bench.", dir="/tmp")
         env = {k: v for k, v in os.environ.items() if not k.startswith(("SMCLI_", "XDG_"))}
-        env.update(HOME=str(home), SMCLI_DB=str(home / "history.db"), SMCLI_CONFIG=str(home / "config.json"),
+        env.update(HOME=str(home), SMCLI_DB=str(home / ".local/state/test-db/history.db"), SMCLI_CONFIG=str(home / "config.json"),
                    SMCLI_RUNTIME_DIR=runtime, SMCLI_SERVICE="1")
         (home / "config.json").write_text("{}\n")
         subprocess.run([binary, "service", "start"], env=env, check=True, capture_output=True, timeout=60)

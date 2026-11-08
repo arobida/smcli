@@ -123,11 +123,11 @@ impl ContextCache {
                 .iter()
                 .min_by_key(|(_, e)| e.touched)
                 .map(|(r, _)| r.clone())
-            {
-                state.entries.remove(&oldest);
-            }
+        {
+            state.entries.remove(&oldest);
+        }
         state.generation += 1;
-            let watcher = {
+        let watcher = {
             let root = repository.root.clone();
             let weak = Arc::downgrade(&self.inner);
             let mut paths = vec![root.clone()];
@@ -157,7 +157,7 @@ impl ContextCache {
                 started: None,
                 touched: Instant::now(),
                 generation: state.generation,
-                            _watcher: watcher,
+                _watcher: watcher,
             },
         );
     }
@@ -216,15 +216,18 @@ mod watcher {
 
     impl FileWatcher {
         pub(super) fn new(paths: &[String], handler: Handler) -> Option<Self> {
-            let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                // inotify also reports opens and reads, and discovery itself reads `.git/HEAD`: only changes count.
-                if event.is_ok_and(|e| !matches!(e.kind, notify::EventKind::Access(_))) {
-                    handler();
-                }
-            })
-            .ok()?;
+            let mut watcher =
+                notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                    // inotify also reports opens and reads, and discovery itself reads `.git/HEAD`: only changes count.
+                    if event.is_ok_and(|e| !matches!(e.kind, notify::EventKind::Access(_))) {
+                        handler();
+                    }
+                })
+                .ok()?;
             for path in paths {
-                watcher.watch(Path::new(path), RecursiveMode::Recursive).ok()?;
+                watcher
+                    .watch(Path::new(path), RecursiveMode::Recursive)
+                    .ok()?;
             }
             Some(Self(watcher))
         }
@@ -278,8 +281,16 @@ mod tests {
         );
         let (context_tx, context_rx) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
-            scope.spawn(|| context_tx.send(cache.context(directory).status_pending).unwrap());
-            assert!(context_rx.recv_timeout(Duration::from_secs(10)).expect("context discovery blocked"));
+            scope.spawn(|| {
+                context_tx
+                    .send(cache.context(directory).status_pending)
+                    .unwrap()
+            });
+            assert!(
+                context_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("context discovery blocked")
+            );
         });
         release_tx.send(()).unwrap();
         let context = wait(&cache, directory);
@@ -414,6 +425,4 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-
-
 }

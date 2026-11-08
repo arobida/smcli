@@ -47,7 +47,9 @@ impl HistoryFile {
         let text = String::from_utf8_lossy(&bytes);
         let mut lines: Vec<String> = text.split('\n').map(String::from).collect();
         if self.shell == Shell::Bash {
-            lines.retain(|l| !(l.len() > 1 && l.starts_with('#') && l[1..].bytes().all(|b| b.is_ascii_digit())));
+            lines.retain(|l| {
+                !(l.len() > 1 && l.starts_with('#') && l[1..].bytes().all(|b| b.is_ascii_digit()))
+            });
         } else {
             let mut continued = false;
             let count = lines.len();
@@ -73,8 +75,14 @@ fn unquote_fish(command: &str) -> String {
     let mut chars = command.chars();
     while let Some(c) = chars.next() {
         match (c, chars.clone().next()) {
-            ('\\', Some('\\')) => { out.push('\\'); chars.next(); }
-            ('\\', Some('n')) => { out.push('\n'); chars.next(); }
+            ('\\', Some('\\')) => {
+                out.push('\\');
+                chars.next();
+            }
+            ('\\', Some('n')) => {
+                out.push('\n');
+                chars.next();
+            }
             _ => out.push(c),
         }
     }
@@ -83,7 +91,9 @@ fn unquote_fish(command: &str) -> String {
 
 /// Removes zsh's `: <start>:<elapsed>;` extended-history prefix.
 fn strip_extended_prefix(line: &str) -> &str {
-    let Some(rest) = line.strip_prefix(": ") else { return line };
+    let Some(rest) = line.strip_prefix(": ") else {
+        return line;
+    };
     let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
     let first = digits(rest);
     if first == 0 || rest.as_bytes().get(first) != Some(&b':') {
@@ -97,7 +107,10 @@ fn strip_extended_prefix(line: &str) -> &str {
     &rest[second + 1..]
 }
 
-pub fn history_files(home: &Path, environment: &HashMap<String, String>) -> Result<Vec<HistoryFile>> {
+pub fn history_files(
+    home: &Path,
+    environment: &HashMap<String, String>,
+) -> Result<Vec<HistoryFile>> {
     let mut files = vec![];
     for (name, shell) in [("bash", Shell::Bash), ("zsh", Shell::Zsh)] {
         let file = home.join(format!(".{name}_history"));
@@ -106,26 +119,49 @@ pub fn history_files(home: &Path, environment: &HashMap<String, String>) -> Resu
         }
         let sessions = home.join(format!(".{name}_sessions"));
         if sessions.is_dir() {
-            let Ok(entries) = std::fs::read_dir(&sessions) else { continue };
-            let mut entries: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+            let Ok(entries) = std::fs::read_dir(&sessions) else {
+                continue;
+            };
+            let mut entries: Vec<PathBuf> =
+                entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
             entries.sort_by_key(|p| p.file_name().map(|n| n.to_os_string()));
             for entry in entries {
-                if matches!(entry.extension().and_then(|e| e.to_str()), Some("history" | "historynew")) {
+                if matches!(
+                    entry.extension().and_then(|e| e.to_str()),
+                    Some("history" | "historynew")
+                ) {
                     files.push(HistoryFile { path: entry, shell });
                 }
             }
         }
     }
-    let fish = home.join(".local/share/fish/fish_history");
+    // fish keeps history under its XDG data dir.
+    let fish = smcli_core::paths::Xdg::Data
+        .dir(home, environment)
+        .join("fish/fish_history");
     if fish.is_file() {
-        files.push(HistoryFile { path: fish, shell: Shell::Fish });
+        files.push(HistoryFile {
+            path: fish,
+            shell: Shell::Fish,
+        });
     }
     if let Some(path) = environment.get("HISTFILE").filter(|p| !p.is_empty()) {
-        let shell = if environment.get("SHELL").is_some_and(|s| s.ends_with("/bash")) { Shell::Bash } else { Shell::Zsh };
-        files.push(HistoryFile { path: PathBuf::from(path), shell });
+        let shell = if environment
+            .get("SHELL")
+            .is_some_and(|s| s.ends_with("/bash"))
+        {
+            Shell::Bash
+        } else {
+            Shell::Zsh
+        };
+        files.push(HistoryFile {
+            path: PathBuf::from(path),
+            shell,
+        });
     }
     let mut seen = HashSet::new();
-    files.retain(|f| seen.insert(std::fs::canonicalize(&f.path).unwrap_or_else(|_| f.path.clone())));
+    files
+        .retain(|f| seen.insert(std::fs::canonicalize(&f.path).unwrap_or_else(|_| f.path.clone())));
     Ok(files)
 }
 
@@ -174,7 +210,11 @@ mod tests {
         let bash = dir.path().join(".bash_history");
         std::fs::write(&bash, "#1700000000\nls -la\ngit status\n").unwrap();
         let zsh = dir.path().join(".zsh_history");
-        std::fs::write(&zsh, b": 1700000000:0;echo \\\nnext\n: 1700000001:2;caf\xc3\x83\x89\n".as_slice()).unwrap();
+        std::fs::write(
+            &zsh,
+            b": 1700000000:0;echo \\\nnext\n: 1700000001:2;caf\xc3\x83\x89\n".as_slice(),
+        )
+        .unwrap();
         let files = history_files(dir.path(), &HashMap::new()).unwrap();
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].read().unwrap(), "ls -la\ngit status\n");

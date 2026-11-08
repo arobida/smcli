@@ -18,13 +18,23 @@ use crate::{ModelId, Potion};
 const SYSTEM_DIRS: &[&str] = if cfg!(target_os = "macos") {
     &["/bin", "/sbin", "/usr/bin", "/usr/sbin"]
 } else {
-    &["/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin"]
+    &[
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+    ]
 };
 
 /// The index directory is private (0700), matching the history search index.
 fn create_private_dir(directory: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(directory)?;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)?;
     Ok(())
 }
 
@@ -40,8 +50,9 @@ pub fn os_programs(system_dirs: &[PathBuf], path: &str) -> HashSet<String> {
         .filter_map(|entry| entry.ok())
         .filter(|entry| {
             // Follows symlinks: macOS ships /usr/bin/tar -> bsdtar.
-            std::fs::metadata(entry.path())
-                .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+            std::fs::metadata(entry.path()).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
         })
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
@@ -68,7 +79,9 @@ fn sources_from(
     platform: &str,
     cheat_dir: Option<PathBuf>,
 ) -> Option<Vec<Box<dyn CommandSource>>> {
-    let mut sources: Vec<Box<dyn CommandSource>> = vec![Box::new(crate::tldr::TldrSource::new(tldr_dir, platform).ok()?)];
+    let mut sources: Vec<Box<dyn CommandSource>> = vec![Box::new(
+        crate::tldr::TldrSource::new(tldr_dir, platform).ok()?,
+    )];
     if let Some(dir) = cheat_dir {
         if let Ok(cheat) = crate::cheat::CheatSource::new(&dir) {
             sources.push(Box::new(cheat));
@@ -102,9 +115,17 @@ pub struct DescriptionMatch {
 
 /// Resolve tldr option alternations (`{{[-p|--patch]}}` -> `--patch`) and drop value placeholders.
 fn bridge_template(template: &str) -> String {
-    crate::tldr::to_placeholders(template).split_whitespace().filter(|word| {
-        !word.contains('@') && !word.contains("{{") && !word.contains("/path/to/") && !word.starts_with('<') && !word.ends_with('>')
-    }).collect::<Vec<_>>().join(" ")
+    crate::tldr::to_placeholders(template)
+        .split_whitespace()
+        .filter(|word| {
+            !word.contains('@')
+                && !word.contains("{{")
+                && !word.contains("/path/to/")
+                && !word.starts_with('<')
+                && !word.ends_with('>')
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The persistent index of command examples, one TalaDB file named
@@ -123,22 +144,37 @@ thread_local! {
 }
 
 impl CommandIndex {
-    pub fn new(directory: impl Into<PathBuf>, potion: Potion, sources: &[&dyn CommandSource]) -> Self {
+    pub fn new(
+        directory: impl Into<PathBuf>,
+        potion: Potion,
+        sources: &[&dyn CommandSource],
+    ) -> Self {
         let mut index = Self::reader(directory, potion.model_id(), sources);
         index.potion = Some(potion);
         index
     }
 
-    pub fn reader(directory: impl Into<PathBuf>, model: ModelId, sources: &[&dyn CommandSource]) -> Self {
+    pub fn reader(
+        directory: impl Into<PathBuf>,
+        model: ModelId,
+        sources: &[&dyn CommandSource],
+    ) -> Self {
         let sources = sources
             .iter()
             .map(|source| format!("{}@{}", source.name(), source.version()))
             .collect::<Vec<_>>();
-        Self { directory: directory.into(), model, potion: None, sources }
+        Self {
+            directory: directory.into(),
+            model,
+            potion: None,
+            sources,
+        }
     }
 
     fn writable(&self) -> Result<&Potion> {
-        self.potion.as_ref().ok_or_else(|| anyhow::anyhow!("command index is read-only here"))
+        self.potion
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("command index is read-only here"))
     }
 
     pub fn index_name(&self) -> String {
@@ -182,22 +218,45 @@ impl CommandIndex {
         if found.is_empty() {
             return Ok(None);
         }
-        found.sort_by(|a, b| a.description.cmp(&b.description).then_with(|| a.source.cmp(&b.source)));
+        found.sort_by(|a, b| {
+            a.description
+                .cmp(&b.description)
+                .then_with(|| a.source.cmp(&b.source))
+        });
         Ok(Some(found))
     }
 
     /// Best description matches, never building an absent index. Callers may silently skip errors.
-    pub fn description_matches(&self, vector: &[f32], k: usize, floor: f64) -> Result<Vec<DescriptionMatch>> {
-        if !self.path().is_file() { return Ok(Vec::new()); }
+    pub fn description_matches(
+        &self,
+        vector: &[f32],
+        k: usize,
+        floor: f64,
+    ) -> Result<Vec<DescriptionMatch>> {
+        if !self.path().is_file() {
+            return Ok(Vec::new());
+        }
         let db = taladb::open(self.path())?;
         let examples = db.typed::<IndexedExample>("examples")?;
-        Ok(examples.raw().find_nearest("embedding", vector, k, None)?.into_iter().filter_map(|hit| {
-            let similarity = f64::from(hit.score);
-            if similarity < floor { return None; }
-            let Some(taladb::Value::Str(template)) = hit.document.get("template") else { return None; };
-            let template = bridge_template(template);
-            (!template.is_empty()).then_some(DescriptionMatch { template, similarity })
-        }).collect())
+        Ok(examples
+            .raw()
+            .find_nearest("embedding", vector, k, None)?
+            .into_iter()
+            .filter_map(|hit| {
+                let similarity = f64::from(hit.score);
+                if similarity < floor {
+                    return None;
+                }
+                let Some(taladb::Value::Str(template)) = hit.document.get("template") else {
+                    return None;
+                };
+                let template = bridge_template(template);
+                (!template.is_empty()).then_some(DescriptionMatch {
+                    template,
+                    similarity,
+                })
+            })
+            .collect())
     }
 
     /// Every indexed example in one read, sorted like `examples`.
@@ -207,7 +266,12 @@ impl CommandIndex {
         }
         let db = self.open()?;
         let mut found = db.typed::<IndexedExample>("examples")?.find(json!({}))?;
-        found.sort_by(|a, b| a.program.cmp(&b.program).then_with(|| a.description.cmp(&b.description)).then_with(|| a.source.cmp(&b.source)));
+        found.sort_by(|a, b| {
+            a.program
+                .cmp(&b.program)
+                .then_with(|| a.description.cmp(&b.description))
+                .then_with(|| a.source.cmp(&b.source))
+        });
         Ok(found)
     }
 
@@ -218,18 +282,27 @@ impl CommandIndex {
             return Ok(());
         }
         let db = self.open()?;
-        db.typed::<IndexedExample>("examples")?.delete_many(json!({"program": program}))?;
+        db.typed::<IndexedExample>("examples")?
+            .delete_many(json!({"program": program}))?;
         Ok(())
     }
 
     /// Programs currently in the index.
     pub fn programs(&self) -> Result<HashSet<String>> {
-        Ok(self.all()?.into_iter().map(|example| example.program).collect())
+        Ok(self
+            .all()?
+            .into_iter()
+            .map(|example| example.program)
+            .collect())
     }
 
     /// Ask sources in priority order for `program`'s examples; the first source with any wins.
     /// `None` when no source has any. `platform` is forwarded for sources that keep a per-platform corpus.
-    pub fn gather(sources: &[&dyn CommandSource], program: &str, platform: &str) -> Option<Vec<CommandExample>> {
+    pub fn gather(
+        sources: &[&dyn CommandSource],
+        program: &str,
+        platform: &str,
+    ) -> Option<Vec<CommandExample>> {
         sources.iter().find_map(|source| {
             let examples = source.examples(program, platform);
             (!examples.is_empty()).then_some(examples)
@@ -255,8 +328,14 @@ impl CommandIndex {
         let _ = lock;
         let path = self.path();
         // A new index becomes visible only once its schema and rows have committed.
-        let target = if path.exists() { path.clone() } else { path.with_extension("building") };
-        if target != path && target.exists() { std::fs::remove_file(&target)?; }
+        let target = if path.exists() {
+            path.clone()
+        } else {
+            path.with_extension("building")
+        };
+        if target != path && target.exists() {
+            std::fs::remove_file(&target)?;
+        }
         let result = (|| -> Result<()> {
             let db = taladb::open(&target)?;
             let collection = self.collection(&db)?;
@@ -264,8 +343,17 @@ impl CommandIndex {
                 collection.delete_many(json!({"program": program}))?;
             }
             #[cfg(test)]
-            BEFORE_INSERT.with(|hook| { if let Some(hook) = hook.borrow_mut().take() { hook(); } });
-            let vectors = potion.embed(&examples.iter().map(|example| example.description.clone()).collect::<Vec<_>>());
+            BEFORE_INSERT.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
+            let vectors = potion.embed(
+                &examples
+                    .iter()
+                    .map(|example| example.description.clone())
+                    .collect::<Vec<_>>(),
+            );
             collection.insert_many(
                 &examples
                     .iter()
@@ -283,8 +371,11 @@ impl CommandIndex {
             Ok(())
         })();
         if target != path {
-            if result.is_ok() { std::fs::rename(&target, &path)?; }
-            else { let _ = std::fs::remove_file(&target); }
+            if result.is_ok() {
+                std::fs::rename(&target, &path)?;
+            } else {
+                let _ = std::fs::remove_file(&target);
+            }
         }
         result
     }
@@ -344,7 +435,10 @@ pub fn build(
         }
     }
     // One lock, one embed call and one write: per-program commits made the build I/O-bound (~20 s).
-    let all: Vec<CommandExample> = pending.iter().flat_map(|(_, examples)| examples.iter().cloned()).collect();
+    let all: Vec<CommandExample> = pending
+        .iter()
+        .flat_map(|(_, examples)| examples.iter().cloned())
+        .collect();
     index.add_all(&all)?;
     indexed.extend(pending.into_iter().map(|(program, _)| program));
     Ok((indexed, empty))
@@ -352,19 +446,33 @@ pub fn build(
 
 /// Add `program` when a source has examples for it and the index lacks it, so an interrupted build
 /// heals on use. Returns whether it was added.
-pub fn ensure(index: &CommandIndex, sources: &[&dyn CommandSource], platform: &str, program: &str) -> Result<bool> {
+pub fn ensure(
+    index: &CommandIndex,
+    sources: &[&dyn CommandSource],
+    platform: &str,
+    program: &str,
+) -> Result<bool> {
     index.writable()?;
     if index.programs()?.contains(program) {
         return Ok(false);
     }
-    let Some(examples) = CommandIndex::gather(sources, program, platform) else { return Ok(false) };
+    let Some(examples) = CommandIndex::gather(sources, program, platform) else {
+        return Ok(false);
+    };
     index.add(program, &examples)?;
     Ok(true)
 }
 
 /// Build a missing index and heal an installed requested program, using the caller's PATH.
-pub fn prepare(index: &CommandIndex, sources: &[&dyn CommandSource], platform: &str, path: &str,
-               captured_programs: &HashSet<String>, rebuild: bool, program: Option<&str>) -> Result<()> {
+pub fn prepare(
+    index: &CommandIndex,
+    sources: &[&dyn CommandSource],
+    platform: &str,
+    path: &str,
+    captured_programs: &HashSet<String>,
+    rebuild: bool,
+    program: Option<&str>,
+) -> Result<()> {
     index.writable()?;
     {
         let _lock = crate::index::lock_index_directory(&index.directory, 20)?
@@ -379,7 +487,9 @@ pub fn prepare(index: &CommandIndex, sources: &[&dyn CommandSource], platform: &
         programs.extend(crate::tldr::installed(captured_programs, path));
         build(index, sources, platform, &programs)?;
     }
-    if let Some(program) = program.filter(|p| !crate::tldr::installed(&HashSet::from([p.to_string()]), path).is_empty()) {
+    if let Some(program) = program
+        .filter(|p| !crate::tldr::installed(&HashSet::from([p.to_string()]), path).is_empty())
+    {
         ensure(index, sources, platform, program)?;
     }
     Ok(())
@@ -464,20 +574,30 @@ mod tests {
 
     /// Selects a PATH candidate with production filtering and indexes that selected set.
     #[cfg(unix)]
-    fn build_path_program(sources: &[&dyn CommandSource], program: &str) -> (String, HashSet<String>, Vec<IndexedExample>) {
+    fn build_path_program(
+        sources: &[&dyn CommandSource],
+        program: &str,
+    ) -> (String, HashSet<String>, Vec<IndexedExample>) {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let executable = dir.path().join(program);
         std::fs::write(&executable, "#!/bin/sh\\nexit 0\\n").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let candidates = os_programs(&[dir.path().to_path_buf()], &dir.path().to_string_lossy());
-        let wanted = HashSet::from([program.to_owned()]).intersection(&candidates).cloned().collect::<HashSet<_>>();
+        let wanted = HashSet::from([program.to_owned()])
+            .intersection(&candidates)
+            .cloned()
+            .collect::<HashSet<_>>();
         assert_eq!(wanted, HashSet::from([program.to_owned()]));
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let index = CommandIndex::new(root.path(), Potion::bundled().unwrap(), sources);
         build(&index, sources, crate::tldr::current_platform(), &wanted).unwrap();
-        (index.index_name(), wanted, index.examples(program).unwrap().unwrap())
+        (
+            index.index_name(),
+            wanted,
+            index.examples(program).unwrap().unwrap(),
+        )
     }
 
     /// A cheat-only program's examples land in the index naming `cheat` as their source.
@@ -491,7 +611,8 @@ mod tests {
             "{\"version\": 1, \"cheat_commit\": \"testcommit\", \"license\": \"CC0-1.0\"}\n\n            {\"program\": \"zzz-cheatexample\", \"platform\": \"common\", \"description\": \"Run it\", \"template\": \"zzz-cheatexample --flag\"}\n",
         )
         .unwrap();
-        let sources = super::sources_from(&tldr_dir, "osx", Some(cheat_dir.path().to_path_buf())).unwrap();
+        let sources =
+            super::sources_from(&tldr_dir, "osx", Some(cheat_dir.path().to_path_buf())).unwrap();
         let refs = super::source_refs(&sources);
         let (name, selected, indexed) = build_path_program(&refs, "zzz-cheatexample");
         assert!(selected.contains("zzz-cheatexample"));
@@ -509,7 +630,9 @@ mod tests {
             if corrupt {
                 std::fs::write(cheat_dir.path().join("cheat.jsonl"), "not json\n{{{\n").unwrap();
             }
-            let sources = super::sources_from(&tldr_dir, platform, Some(cheat_dir.path().to_path_buf())).unwrap();
+            let sources =
+                super::sources_from(&tldr_dir, platform, Some(cheat_dir.path().to_path_buf()))
+                    .unwrap();
             assert_eq!(sources.len(), 1);
             assert_eq!(sources[0].name(), "tldr");
             let refs = super::source_refs(&sources);
@@ -576,7 +699,12 @@ mod tests {
         let sources: Vec<&dyn CommandSource> = vec![&source];
         let index = CommandIndex::new(root.path(), potion, &sources);
         // Pre-existing program that will no longer be wanted.
-        index.add("tar", &CommandIndex::gather(&sources, "tar", "osx").unwrap()).unwrap();
+        index
+            .add(
+                "tar",
+                &CommandIndex::gather(&sources, "tar", "osx").unwrap(),
+            )
+            .unwrap();
         let wanted = HashSet::from(["tar".to_owned(), "noexamples".to_owned()]);
         let (indexed, empty) = sync(&index, &sources, "osx", &wanted).unwrap();
         assert_eq!(indexed, HashSet::from(["tar".to_owned()]));
@@ -597,10 +725,17 @@ mod tests {
         let sources: Vec<&dyn CommandSource> = vec![&source];
         let index = CommandIndex::new(root.path(), potion, &sources);
         assert!(index.index_name().contains("stub@1"));
-        let programs = HashSet::from(["tar".to_owned(), "noexamples".to_owned(), "onlylinux".to_owned()]);
+        let programs = HashSet::from([
+            "tar".to_owned(),
+            "noexamples".to_owned(),
+            "onlylinux".to_owned(),
+        ]);
         let (indexed, empty) = build(&index, &sources, "osx", &programs).unwrap();
         assert_eq!(indexed, HashSet::from(["tar".to_owned()]));
-        assert_eq!(empty, HashSet::from(["noexamples".to_owned(), "onlylinux".to_owned()]));
+        assert_eq!(
+            empty,
+            HashSet::from(["noexamples".to_owned(), "onlylinux".to_owned()])
+        );
         let tar = index.examples("tar").unwrap().unwrap();
         assert_eq!(tar.len(), 1);
         assert_eq!(tar[0].source, "stub");
@@ -615,12 +750,21 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let directory = root.path().join("index");
             drop(crate::index::lock_index_directory(&directory, 1).unwrap());
-            let legacy_history = directory.join("rs-commands-v3-potion-shell-16m-bundled-d256.taladb");
-            let legacy_command = directory.join("rs-commands-potion-shell-16m-bundled-stub@1-d256.taladb");
+            let legacy_history =
+                directory.join("rs-commands-v3-potion-shell-16m-bundled-d256.taladb");
+            let legacy_command =
+                directory.join("rs-commands-potion-shell-16m-bundled-stub@1-d256.taladb");
             let legacy_sidecar = legacy_command.with_extension("building");
             let other_history = directory.join("rs-commands-v4-potion-othermodel-d256.taladb");
-            let other_command = directory.join("rs-examples-v1-potion-shell-16m-othermodel-stub@1-d256.taladb");
-            for path in [&legacy_history, &legacy_command, &legacy_sidecar, &other_history, &other_command] {
+            let other_command =
+                directory.join("rs-examples-v1-potion-shell-16m-othermodel-stub@1-d256.taladb");
+            for path in [
+                &legacy_history,
+                &legacy_command,
+                &legacy_sidecar,
+                &other_history,
+                &other_command,
+            ] {
                 std::fs::write(path, b"fixture").unwrap();
             }
             let legacy_dir = directory.join("rs-commands-potion-shell-16m-old-directory");
@@ -634,15 +778,38 @@ mod tests {
                 let bin = root.path().join("bin");
                 std::fs::create_dir(&bin).unwrap();
                 exe(&bin, "tar");
-                prepare(&index, &sources, "osx", bin.to_str().unwrap(), &HashSet::new(), false, Some("tar")).unwrap();
+                prepare(
+                    &index,
+                    &sources,
+                    "osx",
+                    bin.to_str().unwrap(),
+                    &HashSet::new(),
+                    false,
+                    Some("tar"),
+                )
+                .unwrap();
                 assert!(index.path().exists());
             } else {
-                crate::HistorySearch::new(&directory, potion).reindex(&std::collections::HashMap::new()).unwrap();
+                crate::HistorySearch::new(&directory, potion)
+                    .reindex(&std::collections::HashMap::new())
+                    .unwrap();
             }
-            for path in [&legacy_history, &legacy_command, &legacy_sidecar, &legacy_dir] {
-                assert!(!path.exists(), "obsolete cache remained: {}", path.display());
+            for path in [
+                &legacy_history,
+                &legacy_command,
+                &legacy_sidecar,
+                &legacy_dir,
+            ] {
+                assert!(
+                    !path.exists(),
+                    "obsolete cache remained: {}",
+                    path.display()
+                );
             }
-            assert!(other_history.exists() && other_command.exists(), "other current-format models must stay");
+            assert!(
+                other_history.exists() && other_command.exists(),
+                "other current-format models must stay"
+            );
         }
     }
 
@@ -656,16 +823,27 @@ mod tests {
         let (staged, waiting) = std::sync::mpsc::channel();
         let (resume, continued) = std::sync::mpsc::channel();
         let writer = std::thread::spawn(move || {
-            BEFORE_INSERT.with(|hook| *hook.borrow_mut() = Some(Box::new(move || {
-                staged.send(()).unwrap();
-                continued.recv().unwrap();
-            })));
-            index.add_all(&[CommandExample { program: "tar".into(), description: "Extract archive".into(),
-                template: "tar xf @".into(), source: "test".into() }]).unwrap();
+            BEFORE_INSERT.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    staged.send(()).unwrap();
+                    continued.recv().unwrap();
+                }))
+            });
+            index
+                .add_all(&[CommandExample {
+                    program: "tar".into(),
+                    description: "Extract archive".into(),
+                    template: "tar xf @".into(),
+                    source: "test".into(),
+                }])
+                .unwrap();
         });
         waiting.recv().unwrap();
         assert!(reader.path().with_extension("building").exists());
-        assert!(!reader.path().exists(), "a concurrent picker must still request prepare");
+        assert!(
+            !reader.path().exists(),
+            "a concurrent picker must still request prepare"
+        );
         assert!(reader.all().unwrap().is_empty());
         resume.send(()).unwrap();
         writer.join().unwrap();
@@ -677,20 +855,35 @@ mod tests {
     #[test]
     fn command_index_reader_does_not_create_indexes() {
         let root = tempfile::tempdir().unwrap();
-        let reader = CommandIndex::reader(root.path(), ModelId { identity: "test".into(), dimension: 2 }, &[]);
+        let reader = CommandIndex::reader(
+            root.path(),
+            ModelId {
+                identity: "test".into(),
+                dimension: 2,
+            },
+            &[],
+        );
         // Rows without secondary/vector indexes expose any accidental schema creation by reads.
         let db = taladb::open(reader.path()).unwrap();
-        db.typed::<IndexedExample>("examples").unwrap().insert_many(&[IndexedExample {
-            program: "tar".into(), description: "Extract archive".into(), template: "tar xf @".into(),
-            source: "test".into(), embedding: vec![1.0, 0.0],
-        }]).unwrap();
+        db.typed::<IndexedExample>("examples")
+            .unwrap()
+            .insert_many(&[IndexedExample {
+                program: "tar".into(),
+                description: "Extract archive".into(),
+                template: "tar xf @".into(),
+                source: "test".into(),
+                embedding: vec![1.0, 0.0],
+            }])
+            .unwrap();
         drop(db);
         assert!(reader.examples("tar").unwrap().is_some());
         assert_eq!(reader.all().unwrap().len(), 1);
         let db = taladb::open(reader.path()).unwrap();
         let indexes = db.collection("examples").unwrap().list_indexes().unwrap();
-        assert!(indexes.btree.is_empty() && indexes.vector.is_empty() && indexes.fts.is_empty(),
-            "reads must not create schema indexes");
+        assert!(
+            indexes.btree.is_empty() && indexes.vector.is_empty() && indexes.fts.is_empty(),
+            "reads must not create schema indexes"
+        );
     }
 
     #[test]
@@ -707,12 +900,19 @@ mod tests {
         assert_eq!(reader.all().unwrap().len(), 1);
         assert!(reader.examples("tar").unwrap().is_some());
         let examples = CommandIndex::gather(&sources, "tar", "osx").unwrap();
-        for result in [reader.add("tar", &examples), reader.add_all(&examples), reader.remove("tar"),
+        for result in [
+            reader.add("tar", &examples),
+            reader.add_all(&examples),
+            reader.remove("tar"),
             sync(&reader, &sources, "osx", &HashSet::new()).map(|_| ()),
             build(&reader, &sources, "osx", &HashSet::new()).map(|_| ()),
             ensure(&reader, &sources, "osx", "tar").map(|_| ()),
-            prepare(&reader, &sources, "osx", "", &HashSet::new(), true, None)] {
-            assert_eq!(result.unwrap_err().to_string(), "command index is read-only here");
+            prepare(&reader, &sources, "osx", "", &HashSet::new(), true, None),
+        ] {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "command index is read-only here"
+            );
         }
         assert_eq!(reader.all().unwrap().len(), 1);
     }
@@ -727,13 +927,46 @@ mod tests {
         let bin = tempfile::tempdir().unwrap();
         exe(bin.path(), "onlylinux");
         let path = bin.path().to_str().unwrap();
-        prepare(&index, &sources, "linux", path, &HashSet::from(["onlylinux".into()]), false, None).unwrap();
-        assert_eq!(index.programs().unwrap(), HashSet::from(["onlylinux".into()]));
+        prepare(
+            &index,
+            &sources,
+            "linux",
+            path,
+            &HashSet::from(["onlylinux".into()]),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            index.programs().unwrap(),
+            HashSet::from(["onlylinux".into()])
+        );
         exe(bin.path(), "tar");
-        prepare(&index, &sources, "linux", path, &HashSet::new(), false, Some("tar")).unwrap();
+        prepare(
+            &index,
+            &sources,
+            "linux",
+            path,
+            &HashSet::new(),
+            false,
+            Some("tar"),
+        )
+        .unwrap();
         assert!(index.examples("tar").unwrap().is_some());
-        prepare(&index, &sources, "linux", path, &HashSet::new(), true, Some("tar")).unwrap();
-        assert!(!ensure(&index, &sources, "osx", "tar").unwrap(), "already indexed: nothing to do");
+        prepare(
+            &index,
+            &sources,
+            "linux",
+            path,
+            &HashSet::new(),
+            true,
+            Some("tar"),
+        )
+        .unwrap();
+        assert!(
+            !ensure(&index, &sources, "osx", "tar").unwrap(),
+            "already indexed: nothing to do"
+        );
         assert!(!ensure(&index, &sources, "osx", "noexamples").unwrap());
         assert_eq!(index.programs().unwrap(), HashSet::from(["tar".to_owned()]));
     }

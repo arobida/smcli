@@ -22,7 +22,13 @@ pub fn command_flags(command: &str, found: &[IdentifierEvidence]) -> (bool, bool
 /// Request-scoped project facts. Missing entries are unknown, never negative evidence.
 pub trait ProjectEvidence {
     fn exists(&self, paths: &[PathBuf]) -> Vec<bool>;
-    fn git_activity(&self, _paths: &[PathBuf]) -> Vec<f64> { vec![] }
-    fn find_identifiers(&self, _names: &[String], _budget: Duration) -> Vec<IdentifierEvidence> { vec![] }
-    fn grep_terms(&self, _terms: &[String], _budget: Duration) -> Vec<String> { vec![] }
+    fn git_activity(&self, _paths: &[PathBuf]) -> Vec<f64> {
+        vec![]
+    }
+    fn find_identifiers(&self, _names: &[String], _budget: Duration) -> Vec<IdentifierEvidence> {
+        vec![]
+    }
+    fn grep_terms(&self, _terms: &[String], _budget: Duration) -> Vec<String> {
+        vec![]
+    }
 }

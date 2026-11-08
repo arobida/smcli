@@ -12,9 +12,14 @@ use smcli_search::lexical_search;
 use smcli_search::setup::{corpus, search_signals, working_directory};
 use std::time::Duration;
 
-use super::{directory, print_json, time, Search};
+use super::{Search, directory, print_json, time};
 
-pub(super) fn search(a: Search, captured: &CapturedHistory, service: &ServiceClient, env: &HashMap<String, String>) -> Result<()> {
+pub(super) fn search(
+    a: Search,
+    captured: &CapturedHistory,
+    service: &ServiceClient,
+    env: &HashMap<String, String>,
+) -> Result<()> {
     let filter = SearchFilter {
         program: a.program,
         subcommand: a.subcommand,
@@ -34,18 +39,44 @@ pub(super) fn search(a: Search, captured: &CapturedHistory, service: &ServiceCli
     request.filter = Some(filter.clone());
     request.histfile = env.get("HISTFILE").cloned();
     request.login_shell = env.get("SHELL").cloned();
-    let hits = match service.send(&request, None, Duration::from_secs(600)).filter(|r| r.ok).and_then(|r| r.hits) {
+    let hits = match service
+        .send(&request, None, Duration::from_secs(600))
+        .filter(|r| r.ok)
+        .and_then(|r| r.hits)
+    {
         Some(hits) => hits,
         None => {
             let caller = CallerContext::from_env(env);
-            let context = RankingContext::new(&ProjectContext::discover(&caller.cwd), caller.session.clone(), caller.ranking_off.as_deref());
+            let context = RankingContext::new(
+                &ProjectContext::discover(&caller.cwd),
+                caller.session.clone(),
+                caller.ranking_off.as_deref(),
+            );
             eprintln!("smcli: search service unavailable; showing keyword matches only.");
             let native = caller.native_env();
-            let corpus = corpus(captured, caller.home(), &native, context.project_root.as_deref(), context.kind(), now())?;
-            lexical_search(&query, &corpus, a.limit, &filter, &search_signals(captured, Some(context), &native)?, now())?
+            let corpus = corpus(
+                captured,
+                caller.home(),
+                &native,
+                context.project_root.as_deref(),
+                context.kind(),
+                now(),
+            )?;
+            lexical_search(
+                &query,
+                &corpus,
+                a.limit,
+                &filter,
+                &search_signals(captured, Some(context), &native)?,
+                now(),
+            )?
         }
     };
-    if a.json { print_json(&hits)?; } else { print_hits(&hits); }
+    if a.json {
+        print_json(&hits)?;
+    } else {
+        print_hits(&hits);
+    }
     Ok(())
 }
 
@@ -65,13 +96,26 @@ pub(super) fn suggest(
     request.prefix = Some(prefix.clone());
     request.limit = Some(limit as i64);
     request.session = env.get("SMCLI_SESSION").cloned();
-    let suggestions = match service.send(&request, None, Duration::from_secs(10)).filter(|r| r.ok).and_then(|r| r.suggestions) {
+    let suggestions = match service
+        .send(&request, None, Duration::from_secs(10))
+        .filter(|r| r.ok)
+        .and_then(|r| r.suggestions)
+    {
         Some(s) => s,
         None => {
             let caller = CallerContext::from_env(env);
-            captured.suggestions(&user_name(), &d, &prefix, limit, now(), Some(&RankingContext::new(
-                &ProjectContext::discover(&d), caller.session.clone(), caller.ranking_off.as_deref(),
-            )))?
+            captured.suggestions(
+                &user_name(),
+                &d,
+                &prefix,
+                limit,
+                now(),
+                Some(&RankingContext::new(
+                    &ProjectContext::discover(&d),
+                    caller.session.clone(),
+                    caller.ranking_off.as_deref(),
+                )),
+            )?
         }
     };
     if json {
@@ -90,14 +134,30 @@ fn print_hits(hits: &[SearchEntry]) {
     }
     for h in hits {
         let mut details = vec![format!("runs={}", h.runs)];
-        if let Some(last) = &h.last_run { details.push(format!("last={last}")); }
-        if let Some(code) = h.last_exit_code { details.push(format!("exit={code}")); }
-        if let Some(d) = &h.last_directory { details.push(d.clone()); }
-        if h.runs_here > 0 { details.push(format!("here={}", h.runs_here)); }
-        if h.source == "native" { details.push("native history".into()); }
-        println!("{}\n    {}", crate::picker::history_label(&h.key()), details.join("  "));
+        if let Some(last) = &h.last_run {
+            details.push(format!("last={last}"));
+        }
+        if let Some(code) = h.last_exit_code {
+            details.push(format!("exit={code}"));
+        }
+        if let Some(d) = &h.last_directory {
+            details.push(d.clone());
+        }
+        if h.runs_here > 0 {
+            details.push(format!("here={}", h.runs_here));
+        }
+        if h.source == "native" {
+            details.push("native history".into());
+        }
+        println!(
+            "{}\n    {}",
+            crate::picker::history_label(&h.key()),
+            details.join("  ")
+        );
         if let Some(why) = &h.why {
-            if !why.is_empty() { println!("    why: {}", why.join(", ")); }
+            if !why.is_empty() {
+                println!("    why: {}", why.join(", "));
+            }
         }
     }
 }

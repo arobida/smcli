@@ -27,15 +27,34 @@ struct IndexHealth {
     healthy: bool,
 }
 
+/// `smcli health`: smcli's paths, then the search index.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Health {
+    database: String,
+    config: String,
+    path_problems: Vec<String>,
+    /// Its `healthy` covers the paths too.
+    #[serde(flatten)]
+    index: IndexHealth,
+}
+
 /// History and command-example indexes next to the database; `prune` keeps only the current model's.
-pub(super) fn indexes(captured: &CapturedHistory, home: &Path, env: &HashMap<String, String>, prune: bool, json: bool) -> Result<()> {
+pub(super) fn indexes(
+    captured: &CapturedHistory,
+    home: &Path,
+    env: &HashMap<String, String>,
+    prune: bool,
+    json: bool,
+) -> Result<()> {
     let model = configured_model(home, env)?;
     let directory = index_directory(captured);
     let current = smcli_search::index_name(&model);
     // The command-completion index (bundled sources in priority order); absent tldr data just means it is not current.
     let command_current = smcli_search::commands::bundled_sources().map(|sources| {
         let refs = smcli_search::commands::source_refs(&sources);
-        smcli_search::commands::CommandIndex::reader(directory.clone(), model.clone(), &refs).index_name()
+        smcli_search::commands::CommandIndex::reader(directory.clone(), model.clone(), &refs)
+            .index_name()
     });
     let mut current_names = vec![current.clone(), format!("{current}-typed")];
     current_names.extend(command_current);
@@ -48,7 +67,13 @@ pub(super) fn indexes(captured: &CapturedHistory, home: &Path, env: &HashMap<Str
         println!("No indexes yet; the next search or `smcli reindex` builds {current}.");
     }
     for info in &list {
-        let state = if info.current { "current" } else if prune { "deleted" } else { "unused" };
+        let state = if info.current {
+            "current"
+        } else if prune {
+            "deleted"
+        } else {
+            "unused"
+        };
         println!("  {:<8} {:>12} bytes  {}", state, info.bytes, info.name);
     }
     if !prune && list.iter().any(|i| !i.current) {
@@ -65,16 +90,23 @@ fn index_health(
 ) -> IndexHealth {
     let model = match configured_model(home, env) {
         Ok(model) => model,
-        Err(error) => return IndexHealth {
-            path: format!("{}.search", captured.path.display()),
-            commands: corpus.len(),
-            problems: vec![format!("{error:#}")],
-            ..Default::default()
-        },
+        Err(error) => {
+            return IndexHealth {
+                path: format!("{}.search", captured.path.display()),
+                commands: corpus.len(),
+                problems: vec![format!("{error:#}")],
+                ..Default::default()
+            };
+        }
     };
     let report = smcli_search::index::inspect(&index_directory(captured), &model, corpus);
     IndexHealth {
-        embedder: format!("{} ({} dimensions), {}", smcli_search::Potion::NAME, model.dimension, model.identity),
+        embedder: format!(
+            "{} ({} dimensions), {}",
+            smcli_search::Potion::NAME,
+            model.dimension,
+            model.identity
+        ),
         path: report.path,
         built: report.built,
         indexed: report.indexed,
@@ -89,27 +121,97 @@ fn index_health(
     }
 }
 
-pub(super) fn health(captured: &CapturedHistory, home: &Path, env: &HashMap<String, String>, json: bool) -> Result<()> {
-    let corpus = corpus(captured, home, env, None, None, now())?;
-    let report = index_health(captured, home, env, &corpus);
-    if json {
-        print_json(&report)?;
-    } else {
-        println!("Embedder:     {}\nIndex:        {}", report.embedder, report.path);
-        if report.built {
-            println!("Commands:     {} indexed of {} in history", report.indexed, report.commands);
-            if report.missing > 0 { println!("Missing:      {} (embedded on the next search)", report.missing); }
-            if report.stale > 0 { println!("Stale:        {} (removed on the next search)", report.stale); }
-            println!("Size:         {} bytes", report.bytes);
-            if let Some(updated) = &report.last_updated { println!("Updated:      {updated}"); }
-        } else {
-            println!("Commands:     not built yet; the next search or `smcli reindex` embeds {}", report.commands);
-        }
-        if !report.other_indexes.is_empty() { println!("Other models: {}", report.other_indexes.join(", ")); }
-        println!("Status:       {}", if report.healthy { "healthy" } else { "unhealthy" });
-        for problem in &report.problems { println!("  \u{2717} {problem}"); }
+pub(super) fn health(
+    captured: &CapturedHistory,
+    home: &Path,
+    env: &HashMap<String, String>,
+    json: bool,
+) -> Result<()> {
+    let config = smcli_core::config::SmcliConfig::location(home, env);
+    let mut path_problems = smcli_core::paths::check(home, env);
+    if let Err(error) = smcli_core::config::FileIgnore::load(&config, home) {
+        path_problems.push(format!("{error:#}; file search fails until it is fixed"));
     }
-    if !report.healthy { std::process::exit(1); }
+    if let Some(old) = captured.stranded_legacy(home, env) {
+        path_problems.push(format!(
+            "open shells still use an old smcli build; restart them. {} holds commands not in the main history {}",
+            old.display(),
+            captured.path.display()
+        ));
+    }
+    let corpus = corpus(captured, home, env, None, None, now())?;
+    let mut report = index_health(captured, home, env, &corpus);
+    report.healthy &= path_problems.is_empty();
+    let healthy = report.healthy;
+    if json {
+        print_json(&Health {
+            database: captured.path.display().to_string(),
+            config: config.display().to_string(),
+            path_problems,
+            index: report,
+        })?;
+    } else {
+        println!(
+            "Database:     {}\nConfig:       {}",
+            captured.path.display(),
+            config.display()
+        );
+        println!(
+            "Paths:        {}",
+            if path_problems.is_empty() {
+                "ok"
+            } else {
+                "problems"
+            }
+        );
+        for problem in &path_problems {
+            println!("  \u{2717} {problem}");
+        }
+        println!(
+            "Embedder:     {}\nIndex:        {}",
+            report.embedder, report.path
+        );
+        if report.built {
+            println!(
+                "Commands:     {} indexed of {} in history",
+                report.indexed, report.commands
+            );
+            if report.missing > 0 {
+                println!(
+                    "Missing:      {} (embedded on the next search)",
+                    report.missing
+                );
+            }
+            if report.stale > 0 {
+                println!(
+                    "Stale:        {} (removed on the next search)",
+                    report.stale
+                );
+            }
+            println!("Size:         {} bytes", report.bytes);
+            if let Some(updated) = &report.last_updated {
+                println!("Updated:      {updated}");
+            }
+        } else {
+            println!(
+                "Commands:     not built yet; the next search or `smcli reindex` embeds {}",
+                report.commands
+            );
+        }
+        if !report.other_indexes.is_empty() {
+            println!("Other models: {}", report.other_indexes.join(", "));
+        }
+        println!(
+            "Status:       {}",
+            if healthy { "healthy" } else { "unhealthy" }
+        );
+        for problem in &report.problems {
+            println!("  \u{2717} {problem}");
+        }
+    }
+    if !healthy {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -122,11 +224,18 @@ mod tests {
 
     #[test]
     fn health_json_preserves_cli_fields_and_model_errors() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("smcli-health-output-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("smcli-health-output-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir)?;
         let captured = CapturedHistory::new(dir.join("history.db"));
-        let env = HashMap::from([("SMCLI_CONFIG".into(), dir.join("config.json").to_string_lossy().into_owned())]);
-        let corpus = HashMap::from([("git status".into(), SearchEntry::new("git status", 1, "native"))]);
+        let env = HashMap::from([(
+            "SMCLI_CONFIG".into(),
+            dir.join("config.json").to_string_lossy().into_owned(),
+        )]);
+        let corpus = HashMap::from([(
+            "git status".into(),
+            SearchEntry::new("git status", 1, "native"),
+        )]);
         let report = serde_json::to_value(index_health(&captured, &dir, &env, &corpus))?;
         assert_eq!(report["healthy"], true);
         assert_eq!(report["built"], false);
@@ -138,10 +247,23 @@ mod tests {
         assert_eq!(report["otherIndexes"], serde_json::json!([]));
         assert_eq!(report["problems"], serde_json::json!([]));
         assert!(report.get("lastUpdated").is_none());
-        assert!(report["embedder"].as_str().unwrap().contains(smcli_search::Potion::NAME));
-        assert!(report["path"].as_str().unwrap().starts_with(index_directory(&captured).to_str().unwrap()));
+        assert!(
+            report["embedder"]
+                .as_str()
+                .unwrap()
+                .contains(smcli_search::Potion::NAME)
+        );
+        assert!(
+            report["path"]
+                .as_str()
+                .unwrap()
+                .starts_with(index_directory(&captured).to_str().unwrap())
+        );
         assert!(!index_directory(&captured).exists());
-        std::fs::write(dir.join("config.json"), r#"{"potionPath":"/missing/smcli-model"}"#)?;
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"potionPath":"/missing/smcli-model"}"#,
+        )?;
         let failed = serde_json::to_value(index_health(&captured, &dir, &env, &corpus))?;
         assert_eq!(failed["healthy"], false);
         assert_eq!(failed["commands"], 1);
@@ -149,5 +271,4 @@ mod tests {
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
-
 }

@@ -5,17 +5,17 @@ pub mod context;
 pub mod entry;
 pub mod history;
 pub mod import;
-pub mod prune;
 pub mod parse;
 pub mod paths;
+pub mod prune;
 pub mod ranking;
 pub mod request;
-pub mod time;
-pub mod service_protocol;
 pub mod service_location;
+pub mod service_protocol;
+pub mod time;
 
-pub mod unix_socket;
 pub mod service_client;
+pub mod unix_socket;
 
 pub mod suggestion_index;
 pub mod tests_discovery;

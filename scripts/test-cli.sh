@@ -10,7 +10,7 @@ home="$(mktemp -d)"
 runtime="$(mktemp -d /tmp/smcli-cli.XXXXXX)"
 # An inherited SMCLI_* or XDG_* variable can change results; these checks set their own.
 unset "${!SMCLI_@}" XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME
-export SMCLI_DB="$home/captured.db" SMCLI_RUNTIME_DIR="$runtime"
+export SMCLI_DB="$home/.local/state/test-db/captured.db" SMCLI_RUNTIME_DIR="$runtime"
 trap '"$bin" service stop >/dev/null 2>&1 || true; rm -rf "$home" "$runtime"' EXIT
 
 output="$("$bin")"
@@ -64,7 +64,7 @@ mkdir "$atdir/smcli-at-dir"
 [[ -z "$(cd "$atdir" && "$bin" complete --word @probe42 --command cd)" ]]
 rm -rf "$atdir"
 # A selection rejected by both command and query is counted only once.
-prunedb="$home/prune.db"
+prunedb="$home/.local/state/test-db/prune.db"
 prunecfg="$home/prune.json"
 printf '%s\n' '{"historyFilter":["^secret"]}' > "$prunecfg"
 HOME="$home" SMCLI_DB="$prunedb" SMCLI_SERVICE=0 "$bin" record bash session /tmp 0 1700000000 '' '' 'secret-command'

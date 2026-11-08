@@ -22,7 +22,12 @@ fn ask(question: &str, default: bool) -> Result<bool> {
         }
     }
 }
-pub fn run(args: Init, path: &Path, service: &ServiceClient, captured: &smcli_core::history::CapturedHistory) -> Result<()> {
+pub fn run(
+    args: Init,
+    path: &Path,
+    service: &ServiceClient,
+    captured: &smcli_core::history::CapturedHistory,
+) -> Result<()> {
     let mut config = SmcliConfig::load(path)?;
     if let Some(keys) = &args.keys {
         if !keys.is_empty() {
@@ -31,10 +36,12 @@ pub fn run(args: Init, path: &Path, service: &ServiceClient, captured: &smcli_co
                 .map(str::trim)
                 .map(str::to_lowercase)
                 .collect();
-            if names
-                .iter()
-                .any(|s| !["up", "ctrl-r", "left", "right", "ctrl-t", "ctrl-g", "ctrl-o", "none"].contains(&s.as_str()))
-                || (names.iter().any(|s| s == "none") && names.len() > 1)
+            if names.iter().any(|s| {
+                ![
+                    "up", "ctrl-r", "left", "right", "ctrl-t", "ctrl-g", "ctrl-o", "none",
+                ]
+                .contains(&s.as_str())
+            }) || (names.iter().any(|s| s == "none") && names.len() > 1)
             {
                 bail!("--keys takes up,ctrl-r,left,right,ctrl-t,ctrl-g,ctrl-o or none.");
             }
@@ -47,7 +54,9 @@ pub fn run(args: Init, path: &Path, service: &ServiceClient, captured: &smcli_co
             config.ctrl_o_key = Some(names.iter().any(|s| s == "ctrl-o"));
         } else {
             if !io::stdin().is_terminal() {
-                bail!("smcli init --keys needs a terminal; pass --keys up,ctrl-r,left,right,ctrl-t,ctrl-g,ctrl-o.");
+                bail!(
+                    "smcli init --keys needs a terminal; pass --keys up,ctrl-r,left,right,ctrl-t,ctrl-g,ctrl-o."
+                );
             }
             choose(&mut config)?;
         }
@@ -62,7 +71,11 @@ pub fn run(args: Init, path: &Path, service: &ServiceClient, captured: &smcli_co
     }
     if args.has_model() || args.keys.is_none() {
         let wanted = if args.has_model() {
-            args.potion.as_deref().filter(|s| !s.is_empty()).map(persisted_potion).transpose()?
+            args.potion
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(persisted_potion)
+                .transpose()?
         } else {
             config.potion_path.clone()
         };
@@ -77,11 +90,16 @@ pub fn run(args: Init, path: &Path, service: &ServiceClient, captured: &smcli_co
                 Some(p) => smcli_search::Potion::from_dir(Path::new(p))?,
                 None => smcli_search::Potion::bundled()?,
             };
-            anyhow::ensure!(!potion.embed(&["smcli".into()])[0].is_empty(), "Potion returned an empty embedding");
+            anyhow::ensure!(
+                !potion.embed(&["smcli".into()])[0].is_empty(),
+                "Potion returned an empty embedding"
+            );
             potion.model_id()
         };
         if wanted != config.potion_path {
-            println!("Changing the model rebuilds the search index with it on the next search; that search can take a while on a large history.");
+            println!(
+                "Changing the model rebuilds the search index with it on the next search; that search can take a while on a large history."
+            );
             println!("The old model's index stays on disk; `smcli indexes --prune` deletes it.");
         }
         config.potion_path = wanted;
@@ -99,29 +117,57 @@ pub fn run(args: Init, path: &Path, service: &ServiceClient, captured: &smcli_co
     Ok(())
 }
 fn model_lock(captured: &smcli_core::history::CapturedHistory) -> Result<std::fs::File> {
-    smcli_search::model_lock(captured, std::time::Duration::from_secs(5))?
-        .ok_or_else(|| anyhow::anyhow!("smcli-service still holds the model; run `smcli service stop` and retry."))
+    smcli_search::model_lock(captured, std::time::Duration::from_secs(5))?.ok_or_else(|| {
+        anyhow::anyhow!("smcli-service still holds the model; run `smcli service stop` and retry.")
+    })
 }
 
-pub fn reindex(captured: &smcli_core::history::CapturedHistory, home: &Path,
-               env: &std::collections::HashMap<String, String>, service: &ServiceClient) -> Result<()> {
+pub fn reindex(
+    captured: &smcli_core::history::CapturedHistory,
+    home: &Path,
+    env: &std::collections::HashMap<String, String>,
+    service: &ServiceClient,
+) -> Result<()> {
     let stopped = crate::cli::stop_service(service);
     let _model_lock = model_lock(captured)?;
     let engine = smcli_search::setup::search_engine(captured, home, env)?;
-    let lock = engine.lock_index(u32::MAX)?.ok_or_else(|| anyhow::anyhow!("Another smcli is updating the index."))?;
-    let entries = smcli_search::setup::corpus(captured, home, env, None, None, smcli_core::time::now())?;
+    let lock = engine
+        .lock_index(u32::MAX)?
+        .ok_or_else(|| anyhow::anyhow!("Another smcli is updating the index."))?;
+    let entries =
+        smcli_search::setup::corpus(captured, home, env, None, None, smcli_core::time::now())?;
     let count = engine.reindex_using_lock(&entries, &lock)?;
     drop(lock); // CommandIndex takes the same directory lock.
-    let sources = smcli_search::commands::bundled_sources()
-        .ok_or_else(|| anyhow::anyhow!("tldr data not found beside the smcli executable or in Data/tldr"))?;
+    let sources = smcli_search::commands::bundled_sources().ok_or_else(|| {
+        anyhow::anyhow!("tldr data not found beside the smcli executable or in Data/tldr")
+    })?;
     let refs = smcli_search::commands::source_refs(&sources);
-    let index = smcli_search::commands::CommandIndex::new(engine.directory.clone(), engine.potion.clone(), &refs);
-    let path = smcli_core::service_protocol::shell_path_snapshot(env.get("PATH").map(String::as_str)).unwrap_or_default();
-    smcli_search::commands::prepare(&index, &refs, smcli_search::tldr::current_platform(), &path,
-        &crate::cli::captured_programs(captured)?, true, None)?;
+    let index = smcli_search::commands::CommandIndex::new(
+        engine.directory.clone(),
+        engine.potion.clone(),
+        &refs,
+    );
+    let path =
+        smcli_core::service_protocol::shell_path_snapshot(env.get("PATH").map(String::as_str))
+            .unwrap_or_default();
+    smcli_search::commands::prepare(
+        &index,
+        &refs,
+        smcli_search::tldr::current_platform(),
+        &path,
+        &crate::cli::captured_programs(captured)?,
+        true,
+        None,
+    )?;
     let programs = index.programs()?.len();
-    println!("{}Reindexed {count} commands and {programs} programs' examples.",
-        if stopped { "Stopped smcli-service to free its model. " } else { "" });
+    println!(
+        "{}Reindexed {count} commands and {programs} programs' examples.",
+        if stopped {
+            "Stopped smcli-service to free its model. "
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
 
@@ -147,7 +193,10 @@ fn choose(c: &mut SmcliConfig) -> Result<()> {
     )?;
     let t = ask("Open files with Ctrl-T?", c.ctrl_t_key.unwrap_or(true))?;
     let g = ask("Open grep with Ctrl-G?", c.ctrl_g_key.unwrap_or(true))?;
-    let o = ask("Open command examples with Ctrl-O?", c.ctrl_o_key.unwrap_or(true))?;
+    let o = ask(
+        "Open command examples with Ctrl-O?",
+        c.ctrl_o_key.unwrap_or(true),
+    )?;
     c.up_key = Some(up);
     c.ctrl_r_key = Some(r);
     c.left_key = Some(l);
@@ -175,19 +224,30 @@ mod tests {
         std::fs::create_dir_all(&model)?;
         let model = std::fs::canonicalize(model)?;
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Models/potion-shell-16m");
-        for file in ["config.json", "tokenizer.json"] { std::fs::copy(source.join(file), model.join(file))?; }
+        for file in ["config.json", "tokenizer.json"] {
+            std::fs::copy(source.join(file), model.join(file))?;
+        }
         let bytes = std::fs::read(source.join("model.safetensors"))?;
         let length = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
         std::fs::write(model.join("model.safetensors"), &bytes[..8 + length])?;
         assert!(smcli_search::Potion::from_dir(&model).is_err());
         let config_path = root.join("config.json");
-        SmcliConfig { potion_path: Some(model.to_string_lossy().into_owned()), ..Default::default() }.save(&config_path)?;
+        SmcliConfig {
+            potion_path: Some(model.to_string_lossy().into_owned()),
+            ..Default::default()
+        }
+        .save(&config_path)?;
         let captured = CapturedHistory::new(root.join("history.db"));
         let env = HashMap::from([("SMCLI_SERVICE".into(), "0".into())]);
         let service = ServiceClient::new(&captured.path, &env, Path::new("/missing/smcli"));
         // Holding the lock also proves an unchanged model never tries to acquire it.
         let _lock = smcli_search::model_lock(&captured, std::time::Duration::ZERO)?.unwrap();
-        run(init(Some(model.to_str().unwrap())), &config_path, &service, &captured)?;
+        run(
+            init(Some(model.to_str().unwrap())),
+            &config_path,
+            &service,
+            &captured,
+        )?;
         Ok(())
     }
 
@@ -201,7 +261,10 @@ mod tests {
         let service = ServiceClient::new(&captured.path, &env, Path::new("/missing/smcli"));
         let _lock = smcli_search::model_lock(&captured, std::time::Duration::ZERO)?.unwrap();
         let error = super::reindex(&captured, &root, &env, &service).unwrap_err();
-        assert_eq!(error.to_string(), "smcli-service still holds the model; run `smcli service stop` and retry.");
+        assert_eq!(
+            error.to_string(),
+            "smcli-service still holds the model; run `smcli service stop` and retry."
+        );
         Ok(())
     }
 
@@ -216,16 +279,28 @@ mod tests {
         let env = HashMap::from([
             ("HOME".into(), home.to_string_lossy().into_owned()),
             ("SMCLI_DB".into(), db.to_string_lossy().into_owned()),
-            ("SMCLI_RUNTIME_DIR".into(), root.join("runtime").to_string_lossy().into_owned()),
+            (
+                "SMCLI_RUNTIME_DIR".into(),
+                root.join("runtime").to_string_lossy().into_owned(),
+            ),
         ]);
         let database = CapturedHistory::location(&home, &env);
         assert_eq!(database, db);
         let service = ServiceClient::new(&database, &env, Path::new("/missing/smcli"));
-        let model = std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Models/potion-shell-16m")).unwrap();
+        let model = std::fs::canonicalize(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Models/potion-shell-16m"),
+        )
+        .unwrap();
         let abs = model.to_string_lossy().into_owned();
 
         let abs_cfg = home.join("abs.json");
-        run(init(Some(&abs)), &abs_cfg, &service, &CapturedHistory::new(&database)).unwrap();
+        run(
+            init(Some(&abs)),
+            &abs_cfg,
+            &service,
+            &CapturedHistory::new(&database),
+        )
+        .unwrap();
         // Re-init without a model flag must keep the custom path; pass --keys so a TTY cannot enter the questionnaire.
         run(
             Init {
@@ -237,13 +312,25 @@ mod tests {
             &CapturedHistory::new(&database),
         )
         .unwrap();
-        assert_eq!(SmcliConfig::load(&abs_cfg).unwrap().potion_path.as_deref(), Some(abs.as_str()));
+        assert_eq!(
+            SmcliConfig::load(&abs_cfg).unwrap().potion_path.as_deref(),
+            Some(abs.as_str())
+        );
 
         let rel = relative_from_cwd(&model);
         let rel_cfg = home.join("rel.json");
-        run(init(Some(&rel)), &rel_cfg, &service, &CapturedHistory::new(&database)).unwrap();
+        run(
+            init(Some(&rel)),
+            &rel_cfg,
+            &service,
+            &CapturedHistory::new(&database),
+        )
+        .unwrap();
         let saved = SmcliConfig::load(&rel_cfg).unwrap().potion_path.unwrap();
-        assert_eq!(saved, std::fs::canonicalize(&rel).unwrap().to_string_lossy());
+        assert_eq!(
+            saved,
+            std::fs::canonicalize(&rel).unwrap().to_string_lossy()
+        );
         assert_ne!(saved, rel);
         assert!(Path::new(&saved).is_absolute());
 
@@ -253,7 +340,13 @@ mod tests {
     }
 
     fn init(potion: Option<&str>) -> Init {
-        Init { model: None, potion: potion.map(str::to_owned), builtin: false, default: false, keys: None }
+        Init {
+            model: None,
+            potion: potion.map(str::to_owned),
+            builtin: false,
+            default: false,
+            keys: None,
+        }
     }
 
     fn relative_from_cwd(target: &Path) -> String {
@@ -265,15 +358,22 @@ mod tests {
             ups += 1;
         }
         let mut rel = PathBuf::new();
-        for _ in 0..ups { rel.push(".."); }
+        for _ in 0..ups {
+            rel.push("..");
+        }
         rel.push(target.strip_prefix(base).unwrap());
         let rel = rel.to_string_lossy().into_owned();
-        assert!(!Path::new(&rel).is_absolute() && Path::new(&rel).is_dir(), "{rel}");
+        assert!(
+            !Path::new(&rel).is_absolute() && Path::new(&rel).is_dir(),
+            "{rel}"
+        );
         rel
     }
 
     struct Tmp(PathBuf);
     impl Drop for Tmp {
-        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }

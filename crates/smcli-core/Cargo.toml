@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+ignore = "0.4.33"
 libc = "0.2.191"
 regex = "1.13.1"
 rusqlite = { version = "0.40.2", features = ["bundled", "functions"] }

@@ -5,7 +5,7 @@ metadata native history doesn't reliably keep: the working directory, exit code,
 start time, duration, user, host, and terminal session. Search commands with keyword
 and semantic matching, or rank captured commands for your current directory.
 Search uses potion-shell-16m (potion-code-16M-v2 fine-tuned on shell commands), a static model shipped beside the binaries (about 33 MB, MIT licensed,
-see `Models/`). Search works on macOS and Linux. If the service is unavailable, history search uses keyword matching and `@@` ranks existing examples by words; no embedding model is loaded in the CLI.
+see `Models/`). smcli runs on macOS. Linux support coming soon! If the service is unavailable, history search uses keyword matching and `@@` ranks existing examples by words; no embedding model is loaded in the CLI.
 
 > [!NOTE]
 > Native shell history stores the command line and little else. smcli never rewrites
@@ -53,7 +53,7 @@ git status
 Nothing installs itself: `shell-init` prints the hooks, you `eval` them. Add the line
 to `~/.zshrc` (or `~/.bashrc`) with the binary's absolute path to keep capturing in new
 terminals. Use `shell-init bash` for Bash. Finished interactive command lines are
-saved in SQLite at `~/.local/share/smcli/history.db`; recording normally happens in
+saved in SQLite at `~/.local/state/smcli/history.db`; recording normally happens in
 the background, so the newest command may not appear immediately. Set `SMCLI_SYNC=1`
 in the shell to make recording synchronous.
 
@@ -72,7 +72,7 @@ showing 12 results:
   folder being searched, e.g. `files+dirs @ ~/project/src/`. While editing paths with ^E or @-Tab, it shows `edit @ <whole command line>` instead.
 - Both Ctrl-T at the prompt and @-Tab start with folders for `cd`, `pushd`, `popd`, `z`, `rmdir` and `mkdir`. Other commands use path arguments from their last 20 captured runs: a strict directory or file majority selects that filter; a tie or no evidence shows files+dirs. This works without the service.
 - ^T cycles files+dirs, folders and files; ^G searches file contents; ^R opens history; Enter
-  inserts the path; Esc leaves the line as it was. Resizing the window re-lays out the picker.
+  inserts the path. Ctrl+Enter (where supported) or Alt+Enter on a directory changes into it without changing the command line; on a file these keys do nothing. Esc leaves the line as it was. Resizing the window re-lays out the picker.
 - In the history picker, ^R flips between full history and this directory's suggestions. Only ↑/↓
   move the selection.
 - Rows use your terminal theme's colours. Config options (in `~/.config/smcli/config.json`):
@@ -90,8 +90,7 @@ scripts/install.sh       # build (needs Rust and a C toolchain), install, hook y
 smcli-uninstall          # export your history, then remove everything
 ```
 
-Linux builds include search. Install a C toolchain, pkg-config, and SQLite development
-headers (e.g. `build-essential pkg-config libsqlite3-dev` on Debian/Ubuntu).
+Linux support coming soon!
 
 ## Usage
 
@@ -221,6 +220,10 @@ Project-index ranking switches are controlled by `SMCLI_RANKING_OFF`: `index`, `
   `"cwdFilter": ["^/Users/me/secret"]` for directories. Set `"secretsFilter": false` to turn
   off the secret patterns. `prune` applies the current filters to already-stored history
   and compacts the database so deleted text is not left on disk.
+- `"ignoreFile": "~/.config/smcli/ignore"` points file search (Ctrl-T, `@`-Tab, grep) at a
+  gitignore-syntax file whose matches are left out everywhere; a leading `/` in a pattern
+  means your home, and a relative `ignoreFile` is relative to the config's folder. A
+  configured file that is missing or invalid makes file search fail; `smcli health` reports it.
 - `import --atuin` keeps Atuin's record UUIDs, so re-running it only adds new commands.
   It also carries over soft deletions (hidden from history, search, and suggestions) and
   Atuin's optional `author`/`intent` fields. `ATUIN_DB_PATH` or `XDG_DATA_HOME` override

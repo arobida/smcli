@@ -1,4 +1,5 @@
 //! Inline, controlling-terminal picker. Callers own search, persistence and shell quoting.
+use crate::highlight::{highlight, plain};
 use anyhow::{Context, Result};
 use nucleo_matcher::{
     Matcher, Utf32Str,
@@ -9,7 +10,10 @@ use ratatui::{
     backend::CrosstermBackend,
     crossterm::{
         cursor,
-        event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+        event::{
+            self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+            PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        },
         execute,
         terminal::{disable_raw_mode, enable_raw_mode},
     },
@@ -19,14 +23,16 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, List, ListItem, ListState, Paragraph},
 };
-use crate::highlight::{highlight, plain};
 
 // ANSI-16 roles only, so the user's terminal theme does the painting.
 pub(crate) const MUTED: Style = Style::new().add_modifier(Modifier::DIM);
 pub(crate) const ACCENT: Style = Style::new().fg(Color::Magenta);
-pub(crate) const SELECTED: Style = Style::new().fg(Color::Black).bg(Color::Yellow).add_modifier(Modifier::BOLD);
-use smcli_core::service_protocol::FileHit;
+pub(crate) const SELECTED: Style = Style::new()
+    .fg(Color::Black)
+    .bg(Color::Yellow)
+    .add_modifier(Modifier::BOLD);
 use smcli_core::entry::{command_key, command_parts};
+use smcli_core::service_protocol::FileHit;
 use std::{
     collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
@@ -59,6 +65,12 @@ pub enum Choice {
         query: String,
         semantic: bool,
         edit_paths: bool,
+    },
+    Jump {
+        hit: FileHit,
+        mode: Mode,
+        query: String,
+        scope: String,
     },
     File {
         hit: FileHit,
@@ -120,14 +132,20 @@ impl Picker {
             let mut list = Vec::new();
             for command in commands {
                 let command = command.trim();
-                if !command.is_empty() && !history_internal(command) && seen.insert(command.to_owned()) {
+                if !command.is_empty()
+                    && !history_internal(command)
+                    && seen.insert(command.to_owned())
+                {
                     list.push(command.to_owned());
                 }
             }
             list
         };
         let suggested = add(suggestions);
-        let full = add(recent.into_iter().chain(native.into_iter().rev().map(|s| command_key(&s, None))).collect());
+        let full = add(recent
+            .into_iter()
+            .chain(native.into_iter().rev().map(|s| command_key(&s, None)))
+            .collect());
         Self {
             full,
             suggested,
@@ -159,9 +177,13 @@ fn worker<Q: Send + 'static, R: Send + 'static>(
     std::thread::spawn(move || {
         while let Ok(mut query) = incoming.recv() {
             // A running callback cannot be interrupted, but queued intermediate queries are obsolete.
-            while let Ok(latest) = incoming.try_recv() { query = latest; }
+            while let Ok(latest) = incoming.try_recv() {
+                query = latest;
+            }
             let result = callback(&query);
-            if outgoing.send((query, result)).is_err() { break; }
+            if outgoing.send((query, result)).is_err() {
+                break;
+            }
         }
     });
     (requests, results)
@@ -234,18 +256,22 @@ fn stripe_line(width: u16, filled: u16, fade: Modifier, cell: &str) -> Line<'sta
 fn picker_layout(area: Rect) -> [Rect; 7] {
     let h = area.height;
     let heights = [
-        u16::from(h >= 5), // header
-        u16::from(h >= 9), // filters
+        u16::from(h >= 5),                           // header
+        u16::from(h >= 9),                           // filters
         if h >= 13 { 3 } else { u16::from(h >= 2) }, // search
-        u16::from(h >= 8), // navigation
-        0, // list takes the remainder
-        u16::from(h >= 10), // sunset
-        u16::from(h >= 6), // global hints
+        u16::from(h >= 8),                           // navigation
+        0,                                           // list takes the remainder
+        u16::from(h >= 10),                          // sunset
+        u16::from(h >= 6),                           // global hints
     ];
     let mut rows = [Rect::default(); 7];
     let mut y = area.y;
     for (i, height) in heights.into_iter().enumerate() {
-        let height = if i == 4 { h.saturating_sub(heights.iter().sum()) } else { height };
+        let height = if i == 4 {
+            h.saturating_sub(heights.iter().sum())
+        } else {
+            height
+        };
         rows[i] = Rect::new(area.x, y, area.width, height);
         y += height;
     }
@@ -261,23 +287,42 @@ struct LsColors {
 impl LsColors {
     fn parse(spec: &str) -> Self {
         // Unset: the terminal theme's own ANSI blue for directories and default foreground for files; LS_COLORS refines it.
-        let mut colors = Self { dir: Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD), file: Style::new(), ext: Vec::new() };
+        let mut colors = Self {
+            dir: Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            file: Style::new(),
+            ext: Vec::new(),
+        };
         for entry in spec.split(':') {
-            let Some((key, codes)) = entry.split_once('=') else { continue };
+            let Some((key, codes)) = entry.split_once('=') else {
+                continue;
+            };
             match key {
                 "di" => colors.dir = sgr(codes),
                 "fi" => colors.file = sgr(codes),
-                _ => if let Some(ext) = key.strip_prefix("*.") { colors.ext.push((format!(".{}", ext.to_lowercase()), sgr(codes))) },
+                _ => {
+                    if let Some(ext) = key.strip_prefix("*.") {
+                        colors
+                            .ext
+                            .push((format!(".{}", ext.to_lowercase()), sgr(codes)))
+                    }
+                }
             }
         }
         // Longest suffix wins: `.tar.gz` before `.gz`.
-        colors.ext.sort_by_key(|(ext, _)| std::cmp::Reverse(ext.len()));
+        colors
+            .ext
+            .sort_by_key(|(ext, _)| std::cmp::Reverse(ext.len()));
         colors
     }
     fn style(&self, path: &str) -> Style {
-        if path.ends_with('/') { return self.dir; }
+        if path.ends_with('/') {
+            return self.dir;
+        }
         let path = path.to_lowercase();
-        self.ext.iter().find(|(ext, _)| path.ends_with(ext.as_str())).map_or(self.file, |(_, style)| *style)
+        self.ext
+            .iter()
+            .find(|(ext, _)| path.ends_with(ext.as_str()))
+            .map_or(self.file, |(_, style)| *style)
     }
 }
 
@@ -295,11 +340,21 @@ fn sgr(codes: &str) -> Style {
             n @ 30..=37 => style = style.fg(Color::Indexed(n - 30)),
             n @ 90..=97 => style = style.fg(Color::Indexed(n - 90 + 8)),
             38 => match codes.get(i + 1..) {
-                Some([5, n, ..]) => { style = style.fg(Color::Indexed(*n)); i += 2; }
-                Some([2, r, g, b, ..]) => { style = style.fg(Color::Rgb(*r, *g, *b)); i += 4; }
+                Some([5, n, ..]) => {
+                    style = style.fg(Color::Indexed(*n));
+                    i += 2;
+                }
+                Some([2, r, g, b, ..]) => {
+                    style = style.fg(Color::Rgb(*r, *g, *b));
+                    i += 4;
+                }
                 _ => break,
             },
-            48 => match codes.get(i + 1) { Some(5) => i += 2, Some(2) => i += 4, _ => break },
+            48 => match codes.get(i + 1) {
+                Some(5) => i += 2,
+                Some(2) => i += 4,
+                _ => break,
+            },
             _ => {}
         }
         i += 1;
@@ -312,13 +367,23 @@ fn sgr(codes: &str) -> Style {
 fn inline_layout(area: Rect) -> [Rect; 7] {
     let list = area.height.saturating_sub(5);
     let row = |y: u16, height: u16| Rect::new(area.x, area.y + y, area.width, height);
-    [row(0, 1), row(3, 1), row(1, 1), row(4, 0), row(4, list), row(2, 1), row(4 + list, 1)]
+    [
+        row(0, 1),
+        row(3, 1),
+        row(1, 1),
+        row(4, 0),
+        row(4, list),
+        row(2, 1),
+        row(4 + list, 1),
+    ]
 }
 
 fn hint_line(hints: &[(&str, &str)]) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
     for (i, (key, what)) in hints.iter().enumerate() {
-        if i > 0 { spans.push(Span::styled(" · ", MUTED)); }
+        if i > 0 {
+            spans.push(Span::styled(" · ", MUTED));
+        }
         spans.push(Span::raw((*key).to_owned()));
         spans.push(Span::styled(format!(" {what}"), MUTED));
     }
@@ -327,7 +392,9 @@ fn hint_line(hints: &[(&str, &str)]) -> Line<'static> {
 
 /// Show paths under the home directory as `~/…`.
 fn abbreviate(path: &str, home: &str) -> String {
-    if path == home { return "~".into(); }
+    if path == home {
+        return "~".into();
+    }
     if let Some(rest) = path.strip_prefix(&format!("{home}/")) {
         format!("~/{rest}")
     } else {
@@ -335,10 +402,32 @@ fn abbreviate(path: &str, home: &str) -> String {
     }
 }
 
+fn jump_choice(key: KeyEvent, hit: Option<&FileHit>, query: &str, scope: &str) -> Option<Choice> {
+    if key.code != KeyCode::Enter
+        || key.kind == KeyEventKind::Release
+        || !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+    let hit = hit.filter(|hit| hit.path.ends_with('/'))?;
+    Some(Choice::Jump {
+        hit: hit.clone(),
+        mode: Mode::Files,
+        query: query.into(),
+        scope: scope.into(),
+    })
+}
+
 /// Where inline Tab moves: a directory hit itself, a file's parent. `None` when that is `scope` or outside it.
 fn tab_target(scope: &str, hit: &str) -> Option<String> {
     let path = std::path::Path::new(scope).join(hit);
-    let dir = if hit.ends_with('/') { path } else { path.parent()?.to_path_buf() };
+    let dir = if hit.ends_with('/') {
+        path
+    } else {
+        path.parent()?.to_path_buf()
+    };
     let dir = dir.canonicalize().ok()?;
     let scope = std::path::Path::new(scope).canonicalize().ok()?;
     (dir != scope && dir.starts_with(&scope)).then(|| dir.to_string_lossy().into_owned())
@@ -363,21 +452,40 @@ pub fn run(
     files: Option<Box<dyn FnMut(Mode, &str, u8, &str, Option<&str>) -> Result<FileResults> + Send>>,
     inline: bool,
 ) -> Result<Option<Choice>> {
-    let search = search.map(|mut callback| worker(move |(q, _, all): &(String, u64, bool)| callback(q, *all)));
-    let files = files.map(|mut callback| worker(move |(mode, q, kind, scope, path): &(Mode, String, u8, String, Option<String>)| {
-        callback(*mode, q, *kind, scope, path.as_deref())
-    }));
+    let search = search
+        .map(|mut callback| worker(move |(q, _, all): &(String, u64, bool)| callback(q, *all)));
+    let files = files.map(|mut callback| {
+        worker(
+            move |(mode, q, kind, scope, path): &(Mode, String, u8, String, Option<String>)| {
+                callback(*mode, q, *kind, scope, path.as_deref())
+            },
+        )
+    });
     let mut file_busy = false;
     let mut semantic_busy = false;
     let mut semantic_pending = None;
     let mut semantic_generation = 0u64;
     let mut spinner = 0;
     let mut spun = Instant::now();
-    let rows = ratatui::crossterm::terminal::size().ok().filter(|&(_, rows)| rows > 0).map_or(24, |(_, rows)| rows);
+    let rows = ratatui::crossterm::terminal::size()
+        .ok()
+        .filter(|&(_, rows)| rows > 0)
+        .map_or(24, |(_, rows)| rows);
     let mut terminal = TerminalSession::open(inline, 17, rows)?;
+    // Unsupported terminals ignore the push; probing can consume queued input.
+    // Set before writing so even a partial write is popped during cleanup.
+    terminal.keyboard_enhanced = true;
+    execute!(
+        terminal.terminal.backend_mut(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )?;
     let terminal_inline = terminal.inline.is_some();
     // The terminal theme by default; LS_COLORS only when the user opts in.
-    let ls_colors = LsColors::parse(&if picker.ls_colors { std::env::var("LS_COLORS").unwrap_or_default() } else { String::new() });
+    let ls_colors = LsColors::parse(&if picker.ls_colors {
+        std::env::var("LS_COLORS").unwrap_or_default()
+    } else {
+        String::new()
+    });
     let mut saved = HashMap::new();
     let mut selected = 0usize;
     let mut semantic: Option<(String, Vec<String>)> = None;
@@ -395,7 +503,10 @@ pub fn run(
     let mut page_size = 1usize;
     let mut hits = Vec::new();
     let mut status = if picker.mode == Mode::Tldr {
-        picker.tldr_status.clone().unwrap_or_else(|| "indexing tldr…".into())
+        picker
+            .tldr_status
+            .clone()
+            .unwrap_or_else(|| "indexing tldr…".into())
     } else {
         String::new()
     };
@@ -404,14 +515,22 @@ pub fn run(
     let mut filtered: Option<((String, bool, bool), Vec<String>)> = None;
     let starred: HashSet<String> = picker.suggested.iter().cloned().collect();
     let home = std::env::var("HOME").unwrap_or_default();
-    let cwd = std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+    let cwd = std::env::current_dir()
+        .map(|d| d.to_string_lossy().into_owned())
+        .unwrap_or_default();
     if picker.scope.is_none() {
         picker.scope = Some(cwd.clone());
     }
     loop {
         let scope = picker.scope.clone().unwrap_or_else(|| cwd.clone());
         let file_path = picker.single_file_path.clone();
-        let current = (picker.mode, picker.query.clone(), kind, scope.clone(), file_path.clone());
+        let current = (
+            picker.mode,
+            picker.query.clone(),
+            kind,
+            scope.clone(),
+            file_path.clone(),
+        );
         if observed.as_ref() != Some(&current) {
             observed = Some(current.clone());
             changed_at = Instant::now();
@@ -426,8 +545,12 @@ pub fn run(
                                 let mut hits = filter_kind(result.hits, kind);
                                 suggested_first(&mut hits, &picker.query);
                                 hits
-                            } else { result.hits };
-                            status = if result.complete { String::new() } else {
+                            } else {
+                                result.hits
+                            };
+                            status = if result.complete {
+                                String::new()
+                            } else {
                                 "partial grep results · type more to narrow".into()
                             };
                         }
@@ -442,13 +565,25 @@ pub fn run(
                 if picker.mode == Mode::Tldr && query == picker.query && all == picker.tldr_all {
                     match result {
                         Ok(results) => {
-                            tldr_ranked = results.into_iter().filter_map(|index| index.parse().ok()).filter(|index: &usize| *index < picker.tldr_entries.len()).collect();
+                            tldr_ranked = results
+                                .into_iter()
+                                .filter_map(|index| index.parse().ok())
+                                .filter(|index: &usize| *index < picker.tldr_entries.len())
+                                .collect();
                             selected = 0;
-                            status = if tldr_ranked.is_empty() && !all { picker.tldr_status.clone().unwrap_or_default() } else { String::new() };
+                            status = if tldr_ranked.is_empty() && !all {
+                                picker.tldr_status.clone().unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
                         }
                         Err(error) => status = error.to_string(),
                     }
-                } else if picker.mode == Mode::History && generation == semantic_generation && query == picker.query && semantic_pending.is_none() {
+                } else if picker.mode == Mode::History
+                    && generation == semantic_generation
+                    && query == picker.query
+                    && semantic_pending.is_none()
+                {
                     match result {
                         Ok(results) => {
                             semantic = Some((query, results));
@@ -469,8 +604,17 @@ pub fn run(
                     if tldr_observed.as_ref() != Some(&key) {
                         tldr_ranked.clear();
                         tldr_observed = Some(key);
-                        semantic_busy = requests.send((picker.query.clone(), semantic_generation, picker.tldr_all)).is_ok();
-                        status = if !picker.tldr_all { picker.tldr_status.clone().unwrap_or_else(|| "indexing tldr…".into()) } else { "indexing tldr…".into() };
+                        semantic_busy = requests
+                            .send((picker.query.clone(), semantic_generation, picker.tldr_all))
+                            .is_ok();
+                        status = if !picker.tldr_all {
+                            picker
+                                .tldr_status
+                                .clone()
+                                .unwrap_or_else(|| "indexing tldr…".into())
+                        } else {
+                            "indexing tldr…".into()
+                        };
                     }
                 }
             }
@@ -483,8 +627,10 @@ pub fn run(
                 fetched = Some(current.clone());
                 status = "type to search file contents".into();
             } else if let Some((requests, _)) = &files {
-                if !file_busy && changed_at.elapsed() >= Duration::from_millis(100)
-                    && !event::poll(Duration::ZERO)? {
+                if !file_busy
+                    && changed_at.elapsed() >= Duration::from_millis(100)
+                    && !event::poll(Duration::ZERO)?
+                {
                     file_busy = requests.send(current.clone()).is_ok();
                     fetched = Some(current.clone());
                 }
@@ -493,7 +639,8 @@ pub fn run(
                 status = "files and grep need smcli-service".into();
             }
         }
-        let file_pending = matches!(picker.mode, Mode::Files | Mode::Grep) && fetched.as_ref() != Some(&current);
+        let file_pending =
+            matches!(picker.mode, Mode::Files | Mode::Grep) && fetched.as_ref() != Some(&current);
         let busy = file_busy || semantic_busy || file_pending;
         if busy && spun.elapsed() >= Duration::from_millis(80) {
             spinner = (spinner + 1) % 10;
@@ -505,12 +652,21 @@ pub fn run(
             let commands = if semantic_active {
                 semantic.as_ref().unwrap().1.clone()
             } else {
-                filter_history(if picker.suggested_view { &picker.suggested } else { &picker.full }, &picker.query)
+                filter_history(
+                    if picker.suggested_view {
+                        &picker.suggested
+                    } else {
+                        &picker.full
+                    },
+                    &picker.query,
+                )
             };
             filtered = Some((key_now, commands));
         }
         let commands = &filtered.as_ref().unwrap().1;
-        if picker.mode == Mode::Tldr && tldr_observed.as_ref() != Some(&(picker.query.clone(), picker.tldr_all)) {
+        if picker.mode == Mode::Tldr
+            && tldr_observed.as_ref() != Some(&(picker.query.clone(), picker.tldr_all))
+        {
             tldr_ranked.clear();
         }
         let count = match picker.mode {
@@ -520,162 +676,372 @@ pub fn run(
         };
         selected = selected.min(count.saturating_sub(1));
         // Coalesce key repeat: draw only once queued input is handled, else held arrows pile up behind frames.
-        if !event::poll(std::time::Duration::ZERO)? { terminal.terminal.draw(|frame| {
-            let area = frame.area();
-            cols = area.width;
-            let history = picker.mode == Mode::History;
-            let label = if picker.mode == Mode::Files { match kind { 1 => "folders", 2 => "files", _ => "files+dirs" } } else if history { if picker.suggested_view { picker.title.as_deref().unwrap_or("history") } else { "history" } } else { picker.mode.as_str() };
-            let compact = terminal_inline;
-            let [header_area, filter_area, search_area, navigation_area, list_area, stripe_area, global_area] = if compact { inline_layout(area) } else { picker_layout(area) };
-            let boxed = search_area.height == 3;
-            // Header shows cwd and current scope; single-file grep names the file as its scope.
-            let scope_label = if history || picker.mode == Mode::Tldr {
-                String::new()
-            } else {
-                let displayed = if picker.mode == Mode::Grep && picker.single_file_path.is_some() {
-                    let file = picker.single_file_path.as_deref().unwrap();
-                    format!("{}/{}", abbreviate(&scope, &home), file)
-                } else {
-                    abbreviate(&scope, &home)
-                };
-                format!("{}  →  {}", abbreviate(&cwd, &home), displayed)
-            };
-            let header = if picker.mode == Mode::Tldr {
-                command_helper_header(tldr_ranked.get(selected).map(|&i| picker.tldr_entries[i].template.as_str()).unwrap_or(""), true)
-            } else if let Some(line) = edit_files_header(picker.mode, picker.files_line.as_deref(), true) {
-                line
-            } else if compact && (!history || (picker.suggested_view && picker.title.is_some())) {
-                // Only the searched directory, which grows and shrinks as Tab moves in and out; suggestions name the cwd.
-                let (label, dir) = if history { ("suggested", &cwd) } else { (label, &scope) };
-                let mut path = abbreviate(dir, &home);
-                if !path.ends_with('/') { path.push('/'); }
-                Line::from(vec![Span::styled(format!(" {label} @ "), ACCENT), Span::styled(visible(&path), ls_colors.dir)])
-            } else {
-                Line::from(vec![Span::styled(format!(" {label} "), ACCENT), Span::styled(scope_label, ACCENT.add_modifier(Modifier::BOLD)), Span::styled(if history { "" } else { " ›" }, ACCENT.add_modifier(Modifier::BOLD))])
-            };
-            let found = if compact { format!("{count} Results") } else { format!("{count} {} results", picker.mode.as_str()) };
-            let summary = if history {
-                if status.is_empty() && picker.suggested_view && picker.suggested.is_empty() {
-                    "no suggestions for this directory".into()
-                } else if compact && status.is_empty() { found } else { visible(&status) }
-            } else if (picker.mode == Mode::Tldr && tldr_ranked.is_empty()) || (picker.mode != Mode::Tldr && hits.is_empty()) {
-                if status.is_empty() { "no matches".into() } else { visible(&status) }
-            } else if status.is_empty() { found } else { visible(&status) };
-            let mut summary = Line::styled(format!(" {summary} "), MUTED);
-            if busy {
-                summary.spans.insert(0, Span::styled(format!(" {}", ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][spinner]), ACCENT));
-            }
-            frame.render_widget(Paragraph::new(header), header_area);
-            let search_block = if boxed { Block::bordered().border_set(border::ROUNDED).border_style(MUTED) } else { Block::new() };
-            let input = search_block.inner(search_area);
-            let query = visible(&picker.query);
-            let prompt = " ⌕ ";
-            let text = if query.is_empty() {
-                Span::styled(format!("type to search {}…", if history { "history" } else { picker.mode.as_str() }), MUTED)
-            } else {
-                Span::raw(query.clone())
-            };
-            frame.render_widget(Paragraph::new(Line::from(vec![Span::styled(prompt, ACCENT), text])).block(search_block), search_area);
-            if compact && history {
-                frame.render_widget(Paragraph::new(hint_line(&[("tab", "semantic ")]).right_aligned()), input);
-            }
-            if input.width > 0 && input.height > 0 {
-                let offset = (Span::raw(prompt).width() + Span::raw(query.as_str()).width()).min(input.width.saturating_sub(1) as usize) as u16;
-                frame.set_cursor_position((input.x + offset, input.y));
-            }
-            tall = stripe_area.height > 0;
-            let list_block = if boxed {
-                Block::bordered().border_set(border::ROUNDED).border_style(MUTED)
-                    .title_bottom(summary.clone().right_aligned())
-            } else {
-                Block::new()
-            };
-            page_size = list_block.inner(list_area).height.max(1) as usize;
-            // Inline marks the selection with a yellow cursor and nudges it right instead of a full-row highlight.
-            let cursor = |sel: bool| if !compact { None } else if sel { Some(Span::styled(" ▌", Style::new().fg(Color::Yellow))) } else { Some(Span::raw("  ")) };
-            let items: Vec<ListItem> = if history {
-                // Rows past the selection plus one screen are never visible; skip building them.
-                commands.iter().enumerate().take(selected + area.height as usize).map(|(i, c)| {
-                    let sel = i == selected;
-                    let mark = if picker.suggested_view && starred.contains(c) { "* " } else { "  " };
-                    let spans = history_row(c, list_block.inner(list_area).width.saturating_sub(if compact { 5 } else { 2 }) as usize);
-                    let mut line: Vec<Span> = cursor(sel).into_iter().collect();
-                    // Inline matches the files rows: no leading mark, suggested rows end in ✨.
-                    if !compact { line.push(Span::styled(mark, if sel { Style::new() } else { MUTED })); }
-                    line.extend(if sel && !compact { plain(spans) } else { spans });
-                    if compact && picker.suggested_view && starred.contains(c) { line.push(Span::raw(" ✨")); }
-                    ListItem::new(Line::from(line))
-                }).collect()
-            } else if picker.mode == Mode::Tldr {
-                tldr_ranked.iter().enumerate().map(|(i, index)| {
-                    let entry = &picker.tldr_entries[*index];
-                    let mut line: Vec<Span> = cursor(i == selected).into_iter().collect();
-                    if picker.tldr_all {
-                        line.push(Span::styled(format!("{}  ", entry.program), ACCENT));
+        if !event::poll(std::time::Duration::ZERO)? {
+            terminal.terminal.draw(|frame| {
+                let area = frame.area();
+                cols = area.width;
+                let history = picker.mode == Mode::History;
+                let label = if picker.mode == Mode::Files {
+                    match kind {
+                        1 => "folders",
+                        2 => "files",
+                        _ => "files+dirs",
                     }
-                    line.push(Span::styled(format!("{}  ", visible(&entry.description)), MUTED));
-                    line.push(Span::styled(visible(&entry.template), Style::new().add_modifier(Modifier::BOLD)));
-                    line.push(Span::styled(format!("  {}", picker.tldr_sources.get(*index).map(String::as_str).unwrap_or("")), MUTED));
-                    ListItem::new(Line::from(line))
-                }).collect()
-            } else {
-                let row_width = list_block.inner(list_area).width as usize;
-                hits.iter().enumerate().map(|(i, h)| {
-                    // Inline: colour already tells dirs from files; git status stays and suggested (picked) rows get ✨.
-                    ListItem::new(Line::from(cursor(i == selected).into_iter().chain(file_row_spans(h, picker.mode, compact, row_width, &ls_colors)).collect::<Vec<_>>()))
-                }).collect()
-            };
-            let list = List::new(items).block(list_block).highlight_style(if compact { Style::new().add_modifier(Modifier::BOLD) } else { SELECTED });
-            let mut state = ListState::default().with_selected((count > 0).then_some(selected));
-            frame.render_stateful_widget(list, list_area, &mut state);
-            let filters = if history && compact {
-                vec![("^R", "full/suggested")]
-            } else if history {
-                vec![("^R", "full/suggested"), ("tab", "semantic")]
-            } else if picker.mode == Mode::Files {
-                vec![("tab", "into"), ("⇧tab", "out"), ("^T", "dirs/files")]
-            } else if picker.mode == Mode::Grep {
-                vec![("⇧tab", "out")]
-            } else if picker.mode == Mode::Tldr {
-                vec![("^A", "page/all")]
-            } else {
-                vec![]
-            };
-            let mut filters = filters;
-            if compact { filters.extend([("⏎", "accept"), ("↑↓", "move")]); }
-            frame.render_widget(Paragraph::new(hint_line(&filters)), filter_area);
-            frame.render_widget(Paragraph::new(hint_line(&[("[ ⏎ ]", "accept"), ("↑↓", "move"), ("PgUp/PgDn", "page")])), navigation_area);
-            let mut globals = vec![("esc", "cancel")];
-            if picker.mode != Mode::Tldr {
-                if picker.mode != Mode::Files { globals.push(("^T", "files")); }
-                if picker.mode != Mode::History { globals.push(("^R", "history")); }
-                if picker.mode == Mode::History { globals.push(("^E", "edit paths")); }
-                if picker.mode != Mode::Grep { globals.push(("^G", "grep")); }
-            }
-            globals.push(("^U", "clear"));
-            let fade = if tick < 3 { Modifier::DIM } else { Modifier::empty() };
-            if compact {
-                // The search underline is the sunset; the result count ends it.
-                let width = area.width.saturating_sub(summary.width() as u16);
-                cols = width;
-                let filled = shown.min(width);
-                let mut line = if filled > 0 && filled < width {
-                    // A `╸` tip in the edge cell's colour leads the bar.
-                    let mut line = stripe_line(width, filled - 1, fade, "━");
-                    let rest = line.spans.pop();
-                    line.spans.push(Span::styled("╸", Style::new().fg(stripe_color(filled as usize - 1, width as usize)).add_modifier(fade)));
-                    line.spans.extend(rest.map(|span| Span::styled("━".repeat(span.content.chars().count() - 1), span.style)));
-                    line
+                } else if history {
+                    if picker.suggested_view {
+                        picker.title.as_deref().unwrap_or("history")
+                    } else {
+                        "history"
+                    }
                 } else {
-                    stripe_line(width, filled, fade, "━")
+                    picker.mode.as_str()
                 };
-                line.spans.extend(summary.spans);
-                frame.render_widget(Paragraph::new(line), stripe_area);
-            } else {
-                frame.render_widget(Paragraph::new(stripe_line(area.width, shown, fade, "▀")), stripe_area);
-            }
-            frame.render_widget(Paragraph::new(hint_line(&globals)), global_area);
-        })?; }
+                let compact = terminal_inline;
+                let [
+                    header_area,
+                    filter_area,
+                    search_area,
+                    navigation_area,
+                    list_area,
+                    stripe_area,
+                    global_area,
+                ] = if compact {
+                    inline_layout(area)
+                } else {
+                    picker_layout(area)
+                };
+                let boxed = search_area.height == 3;
+                // Header shows cwd and current scope; single-file grep names the file as its scope.
+                let scope_label = if history || picker.mode == Mode::Tldr {
+                    String::new()
+                } else {
+                    let displayed =
+                        if picker.mode == Mode::Grep && picker.single_file_path.is_some() {
+                            let file = picker.single_file_path.as_deref().unwrap();
+                            format!("{}/{}", abbreviate(&scope, &home), file)
+                        } else {
+                            abbreviate(&scope, &home)
+                        };
+                    format!("{}  →  {}", abbreviate(&cwd, &home), displayed)
+                };
+                let header = if picker.mode == Mode::Tldr {
+                    command_helper_header(
+                        tldr_ranked
+                            .get(selected)
+                            .map(|&i| picker.tldr_entries[i].template.as_str())
+                            .unwrap_or(""),
+                        true,
+                    )
+                } else if let Some(line) =
+                    edit_files_header(picker.mode, picker.files_line.as_deref(), true)
+                {
+                    line
+                } else if compact && (!history || (picker.suggested_view && picker.title.is_some()))
+                {
+                    // Only the searched directory, which grows and shrinks as Tab moves in and out; suggestions name the cwd.
+                    let (label, dir) = if history {
+                        ("suggested", &cwd)
+                    } else {
+                        (label, &scope)
+                    };
+                    let mut path = abbreviate(dir, &home);
+                    if !path.ends_with('/') {
+                        path.push('/');
+                    }
+                    Line::from(vec![
+                        Span::styled(format!(" {label} @ "), ACCENT),
+                        Span::styled(visible(&path), ls_colors.dir),
+                    ])
+                } else {
+                    Line::from(vec![
+                        Span::styled(format!(" {label} "), ACCENT),
+                        Span::styled(scope_label, ACCENT.add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            if history { "" } else { " ›" },
+                            ACCENT.add_modifier(Modifier::BOLD),
+                        ),
+                    ])
+                };
+                let found = if compact {
+                    format!("{count} Results")
+                } else {
+                    format!("{count} {} results", picker.mode.as_str())
+                };
+                let summary = if history {
+                    if status.is_empty() && picker.suggested_view && picker.suggested.is_empty() {
+                        "no suggestions for this directory".into()
+                    } else if compact && status.is_empty() {
+                        found
+                    } else {
+                        visible(&status)
+                    }
+                } else if (picker.mode == Mode::Tldr && tldr_ranked.is_empty())
+                    || (picker.mode != Mode::Tldr && hits.is_empty())
+                {
+                    if status.is_empty() {
+                        "no matches".into()
+                    } else {
+                        visible(&status)
+                    }
+                } else if status.is_empty() {
+                    found
+                } else {
+                    visible(&status)
+                };
+                let mut summary = Line::styled(format!(" {summary} "), MUTED);
+                if busy {
+                    summary.spans.insert(
+                        0,
+                        Span::styled(
+                            format!(
+                                " {}",
+                                ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][spinner]
+                            ),
+                            ACCENT,
+                        ),
+                    );
+                }
+                frame.render_widget(Paragraph::new(header), header_area);
+                let search_block = if boxed {
+                    Block::bordered()
+                        .border_set(border::ROUNDED)
+                        .border_style(MUTED)
+                } else {
+                    Block::new()
+                };
+                let input = search_block.inner(search_area);
+                let query = visible(&picker.query);
+                let prompt = " ⌕ ";
+                let text = if query.is_empty() {
+                    Span::styled(
+                        format!(
+                            "type to search {}…",
+                            if history {
+                                "history"
+                            } else {
+                                picker.mode.as_str()
+                            }
+                        ),
+                        MUTED,
+                    )
+                } else {
+                    Span::raw(query.clone())
+                };
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![Span::styled(prompt, ACCENT), text]))
+                        .block(search_block),
+                    search_area,
+                );
+                if compact && history {
+                    frame.render_widget(
+                        Paragraph::new(hint_line(&[("tab", "semantic ")]).right_aligned()),
+                        input,
+                    );
+                }
+                if input.width > 0 && input.height > 0 {
+                    let offset = (Span::raw(prompt).width() + Span::raw(query.as_str()).width())
+                        .min(input.width.saturating_sub(1) as usize)
+                        as u16;
+                    frame.set_cursor_position((input.x + offset, input.y));
+                }
+                tall = stripe_area.height > 0;
+                let list_block = if boxed {
+                    Block::bordered()
+                        .border_set(border::ROUNDED)
+                        .border_style(MUTED)
+                        .title_bottom(summary.clone().right_aligned())
+                } else {
+                    Block::new()
+                };
+                page_size = list_block.inner(list_area).height.max(1) as usize;
+                // Inline marks the selection with a yellow cursor and nudges it right instead of a full-row highlight.
+                let cursor = |sel: bool| {
+                    if !compact {
+                        None
+                    } else if sel {
+                        Some(Span::styled(" ▌", Style::new().fg(Color::Yellow)))
+                    } else {
+                        Some(Span::raw("  "))
+                    }
+                };
+                let items: Vec<ListItem> = if history {
+                    // Rows past the selection plus one screen are never visible; skip building them.
+                    commands
+                        .iter()
+                        .enumerate()
+                        .take(selected + area.height as usize)
+                        .map(|(i, c)| {
+                            let sel = i == selected;
+                            let mark = if picker.suggested_view && starred.contains(c) {
+                                "* "
+                            } else {
+                                "  "
+                            };
+                            let spans = history_row(
+                                c,
+                                list_block
+                                    .inner(list_area)
+                                    .width
+                                    .saturating_sub(if compact { 5 } else { 2 })
+                                    as usize,
+                            );
+                            let mut line: Vec<Span> = cursor(sel).into_iter().collect();
+                            // Inline matches the files rows: no leading mark, suggested rows end in ✨.
+                            if !compact {
+                                line.push(Span::styled(
+                                    mark,
+                                    if sel { Style::new() } else { MUTED },
+                                ));
+                            }
+                            line.extend(if sel && !compact { plain(spans) } else { spans });
+                            if compact && picker.suggested_view && starred.contains(c) {
+                                line.push(Span::raw(" ✨"));
+                            }
+                            ListItem::new(Line::from(line))
+                        })
+                        .collect()
+                } else if picker.mode == Mode::Tldr {
+                    tldr_ranked
+                        .iter()
+                        .enumerate()
+                        .map(|(i, index)| {
+                            let entry = &picker.tldr_entries[*index];
+                            let mut line: Vec<Span> = cursor(i == selected).into_iter().collect();
+                            if picker.tldr_all {
+                                line.push(Span::styled(format!("{}  ", entry.program), ACCENT));
+                            }
+                            line.push(Span::styled(
+                                format!("{}  ", visible(&entry.description)),
+                                MUTED,
+                            ));
+                            line.push(Span::styled(
+                                visible(&entry.template),
+                                Style::new().add_modifier(Modifier::BOLD),
+                            ));
+                            line.push(Span::styled(
+                                format!(
+                                    "  {}",
+                                    picker
+                                        .tldr_sources
+                                        .get(*index)
+                                        .map(String::as_str)
+                                        .unwrap_or("")
+                                ),
+                                MUTED,
+                            ));
+                            ListItem::new(Line::from(line))
+                        })
+                        .collect()
+                } else {
+                    let row_width = list_block.inner(list_area).width as usize;
+                    hits.iter()
+                        .enumerate()
+                        .map(|(i, h)| {
+                            // Inline: colour already tells dirs from files; git status stays and suggested (picked) rows get ✨.
+                            ListItem::new(Line::from(
+                                cursor(i == selected)
+                                    .into_iter()
+                                    .chain(file_row_spans(
+                                        h,
+                                        picker.mode,
+                                        compact,
+                                        row_width,
+                                        &ls_colors,
+                                    ))
+                                    .collect::<Vec<_>>(),
+                            ))
+                        })
+                        .collect()
+                };
+                let list = List::new(items)
+                    .block(list_block)
+                    .highlight_style(if compact {
+                        Style::new().add_modifier(Modifier::BOLD)
+                    } else {
+                        SELECTED
+                    });
+                let mut state = ListState::default().with_selected((count > 0).then_some(selected));
+                frame.render_stateful_widget(list, list_area, &mut state);
+                let filters = if history && compact {
+                    vec![("^R", "full/suggested")]
+                } else if history {
+                    vec![("^R", "full/suggested"), ("tab", "semantic")]
+                } else if picker.mode == Mode::Files {
+                    vec![("tab", "into"), ("⇧tab", "out"), ("^T", "dirs/files")]
+                } else if picker.mode == Mode::Grep {
+                    vec![("⇧tab", "out")]
+                } else if picker.mode == Mode::Tldr {
+                    vec![("^A", "page/all")]
+                } else {
+                    vec![]
+                };
+                let mut filters = filters;
+                if compact {
+                    filters.extend([("⏎", "accept"), ("↑↓", "move")]);
+                }
+                frame.render_widget(Paragraph::new(hint_line(&filters)), filter_area);
+                frame.render_widget(
+                    Paragraph::new(hint_line(&[
+                        ("[ ⏎ ]", "accept"),
+                        ("↑↓", "move"),
+                        ("PgUp/PgDn", "page"),
+                    ])),
+                    navigation_area,
+                );
+                let mut globals = vec![("esc", "cancel")];
+                if picker.mode != Mode::Tldr {
+                    if picker.mode != Mode::Files {
+                        globals.push(("^T", "files"));
+                    }
+                    if picker.mode != Mode::History {
+                        globals.push(("^R", "history"));
+                    }
+                    if picker.mode == Mode::History {
+                        globals.push(("^E", "edit paths"));
+                    }
+                    if picker.mode != Mode::Grep {
+                        globals.push(("^G", "grep"));
+                    }
+                }
+                globals.push(("^U", "clear"));
+                let fade = if tick < 3 {
+                    Modifier::DIM
+                } else {
+                    Modifier::empty()
+                };
+                if compact {
+                    // The search underline is the sunset; the result count ends it.
+                    let width = area.width.saturating_sub(summary.width() as u16);
+                    cols = width;
+                    let filled = shown.min(width);
+                    let mut line = if filled > 0 && filled < width {
+                        // A `╸` tip in the edge cell's colour leads the bar.
+                        let mut line = stripe_line(width, filled - 1, fade, "━");
+                        let rest = line.spans.pop();
+                        line.spans.push(Span::styled(
+                            "╸",
+                            Style::new()
+                                .fg(stripe_color(filled as usize - 1, width as usize))
+                                .add_modifier(fade),
+                        ));
+                        line.spans.extend(rest.map(|span| {
+                            Span::styled("━".repeat(span.content.chars().count() - 1), span.style)
+                        }));
+                        line
+                    } else {
+                        stripe_line(width, filled, fade, "━")
+                    };
+                    line.spans.extend(summary.spans);
+                    frame.render_widget(Paragraph::new(line), stripe_area);
+                } else {
+                    frame.render_widget(
+                        Paragraph::new(stripe_line(area.width, shown, fade, "▀")),
+                        stripe_area,
+                    );
+                }
+                frame.render_widget(Paragraph::new(hint_line(&globals)), global_area);
+            })?;
+        }
         // Soonest of bar ease (~20ms), fade-in (70ms), and spinner (80ms). A queued key
         // makes poll return at once, so held arrows still skip frames and coalesce.
         let fill = stripe_fill(cols, selected, count);
@@ -724,11 +1090,26 @@ pub fn run(
             continue;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if picker.mode == Mode::Files
+            && key.code == KeyCode::Enter
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            if let Some(choice) = jump_choice(key, hits.get(selected), &picker.query, &scope) {
+                return Ok(Some(choice));
+            }
+            continue;
+        }
         match key.code {
             KeyCode::Esc => return Ok(None),
             KeyCode::Char('c' | 'd') if ctrl => return Ok(None),
             KeyCode::PageUp => selected = selected.saturating_sub(page_size),
-            KeyCode::PageDown => selected = selected.saturating_add(page_size).min(count.saturating_sub(1)),
+            KeyCode::PageDown => {
+                selected = selected
+                    .saturating_add(page_size)
+                    .min(count.saturating_sub(1))
+            }
             KeyCode::Up => selected = selected.saturating_sub(1),
             KeyCode::Down => selected = (selected + 1).min(count.saturating_sub(1)),
             KeyCode::Enter => {
@@ -743,7 +1124,9 @@ pub fn run(
                     })
                 } else if picker.mode == Mode::Tldr {
                     Some(Choice::Command {
-                        command: smcli_search::tldr::to_placeholders(&picker.tldr_entries[tldr_ranked[selected]].template),
+                        command: smcli_search::tldr::to_placeholders(
+                            &picker.tldr_entries[tldr_ranked[selected]].template,
+                        ),
                         query: picker.query,
                         semantic: false,
                         edit_paths: false,
@@ -766,10 +1149,18 @@ pub fn run(
                     selected = 0;
                     status.clear();
                 } else if picker.mode != Mode::Tldr {
-                    switch_mode(&mut picker, Mode::History, &mut saved, &mut selected, &mut status);
+                    switch_mode(
+                        &mut picker,
+                        Mode::History,
+                        &mut saved,
+                        &mut selected,
+                        &mut status,
+                    );
                 }
             }
-            KeyCode::Char('a') if ctrl && picker.mode == Mode::Tldr && picker.tldr_program.is_some() => {
+            KeyCode::Char('a')
+                if ctrl && picker.mode == Mode::Tldr && picker.tldr_program.is_some() =>
+            {
                 picker.tldr_all = !picker.tldr_all;
                 tldr_ranked.clear();
                 selected = 0;
@@ -780,11 +1171,25 @@ pub fn run(
                     kind = (kind + 1) % 3;
                     selected = 0;
                 } else {
-                    switch_mode(&mut picker, Mode::Files, &mut saved, &mut selected, &mut status);
+                    switch_mode(
+                        &mut picker,
+                        Mode::Files,
+                        &mut saved,
+                        &mut selected,
+                        &mut status,
+                    );
                     kind = picker.kind;
                 }
             }
-            KeyCode::Char('g') if ctrl && !matches!(picker.mode, Mode::Grep | Mode::Tldr) => switch_mode(&mut picker, Mode::Grep, &mut saved, &mut selected, &mut status),
+            KeyCode::Char('g') if ctrl && !matches!(picker.mode, Mode::Grep | Mode::Tldr) => {
+                switch_mode(
+                    &mut picker,
+                    Mode::Grep,
+                    &mut saved,
+                    &mut selected,
+                    &mut status,
+                )
+            }
             KeyCode::Char('e') if ctrl && picker.mode == Mode::History && count > 0 => {
                 return Ok(Some(Choice::Command {
                     command: commands[selected].clone(),
@@ -867,7 +1272,13 @@ pub fn run(
     }
 }
 
-fn switch_mode(picker: &mut Picker, target: Mode, saved: &mut HashMap<Mode, String>, selected: &mut usize, status: &mut String) {
+fn switch_mode(
+    picker: &mut Picker,
+    target: Mode,
+    saved: &mut HashMap<Mode, String>,
+    selected: &mut usize,
+    status: &mut String,
+) {
     saved.insert(picker.mode, std::mem::take(&mut picker.query));
     if picker.mode == Mode::Grep {
         picker.single_file_path = None;
@@ -898,8 +1309,12 @@ pub(crate) fn history_insert(key: &str) -> String {
 /// from the start, join with `…`. Measured by display width, char by char, like `history_row`.
 /// Only when the last component alone does not fit is its end cut. Display only: insertion uses the full path.
 pub(crate) fn truncate_middle(path: &str, room: usize) -> String {
-    if room == 0 { return String::new(); }
-    if Span::raw(path).width() <= room { return path.to_string(); }
+    if room == 0 {
+        return String::new();
+    }
+    if Span::raw(path).width() <= room {
+        return path.to_string();
+    }
     // Directory rows end in '/': the last component is the final non-empty one, slash kept.
     let trimmed = path.trim_end_matches('/');
     let file = trimmed.rsplit('/').next().unwrap_or(trimmed).to_string();
@@ -911,8 +1326,12 @@ pub(crate) fn truncate_middle(path: &str, room: usize) -> String {
         let prefix_len = path.len() - tail.len(); // bytes before the last component
         let mut lead = String::new();
         for c in path.chars() {
-            if lead.len() >= prefix_len { break; } // never eat into the file name
-            if Span::raw(format!("{lead}{c}")).width() > budget { break; }
+            if lead.len() >= prefix_len {
+                break;
+            } // never eat into the file name
+            if Span::raw(format!("{lead}{c}")).width() > budget {
+                break;
+            }
             lead.push(c);
         }
         return format!("{lead}…{tail}");
@@ -920,39 +1339,78 @@ pub(crate) fn truncate_middle(path: &str, room: usize) -> String {
     // The component fits but the `…` join does not: show the whole component, no prefix.
     if Span::raw(&file).width() <= room {
         let slash = &path[trimmed.len()..];
-        return if Span::raw(format!("{file}{slash}")).width() <= room { format!("{file}{slash}") } else { file };
+        return if Span::raw(format!("{file}{slash}")).width() <= room {
+            format!("{file}{slash}")
+        } else {
+            file
+        };
     }
     // End-cut the component: it alone does not fit.
     let mut cut = String::new();
     for c in file.chars() {
-        if Span::raw(format!("{cut}{c}…")).width() > room { break; }
+        if Span::raw(format!("{cut}{c}…")).width() > room {
+            break;
+        }
         cut.push(c);
     }
-    if cut.is_empty() { "…".into() } else { format!("{cut}…") }
+    if cut.is_empty() {
+        "…".into()
+    } else {
+        format!("{cut}…")
+    }
 }
 
 /// File/grep row spans: git mark, path (middle-truncated to its room), `:line text`, provenance/status.
 /// LS_COLORS style always comes from the full name; in grep mode the path gets at most half the row.
-fn file_row_spans(h: &FileHit, mode: Mode, compact: bool, row_width: usize, ls_colors: &LsColors) -> Vec<Span<'static>> {
-    let git = if compact { String::new() } else { h.git.as_deref().map(|g| format!("{g} ")).unwrap_or_default() };
-    let location = h.line.map(|n| format!(":{n}  {}", h.text.as_deref().unwrap_or(""))).unwrap_or_default();
+fn file_row_spans(
+    h: &FileHit,
+    mode: Mode,
+    compact: bool,
+    row_width: usize,
+    ls_colors: &LsColors,
+) -> Vec<Span<'static>> {
+    let git = if compact {
+        String::new()
+    } else {
+        h.git
+            .as_deref()
+            .map(|g| format!("{g} "))
+            .unwrap_or_default()
+    };
+    let location = h
+        .line
+        .map(|n| format!(":{n}  {}", h.text.as_deref().unwrap_or("")))
+        .unwrap_or_default();
     let trail = if !compact {
         format!("  {}", h.provenance.join("+"))
     } else {
-        h.git.as_deref().map(str::trim).filter(|g| !g.is_empty()).map(|g| format!("  {g}")).unwrap_or_default()
+        h.git
+            .as_deref()
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+            .map(|g| format!("  {g}"))
+            .unwrap_or_default()
     };
     let sparkle = if compact && suggested(h) { " ✨" } else { "" };
     // The match text never eats the path's share: it is cut at the terminal's edge instead.
-    let fixed = 2 + git.len() + trail.len() + sparkle.len()
-        + if compact { 2 } else { 0 }; // inline cursor
+    let fixed = 2 + git.len() + trail.len() + sparkle.len() + if compact { 2 } else { 0 }; // inline cursor
     let mut room = row_width.saturating_sub(fixed);
-    if mode == Mode::Grep { room /= 2; }
+    if mode == Mode::Grep {
+        room /= 2;
+    }
     let name = &h.path;
     // Truncate the visible() expansion (a tab is two cells, not one); style and insertion use the raw name.
     let shown = truncate_middle(&visible(name), room);
     vec![
         Span::styled(git, ACCENT),
-        Span::styled(shown, if compact { ls_colors.style(name) } else { Style::new() }),
+        Span::styled(
+            shown,
+            if compact {
+                ls_colors.style(name)
+            } else {
+                Style::new()
+            },
+        ),
         Span::styled(visible(&location), MUTED),
         Span::styled(visible(&trail), MUTED),
         Span::raw(sparkle),
@@ -963,7 +1421,9 @@ fn file_row_spans(h: &FileHit, mode: Mode, compact: bool, row_width: usize, ls_c
 fn history_row(key: &str, width: usize) -> Vec<Span<'static>> {
     let (typed, expanded) = command_parts(key);
     let mut spans = highlight(&visible(&typed));
-    let Some(expanded) = expanded else { return spans };
+    let Some(expanded) = expanded else {
+        return spans;
+    };
     let room = width.saturating_sub(Line::from(spans.clone()).width() + 4);
     let expanded = visible(&expanded);
     let shown = if Span::raw(expanded.as_str()).width() <= room {
@@ -971,13 +1431,21 @@ fn history_row(key: &str, width: usize) -> Vec<Span<'static>> {
     } else {
         let mut cut = String::new();
         for c in expanded.chars() {
-            if Span::raw(format!("{cut}{c}…")).width() > room { break; }
+            if Span::raw(format!("{cut}{c}…")).width() > room {
+                break;
+            }
             cut.push(c);
         }
-        if cut.is_empty() { String::new() } else { format!("{cut}…") }
+        if cut.is_empty() {
+            String::new()
+        } else {
+            format!("{cut}…")
+        }
     };
     spans.extend([Span::raw("  "), Span::styled("↦", ACCENT)]);
-    if !shown.is_empty() { spans.push(Span::styled(format!(" {shown}"), MUTED)); }
+    if !shown.is_empty() {
+        spans.push(Span::styled(format!(" {shown}"), MUTED));
+    }
     spans
 }
 
@@ -1006,18 +1474,28 @@ fn filter_history(candidates: &[String], query: &str) -> Vec<String> {
 
 /// fff's blank-search suggestions, or files picked before.
 fn suggested(hit: &FileHit) -> bool {
-    hit.provenance.iter().any(|p| p == "picked" || p == "suggested")
+    hit.provenance
+        .iter()
+        .any(|p| p == "picked" || p == "suggested")
 }
 
 /// Suggested rows that contain the query first; the stable sort keeps ranking within each group.
 /// A picked row that only fuzzy-matched (a typo away) keeps its rank, so it never jumps over real matches.
 fn suggested_first(hits: &mut [FileHit], query: &str) {
-    let pattern = Pattern::new(query, CaseMatching::Ignore, Normalization::Smart, nucleo_matcher::pattern::AtomKind::Substring);
+    let pattern = Pattern::new(
+        query,
+        CaseMatching::Ignore,
+        Normalization::Smart,
+        nucleo_matcher::pattern::AtomKind::Substring,
+    );
     let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
     let mut buffer = Vec::new();
     hits.sort_by_cached_key(|h| {
         let exact = h.path.rsplit('/').next() == Some(query);
-        let suggested_match = suggested(h) && pattern.score(Utf32Str::new(&h.path, &mut buffer), &mut matcher).is_some();
+        let suggested_match = suggested(h)
+            && pattern
+                .score(Utf32Str::new(&h.path, &mut buffer), &mut matcher)
+                .is_some();
         (!exact, !suggested_match)
     });
 }
@@ -1027,7 +1505,10 @@ fn suggested_first(hits: &mut [FileHit], query: &str) {
 fn filter_kind(hits: Vec<FileHit>, kind: u8) -> Vec<FileHit> {
     // A blank search also returns dirs (trailing `/`): files mode drops them, folders mode keeps them as they are.
     if kind == 2 {
-        return hits.into_iter().filter(|h| !h.path.ends_with('/')).collect();
+        return hits
+            .into_iter()
+            .filter(|h| !h.path.ends_with('/'))
+            .collect();
     }
     if kind != 1 {
         return hits;
@@ -1036,9 +1517,19 @@ fn filter_kind(hits: Vec<FileHit>, kind: u8) -> Vec<FileHit> {
     let mut seen = HashSet::new();
     hits.into_iter()
         .filter_map(|h| {
-            if h.path.ends_with('/') { return seen.insert(h.path.clone()).then_some(h); }
+            if h.path.ends_with('/') {
+                return seen.insert(h.path.clone()).then_some(h);
+            }
             let path = parent(&h.path)?;
-            seen.insert(path.clone()).then(|| FileHit { insert: parent(&h.insert).unwrap_or_else(|| "./".to_string()), path, git: None, line: None, column: None, text: None, ..h })
+            seen.insert(path.clone()).then(|| FileHit {
+                insert: parent(&h.insert).unwrap_or_else(|| "./".to_string()),
+                path,
+                git: None,
+                line: None,
+                column: None,
+                text: None,
+                ..h
+            })
         })
         .collect()
 }
@@ -1066,27 +1557,43 @@ pub(crate) struct TerminalSession {
     pub terminal: Terminal<CrosstermBackend<File>>,
     /// The prompt's cursor column and the caller's stdout when drawn inline under it (`@`-Tab).
     inline: Option<(u16, std::os::fd::OwnedFd)>,
+    keyboard_enhanced: bool,
 }
 impl TerminalSession {
     /// Inline under the prompt when asked and it fits, else (or if the terminal won't say where the cursor is) fullscreen.
     // shortcut: a pty that never answers the cursor query waits crossterm's timeout on every open; cache the failure if one shows up.
     pub fn open(inline: bool, wanted: u16, rows: u16) -> Result<Self> {
-        match inline.then(|| inline_height(wanted, rows)).flatten().and_then(|height| Self::inline(height).ok()) {
+        match inline
+            .then(|| inline_height(wanted, rows))
+            .flatten()
+            .and_then(|height| Self::inline(height).ok())
+        {
             Some(session) => Ok(session),
             None => Self::new(),
         }
     }
     /// A `height`-row viewport below the prompt line. Errors (e.g. a pty that never reports the cursor) leave the terminal as found.
     pub fn inline(height: u16) -> Result<Self> {
-        let tty = OpenOptions::new().read(true).write(true).open("/dev/tty").context("pick needs a terminal")?;
+        let tty = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .context("pick needs a terminal")?;
         use std::os::fd::{AsRawFd, FromRawFd};
         // crossterm asks for the cursor on stdout, which the shell captures: point stdout at the tty until Drop.
         let saved = unsafe { libc::dup(1) };
-        if saved < 0 { return Err(std::io::Error::last_os_error().into()); }
+        if saved < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
         let stdout = unsafe { std::os::fd::OwnedFd::from_raw_fd(saved) };
         let restore = |stdout: &std::os::fd::OwnedFd| unsafe { libc::dup2(stdout.as_raw_fd(), 1) };
-        if unsafe { libc::dup2(tty.as_raw_fd(), 1) } < 0 { return Err(std::io::Error::last_os_error().into()); }
-        if let Err(error) = enable_raw_mode() { restore(&stdout); return Err(error.into()); }
+        if unsafe { libc::dup2(tty.as_raw_fd(), 1) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if let Err(error) = enable_raw_mode() {
+            restore(&stdout);
+            return Err(error.into());
+        }
         let column = match cursor::position() {
             Ok((column, _)) => column,
             Err(error) => {
@@ -1096,11 +1603,22 @@ impl TerminalSession {
             }
         };
         let mut display = tty.try_clone().context("pick needs a terminal")?;
-        let terminal = std::io::Write::write_all(&mut display, b"\r\n").map_err(anyhow::Error::from).and_then(|_| {
-            Ok(Terminal::with_options(CrosstermBackend::new(display), TerminalOptions { viewport: Viewport::Inline(height) })?)
-        });
+        let terminal = std::io::Write::write_all(&mut display, b"\r\n")
+            .map_err(anyhow::Error::from)
+            .and_then(|_| {
+                Ok(Terminal::with_options(
+                    CrosstermBackend::new(display),
+                    TerminalOptions {
+                        viewport: Viewport::Inline(height),
+                    },
+                )?)
+            });
         match terminal {
-            Ok(terminal) => Ok(Self { terminal, inline: Some((column, stdout)) }),
+            Ok(terminal) => Ok(Self {
+                terminal,
+                inline: Some((column, stdout)),
+                keyboard_enhanced: false,
+            }),
             Err(error) => {
                 let _ = execute!(&tty, cursor::MoveUp(1), cursor::MoveToColumn(column));
                 let _ = disable_raw_mode();
@@ -1123,12 +1641,22 @@ impl TerminalSession {
             .map_err(anyhow::Error::from)
             .and_then(|_| {
                 // A terminal reporting no size (some ptys) is drawn as 24x80.
-                let (columns, rows) = ratatui::crossterm::terminal::size().ok().filter(|&(_, rows)| rows > 0).unwrap_or((80, 24));
+                let (columns, rows) = ratatui::crossterm::terminal::size()
+                    .ok()
+                    .filter(|&(_, rows)| rows > 0)
+                    .unwrap_or((80, 24));
                 let viewport = Viewport::Fixed(ratatui::layout::Rect::new(0, 0, columns, rows));
-                Ok(Terminal::with_options(CrosstermBackend::new(display), TerminalOptions { viewport })?)
+                Ok(Terminal::with_options(
+                    CrosstermBackend::new(display),
+                    TerminalOptions { viewport },
+                )?)
             });
         match terminal {
-            Ok(terminal) => Ok(Self { terminal, inline: None }),
+            Ok(terminal) => Ok(Self {
+                terminal,
+                inline: None,
+                keyboard_enhanced: false,
+            }),
             Err(error) => {
                 let _ = execute!(tty, ratatui::crossterm::terminal::LeaveAlternateScreen);
                 let _ = disable_raw_mode();
@@ -1139,15 +1667,26 @@ impl TerminalSession {
 }
 impl Drop for TerminalSession {
     fn drop(&mut self) {
+        if self.keyboard_enhanced {
+            let _ = execute!(self.terminal.backend_mut(), PopKeyboardEnhancementFlags);
+        }
         if let Some((column, stdout)) = &self.inline {
             let column = *column;
             // The viewport may have scrolled the screen; the prompt is the line just above it.
             let row = self.terminal.get_frame().area().y.saturating_sub(1);
             let _ = self.terminal.clear();
-            let _ = execute!(self.terminal.backend_mut(), cursor::MoveTo(column, row), cursor::Show);
+            let _ = execute!(
+                self.terminal.backend_mut(),
+                cursor::MoveTo(column, row),
+                cursor::Show
+            );
             unsafe { libc::dup2(std::os::fd::AsRawFd::as_raw_fd(stdout), 1) };
         } else {
-            let _ = execute!(self.terminal.backend_mut(), ratatui::crossterm::terminal::LeaveAlternateScreen, cursor::Show);
+            let _ = execute!(
+                self.terminal.backend_mut(),
+                ratatui::crossterm::terminal::LeaveAlternateScreen,
+                cursor::Show
+            );
         }
         let _ = disable_raw_mode();
     }
@@ -1155,7 +1694,9 @@ impl Drop for TerminalSession {
 
 /// `cmd ? <selected template>`; `ok` colors the `?` and every `{{param}}` green, red on failure.
 fn command_helper_header(template: &str, ok: bool) -> Line<'static> {
-    let status = Style::new().fg(if ok { Color::Green } else { Color::Red }).add_modifier(Modifier::BOLD);
+    let status = Style::new()
+        .fg(if ok { Color::Green } else { Color::Red })
+        .add_modifier(Modifier::BOLD);
     let mut spans = vec![Span::styled(" cmd ", ACCENT), Span::styled("? ", status)];
     let mut depth = 0;
     for span in highlight(&visible(template)) {
@@ -1164,10 +1705,18 @@ fn command_helper_header(template: &str, ok: bool) -> Line<'static> {
         let mut rest = text.as_str();
         while !rest.is_empty() {
             let style = if depth == 0 { span.style } else { status };
-            let found = if depth == 0 { rest.find("{{") } else { rest.find("}}").map(|i| i + 2) };
+            let found = if depth == 0 {
+                rest.find("{{")
+            } else {
+                rest.find("}}").map(|i| i + 2)
+            };
             let cut = found.unwrap_or(rest.len());
-            if cut > 0 { spans.push(Span::styled(rest[..cut].to_string(), style)); }
-            if found.is_some() { depth = 1 - depth; }
+            if cut > 0 {
+                spans.push(Span::styled(rest[..cut].to_string(), style));
+            }
+            if found.is_some() {
+                depth = 1 - depth;
+            }
             rest = &rest[cut..];
         }
     }
@@ -1177,20 +1726,40 @@ fn command_helper_header(template: &str, ok: bool) -> Line<'static> {
 /// `ok` picks the arrow and placeholder color: green now, red once edits can fail.
 fn edit_files_header(mode: Mode, line: Option<&str>, ok: bool) -> Option<Line<'static>> {
     let line = visible(line.filter(|_| mode == Mode::Files)?);
-    let status = Style::new().fg(if ok { Color::Green } else { Color::Red }).add_modifier(Modifier::BOLD);
+    let status = Style::new()
+        .fg(if ok { Color::Green } else { Color::Red })
+        .add_modifier(Modifier::BOLD);
     // A placeholder is a bare @, not the start of a word like npm's @scope/pkg.
-    let is_placeholder = |s: &str, i: usize| s[i + 1..].starts_with(|c: char| c.is_alphanumeric() || "_./-".contains(c)) == false;
-    let total = line.match_indices('@').filter(|(i, _)| is_placeholder(&line, *i)).count();
-    let mut spans = vec![Span::styled(" editing ", ACCENT), Span::styled("→ ", status)];
+    let is_placeholder = |s: &str, i: usize| {
+        s[i + 1..].starts_with(|c: char| c.is_alphanumeric() || "_./-".contains(c)) == false
+    };
+    let total = line
+        .match_indices('@')
+        .filter(|(i, _)| is_placeholder(&line, *i))
+        .count();
+    let mut spans = vec![
+        Span::styled(" editing ", ACCENT),
+        Span::styled("→ ", status),
+    ];
     let mut n = 0;
     for span in highlight(&line) {
         let text = span.content.into_owned();
         let mut start = 0;
-        for (i, _) in text.match_indices('@').filter(|(i, _)| is_placeholder(&text, *i)) {
+        for (i, _) in text
+            .match_indices('@')
+            .filter(|(i, _)| is_placeholder(&text, *i))
+        {
             spans.push(Span::styled(text[start..i].to_string(), span.style));
             n += 1;
             // The number is display only; the accepted line keeps the bare @.
-            spans.push(Span::styled(if total > 1 { format!("@{n}") } else { "@".into() }, status));
+            spans.push(Span::styled(
+                if total > 1 {
+                    format!("@{n}")
+                } else {
+                    "@".into()
+                },
+                status,
+            ));
             start = i + 1;
         }
         spans.push(Span::styled(text[start..].to_string(), span.style));
@@ -1204,25 +1773,50 @@ mod tests {
     fn command_helper_header() {
         let line = super::command_helper_header("mise plugins add {{name}}", true);
         assert_eq!(line.to_string(), " cmd ? mise plugins add {{name}}");
-        let param: Vec<_> = line.spans.iter().filter(|s| s.content.contains("name")).collect();
-        assert!(param.iter().all(|s| s.style.fg == Some(ratatui::style::Color::Green)) && !param.is_empty());
+        let param: Vec<_> = line
+            .spans
+            .iter()
+            .filter(|s| s.content.contains("name"))
+            .collect();
+        assert!(
+            param
+                .iter()
+                .all(|s| s.style.fg == Some(ratatui::style::Color::Green))
+                && !param.is_empty()
+        );
     }
 
     #[test]
     fn files_edit_header() {
-        let text = |line| super::edit_files_header(super::Mode::Files, Some(line), true).map(|l| l.to_string());
+        let text = |line| {
+            super::edit_files_header(super::Mode::Files, Some(line), true).map(|l| l.to_string())
+        };
         assert_eq!(text("cat @").as_deref(), Some(" editing → cat @"));
         assert_eq!(text("mv @ @").as_deref(), Some(" editing → mv @1 @2"));
-        assert_eq!(text("echo café @").as_deref(), Some(" editing → echo café @"));
+        assert_eq!(
+            text("echo café @").as_deref(),
+            Some(" editing → echo café @")
+        );
         assert_eq!(text("mv é @ @").as_deref(), Some(" editing → mv é @1 @2"));
-        assert_eq!(text("npm i @scope/pkg --out=@").as_deref(), Some(" editing → npm i @scope/pkg --out=@"));
-        assert_eq!(super::edit_files_header(super::Mode::Files, None, true), None);
-        assert_eq!(super::edit_files_header(super::Mode::History, Some("cat @"), true), None);
+        assert_eq!(
+            text("npm i @scope/pkg --out=@").as_deref(),
+            Some(" editing → npm i @scope/pkg --out=@")
+        );
+        assert_eq!(
+            super::edit_files_header(super::Mode::Files, None, true),
+            None
+        );
+        assert_eq!(
+            super::edit_files_header(super::Mode::History, Some("cat @"), true),
+            None
+        );
     }
 
     use super::*;
 
-    fn width(s: &str) -> usize { Span::raw(s).width() }
+    fn width(s: &str) -> usize {
+        Span::raw(s).width()
+    }
 
     #[test]
     fn truncate_middle_fits_unchanged() {
@@ -1287,33 +1881,57 @@ mod tests {
     }
 
     fn hit(path: &str, line: Option<u32>, text: Option<&str>) -> FileHit {
-        FileHit { insert: path.into(), path: path.into(), git: None, line: line.map(i64::from), column: None, text: text.map(str::to_string), provenance: vec![], definition: None }
+        FileHit {
+            insert: path.into(),
+            path: path.into(),
+            git: None,
+            line: line.map(i64::from),
+            column: None,
+            text: text.map(str::to_string),
+            provenance: vec![],
+            definition: None,
+        }
     }
 
     #[test]
     fn file_row_truncates_path_to_room() {
         let ls = LsColors::parse("");
-        let h = hit("services/backend/internal/handlers/user_profile.go", None, None);
+        let h = hit(
+            "services/backend/internal/handlers/user_profile.go",
+            None,
+            None,
+        );
         let spans = file_row_spans(&h, Mode::Files, false, 40, &ls);
         let path = spans[1].content.clone();
         assert!(path.ends_with("/user_profile.go"), "{path}");
         assert!(path.contains('…'), "{path}");
         assert!(width(&path) <= 38, "{path}");
         // The inserted path is untouched.
-        assert_eq!(h.insert, "services/backend/internal/handlers/user_profile.go");
+        assert_eq!(
+            h.insert,
+            "services/backend/internal/handlers/user_profile.go"
+        );
     }
 
     #[test]
     fn grep_row_caps_path_at_half_row() {
         let ls = LsColors::parse("");
-        let h = hit("services/backend/internal/handlers/user_profile.go", Some(42), Some("func main()"));
+        let h = hit(
+            "services/backend/internal/handlers/user_profile.go",
+            Some(42),
+            Some("func main()"),
+        );
         let spans = file_row_spans(&h, Mode::Grep, false, 80, &ls);
         let path = spans[1].content.clone();
         assert!(path.contains('…'), "{path}");
         assert!(width(&path) <= (80 - 2) / 2, "{path}");
         // Match text stays visible.
         assert!(spans[2].content.contains(":42"), "{}", spans[2].content);
-        assert!(spans[2].content.contains("func main()"), "{}", spans[2].content);
+        assert!(
+            spans[2].content.contains("func main()"),
+            "{}",
+            spans[2].content
+        );
     }
 
     #[test]
@@ -1321,7 +1939,11 @@ mod tests {
         // A match longer than the row must not shrink the path below its half-row share.
         let ls = LsColors::parse("");
         let long = "x".repeat(500);
-        let h = hit("services/backend/internal/handlers/user_profile.go", Some(7), Some(&long));
+        let h = hit(
+            "services/backend/internal/handlers/user_profile.go",
+            Some(7),
+            Some(&long),
+        );
         let spans = file_row_spans(&h, Mode::Grep, false, 80, &ls);
         let path = spans[1].content.clone();
         assert!(path.ends_with("/user_profile.go"), "{path}");
@@ -1332,29 +1954,44 @@ mod tests {
     fn file_row_truncates_visible_expansion_not_raw_path() {
         // A tab is two display cells; the raw path must never reach the terminal or shrink the room wrongly.
         let ls = LsColors::parse("");
-        let h = hit("services/backend\tinternal/handlers/user_profile.go", None, None);
+        let h = hit(
+            "services/backend\tinternal/handlers/user_profile.go",
+            None,
+            None,
+        );
         let spans = file_row_spans(&h, Mode::Files, false, 40, &ls);
         let path = spans[1].content.clone();
         assert!(!path.contains('\t'), "{path:?}");
         assert!(path.ends_with("/user_profile.go"), "{path}");
         assert!(width(&path) <= 38, "{path}");
-        assert_eq!(h.insert, "services/backend\tinternal/handlers/user_profile.go");
+        assert_eq!(
+            h.insert,
+            "services/backend\tinternal/handlers/user_profile.go"
+        );
     }
 
     fn render_row(spans: Vec<Span>, width: u16) -> String {
         let backend = ratatui::backend::TestBackend::new(width, 1);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| {
-            frame.render_widget(Paragraph::new(Line::from(spans)), frame.area());
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(Line::from(spans)), frame.area());
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer();
-        (0..width as usize).map(|x| buffer[(x as u16, 0)].symbol()).collect()
+        (0..width as usize)
+            .map(|x| buffer[(x as u16, 0)].symbol())
+            .collect()
     }
 
     #[test]
     fn rendered_file_row_shortens_middle_at_fixed_width() {
         let ls = LsColors::parse("");
-        let h = hit("services/backend/internal/handlers/user_profile.go", None, None);
+        let h = hit(
+            "services/backend/internal/handlers/user_profile.go",
+            None,
+            None,
+        );
         let row = render_row(file_row_spans(&h, Mode::Files, false, 40, &ls), 40);
         assert!(row.contains("user_profile.go"), "{row:?}");
         assert!(row.contains('…'), "{row:?}");
@@ -1365,7 +2002,11 @@ mod tests {
     #[test]
     fn rendered_grep_row_keeps_path_and_line_at_fixed_width() {
         let ls = LsColors::parse("");
-        let h = hit("services/backend/internal/handlers/user_profile.go", Some(42), Some(&"y".repeat(200)));
+        let h = hit(
+            "services/backend/internal/handlers/user_profile.go",
+            Some(42),
+            Some(&"y".repeat(200)),
+        );
         let row = render_row(file_row_spans(&h, Mode::Grep, false, 60, &ls), 60);
         assert!(row.contains("user_profile.go"), "{row:?}");
         assert!(row.contains('…'), "{row:?}");
@@ -1373,8 +2014,57 @@ mod tests {
     }
 
     #[test]
+    fn picker_modified_enter_jumps_only_to_directories() {
+        let dir = hit("Dev/Apps/", None, None);
+        let file = hit("report.txt", None, None);
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            let key = KeyEvent::new(KeyCode::Enter, modifiers);
+            let Some(Choice::Jump {
+                hit,
+                mode,
+                query,
+                scope,
+            }) = jump_choice(key, Some(&dir), "Apps", "/home/user")
+            else {
+                panic!("modified Enter should jump to a directory");
+            };
+            assert_eq!(hit.path, "Dev/Apps/");
+            assert_eq!(mode, Mode::Files);
+            assert_eq!(query, "Apps");
+            assert_eq!(scope, "/home/user");
+            assert!(jump_choice(key, Some(&file), "", "/home/user").is_none());
+            assert!(jump_choice(key, None, "", "/home/user").is_none());
+            let release = KeyEvent::new_with_kind(KeyCode::Enter, modifiers, KeyEventKind::Release);
+            assert!(jump_choice(release, Some(&dir), "", "/home/user").is_none());
+        }
+        assert!(
+            jump_choice(
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                Some(&dir),
+                "",
+                "/home/user"
+            )
+            .is_none()
+        );
+        assert!(
+            jump_choice(
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::ALT),
+                Some(&dir),
+                "",
+                "/home/user"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn picker_keeps_full_and_suggested_lists_separate() {
-        let p = Picker::new(vec!["suggested".into(), "shared".into()], vec!["shared".into(), "recent".into()], vec!["native".into()], String::new());
+        let p = Picker::new(
+            vec!["suggested".into(), "shared".into()],
+            vec!["shared".into(), "recent".into()],
+            vec!["native".into()],
+            String::new(),
+        );
         assert_eq!(p.full, ["shared", "recent", "native"]);
         assert_eq!(p.suggested, ["suggested", "shared"]);
     }
@@ -1387,14 +2077,29 @@ mod tests {
         let mut status = "status".into();
         p.query = "history".into();
         switch_mode(&mut p, Mode::Files, &mut saved, &mut selected, &mut status);
-        assert_eq!((p.mode, p.query.as_str(), selected, status.as_str()), (Mode::Files, "", 0, ""));
+        assert_eq!(
+            (p.mode, p.query.as_str(), selected, status.as_str()),
+            (Mode::Files, "", 0, "")
+        );
         p.query = "files".into();
-        switch_mode(&mut p, Mode::History, &mut saved, &mut selected, &mut status);
+        switch_mode(
+            &mut p,
+            Mode::History,
+            &mut saved,
+            &mut selected,
+            &mut status,
+        );
         assert_eq!((p.mode, p.query.as_str()), (Mode::History, "history"));
         p.mode = Mode::Grep;
         p.single_file_path = Some("f".into());
         p.saved_file_scope = Some("scope".into());
-        switch_mode(&mut p, Mode::History, &mut saved, &mut selected, &mut status);
+        switch_mode(
+            &mut p,
+            Mode::History,
+            &mut saved,
+            &mut selected,
+            &mut status,
+        );
         assert_eq!((p.single_file_path, p.saved_file_scope), (None, None));
     }
 
@@ -1403,9 +2108,15 @@ mod tests {
         let mut kind = 0;
         let cycle = |kind: &mut u8| *kind = (*kind + 1) % 3;
         let mut values = Vec::new();
-        for _ in 0..4 { values.push(kind); cycle(&mut kind); }
+        for _ in 0..4 {
+            values.push(kind);
+            cycle(&mut kind);
+        }
         assert_eq!(values, [0, 1, 2, 0]);
-        let p = Picker { kind: 1, ..Picker::new(vec![], vec![], vec![], String::new()) };
+        let p = Picker {
+            kind: 1,
+            ..Picker::new(vec![], vec![], vec![], String::new())
+        };
         assert_eq!(p.kind, 1);
     }
 
@@ -1413,15 +2124,20 @@ mod tests {
     fn fixed_viewport_can_shrink_and_grow() {
         let mut terminal = Terminal::with_options(
             ratatui::backend::TestBackend::new(100, 30),
-            TerminalOptions { viewport: Viewport::Fixed(Rect::new(0, 0, 100, 30)) },
-        ).unwrap();
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 100, 30)),
+            },
+        )
+        .unwrap();
         for (columns, rows) in [(40, 8), (120, 40)] {
             terminal.backend_mut().resize(columns, rows);
             terminal.resize(Rect::new(0, 0, columns, rows)).unwrap();
-            terminal.draw(|frame| {
-                assert_eq!(frame.area(), Rect::new(0, 0, columns, rows));
-                assert_eq!(picker_layout(frame.area())[6].bottom(), rows);
-            }).unwrap();
+            terminal
+                .draw(|frame| {
+                    assert_eq!(frame.area(), Rect::new(0, 0, columns, rows));
+                    assert_eq!(picker_layout(frame.area())[6].bottom(), rows);
+                })
+                .unwrap();
         }
     }
 
@@ -1433,35 +2149,78 @@ mod tests {
         let mut backend = ratatui::backend::TestBackend::new(80, 24);
         // The cursor after `\r\n` from a prompt on the last row.
         ratatui::backend::Backend::set_cursor_position(&mut backend, (0, 23)).unwrap();
-        let mut terminal = Terminal::with_options(backend, TerminalOptions { viewport: Viewport::Inline(17) }).unwrap();
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(17),
+            },
+        )
+        .unwrap();
         let area = terminal.get_frame().area();
         assert_eq!((area.y, area.height), (7, 17));
         assert_eq!(area.y.saturating_sub(1), 6);
         let [header, filters, search, _, list, sunset, globals] = inline_layout(area);
-        let order: Vec<u16> = [header, search, sunset, filters, list, globals].iter().map(|r| r.y).collect();
-        assert_eq!(order, [7, 8, 9, 10, 11, 23], "search, underline, list hints, 12 results, global hints");
+        let order: Vec<u16> = [header, search, sunset, filters, list, globals]
+            .iter()
+            .map(|r| r.y)
+            .collect();
+        assert_eq!(
+            order,
+            [7, 8, 9, 10, 11, 23],
+            "search, underline, list hints, 12 results, global hints"
+        );
         assert_eq!(list.height, 12);
     }
 
     #[test]
     fn ls_colors_match_dirs_and_longest_extension() {
         let unset = LsColors::parse("");
-        assert_eq!(unset.style("src/"), Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD));
+        assert_eq!(
+            unset.style("src/"),
+            Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)
+        );
         assert_eq!(unset.style("a.rs"), Style::new());
-        let colors = LsColors::parse("di=01;36:*.gz=31:*.tar.gz=38;5;208:*.RS=38;2;1;2;3:fi=00:x=bad:*.ok=38;5");
-        assert_eq!(colors.style("lib.d/"), Style::new().fg(Color::Indexed(6)).add_modifier(Modifier::BOLD));
-        assert_eq!(colors.style("a.TAR.GZ"), Style::new().fg(Color::Indexed(208)));
+        let colors = LsColors::parse(
+            "di=01;36:*.gz=31:*.tar.gz=38;5;208:*.RS=38;2;1;2;3:fi=00:x=bad:*.ok=38;5",
+        );
+        assert_eq!(
+            colors.style("lib.d/"),
+            Style::new()
+                .fg(Color::Indexed(6))
+                .add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            colors.style("a.TAR.GZ"),
+            Style::new().fg(Color::Indexed(208))
+        );
         assert_eq!(colors.style("a.gz"), Style::new().fg(Color::Indexed(1)));
-        assert_eq!(colors.style("main.rs"), Style::new().fg(Color::Rgb(1, 2, 3)));
+        assert_eq!(
+            colors.style("main.rs"),
+            Style::new().fg(Color::Rgb(1, 2, 3))
+        );
         assert_eq!(colors.style("x.ok"), Style::new());
-        assert_eq!(sgr("41;32"), Style::new().fg(Color::Indexed(2)), "backgrounds dropped");
+        assert_eq!(
+            sgr("41;32"),
+            Style::new().fg(Color::Indexed(2)),
+            "backgrounds dropped"
+        );
     }
 
     #[test]
     fn suggested_rows_lead_only_when_they_contain_the_query() {
         let hit = |path: &str, picked: bool| FileHit {
-            insert: path.into(), path: path.into(), git: None, line: None, column: None, text: None, definition: None,
-            provenance: if picked { vec!["fff".into(), "picked".into()] } else { vec!["fff".into()] },
+            insert: path.into(),
+            path: path.into(),
+            git: None,
+            line: None,
+            column: None,
+            text: None,
+            definition: None,
+            provenance: if picked {
+                vec!["fff".into(), "picked".into()]
+            } else {
+                vec!["fff".into()]
+            },
         };
         let mut hits = vec![hit("t02 a", false), hit("t01 b", true), hit("t02 c", true)];
         suggested_first(&mut hits, "t02");
@@ -1469,18 +2228,35 @@ mod tests {
         assert_eq!(order, ["t02 c", "t02 a", "t01 b"]);
         suggested_first(&mut hits, "");
         let order: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
-        assert_eq!(order, ["t02 c", "t01 b", "t02 a"], "empty query: every suggestion leads");
+        assert_eq!(
+            order,
+            ["t02 c", "t01 b", "t02 a"],
+            "empty query: every suggestion leads"
+        );
     }
 
     #[test]
     fn exact_filename_stays_ahead_of_picked_fuzzy_match() {
         let hit = |path: &str, picked: bool| FileHit {
-            insert: path.into(), path: path.into(), git: None, line: None, column: None, text: None, definition: None,
-            provenance: if picked { vec!["fff".into(), "picked".into()] } else { vec!["fff".into()] },
+            insert: path.into(),
+            path: path.into(),
+            git: None,
+            line: None,
+            column: None,
+            text: None,
+            definition: None,
+            provenance: if picked {
+                vec!["fff".into(), "picked".into()]
+            } else {
+                vec!["fff".into()]
+            },
         };
         let mut hits = vec![hit("xneedle.rs", true), hit("needle.rs", false)];
         suggested_first(&mut hits, "needle.rs");
-        assert_eq!(hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(), ["needle.rs", "xneedle.rs"]);
+        assert_eq!(
+            hits.iter().map(|h| h.path.as_str()).collect::<Vec<_>>(),
+            ["needle.rs", "xneedle.rs"]
+        );
     }
 
     #[test]
@@ -1491,8 +2267,14 @@ mod tests {
         std::fs::write(root.join("top.txt"), "").unwrap();
         let scope = root.canonicalize().unwrap();
         let s = scope.to_str().unwrap();
-        assert_eq!(tab_target(s, "a/"), Some(scope.join("a").to_string_lossy().into_owned()));
-        assert_eq!(tab_target(s, "a/b/f.txt"), Some(scope.join("a/b").to_string_lossy().into_owned()));
+        assert_eq!(
+            tab_target(s, "a/"),
+            Some(scope.join("a").to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            tab_target(s, "a/b/f.txt"),
+            Some(scope.join("a/b").to_string_lossy().into_owned())
+        );
         assert_eq!(tab_target(s, "top.txt"), None, "parent is the scope");
         assert_eq!(tab_target(s, "../"), None, "outside the scope");
         std::fs::remove_dir_all(&root).unwrap();
@@ -1500,36 +2282,94 @@ mod tests {
 
     #[test]
     fn project_folders_from_file_parents() {
-        let hit = |path: &str, insert: &str| FileHit { insert: insert.into(), path: path.into(), provenance: vec!["files".into()], git: None, line: None, column: None, text: None, definition: None };
-        let dirs = filter_kind(vec![hit("src/a.rs", "../src/a.rs"), hit("src/b.rs", "../src/b.rs"), hit("top.rs", "../top.rs")], 1);
-        assert_eq!(dirs.iter().map(|h| (h.path.as_str(), h.insert.as_str())).collect::<Vec<_>>(), [("src/", "../src/")]);
+        let hit = |path: &str, insert: &str| FileHit {
+            insert: insert.into(),
+            path: path.into(),
+            provenance: vec!["files".into()],
+            git: None,
+            line: None,
+            column: None,
+            text: None,
+            definition: None,
+        };
+        let dirs = filter_kind(
+            vec![
+                hit("src/a.rs", "../src/a.rs"),
+                hit("src/b.rs", "../src/b.rs"),
+                hit("top.rs", "../top.rs"),
+            ],
+            1,
+        );
+        assert_eq!(
+            dirs.iter()
+                .map(|h| (h.path.as_str(), h.insert.as_str()))
+                .collect::<Vec<_>>(),
+            [("src/", "../src/")]
+        );
         let cwd = filter_kind(vec![hit("src/a.rs", "a.rs")], 1);
-        assert_eq!(cwd.iter().map(|h| (h.path.as_str(), h.insert.as_str())).collect::<Vec<_>>(), [("src/", "./")]);
+        assert_eq!(
+            cwd.iter()
+                .map(|h| (h.path.as_str(), h.insert.as_str()))
+                .collect::<Vec<_>>(),
+            [("src/", "./")]
+        );
         assert_eq!(filter_kind(vec![hit("x/y", "y")], 2).len(), 1);
     }
     #[test]
     fn alias_identity_display_and_insertion_are_separate() {
         let first = command_key("gl", Some("git log"));
         let second = command_key("gl", Some("git ls-files"));
-        let picker = Picker::new(vec![first.clone()], vec![second.clone()], vec!["gl".into()], String::new());
+        let picker = Picker::new(
+            vec![first.clone()],
+            vec![second.clone()],
+            vec!["gl".into()],
+            String::new(),
+        );
         assert_eq!(picker.full.len(), 2);
         assert_eq!(picker.suggested, [first.clone()]);
         assert_eq!(history_label(&first), "gl  ↦ git log");
         assert_eq!(history_insert(&first), "gl");
         assert_eq!(history_insert("gl"), "gl");
-        assert_eq!(filter_history(&picker.full, "ls-files"), [second], "{:?}", picker.full.iter().map(|s| history_label(s)).collect::<Vec<_>>());
-        assert_eq!(history_label(&command_key("g\x1b[31m", Some("git status"))), "g^[[31m  ↦ git status");
+        assert_eq!(
+            filter_history(&picker.full, "ls-files"),
+            [second],
+            "{:?}",
+            picker
+                .full
+                .iter()
+                .map(|s| history_label(s))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            history_label(&command_key("g\x1b[31m", Some("git status"))),
+            "g^[[31m  ↦ git status"
+        );
     }
 
     #[test]
     fn alias_rows_mark_the_alias_and_cut_only_the_expansion() {
-        let text = |spans: Vec<Span>| spans.iter().map(|s| s.content.to_string()).collect::<String>();
-        let key = command_key("mkal", Some(r#"$EDITOR $ZDOTDIR/conf.d/50-aliases.zsh && source "$ZDOTDIR/.zshrc""#));
-        assert_eq!(text(history_row(&key, 200)), r#"mkal  ↦ $EDITOR $ZDOTDIR/conf.d/50-aliases.zsh && source "$ZDOTDIR/.zshrc""#);
+        let text = |spans: Vec<Span>| {
+            spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        let key = command_key(
+            "mkal",
+            Some(r#"$EDITOR $ZDOTDIR/conf.d/50-aliases.zsh && source "$ZDOTDIR/.zshrc""#),
+        );
+        assert_eq!(
+            text(history_row(&key, 200)),
+            r#"mkal  ↦ $EDITOR $ZDOTDIR/conf.d/50-aliases.zsh && source "$ZDOTDIR/.zshrc""#
+        );
         let narrow = text(history_row(&key, 20));
         assert_eq!(narrow, "mkal  ↦ $EDITOR $ZD…");
         assert_eq!(Span::raw(narrow).width(), 20);
-        assert_eq!(text(history_row(&key, 4)), "mkal  ↦", "too narrow: the alias stays whole and the expansion goes");
+        assert_eq!(
+            text(history_row(&key, 4)),
+            "mkal  ↦",
+            "too narrow: the alias stays whole and the expansion goes"
+        );
         assert_eq!(text(history_row("git status", 4)), "git status");
         let row = history_row(&key, 200);
         assert!(row.iter().any(|s| s.content == "↦" && s.style == ACCENT));
@@ -1595,14 +2435,30 @@ mod tests {
             assert_eq!(style.fg, Some(stripe_color(col, width as usize)));
             assert!(!style.add_modifier.contains(Modifier::DIM));
         }
-        assert!(colors[filled as usize..].iter().all(|style| *style == MUTED));
+        assert!(
+            colors[filled as usize..]
+                .iter()
+                .all(|style| *style == MUTED)
+        );
         let dim = stripe_line(9, 9, Modifier::DIM, "▀");
-        assert!(dim.spans.iter().all(|span| span.style.add_modifier.contains(Modifier::DIM)));
+        assert!(
+            dim.spans
+                .iter()
+                .all(|span| span.style.add_modifier.contains(Modifier::DIM))
+        );
         assert_eq!(
-            dim.spans.iter().map(|span| span.content.chars().count()).sum::<usize>(),
+            dim.spans
+                .iter()
+                .map(|span| span.content.chars().count())
+                .sum::<usize>(),
             9
         );
-        assert!(stripe_line(8, 0, Modifier::empty(), "▀").spans.iter().all(|span| span.style == MUTED));
+        assert!(
+            stripe_line(8, 0, Modifier::empty(), "▀")
+                .spans
+                .iter()
+                .all(|span| span.style == MUTED)
+        );
     }
 }
 
@@ -1616,16 +2472,26 @@ mod worker_tests {
         let (release, wait) = mpsc::channel();
         let (requests, replies) = worker(move |query: &usize| {
             started.send(*query).unwrap();
-            if *query == 0 { wait.recv().unwrap(); }
+            if *query == 0 {
+                wait.recv().unwrap();
+            }
             *query
         });
         requests.send(0).unwrap();
         assert_eq!(running.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
-        for query in 1..=10 { requests.send(query).unwrap(); }
+        for query in 1..=10 {
+            requests.send(query).unwrap();
+        }
         release.send(()).unwrap();
-        assert_eq!(replies.recv_timeout(Duration::from_secs(2)).unwrap(), (0, 0));
+        assert_eq!(
+            replies.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (0, 0)
+        );
         assert_eq!(running.recv_timeout(Duration::from_secs(2)).unwrap(), 10);
-        assert_eq!(replies.recv_timeout(Duration::from_secs(2)).unwrap(), (10, 10));
+        assert_eq!(
+            replies.recv_timeout(Duration::from_secs(2)).unwrap(),
+            (10, 10)
+        );
         assert!(replies.try_recv().is_err());
     }
 
@@ -1638,13 +2504,26 @@ mod worker_tests {
             wait.recv().unwrap();
             query.1.clone()
         });
-        let request = (Mode::Grep, "old query".to_owned(), "/scope".into(), Some("file.rs".into()));
+        let request = (
+            Mode::Grep,
+            "old query".to_owned(),
+            "/scope".into(),
+            Some("file.rs".into()),
+        );
         requests.send(request.clone()).unwrap();
         assert!(matches!(replies.try_recv(), Err(mpsc::TryRecvError::Empty)));
         release.send(()).unwrap();
         let (identity, result) = replies.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(identity, request);
-        assert_ne!(identity, (Mode::Grep, "new query".to_owned(), "/scope".into(), Some("file.rs".into())));
+        assert_ne!(
+            identity,
+            (
+                Mode::Grep,
+                "new query".to_owned(),
+                "/scope".into(),
+                Some("file.rs".into())
+            )
+        );
         assert_eq!(result, "old query");
     }
 }
@@ -1663,7 +2542,10 @@ mod scope_tests {
     #[test]
     fn widen_scope_stops_at_home_and_outside_it() {
         let home = "/Users/u";
-        assert_eq!(widen_scope("/Users/u/Dev/Apps", home), Some("/Users/u/Dev".into()));
+        assert_eq!(
+            widen_scope("/Users/u/Dev/Apps", home),
+            Some("/Users/u/Dev".into())
+        );
         assert_eq!(widen_scope("/Users/u", home), None);
         assert_eq!(widen_scope("/Users/u/Dev", home), Some("/Users/u".into()));
         assert_eq!(widen_scope("/var/log", home), None);
@@ -1686,7 +2568,10 @@ mod hint_layout_tests {
                 bottom = row.bottom();
             }
             assert_eq!(bottom, area.bottom());
-            let content_height = rows[4].height.saturating_sub(if rows[2].height == 3 { 2 } else { 0 });
+            let content_height =
+                rows[4]
+                    .height
+                    .saturating_sub(if rows[2].height == 3 { 2 } else { 0 });
             assert!(content_height >= height.saturating_sub(1).min(3));
             if height >= 13 {
                 assert_eq!(rows.map(|r| r.height), [1, 1, 3, 1, height - 8, 1, 1]);

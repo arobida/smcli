@@ -1,13 +1,6 @@
 # Roadmap
 
-Open work, not scheduled. macOS and Linux are supported today; search is included on both.
-
-## Verification
-
-- **Linux:** run `make linux` (Docker) to exercise the full suite on Linux. The historical Fish prompt
-  timeout in `scripts/test-shells.py` is still unverified; record the container Fish version and the prompt
-  transcript if it recurs. The musl descriptor close (`close_range`, `/proc/self/fd` fallback in
-  `service_client.rs`) is compile-checked only; run it on a musl system with the Linux release.
+Open work, not scheduled. macOS is the current target. Linux is still wanted, but all Linux work is on the backburner; see [Linux (backburner)](#linux-backburner).
 
 ## Search
 
@@ -49,7 +42,20 @@ Open work, not scheduled. macOS and Linux are supported today; search is include
 - **Licensing:** choose the root `LICENSE`, settle the xdiff (LGPL) distribution route, and add the
   missing license texts. Tracked in `shipit-checklist.md`.
 - **Notices:** regenerate `THIRD_PARTY_NOTICES.md` against the release dependency set before shipping.
-- **Linux packaging:** decide on tarball, .deb or Homebrew-on-Linux, and apply `shipit-checklist.md` to those artifacts.
+
+## Linux (backburner)
+
+Not a priority: do not run `make linux`, and do not let Linux issues block macOS work. The existing Linux code stays in place. Pick these up together when Linux becomes the focus.
+
+- **Full suite:** `make linux` has not been confirmed passing; Docker was unavailable on the last recorded attempts. Run it first. It includes the `/proc/<pid>/environ` check in `scripts/test-service.py`, which runs only on Linux.
+- **Fish:** the historical prompt timeout in `scripts/test-shells.py` is unverified. Record the container Fish version and the prompt transcript if it recurs.
+- **musl:** the descriptor close (`close_range`, `/proc/self/fd` fallback in `service_client.rs`) is compile-checked only. Run it on a musl system with the Linux release.
+- **Earlier acceptance:** the Linux acceptance step in `build-test-efficiency.md` is unverified.
+- **Install:** `scripts/install.sh` stops on anything but macOS, so Linux users copy files by hand. Add a Linux path, or delete its unreachable Linux `stat` branch.
+- **Packaging:** decide on tarball, .deb or Homebrew-on-Linux, and apply `shipit-checklist.md` to those artifacts.
+- **File watching:** inotify needs one watch per directory, so a huge tree can hit the user's limit and leave Git status refreshing by age only (`context_cache.rs`). The recursive watch is also set up while the context cache lock is held; its cost on Linux is unmeasured.
+- **Dead-code audit:** `make unused` on macOS cannot see private code compiled only on Linux. Run it on Linux too.
+- **Docs:** `README.md` and `docs/install.md` say "Linux support coming soon!". When Linux ships, replace that and restore the build prerequisites: a C toolchain, `pkg-config` and SQLite development headers (`build-essential pkg-config libsqlite3-dev` on Debian/Ubuntu).
 
 ## Ideas (unscheduled)
 

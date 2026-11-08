@@ -1,33 +1,80 @@
-use std::{collections::HashMap, panic::{catch_unwind, AssertUnwindSafe}, path::PathBuf, sync::{Arc, Condvar, Mutex}, time::{Duration, Instant}};
 use anyhow::{Result, anyhow};
-use fff_search::{FilePicker, FilePickerOptions, SharedFilePicker, SharedFrecency, QueryParser, FuzzySearchOptions, PaginationArgs, GrepSearchOptions, DirSearchConfig, MixedSearchConfig, Constraint};
-use smcli_core::request::{Complete as CompleteQuery, FileQuery, Select as SelectQuery};
+use fff_search::{
+    Constraint, DirSearchConfig, FilePicker, FilePickerOptions, FuzzySearchOptions,
+    GrepSearchOptions, MixedSearchConfig, PaginationArgs, QueryParser, SharedFilePicker,
+    SharedFrecency,
+};
 #[cfg(test)]
 use smcli_core::request::Request;
+use smcli_core::request::{Complete as CompleteQuery, FileQuery, Select as SelectQuery};
 use smcli_core::service_protocol::FailureCode;
-use smcli_core::{context::ProjectContext, paths::relative_insert, service_protocol::{FileHit, FileIndexInfo, ServiceResponse}};
 #[cfg(test)]
 use smcli_core::service_protocol::ServiceRequest;
+use smcli_core::{
+    context::ProjectContext,
+    paths::relative_insert,
+    service_protocol::{FileHit, FileIndexInfo, ServiceResponse},
+};
+use std::{
+    collections::HashMap,
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::{Path, PathBuf},
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
+};
 
-type Scores = Box<dyn Fn(&str) -> HashMap<String, f64> + Send + Sync>;
-type Record = Box<dyn Fn(&str, &str, &str, &str, &str, Option<&str>, &std::path::Path) -> Result<()> + Send + Sync>;
+/// (picked scores, visited scores): visits are folders the user only ran commands in.
+type ScoreMaps = (HashMap<String, f64>, HashMap<String, f64>);
+type Scores = Box<dyn Fn(&str) -> ScoreMaps + Send + Sync>;
+
+/// Visits rank below picks: squashed by `s / (1 + s)`, a cd-only folder's lift stays under this, below one fresh pick's.
+const VISIT_WEIGHT: f64 = 0.5;
+/// Most frecent paths considered when extending a blank query.
+const FRECENT_LIMIT: usize = 200;
+
+fn boost(picked: &HashMap<String, f64>, visited: &HashMap<String, f64>, key: &str) -> f64 {
+    let key = key.trim_end_matches('/');
+    picked
+        .get(key)
+        .copied()
+        .unwrap_or_else(|| visited.get(key).map_or(0., |v| VISIT_WEIGHT * v / (1. + v)))
+        .min(3.)
+}
+type Record = Box<
+    dyn Fn(&str, &str, &str, &str, &str, Option<&str>, &std::path::Path) -> Result<()>
+        + Send
+        + Sync,
+>;
 /// Owns one fff instance for one root. An evicted index lives until its last request ends.
 pub(crate) struct OwnedIndex(SharedFilePicker);
 impl std::ops::Deref for OwnedIndex {
     type Target = SharedFilePicker;
-    fn deref(&self) -> &Self::Target { &self.0 }
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 impl Drop for OwnedIndex {
     fn drop(&mut self) {
         self.0.shutdown_watches_and_wait();
-        if let Ok(mut guard) = self.0.write() { guard.take(); }
+        if let Ok(mut guard) = self.0.write() {
+            guard.take();
+        }
     }
 }
 pub(crate) type Index = Arc<OwnedIndex>;
 type Pending = Arc<(Mutex<Option<Result<Index, String>>>, Condvar)>;
-struct Entry { id: i64, index: Index, used: Instant }
+struct Entry {
+    id: i64,
+    index: Index,
+    used: Instant,
+}
 #[derive(Default)]
-struct Pool { entries: HashMap<(String, bool), Entry>, pending: HashMap<(String, bool), Pending>, building: usize, next: i64 }
+struct Pool {
+    entries: HashMap<(String, bool), Entry>,
+    pending: HashMap<(String, bool), Pending>,
+    building: usize,
+    next: i64,
+}
 
 /// `files`, `grep` and `select` of a file: fff searches over one instance per root, with the root and Git worktree taken
 /// from the directory context. Runs on the caller's connection thread, never on the state queue.
@@ -40,24 +87,58 @@ pub struct FileSearch {
     scores: Scores,
     record: Record,
     home: PathBuf,
+    /// The live database; roots holding it are refused unless `paths::fff_skips` says fff skips it there.
+    exposed: Option<PathBuf>, // canonical database path
 }
 #[path = "evidence.rs"]
 pub(crate) mod evidence;
 
 impl FileSearch {
-    pub fn new(capacity: usize, idle: Duration, scores: Scores, record: Record, home: PathBuf) -> Self {
-        Self { capacity: capacity.max(1), idle, pool: Mutex::new(Pool::default()), available: Condvar::new(), scores, record, home }
+    pub fn new(
+        capacity: usize,
+        idle: Duration,
+        scores: Scores,
+        record: Record,
+        home: PathBuf,
+    ) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            idle,
+            pool: Mutex::new(Pool::default()),
+            available: Condvar::new(),
+            scores,
+            record,
+            home,
+            exposed: None,
+        }
     }
 
-    pub(crate) fn capacity(&self) -> usize { self.capacity }
+    /// Refuse to index any root that holds `database`: fff would open it and drop the service's SQLite locks.
+    pub fn refuse_roots_holding(mut self, database: PathBuf) -> Self {
+        self.exposed = Some(database);
+        self
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
 
     /// The directory's Git worktree, or the directory itself outside Git. Real paths, so symlinks don't split instances.
     pub(crate) fn root(directory: &str) -> Option<String> {
-        ProjectContext::discover(directory).repository.map(|r| r.root).or_else(|| std::fs::canonicalize(directory).ok().map(|p| p.to_string_lossy().into_owned()))
+        ProjectContext::discover(directory)
+            .repository
+            .map(|r| r.root)
+            .or_else(|| {
+                std::fs::canonicalize(directory)
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            })
     }
 
     pub(crate) fn ready(&self, root: &str) -> Option<Index> {
-        self.ready_with_id(root, true).or_else(|| self.ready_with_id(root, false)).map(|(index, _)| index)
+        self.ready_with_id(root, true)
+            .or_else(|| self.ready_with_id(root, false))
+            .map(|(index, _)| index)
     }
 
     /// The instance for `root`, created (and the least recently used one evicted) when needed.
@@ -66,21 +147,35 @@ impl FileSearch {
         self.index_with_content(root, true)
     }
 
-    fn index_with_content(&self, root: &str, enable_content_indexing: bool) -> Result<(Index, i64)> {
+    fn index_with_content(
+        &self,
+        root: &str,
+        enable_content_indexing: bool,
+    ) -> Result<(Index, i64)> {
         let key = (root.to_string(), enable_content_indexing);
         loop {
             let mut pool = self.pool.lock().unwrap();
             pool.entries.retain(|_, e| e.used.elapsed() <= self.idle);
-            if let Some(e) = pool.entries.get_mut(&key) { e.used = Instant::now(); return Ok((e.index.clone(), e.id)); }
+            if let Some(e) = pool.entries.get_mut(&key) {
+                e.used = Instant::now();
+                return Ok((e.index.clone(), e.id));
+            }
             if let Some(pending) = pool.pending.get(&key).cloned() {
                 drop(pool);
                 let (lock, ready) = &*pending;
                 let mut result = lock.lock().unwrap();
-                while result.is_none() { result = ready.wait(result).unwrap(); }
-                if let Err(error) = result.as_ref().unwrap() { return Err(anyhow!(error.clone())); }
+                while result.is_none() {
+                    result = ready.wait(result).unwrap();
+                }
+                if let Err(error) = result.as_ref().unwrap() {
+                    return Err(anyhow!(error.clone()));
+                }
                 continue;
             }
-            if pool.building >= self.capacity { drop(self.available.wait(pool).unwrap()); continue; }
+            if pool.building >= self.capacity {
+                drop(self.available.wait(pool).unwrap());
+                continue;
+            }
             let pending = Arc::new((Mutex::new(None), Condvar::new()));
             pool.pending.insert(key.clone(), pending.clone());
             pool.building += 1;
@@ -88,8 +183,11 @@ impl FileSearch {
             // No LMDB stores: frecency lives in smcli's own database. The watcher keeps the index current.
             let result = catch_unwind(AssertUnwindSafe(|| -> Result<Index> {
                 if root.contains('\0') { return Err(anyhow!("NUL in root")); }
+                if let Some(db) = &self.exposed && db.starts_with(root) && !smcli_core::paths::fff_skips(Path::new(root), db) {
+                    return Err(anyhow!("Not indexing {root}: it holds smcli's database {}, which file search would corrupt. `smcli health` explains the fix.", db.display()));
+                }
                 let picker = SharedFilePicker::default();
-                FilePicker::new_with_shared_state(picker.clone(), SharedFrecency::default(), FilePickerOptions { base_path: root.into(), enable_content_indexing, ..Default::default() })?;
+                FilePicker::new_with_shared_state(picker.clone(), SharedFrecency::default(), FilePickerOptions { base_path: root.into(), enable_content_indexing, enable_home_dir_scanning: true, ..Default::default() })?;
                 // A slow scan is not an error: search what is indexed so far.
                 if picker.wait_for_scan(Duration::from_secs(10)) { picker.wait_for_watcher(Duration::from_secs(10)); }
                 Ok(Arc::new(OwnedIndex(picker)))
@@ -101,12 +199,25 @@ impl FileSearch {
             pool.pending.remove(&key);
             let answer = result.clone().map(|index| {
                 while pool.entries.len() >= self.capacity {
-                    let oldest = pool.entries.iter().min_by_key(|(_, e)| e.used).unwrap().0.clone();
+                    let oldest = pool
+                        .entries
+                        .iter()
+                        .min_by_key(|(_, e)| e.used)
+                        .unwrap()
+                        .0
+                        .clone();
                     pool.entries.remove(&oldest);
                 }
                 pool.next += 1;
                 let id = pool.next;
-                pool.entries.insert(key.clone(), Entry { id, index: index.clone(), used: Instant::now() });
+                pool.entries.insert(
+                    key.clone(),
+                    Entry {
+                        id,
+                        index: index.clone(),
+                        used: Instant::now(),
+                    },
+                );
                 (index, id)
             });
             *pending.0.lock().unwrap() = Some(result);
@@ -119,13 +230,17 @@ impl FileSearch {
     fn ready_with_id(&self, root: &str, content: bool) -> Option<(Index, i64)> {
         let mut pool = self.pool.lock().unwrap();
         let entry = pool.entries.get_mut(&(root.to_string(), content))?;
-        if entry.used.elapsed() > self.idle { return None; }
+        if entry.used.elapsed() > self.idle {
+            return None;
+        }
         entry.used = Instant::now();
         let index = entry.index.clone();
         let id = entry.id;
         drop(pool);
         let guard = index.read().ok()?;
-        if guard.as_ref()?.is_scan_active() { return None; }
+        if guard.as_ref()?.is_scan_active() {
+            return None;
+        }
         drop(guard);
         Some((index, id))
     }
@@ -137,7 +252,10 @@ impl FileSearch {
         match Request::try_from(&request) {
             Ok(Request::Files(query)) => self.search(query, false),
             Err((code, message)) => ServiceResponse::fail(code, message),
-            Ok(_) => ServiceResponse::fail(FailureCode::BadRequest, "files needs a query and an absolute directory."),
+            Ok(_) => ServiceResponse::fail(
+                FailureCode::BadRequest,
+                "files needs a query and an absolute directory.",
+            ),
         }
     }
     #[cfg(test)]
@@ -147,36 +265,65 @@ impl FileSearch {
         match Request::try_from(&request) {
             Ok(Request::Grep(query)) => self.search(query, true),
             Err((code, message)) => ServiceResponse::fail(code, message),
-            Ok(_) => ServiceResponse::fail(FailureCode::BadRequest, "grep needs a query and an absolute directory."),
+            Ok(_) => ServiceResponse::fail(
+                FailureCode::BadRequest,
+                "grep needs a query and an absolute directory.",
+            ),
         }
     }
-    pub(crate) fn files_typed(&self, query: FileQuery) -> ServiceResponse { self.search(query, false) }
-    pub(crate) fn grep_typed(&self, query: FileQuery) -> ServiceResponse { self.search(query, true) }
-    pub(crate) fn complete_typed(&self, query: CompleteQuery) -> ServiceResponse { self.complete_query(query) }
+    pub(crate) fn files_typed(&self, query: FileQuery) -> ServiceResponse {
+        self.search(query, false)
+    }
+    pub(crate) fn grep_typed(&self, query: FileQuery) -> ServiceResponse {
+        self.search(query, true)
+    }
+    pub(crate) fn complete_typed(&self, query: CompleteQuery) -> ServiceResponse {
+        self.complete_query(query)
+    }
 
     fn content_indexing_enabled(home: &std::path::Path, scope: &str) -> bool {
         let in_repo = ProjectContext::discover(scope).repository.is_some();
-        if in_repo { return true; }
-        let Ok(scope) = std::fs::canonicalize(scope) else { return true };
+        if in_repo {
+            return true;
+        }
+        let Ok(scope) = std::fs::canonicalize(scope) else {
+            return true;
+        };
         let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-        let Some(rest) = scope.strip_prefix(&home).ok().and_then(|p| p.to_str()) else { return false };
+        let Some(rest) = scope.strip_prefix(&home).ok().and_then(|p| p.to_str()) else {
+            return false;
+        };
         rest.contains('/')
     }
 
-    fn scoped_index(&self, scope: &str, home: &std::path::Path) -> Result<(Index, i64, Option<String>)> {
+    fn scoped_index(
+        &self,
+        scope: &str,
+        home: &std::path::Path,
+    ) -> Result<(Index, i64, Option<String>)> {
         let content = Self::content_indexing_enabled(home, scope);
         let pool = self.pool.lock().unwrap();
-        let mut roots: Vec<String> = pool.entries.keys()
-            .filter(|(root, enabled)| *enabled == content && (*root == scope || scope.starts_with(&format!("{root}/"))))
+        let mut roots: Vec<String> = pool
+            .entries
+            .keys()
+            .filter(|(root, enabled)| {
+                *enabled == content && (*root == scope || scope.starts_with(&format!("{root}/")))
+            })
             .map(|(root, _)| root.clone())
             .collect();
         drop(pool);
         roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
         for root in roots {
             if let Some((index, id)) = self.ready_with_id(&root, content) {
-                let prefix = if root == scope { None } else {
+                let prefix = if root == scope {
+                    None
+                } else {
                     let rest = scope.strip_prefix(&root).unwrap().trim_start_matches('/');
-                    if rest.is_empty() { None } else { Some(format!("{rest}/")) }
+                    if rest.is_empty() {
+                        None
+                    } else {
+                        Some(format!("{rest}/"))
+                    }
                 };
                 return Ok((index, id, prefix));
             }
@@ -187,12 +334,22 @@ impl FileSearch {
 
     fn search(&self, parsed: FileQuery, grep: bool) -> ServiceResponse {
         let name = if grep { "grep" } else { "files" };
-        let FileQuery { directory, query, limit, scope: scoped, cwd, path, home } = parsed;
+        let FileQuery {
+            directory,
+            query,
+            limit,
+            scope: scoped,
+            cwd,
+            path,
+            home,
+            config,
+        } = parsed;
         let directory = directory.as_str();
         let query = query.as_str();
         let home = home.unwrap_or_else(|| self.home.clone());
         let path_filter = path.as_deref();
         let result = (|| -> Result<ServiceResponse> {
+            let ignore = user_ignore(config.as_deref(), &home)?;
             let (scope, (index, id, prefix)) = if scoped {
                 let scope = std::fs::canonicalize(directory)
                     .map_err(|e| anyhow!("Cannot resolve {directory}: {e}"))?
@@ -200,14 +357,23 @@ impl FileSearch {
                     .into_owned();
                 (scope.clone(), self.scoped_index(&scope, &home)?)
             } else {
-                let root = Self::root(directory).ok_or_else(|| anyhow!("Cannot resolve {directory}."))?;
+                let root =
+                    Self::root(directory).ok_or_else(|| anyhow!("Cannot resolve {directory}."))?;
                 let (index, id) = self.index_with_content(&root, true)?;
                 (root.clone(), (index, id, None))
             };
-            let picked = (self.scores)(&scope);
-            if query.contains('\0') { return Err(anyhow!("NUL in query")); }
+            let (picked, visited) = (self.scores)(&scope);
+            if query.contains('\0') {
+                return Err(anyhow!("NUL in query"));
+            }
             let guard = index.read()?;
             let picker = guard.as_ref().ok_or_else(|| anyhow!("Missing instance"))?;
+            // shortcut: results can still come up short when most matches are ignored; page further if users hit it.
+            let fetch = if ignore.is_some() {
+                limit as usize * 2 + 15
+            } else {
+                limit as usize + 15
+            };
             let glob = match (prefix.as_deref(), path_filter) {
                 (None, None) => None,
                 (Some(pre), None) => Some(format!("{}**", escape_glob(pre))),
@@ -221,92 +387,251 @@ impl FileSearch {
             let scope_relative = |fff_path: &str| -> Option<String> {
                 let p = if let Some(prefix) = &prefix {
                     fff_path.strip_prefix(prefix)?
-                } else { fff_path };
-                if p.is_empty() { return None; }
+                } else {
+                    fff_path
+                };
+                if p.is_empty() {
+                    return None;
+                }
                 if let Some(want) = path_filter {
-                    if p != want { return None; }
+                    if p != want {
+                        return None;
+                    }
                 }
                 Some(p.to_owned())
             };
             let hit = |fff_path: &str, file: Option<&fff_search::FileItem>| -> Option<FileHit> {
                 let path = scope_relative(fff_path)?;
+                if ignore.as_ref().is_some_and(|i| {
+                    i.ignores(
+                        Path::new(&scope),
+                        &Path::new(&scope).join(&path),
+                        path.ends_with('/'),
+                    )
+                }) {
+                    return None;
+                }
                 let mut provenance = vec![name.into()];
-                if picked.contains_key(path.trim_end_matches('/')) { provenance.push("picked".into()); }
-                let git = file.map(|f| fff_search::git::format_git_status(f.git_status)).as_deref().map(git).flatten();
-                Some(FileHit { insert: relative_insert(&path, &scope, &cwd), path, provenance, git, line: None, column: None, text: None, definition: None })
+                if picked.contains_key(path.trim_end_matches('/')) {
+                    provenance.push("picked".into());
+                } else if visited.contains_key(path.trim_end_matches('/')) {
+                    provenance.push("visited".into());
+                }
+                let git = file
+                    .map(|f| fff_search::git::format_git_status(f.git_status))
+                    .as_deref()
+                    .map(git)
+                    .flatten();
+                Some(FileHit {
+                    insert: relative_insert(&path, &scope, &cwd),
+                    path,
+                    provenance,
+                    git,
+                    line: None,
+                    column: None,
+                    text: None,
+                    definition: None,
+                })
             };
             let score_of = |fff_path: &str| {
-                let p = prefix.as_deref().and_then(|pre| fff_path.strip_prefix(pre)).unwrap_or(fff_path);
-                picked.get(p.trim_end_matches('/')).copied().unwrap_or(0.).min(3.)
+                let p = prefix
+                    .as_deref()
+                    .and_then(|pre| fff_path.strip_prefix(pre))
+                    .unwrap_or(fff_path);
+                boost(&picked, &visited, p)
             };
             let mut response = ServiceResponse::new(true);
             let hits = if grep {
                 // fff checks the deadline between files, including before any match; not a hard I/O timeout.
                 let mut parsed = fff_search::grep::parse_grep_query(query);
-                if let Some(g) = glob.as_deref() { parsed.constraints.push(Constraint::Glob(g)); }
-                let page = picker.grep(&parsed, &grep_options(limit as usize));
-                let mut hits: Vec<_> = page.matches.iter().filter_map(|m| {
-                    let file = page.files[m.file_index];
-                    let mut h = hit(&file.relative_path(picker), Some(file))?;
-                    h.line = Some(m.line_number as i64); h.column = Some(m.col as i64 + 1); h.text = Some(m.line_content.clone()); h.definition = Some(m.is_definition); Some(h)
-                }).collect();
-                if page.next_file_offset != 0 || hits.len() > limit as usize { response.partial = Some(true); }
+                if let Some(g) = glob.as_deref() {
+                    parsed.constraints.push(Constraint::Glob(g));
+                }
+                let page = picker.grep(&parsed, &grep_options(fetch));
+                let mut hits: Vec<_> = page
+                    .matches
+                    .iter()
+                    .filter_map(|m| {
+                        let file = page.files[m.file_index];
+                        let mut h = hit(&file.relative_path(picker), Some(file))?;
+                        h.line = Some(m.line_number as i64);
+                        h.column = Some(m.col as i64 + 1);
+                        h.text = Some(m.line_content.clone());
+                        h.definition = Some(m.is_definition);
+                        Some(h)
+                    })
+                    .collect();
+                if page.next_file_offset != 0 || hits.len() > limit as usize {
+                    response.partial = Some(true);
+                }
                 hits.truncate(limit as usize);
                 hits
             } else if query.trim().is_empty() {
                 // Blank: fff git/frecency as the base order, then SQLite pick scores; keep `picked`.
                 let mut parsed = QueryParser::new(MixedSearchConfig).parse("");
-                if let Some(g) = glob.as_deref() { parsed.constraints.push(Constraint::Glob(g)); }
-                let found = picker.fuzzy_search_mixed(&parsed, None, FuzzySearchOptions { pagination: PaginationArgs { offset: 0, limit: (limit as usize).saturating_add(15) }, ..Default::default() });
+                if let Some(g) = glob.as_deref() {
+                    parsed.constraints.push(Constraint::Glob(g));
+                }
+                let found = picker.fuzzy_search_mixed(
+                    &parsed,
+                    None,
+                    FuzzySearchOptions {
+                        pagination: PaginationArgs {
+                            offset: 0,
+                            limit: fetch,
+                        },
+                        ..Default::default()
+                    },
+                );
                 let rel = |i: usize| match &found.items[i] {
                     fff_search::MixedItemRef::File(f) => f.relative_path(picker),
                     fff_search::MixedItemRef::Dir(d) => d.relative_path(picker),
                 };
-                let key = |i: usize| i as f64 - 5. * score_of(&rel(i));
-                let mut order: Vec<_> = (0..found.items.len()).collect();
-                order.sort_by(|&a, &b| key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
+                let mut paths: Vec<_> = (0..found.items.len()).map(rel).collect();
+                // Frecent extras only if fff's own index holds them (keeps its gitignore/hidden/IGNORED_DIRS
+                // filtering); the user's ignoreFile is applied by `hit`.
+                let mut frecent: Vec<_> = picked.keys().chain(visited.keys()).collect();
+                frecent.sort_by(|a, b| {
+                    boost(&picked, &visited, b)
+                        .partial_cmp(&boost(&picked, &visited, a))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.cmp(b))
+                });
+                frecent.dedup();
+                frecent.truncate(FRECENT_LIMIT);
+                let prefix_str = prefix.as_deref().unwrap_or("");
+                let mut wanted_dirs = std::collections::HashSet::new();
+                let mut extras = Vec::new();
+                for path in frecent {
+                    let bare = path.trim_end_matches('/');
+                    if bare == "." || bare.is_empty() {
+                        continue;
+                    }
+                    let file = format!("{prefix_str}{bare}");
+                    if picker
+                        .get_file_by_path(picker.base_path().join(&file))
+                        .is_some()
+                    {
+                        extras.push(file);
+                    } else {
+                        wanted_dirs.insert(format!("{file}/"));
+                    }
+                }
+                let mut known: std::collections::HashSet<String> = paths.iter().cloned().collect();
+                if !wanted_dirs.is_empty() {
+                    // shortcut: binary search only fff's sorted scan-built dirs (the non-overflow prefix); dirs the
+                    // watcher added since are missed until fff's next rescan.
+                    let dirs = picker.get_dirs();
+                    let base = &dirs[..dirs.partition_point(|d| !d.is_overflow())];
+                    for wanted in wanted_dirs {
+                        if let Ok(i) =
+                            base.binary_search_by(|d| d.relative_path(picker).cmp(&wanted))
+                        {
+                            if !base[i].is_deleted() {
+                                extras.push(wanted);
+                            }
+                        }
+                    }
+                }
+                extras.sort();
+                for extra in extras {
+                    if known.insert(extra.clone()) {
+                        paths.push(extra);
+                    }
+                }
+                let key = |i: usize| i as f64 - 5. * score_of(&paths[i]);
+                let mut order: Vec<_> = (0..paths.len()).collect();
+                order.sort_by(|&a, &b| {
+                    key(a)
+                        .partial_cmp(&key(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.cmp(&b))
+                });
                 let mut seen = std::collections::HashSet::new();
                 let mut hits = Vec::new();
                 for i in order {
-                    let fff_path = rel(i);
-                    let Some(mut h) = (match &found.items[i] {
-                        fff_search::MixedItemRef::File(f) => hit(&fff_path, Some(f)),
-                        fff_search::MixedItemRef::Dir(_) => hit(&fff_path, None),
-                    }) else { continue };
-                    if found.scores[i].frecency_boost + found.scores[i].git_status_boost + found.scores[i].git_recency_boost > 0 {
+                    let fff_path = &paths[i];
+                    let Some(mut h) = (match found.items.get(i) {
+                        Some(fff_search::MixedItemRef::File(f)) => hit(fff_path, Some(f)),
+                        _ => hit(fff_path, None),
+                    }) else {
+                        continue;
+                    };
+                    if h.path.trim_end_matches('/') == "." {
+                        continue;
+                    }
+                    if found.scores.get(i).is_some_and(|s| {
+                        s.frecency_boost + s.git_status_boost + s.git_recency_boost > 0
+                    }) {
                         h.provenance.push("suggested".into());
                         // fff ranks dirs last on a blank query: a suggested file's folder is suggested just above it.
                         if let Some((dir, _)) = fff_path.rsplit_once('/') {
                             let dir = format!("{dir}/");
                             if let Some(mut d) = hit(&dir, None) {
-                                if !d.path.is_empty() && seen.insert(d.path.clone()) {
+                                if !d.path.is_empty()
+                                    && d.path.trim_end_matches('/') != "."
+                                    && seen.insert(d.path.clone())
+                                {
                                     d.provenance.push("suggested".into());
                                     hits.push(d);
                                 }
                             }
                         }
                     }
-                    if seen.insert(h.path.clone()) { hits.push(h); }
+                    if seen.insert(h.path.clone()) {
+                        hits.push(h);
+                    }
                 }
                 hits.truncate(limit as usize);
                 hits
             } else {
                 let parser = QueryParser::default();
                 let mut parsed = parser.parse(query);
-                if let Some(g) = glob.as_deref() { parsed.constraints.push(Constraint::Glob(g)); }
-                let found = picker.fuzzy_search(&parsed, None, FuzzySearchOptions { pagination: PaginationArgs { offset: 0, limit: (limit as usize * 3).min(500) }, ..Default::default() });
+                if let Some(g) = glob.as_deref() {
+                    parsed.constraints.push(Constraint::Glob(g));
+                }
+                let found = picker.fuzzy_search(
+                    &parsed,
+                    None,
+                    FuzzySearchOptions {
+                        pagination: PaginationArgs {
+                            offset: 0,
+                            limit: fetch.max(limit as usize * 3).min(500),
+                        },
+                        ..Default::default()
+                    },
+                );
                 let best = found.scores.first().map_or(0., |s| s.total as f64);
                 // Exact name matches stay first; only files close to the best may be lifted by previous picks.
                 let key = |i: usize| {
                     let score = &found.scores[i];
                     let picked_score = score_of(&found.items[i].relative_path(picker));
-                    i as f64 - if !score.exact_match && score.total as f64 >= 0.8 * best { 5. * picked_score } else { 0. } - if score.exact_match { 1000. } else { 0. }
+                    i as f64
+                        - if !score.exact_match && score.total as f64 >= 0.8 * best {
+                            5. * picked_score
+                        } else {
+                            0.
+                        }
+                        - if score.exact_match { 1000. } else { 0. }
                 };
                 let mut order: Vec<_> = (0..found.items.len()).collect();
-                order.sort_by(|&a, &b| key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
-                order.into_iter().take(limit as usize).filter_map(|i| hit(&found.items[i].relative_path(picker), Some(&found.items[i]))).collect()
+                order.sort_by(|&a, &b| {
+                    key(a)
+                        .partial_cmp(&key(b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.cmp(&b))
+                });
+                order
+                    .into_iter()
+                    .filter_map(|i| {
+                        hit(&found.items[i].relative_path(picker), Some(&found.items[i]))
+                    })
+                    .take(limit as usize)
+                    .collect()
             };
-            response.files = Some(hits); response.root = Some(scope.clone()); response.instance = Some(id);
+            response.files = Some(hits);
+            response.root = Some(scope.clone());
+            response.instance = Some(id);
             Ok(response)
         })();
         result.unwrap_or_else(|e| ServiceResponse::failure("failed", e.to_string()))
@@ -317,32 +642,70 @@ impl FileSearch {
         let parsed = match Request::try_from(request) {
             Ok(Request::Complete(query)) => query,
             Err((code, message)) => return ServiceResponse::fail(code, message),
-            Ok(_) => return ServiceResponse::fail(FailureCode::BadRequest, "complete needs a query and an absolute directory."),
+            Ok(_) => {
+                return ServiceResponse::fail(
+                    FailureCode::BadRequest,
+                    "complete needs a query and an absolute directory.",
+                );
+            }
         };
         self.complete_query(parsed)
     }
 
     fn complete_query(&self, parsed: CompleteQuery) -> ServiceResponse {
-        let CompleteQuery { directory, query, limit, dirs_only, home: _ } = parsed;
+        let CompleteQuery {
+            directory,
+            query,
+            limit,
+            dirs_only,
+            home,
+            config,
+        } = parsed;
+        let home = home.unwrap_or_else(|| self.home.clone());
         let directory = directory.as_str();
         let query = query.as_str();
-        let Some(root) = Self::root(directory) else { return ServiceResponse::failure("failed", format!("Cannot resolve {directory}.")); };
+        let Some(root) = Self::root(directory) else {
+            return ServiceResponse::failure("failed", format!("Cannot resolve {directory}."));
+        };
         let result = (|| -> Result<ServiceResponse> {
             let (index, id) = self.index(&root)?;
-            let picked = (self.scores)(&root);
-            if query.contains('\0') { return Err(anyhow!("NUL in query")); }
+            let (picked, visited) = (self.scores)(&root);
+            if query.contains('\0') {
+                return Err(anyhow!("NUL in query"));
+            }
             let guard = index.read()?;
             let picker = guard.as_ref().ok_or_else(|| anyhow!("Missing instance"))?;
             let page_limit = (limit as usize * 3).min(500);
-            let pagination = PaginationArgs { offset: 0, limit: page_limit };
+            let pagination = PaginationArgs {
+                offset: 0,
+                limit: page_limit,
+            };
             let has_glob = query.contains('*') || query.contains('?') || query.contains('[');
             let (paths, scores) = if dirs_only {
                 if has_glob {
-                    let fuzzy_query: String = query.chars().map(|c| if matches!(c, '*' | '?' | '[' | ']' | '/') { ' ' } else { c }).collect();
+                    let fuzzy_query: String = query
+                        .chars()
+                        .map(|c| {
+                            if matches!(c, '*' | '?' | '[' | ']' | '/') {
+                                ' '
+                            } else {
+                                c
+                            }
+                        })
+                        .collect();
                     let parser = QueryParser::new(DirSearchConfig);
                     let parsed = parser.parse(&fuzzy_query);
-                    let found = picker.fuzzy_search_directories(&parsed, FuzzySearchOptions { pagination, ..Default::default() });
-                    let mut matched: Vec<(String, fff_search::Score)> = found.items.iter().zip(found.scores.iter())
+                    let found = picker.fuzzy_search_directories(
+                        &parsed,
+                        FuzzySearchOptions {
+                            pagination,
+                            ..Default::default()
+                        },
+                    );
+                    let mut matched: Vec<(String, fff_search::Score)> = found
+                        .items
+                        .iter()
+                        .zip(found.scores.iter())
                         .filter_map(|(d, s)| {
                             let p = d.relative_path(picker);
                             let match_p = p.strip_suffix('/').unwrap_or(&p);
@@ -351,48 +714,120 @@ impl FileSearch {
                         })
                         .collect();
                     matched.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then(a.0.cmp(&b.0)));
-                    matched.truncate(limit as usize);
                     let paths = matched.iter().map(|(p, _)| (p.clone(), None)).collect();
                     let scores = matched.iter().map(|(_, s)| s.clone()).collect();
                     (paths, scores)
                 } else {
                     let parser = QueryParser::new(DirSearchConfig);
                     let parsed = parser.parse(query);
-                    let found = picker.fuzzy_search_directories(&parsed, FuzzySearchOptions { pagination, ..Default::default() });
-                    (found.items.iter().map(|d| (d.relative_path(picker), None)).collect::<Vec<(String, Option<_>)>>(), found.scores)
+                    let found = picker.fuzzy_search_directories(
+                        &parsed,
+                        FuzzySearchOptions {
+                            pagination,
+                            ..Default::default()
+                        },
+                    );
+                    (
+                        found
+                            .items
+                            .iter()
+                            .map(|d| (d.relative_path(picker), None))
+                            .collect::<Vec<(String, Option<_>)>>(),
+                        found.scores,
+                    )
                 }
             } else if has_glob {
-                let found = picker.glob(query, FuzzySearchOptions { pagination, ..Default::default() });
-                (found.items.iter().map(|f| (f.relative_path(picker), f.git_status)).collect(), found.scores)
+                let found = picker.glob(
+                    query,
+                    FuzzySearchOptions {
+                        pagination,
+                        ..Default::default()
+                    },
+                );
+                (
+                    found
+                        .items
+                        .iter()
+                        .map(|f| (f.relative_path(picker), f.git_status))
+                        .collect(),
+                    found.scores,
+                )
             } else {
                 let parser = QueryParser::new(MixedSearchConfig);
                 let parsed = parser.parse(query);
-                let found = picker.fuzzy_search_mixed(&parsed, None, FuzzySearchOptions { pagination, ..Default::default() });
-                (found.items.iter().map(|m| match m {
-                    fff_search::MixedItemRef::File(f) => (f.relative_path(picker), f.git_status),
-                    fff_search::MixedItemRef::Dir(d) => (d.relative_path(picker), None),
-                }).collect(), found.scores)
+                let found = picker.fuzzy_search_mixed(
+                    &parsed,
+                    None,
+                    FuzzySearchOptions {
+                        pagination,
+                        ..Default::default()
+                    },
+                );
+                (
+                    found
+                        .items
+                        .iter()
+                        .map(|m| match m {
+                            fff_search::MixedItemRef::File(f) => {
+                                (f.relative_path(picker), f.git_status)
+                            }
+                            fff_search::MixedItemRef::Dir(d) => (d.relative_path(picker), None),
+                        })
+                        .collect(),
+                    found.scores,
+                )
             };
+            let ignore = user_ignore(config.as_deref(), &home)?;
+            let (paths, scores): (Vec<_>, Vec<_>) = paths
+                .into_iter()
+                .zip(scores)
+                .filter(|((p, _), _)| {
+                    !ignore.as_ref().is_some_and(|i| {
+                        i.ignores(
+                            Path::new(&root),
+                            &Path::new(&root).join(p),
+                            p.ends_with('/'),
+                        )
+                    })
+                })
+                .unzip();
             let best = scores.first().map_or(0., |s| s.total as f64);
             let key = |i: usize| {
                 let score = &scores[i];
-                let picked_score = picked.get(paths[i].0.trim_end_matches('/')).copied().unwrap_or(0.).min(3.);
-                i as f64 - if !score.exact_match && score.total as f64 >= 0.8 * best { 5. * picked_score } else { 0. } - if score.exact_match { 1000. } else { 0. }
+                let picked_score = boost(&picked, &visited, &paths[i].0);
+                i as f64
+                    - if !score.exact_match && score.total as f64 >= 0.8 * best {
+                        5. * picked_score
+                    } else {
+                        0.
+                    }
+                    - if score.exact_match { 1000. } else { 0. }
             };
             let mut order: Vec<_> = (0..paths.len()).collect();
-            order.sort_by(|&a, &b| key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
-            let hits = order.into_iter().take(limit as usize).map(|i| FileHit {
-                insert: relative_insert(&paths[i].0, &root, &directory),
-                path: paths[i].0.clone(),
-                provenance: vec!["complete".into()],
-                git: git(fff_search::git::format_git_status(paths[i].1)),
-                line: None,
-                column: None,
-                text: None,
-                definition: None,
-            }).collect();
+            order.sort_by(|&a, &b| {
+                key(a)
+                    .partial_cmp(&key(b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.cmp(&b))
+            });
+            let hits = order
+                .into_iter()
+                .take(limit as usize)
+                .map(|i| FileHit {
+                    insert: relative_insert(&paths[i].0, &root, &directory),
+                    path: paths[i].0.clone(),
+                    provenance: vec!["complete".into()],
+                    git: git(fff_search::git::format_git_status(paths[i].1)),
+                    line: None,
+                    column: None,
+                    text: None,
+                    definition: None,
+                })
+                .collect();
             let mut response = ServiceResponse::new(true);
-            response.files = Some(hits); response.root = Some(root.clone()); response.instance = Some(id);
+            response.files = Some(hits);
+            response.root = Some(root.clone());
+            response.instance = Some(id);
             Ok(response)
         })();
         result.unwrap_or_else(|e| ServiceResponse::failure("failed", e.to_string()))
@@ -404,44 +839,114 @@ impl FileSearch {
         let parsed = match Request::try_from(request) {
             Ok(Request::Select(file @ SelectQuery::File { .. })) => file,
             Err((code, message)) => return ServiceResponse::fail(code, message),
-            Ok(_) => return ServiceResponse::fail(FailureCode::BadRequest, "select needs a directory, a path and a mode of files or grep."),
+            Ok(_) => {
+                return ServiceResponse::fail(
+                    FailureCode::BadRequest,
+                    "select needs a directory, a path and a mode of files or grep.",
+                );
+            }
         };
         self.select_file(parsed)
     }
 
     pub(crate) fn select_file(&self, parsed: SelectQuery) -> ServiceResponse {
-        let SelectQuery::File { cwd, directory, path, mode, query, scope, config } = parsed else {
-            return ServiceResponse::fail(FailureCode::BadRequest, "select needs a directory, a path and a mode of files or grep.");
+        let SelectQuery::File {
+            cwd,
+            directory,
+            path,
+            mode,
+            query,
+            scope,
+            config,
+        } = parsed
+        else {
+            return ServiceResponse::fail(
+                FailureCode::BadRequest,
+                "select needs a directory, a path and a mode of files or grep.",
+            );
         };
         let root = if scope {
-            std::fs::canonicalize(&directory).ok().map(|p| p.to_string_lossy().into_owned())
+            std::fs::canonicalize(&directory)
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
         } else {
             Self::root(&directory)
         };
-        let Some(root) = root else { return ServiceResponse::failure("failed", format!("Cannot resolve {directory}.")); };
-        match (self.record)(&root, &path, &mode, &query, &directory, cwd.as_deref(), &config) {
-            Ok(()) => { let mut response = ServiceResponse::new(true); response.root = Some(root); response }
+        let Some(root) = root else {
+            return ServiceResponse::failure("failed", format!("Cannot resolve {directory}."));
+        };
+        match (self.record)(
+            &root,
+            &path,
+            &mode,
+            &query,
+            &directory,
+            cwd.as_deref(),
+            &config,
+        ) {
+            Ok(()) => {
+                let mut response = ServiceResponse::new(true);
+                response.root = Some(root);
+                response
+            }
             Err(e) => ServiceResponse::failure("failed", e.to_string()),
         }
     }
 
     /// Drops instances unused for the idle timeout.
-    pub fn evict_idle(&self) { self.pool.lock().unwrap().entries.retain(|_, e| e.used.elapsed() <= self.idle); }
+    pub fn evict_idle(&self) {
+        self.pool
+            .lock()
+            .unwrap()
+            .entries
+            .retain(|_, e| e.used.elapsed() <= self.idle);
+    }
     /// Live instances, oldest id first.
     pub fn instances(&self) -> Vec<FileIndexInfo> {
-        let mut entries: Vec<_> = self.pool.lock().unwrap().entries.iter().map(|((root, _), e)| FileIndexInfo { id: e.id, root: root.clone() }).collect();
-        entries.sort_by_key(|e| e.id); entries
+        let mut entries: Vec<_> = self
+            .pool
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|((root, _), e)| FileIndexInfo {
+                id: e.id,
+                root: root.clone(),
+            })
+            .collect();
+        entries.sort_by_key(|e| e.id);
+        entries
     }
 }
 
+/// The caller's `ignoreFile`; none without a config. shortcut: re-read per request, cache by mtime if it shows up in profiles.
+fn user_ignore(
+    config: Option<&Path>,
+    home: &Path,
+) -> Result<Option<smcli_core::config::FileIgnore>> {
+    config.map_or(Ok(None), |config| {
+        smcli_core::config::FileIgnore::load(config, home)
+    })
+}
+
 fn grep_options(limit: usize) -> GrepSearchOptions {
-    GrepSearchOptions { page_limit: limit, max_matches_per_file: limit + 1, time_budget_ms: 1000, enforce_time_budget: true, max_file_size: 10 * 1024 * 1024, classify_definitions: true, ..Default::default() }
+    GrepSearchOptions {
+        page_limit: limit,
+        max_matches_per_file: limit + 1,
+        time_budget_ms: 1000,
+        enforce_time_budget: true,
+        max_file_size: 10 * 1024 * 1024,
+        classify_definitions: true,
+        ..Default::default()
+    }
 }
 
 fn escape_glob(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if matches!(c, '\\' | '*' | '?' | '[' | ']' | '{' | '}') { out.push('\\'); }
+        if matches!(c, '\\' | '*' | '?' | '[' | ']' | '{' | '}') {
+            out.push('\\');
+        }
         out.push(c);
     }
     out
@@ -451,24 +956,46 @@ fn escape_glob(s: &str) -> String {
 /// Clean files and anything outside a repository have none.
 fn git(status: &str) -> Option<String> {
     match status {
-        "modified" => Some(" M"), "untracked" => Some("??"), "deleted" => Some(" D"), "renamed" => Some(" R"),
-        "staged_new" => Some("A "), "staged_modified" => Some("M "), "staged_deleted" => Some("D "), "ignored" => Some("!!"),
-        "" | "clean" => None, _ => Some("~~"),
-    }.map(str::to_owned)
+        "modified" => Some(" M"),
+        "untracked" => Some("??"),
+        "deleted" => Some(" D"),
+        "renamed" => Some(" R"),
+        "staged_new" => Some("A "),
+        "staged_modified" => Some("M "),
+        "staged_deleted" => Some("D "),
+        "ignored" => Some("!!"),
+        "" | "clean" => None,
+        _ => Some("~~"),
+    }
+    .map(str::to_owned)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use smcli_core::service_protocol::Operation;
-    use std::{path::PathBuf, sync::atomic::{AtomicUsize, Ordering}};
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     struct Repo(PathBuf);
     impl Repo {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(format!("smcli-file-search-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let path = std::env::temp_dir().join(format!(
+                "smcli-file-search-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
             std::fs::create_dir_all(path.join("src")).unwrap();
-            assert!(std::process::Command::new("git").args(["init", "-q"]).arg(&path).status().unwrap().success());
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
             std::fs::write(path.join("src/example.txt"), "first\nhello needle\n").unwrap();
             Self(std::fs::canonicalize(path).unwrap())
         }
@@ -480,11 +1007,175 @@ mod tests {
             r
         }
     }
-    impl Drop for Repo { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
-    fn search(capacity: usize) -> FileSearch {
-        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-        FileSearch::new(capacity, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(|_, _, _, _, _, _, _| Ok(())), home)
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
+    fn search(capacity: usize) -> FileSearch {
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        FileSearch::new(
+            capacity,
+            Duration::from_secs(600),
+            Box::new(|_| Default::default()),
+            Box::new(|_, _, _, _, _, _, _| Ok(())),
+            home,
+        )
+    }
+    #[test]
+    fn exposed_database_roots_are_refused_unless_fff_skips_them() {
+        let tmp = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("smcli-exposed-{}", std::process::id()));
+        let (home, srv) = (tmp.join("home"), tmp.join("srv/x"));
+        let state = home.join(".local/state/smcli");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::create_dir_all(&srv).unwrap();
+        let guarded = |db: &Path| {
+            FileSearch::new(
+                1,
+                Duration::from_secs(60),
+                Box::new(|_| Default::default()),
+                Box::new(|_, _, _, _, _, _, _| Ok(())),
+                home.clone(),
+            )
+            .refuse_roots_holding(db.to_path_buf())
+        };
+        let refused = |s: &FileSearch, root: &Path| {
+            s.index(root.to_str().unwrap())
+                .err()
+                .is_some_and(|e| e.to_string().contains("holds smcli's database"))
+        };
+        let db = state.join("history.db");
+        let s = guarded(&db);
+        assert!(
+            !refused(&s, &home),
+            "non-git home with the db under .local/state is allowed"
+        );
+        assert!(refused(&s, &home.join(".local")) && refused(&s, &state));
+        assert!(refused(&guarded(&srv.join("history.db")), &srv));
+        std::fs::create_dir(home.join(".git")).unwrap();
+        assert!(refused(&guarded(&db), &home), "a git home is refused");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn ignore_file_hides_matches_from_files_grep_and_complete() {
+        let repo = Repo::new();
+        std::fs::write(repo.0.join("src/debug.log"), "hello needle\n").unwrap();
+        let config = repo.0.join("config.json");
+        std::fs::write(repo.0.join("smcli-ignore"), "*.log\n").unwrap();
+        std::fs::write(&config, r#"{"ignoreFile":"smcli-ignore"}"#).unwrap();
+        let search = search(2);
+        let ask = |op, q: &str| {
+            let mut r = repo.request(op, q);
+            r.config = Some(config.to_string_lossy().into_owned());
+            r.home = Some(repo.0.to_string_lossy().into_owned());
+            r
+        };
+        let paths = |r: ServiceResponse| {
+            r.files
+                .unwrap_or_default()
+                .into_iter()
+                .map(|h| h.path)
+                .collect::<Vec<_>>()
+        };
+        let files = paths(search.files(&ask(Operation::Files, "")));
+        assert!(
+            files.iter().any(|p| p.ends_with("example.txt"))
+                && !files.iter().any(|p| p.ends_with(".log")),
+            "{files:?}"
+        );
+        let grep = paths(search.grep(&ask(Operation::Grep, "needle")));
+        assert!(
+            grep.iter().all(|p| !p.ends_with(".log")) && !grep.is_empty(),
+            "{grep:?}"
+        );
+        let complete = paths(search.complete(&ask(Operation::Complete, "debug")));
+        assert!(
+            complete.iter().all(|p| !p.ends_with(".log")),
+            "{complete:?}"
+        );
+        std::fs::remove_file(repo.0.join("smcli-ignore")).unwrap();
+        assert!(
+            !search.files(&ask(Operation::Files, "")).ok,
+            "a missing ignoreFile fails rather than shows everything"
+        );
+    }
+
+    #[test]
+    fn ignore_file_filters_before_the_limit() {
+        let repo = Repo::new();
+        for i in 0..6 {
+            std::fs::write(repo.0.join(format!("src/note{i}.log")), "needle\n").unwrap();
+        }
+        for i in 0..3 {
+            std::fs::write(repo.0.join(format!("src/note-keep{i}.txt")), "needle\n").unwrap();
+        }
+        let config = repo.0.join("config.json");
+        std::fs::write(repo.0.join("smcli-ignore"), "*.log\n").unwrap();
+        std::fs::write(&config, r#"{"ignoreFile":"smcli-ignore"}"#).unwrap();
+        let search = search(2);
+        let ask = |op, q: &str| {
+            let mut r = repo.request(op, q);
+            r.config = Some(config.to_string_lossy().into_owned());
+            r.home = Some(repo.0.to_string_lossy().into_owned());
+            r.limit = Some(3);
+            r
+        };
+        let fuzzy = search.files(&ask(Operation::Files, "note"));
+        let fuzzy = fuzzy.files.unwrap_or_default();
+        assert!(
+            fuzzy.len() == 3 && fuzzy.iter().all(|h| !h.path.ends_with(".log")),
+            "{fuzzy:?}"
+        );
+        let grep = search.grep(&ask(Operation::Grep, "needle"));
+        let grep = grep.files.unwrap_or_default();
+        assert!(
+            grep.len() == 3 && grep.iter().all(|h| !h.path.ends_with(".log")),
+            "{grep:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_home_search_finds_report_outside_config() {
+        let repo = Repo::new();
+        let home = &repo.0;
+        std::fs::create_dir_all(home.join(".config")).unwrap();
+        std::fs::create_dir_all(home.join("Documents")).unwrap();
+        for i in 0..1000 {
+            std::fs::write(home.join(format!(".config/{i}.txt")), "").unwrap();
+        }
+        std::fs::write(home.join("Documents/report.txt"), "").unwrap();
+        let previous_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", home);
+        }
+        let search = search(1);
+        let mut request = repo.request(Operation::Files, "report");
+        request.directory = Some(home.to_string_lossy().into_owned());
+        request.cwd = request.directory.clone();
+        request.scope = Some(true);
+        let response = search.files(&request);
+        unsafe {
+            if let Some(value) = previous_home {
+                std::env::set_var("HOME", value);
+            } else {
+                std::env::remove_var("HOME");
+            }
+        }
+        assert!(response.ok, "{:?}", response.error);
+        assert!(
+            response
+                .files
+                .unwrap()
+                .iter()
+                .any(|hit| hit.path == "Documents/report.txt")
+        );
+    }
+
     #[test]
     fn grep_budget_applies_before_the_first_match() {
         let options = grep_options(50);
@@ -508,8 +1199,19 @@ mod tests {
         for budget in [1, 1000] {
             for enforce in [false, true] {
                 let start = Instant::now();
-                let page = picker.grep(&query, &GrepSearchOptions { time_budget_ms: budget, enforce_time_budget: enforce, ..grep_options(50) });
-                eprintln!("5000 files, budget={budget}ms enforce={enforce}: {:?}, partial={}", start.elapsed(), page.next_file_offset != 0);
+                let page = picker.grep(
+                    &query,
+                    &GrepSearchOptions {
+                        time_budget_ms: budget,
+                        enforce_time_budget: enforce,
+                        ..grep_options(50)
+                    },
+                );
+                eprintln!(
+                    "5000 files, budget={budget}ms enforce={enforce}: {:?}, partial={}",
+                    start.elapsed(),
+                    page.next_file_offset != 0
+                );
                 assert!(page.matches.is_empty());
             }
         }
@@ -517,12 +1219,15 @@ mod tests {
 
     #[test]
     fn files_relative_insert_and_grep_coordinates() {
-        fn send_sync<T: Send + Sync>() {} send_sync::<FileSearch>();
-        let repo = Repo::new(); let search = search(4);
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<FileSearch>();
+        let repo = Repo::new();
+        let search = search(4);
         let files = search.files(&repo.request(Operation::Files, "example.txt"));
         assert!(files.ok, "{:?}", files.error);
         let hit = &files.files.unwrap()[0];
-        assert_eq!(hit.path, "src/example.txt"); assert_eq!(hit.insert, "example.txt");
+        assert_eq!(hit.path, "src/example.txt");
+        assert_eq!(hit.insert, "example.txt");
         let grep = search.grep(&repo.request(Operation::Grep, "needle"));
         assert!(grep.ok, "{:?}", grep.error);
         let hits = grep.files.unwrap();
@@ -541,8 +1246,14 @@ mod tests {
         assert!(response.ok, "{:?}", response.error);
         let files = response.files.unwrap();
         let paths: Vec<_> = files.iter().map(|h| h.path.clone()).collect();
-        assert!(paths.contains(&"src/components/".into()), "mixed should include dir: {paths:?}");
-        assert!(paths.contains(&"src/components/mod.rs".into()), "mixed should include file: {paths:?}");
+        assert!(
+            paths.contains(&"src/components/".into()),
+            "mixed should include dir: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"src/components/mod.rs".into()),
+            "mixed should include file: {paths:?}"
+        );
         let dir = paths.iter().position(|p| p == "src/components/").unwrap();
         assert_eq!(files[dir].insert, "components/");
     }
@@ -557,9 +1268,20 @@ mod tests {
         r.dirs_only = Some(true);
         let response = search.complete(&r);
         assert!(response.ok, "{:?}", response.error);
-        let paths: Vec<_> = response.files.unwrap().iter().map(|h| h.path.clone()).collect();
-        assert!(paths.iter().all(|p| p.ends_with('/')), "dirs_only should return only directories: {paths:?}");
-        assert!(paths.contains(&"src/components/".into()), "dirs_only should find components: {paths:?}");
+        let paths: Vec<_> = response
+            .files
+            .unwrap()
+            .iter()
+            .map(|h| h.path.clone())
+            .collect();
+        assert!(
+            paths.iter().all(|p| p.ends_with('/')),
+            "dirs_only should return only directories: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"src/components/".into()),
+            "dirs_only should find components: {paths:?}"
+        );
     }
     #[test]
     fn complete_glob_files() {
@@ -570,10 +1292,24 @@ mod tests {
         let search = search(4);
         let response = search.complete(&repo.request(Operation::Complete, "*.rs"));
         assert!(response.ok, "{:?}", response.error);
-        let paths: Vec<_> = response.files.unwrap().iter().map(|h| h.path.clone()).collect();
-        assert!(paths.contains(&"src/main.rs".into()), "glob should match main.rs: {paths:?}");
-        assert!(paths.contains(&"src/components/mod.rs".into()), "glob should match mod.rs: {paths:?}");
-        assert!(!paths.iter().any(|p| p.ends_with('/')), "glob should not return directories: {paths:?}");
+        let paths: Vec<_> = response
+            .files
+            .unwrap()
+            .iter()
+            .map(|h| h.path.clone())
+            .collect();
+        assert!(
+            paths.contains(&"src/main.rs".into()),
+            "glob should match main.rs: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"src/components/mod.rs".into()),
+            "glob should match mod.rs: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.ends_with('/')),
+            "glob should not return directories: {paths:?}"
+        );
     }
     #[test]
     fn complete_dirs_only_glob() {
@@ -588,57 +1324,208 @@ mod tests {
         r.dirs_only = Some(true);
         let response = search.complete(&r);
         assert!(response.ok, "{:?}", response.error);
-        let paths: Vec<_> = response.files.unwrap().iter().map(|h| h.path.clone()).collect();
-        assert!(paths.contains(&"src/foo/bar/service/".into()), "fuzzy should find service dir: {paths:?}");
+        let paths: Vec<_> = response
+            .files
+            .unwrap()
+            .iter()
+            .map(|h| h.path.clone())
+            .collect();
+        assert!(
+            paths.contains(&"src/foo/bar/service/".into()),
+            "fuzzy should find service dir: {paths:?}"
+        );
         let mut r = repo.request(Operation::Complete, "src/**/serv*");
         r.dirs_only = Some(true);
         let response = search.complete(&r);
         assert!(response.ok, "{:?}", response.error);
-        let paths: Vec<_> = response.files.unwrap().iter().map(|h| h.path.clone()).collect();
-        assert_eq!(paths, ["src/foo/bar/service/"], "dirs_only glob should return only matching directory: {paths:?}");
+        let paths: Vec<_> = response
+            .files
+            .unwrap()
+            .iter()
+            .map(|h| h.path.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            ["src/foo/bar/service/"],
+            "dirs_only glob should return only matching directory: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn complete_dirs_only_glob_fills_limit_past_ignored_dirs() {
+        let repo = Repo::new();
+        for d in ["b1", "b2", "b3", "build1", "build22"] {
+            std::fs::create_dir_all(repo.0.join("src").join(d)).unwrap();
+            std::fs::write(repo.0.join("src").join(d).join("f.txt"), "").unwrap();
+        }
+        let config = repo.0.join("config.json");
+        std::fs::write(repo.0.join("smcli-ignore"), "b?\n").unwrap();
+        std::fs::write(&config, r#"{"ignoreFile":"smcli-ignore"}"#).unwrap();
+        let mut r = repo.request(Operation::Complete, "src/b*");
+        r.config = Some(config.to_string_lossy().into_owned());
+        r.home = Some(repo.0.to_string_lossy().into_owned());
+        r.dirs_only = Some(true);
+        r.limit = Some(2);
+        let response = search(2).complete(&r);
+        assert!(response.ok, "{:?}", response.error);
+        let paths: Vec<_> = response
+            .files
+            .unwrap()
+            .into_iter()
+            .map(|h| h.path)
+            .collect();
+        assert_eq!(paths.len(), 2, "{paths:?}");
     }
 
     #[test]
     fn ready_never_builds_a_cold_root() {
-        let repo = Repo::new(); let search = search(4);
+        let repo = Repo::new();
+        let search = search(4);
         assert!(search.ready(&repo.0.to_string_lossy()).is_none());
         assert!(search.instances().is_empty());
         search.files(&repo.request(Operation::Files, "example.txt"));
         let index = search.ready(&repo.0.to_string_lossy()).unwrap();
         use smcli_search::ProjectEvidence;
         let evidence = evidence::IndexEvidence(index);
-        assert_eq!(evidence.exists(&[repo.0.join("src/example.txt"), repo.0.join("missing.txt")]), vec![true, false]);
+        assert_eq!(
+            evidence.exists(&[repo.0.join("src/example.txt"), repo.0.join("missing.txt")]),
+            vec![true, false]
+        );
     }
 
     #[test]
     fn selection_records_and_rejects_escape() {
-        let repo = Repo::new(); let recorded = Arc::new(Mutex::new(Vec::new())); let out = recorded.clone();
-        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(move |r, p, m, q, _, _, _| { out.lock().unwrap().push((r.to_string(), p.to_string(), m.to_string(), q.to_string())); Ok(()) }), home);
-        let mut request = repo.request(Operation::Select, "example"); request.path = Some("src/example.txt".into()); request.mode = Some("files".into());
+        let repo = Repo::new();
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let out = recorded.clone();
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let search = FileSearch::new(
+            4,
+            Duration::from_secs(600),
+            Box::new(|_| Default::default()),
+            Box::new(move |r, p, m, q, _, _, _| {
+                out.lock().unwrap().push((
+                    r.to_string(),
+                    p.to_string(),
+                    m.to_string(),
+                    q.to_string(),
+                ));
+                Ok(())
+            }),
+            home,
+        );
+        let mut request = repo.request(Operation::Select, "example");
+        request.path = Some("src/example.txt".into());
+        request.mode = Some("files".into());
         assert!(search.select(&request).ok);
-        assert_eq!(recorded.lock().unwrap()[0], (repo.0.to_string_lossy().into_owned(), "src/example.txt".into(), "files".into(), "example".into()));
+        assert_eq!(
+            recorded.lock().unwrap()[0],
+            (
+                repo.0.to_string_lossy().into_owned(),
+                "src/example.txt".into(),
+                "files".into(),
+                "example".into()
+            )
+        );
         request.path = Some("folder/".into());
         assert!(search.select(&request).ok);
-        assert_eq!(recorded.lock().unwrap()[1], (repo.0.to_string_lossy().into_owned(), "folder".into(), "files".into(), "example".into()));
-        for path in ["../escape", "a//b", "/absolute", "a\0b", ""] { request.path = Some(path.into()); assert!(!search.select(&request).ok); }
+        assert_eq!(
+            recorded.lock().unwrap()[1],
+            (
+                repo.0.to_string_lossy().into_owned(),
+                "folder".into(),
+                "files".into(),
+                "example".into()
+            )
+        );
+        for path in ["../escape", "a//b", "/absolute", "a\0b", ""] {
+            request.path = Some(path.into());
+            assert!(!search.select(&request).ok);
+        }
         assert_eq!(recorded.lock().unwrap().len(), 2);
     }
     #[test]
     fn scoped_select_stores_under_scope_root() {
         let repo = Repo::new();
         std::fs::write(repo.0.join("src/needle.rs"), "").unwrap();
-        let recorded = Arc::new(Mutex::new(Vec::new())); let out = recorded.clone();
-        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(move |r, p, m, q, _, _, _| { out.lock().unwrap().push((r.to_string(), p.to_string(), m.to_string(), q.to_string())); Ok(()) }), home);
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let out = recorded.clone();
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let search = FileSearch::new(
+            4,
+            Duration::from_secs(600),
+            Box::new(|_| Default::default()),
+            Box::new(move |r, p, m, q, _, _, _| {
+                out.lock().unwrap().push((
+                    r.to_string(),
+                    p.to_string(),
+                    m.to_string(),
+                    q.to_string(),
+                ));
+                Ok(())
+            }),
+            home,
+        );
         let mut request = repo.request(Operation::Select, "needle.rs");
-        request.path = Some("needle.rs".into()); request.mode = Some("files".into()); request.scope = Some(true);
+        request.path = Some("needle.rs".into());
+        request.mode = Some("files".into());
+        request.scope = Some(true);
         let response = search.select(&request);
         assert!(response.ok, "{:?}", response.error);
         let got = recorded.lock().unwrap()[0].clone();
         assert_eq!(got.0, repo.0.join("src").to_string_lossy().into_owned());
         assert_eq!(got.1, "needle.rs");
     }
+    #[test]
+    fn file_search_project_pick_lifts_file_in_home_scope() {
+        let repo = Repo::new();
+        let project = repo.0.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("chosen.txt"), "x").unwrap();
+        let history = smcli_core::history::CapturedHistory::new(repo.0.join("history.db"));
+        let db = history.open_connection().unwrap();
+        for _ in 0..4 {
+            history
+                .record_selection(
+                    project.to_str().unwrap(),
+                    "chosen.txt",
+                    "files",
+                    "",
+                    None,
+                    100.,
+                    &db,
+                )
+                .unwrap();
+        }
+        drop(db);
+        let home = repo.0.clone();
+        let search = FileSearch::new(
+            4,
+            Duration::from_secs(600),
+            Box::new(move |scope| {
+                let db = history.open_connection().unwrap();
+                (
+                    history.scope_selection_scores(scope, 100., &db).unwrap(),
+                    HashMap::new(),
+                )
+            }),
+            Box::new(|_, _, _, _, _, _, _| Ok(())),
+            home,
+        );
+        let mut request = repo.request(Operation::Files, "");
+        request.directory = Some(repo.0.to_string_lossy().into_owned());
+        request.scope = Some(true);
+        let response = search.files(&request);
+        assert!(response.ok, "{:?}", response.error);
+        let hits = response.files.unwrap();
+        assert_eq!(hits[0].path, "project/chosen.txt");
+        assert!(hits[0].provenance.iter().any(|p| p == "picked"));
+    }
+
     #[test]
     fn blank_files_reorder_after_picks_and_keep_picked() {
         let repo = Repo::new();
@@ -647,24 +1534,127 @@ mod tests {
         }
         let scores = Arc::new(Mutex::new(HashMap::<String, f64>::new()));
         let s = scores.clone();
-        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(move |_| s.lock().unwrap().clone()), Box::new(|_, _, _, _, _, _, _| Ok(())), home);
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let search = FileSearch::new(
+            4,
+            Duration::from_secs(600),
+            Box::new(move |_| (s.lock().unwrap().clone(), HashMap::new())),
+            Box::new(|_, _, _, _, _, _, _| Ok(())),
+            home,
+        );
         let blank = |search: &FileSearch| {
             let r = search.files(&repo.request(Operation::Files, ""));
             assert!(r.ok, "{:?}", r.error);
             r.files.unwrap()
         };
         let before_all = blank(&search);
-        let before: Vec<_> = before_all.iter().filter(|h| !h.path.ends_with('/')).collect();
-        let target = before.iter().skip(1).map(|h| h.path.clone()).find(|p| p.ends_with(".txt")).expect("non-first txt in blank list");
+        let before: Vec<_> = before_all
+            .iter()
+            .filter(|h| !h.path.ends_with('/'))
+            .collect();
+        let target = before
+            .iter()
+            .skip(1)
+            .map(|h| h.path.clone())
+            .find(|p| p.ends_with(".txt"))
+            .expect("non-first txt in blank list");
         let before_pos = before.iter().position(|h| h.path == target).unwrap();
         assert!(!before[before_pos].provenance.iter().any(|p| p == "picked"));
         scores.lock().unwrap().insert(target.clone(), 3.0);
         let after_all = blank(&search);
-        let after: Vec<_> = after_all.iter().filter(|h| !h.path.ends_with('/')).collect();
-        let after_pos = after.iter().position(|h| h.path == target).expect("picked path still listed");
-        assert!(after[after_pos].provenance.iter().any(|p| p == "picked"), "{:?}", after[after_pos].provenance);
-        assert!(after_pos < before_pos, "before_pos={before_pos} after_pos={after_pos} before={:?} after={:?}", before.iter().map(|h| &h.path).collect::<Vec<_>>(), after.iter().map(|h| &h.path).collect::<Vec<_>>());
+        let after: Vec<_> = after_all
+            .iter()
+            .filter(|h| !h.path.ends_with('/'))
+            .collect();
+        let after_pos = after
+            .iter()
+            .position(|h| h.path == target)
+            .expect("picked path still listed");
+        assert!(
+            after[after_pos].provenance.iter().any(|p| p == "picked"),
+            "{:?}",
+            after[after_pos].provenance
+        );
+        assert!(
+            after_pos < before_pos,
+            "before_pos={before_pos} after_pos={after_pos} before={:?} after={:?}",
+            before.iter().map(|h| &h.path).collect::<Vec<_>>(),
+            after.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
+    }
+    fn search_with(picks: HashMap<String, f64>, visits: HashMap<String, f64>) -> FileSearch {
+        FileSearch::new(
+            4,
+            Duration::from_secs(600),
+            Box::new(move |_| (picks.clone(), visits.clone())),
+            Box::new(|_, _, _, _, _, _, _| Ok(())),
+            std::env::temp_dir(),
+        )
+    }
+    #[test]
+    fn visited_folder_ranks_higher_but_is_not_picked() {
+        let repo = Repo::new();
+        for d in ["aaa", "zzz"] {
+            std::fs::create_dir_all(repo.0.join("src").join(d)).unwrap();
+            std::fs::write(repo.0.join("src").join(d).join("f.rs"), "").unwrap();
+        }
+        let blank = |search: &FileSearch| {
+            let r = search.files(&repo.request(Operation::Files, ""));
+            assert!(r.ok, "{:?}", r.error);
+            r.files.unwrap()
+        };
+        let base = blank(&search_with(HashMap::new(), HashMap::new()));
+        let pos = |hits: &[FileHit], p: &str| hits.iter().position(|h| h.path == p).unwrap();
+        let (a, z) = (pos(&base, "src/aaa/"), pos(&base, "src/zzz/"));
+        let (low, high) = if a > z {
+            ("aaa", "zzz")
+        } else {
+            ("zzz", "aaa")
+        };
+        let visits = HashMap::from([(format!("src/{low}"), 10.)]);
+        let hits = blank(&search_with(HashMap::new(), visits));
+        let key = format!("src/{low}/");
+        assert!(
+            pos(&hits, &key) < pos(&hits, &format!("src/{high}/")),
+            "{hits:?}"
+        );
+        let hit = &hits[pos(&hits, &key)];
+        assert!(hit.provenance.iter().any(|p| p == "visited"), "{hit:?}");
+        assert!(!hit.provenance.iter().any(|p| p == "picked"), "{hit:?}");
+    }
+    #[test]
+    fn many_visits_stay_below_one_pick_but_above_unvisited() {
+        let picked = HashMap::from([("picked".to_string(), 1.)]);
+        let visited = HashMap::from([("busy".to_string(), 1e6), ("picked".to_string(), 0.)]);
+        let (p, v, n) = (
+            boost(&picked, &visited, "picked/"),
+            boost(&picked, &visited, "busy/"),
+            boost(&picked, &visited, "none/"),
+        );
+        assert!(p > v && v > n, "{p} {v} {n}");
+    }
+    #[test]
+    fn frecent_extras_respect_fff_filtering() {
+        let repo = Repo::new();
+        std::fs::write(repo.0.join(".gitignore"), "ignored/\n").unwrap();
+        for d in ["ignored", "kept"] {
+            std::fs::create_dir_all(repo.0.join("src").join(d)).unwrap();
+            std::fs::write(repo.0.join("src").join(d).join("f.rs"), "").unwrap();
+        }
+        let picks = HashMap::from([
+            ("src/ignored".to_string(), 3.),
+            ("src/kept".to_string(), 3.),
+        ]);
+        let r = search_with(picks, HashMap::new()).files(&repo.request(Operation::Files, ""));
+        assert!(r.ok, "{:?}", r.error);
+        let paths: Vec<_> = r.files.unwrap().into_iter().map(|h| h.path).collect();
+        assert!(paths.iter().any(|p| p == "src/kept/"), "{paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.starts_with("src/ignored")),
+            "{paths:?}"
+        );
     }
     #[test]
     fn complete_directory_pick_boosts_nonexact() {
@@ -675,22 +1665,46 @@ mod tests {
         std::fs::write(repo.0.join("src/libomega/mod.rs"), "").unwrap();
         let scores = Arc::new(Mutex::new(HashMap::<String, f64>::new()));
         let s = scores.clone();
-        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(move |_| s.lock().unwrap().clone()), Box::new(|_, _, _, _, _, _, _| Ok(())), home);
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let search = FileSearch::new(
+            4,
+            Duration::from_secs(600),
+            Box::new(move |_| (s.lock().unwrap().clone(), HashMap::new())),
+            Box::new(|_, _, _, _, _, _, _| Ok(())),
+            home,
+        );
         let mut r = repo.request(Operation::Complete, "lib");
         r.dirs_only = Some(true);
         let before = search.complete(&r);
         assert!(before.ok, "{:?}", before.error);
         let files = before.files.unwrap();
-        let target = files.iter().skip(1).map(|h| h.path.clone()).find(|p| p.contains("lib")).expect("non-first lib dir");
+        let target = files
+            .iter()
+            .skip(1)
+            .map(|h| h.path.clone())
+            .find(|p| p.contains("lib"))
+            .expect("non-first lib dir");
         assert!(target.ends_with('/'), "{target}");
         let before_pos = files.iter().position(|h| h.path == target).unwrap();
-        scores.lock().unwrap().insert(target.trim_end_matches('/').to_string(), 3.0);
+        scores
+            .lock()
+            .unwrap()
+            .insert(target.trim_end_matches('/').to_string(), 3.0);
         let after = search.complete(&r);
         assert!(after.ok, "{:?}", after.error);
         let after_files = after.files.unwrap();
-        let after_pos = after_files.iter().position(|h| h.path == target).expect("picked dir still listed");
-        assert!(after_pos < before_pos, "before_pos={before_pos} after_pos={after_pos} before={:?} after={:?}", files.iter().map(|h| &h.path).collect::<Vec<_>>(), after_files.iter().map(|h| &h.path).collect::<Vec<_>>());
+        let after_pos = after_files
+            .iter()
+            .position(|h| h.path == target)
+            .expect("picked dir still listed");
+        assert!(
+            after_pos < before_pos,
+            "before_pos={before_pos} after_pos={after_pos} before={:?} after={:?}",
+            files.iter().map(|h| &h.path).collect::<Vec<_>>(),
+            after_files.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
     }
     #[test]
     fn scoped_picks_boost_with_warm_parent() {
@@ -700,22 +1714,42 @@ mod tests {
         std::fs::create_dir_all(repo.0.join("src/sub")).unwrap();
         std::fs::write(repo.0.join("src/sub/inside.txt"), "x\n").unwrap();
         let git = |args: &[&str]| {
-            let st = std::process::Command::new("git").args(args).current_dir(&repo.0)
-                .env("GIT_AUTHOR_NAME", "t").env("GIT_AUTHOR_EMAIL", "t@t")
-                .env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
-                .status().unwrap();
+            let st = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo.0)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .status()
+                .unwrap();
             assert!(st.success(), "git {args:?}");
         };
         git(&["add", "-A"]);
         git(&["commit", "-m", "t", "--no-gpg-sign"]);
         let scores = Arc::new(Mutex::new(HashMap::<String, f64>::new()));
         let s = scores.clone();
-        let src = std::fs::canonicalize(repo.0.join("src")).unwrap().to_string_lossy().into_owned();
+        let src = std::fs::canonicalize(repo.0.join("src"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let src_for_cb = src.clone();
-        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(move |root| {
-            if root == src_for_cb { s.lock().unwrap().clone() } else { HashMap::new() }
-        }), Box::new(|_, _, _, _, _, _, _| Ok(())), home);
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let search = FileSearch::new(
+            4,
+            Duration::from_secs(600),
+            Box::new(move |root| {
+                if root == src_for_cb {
+                    (s.lock().unwrap().clone(), HashMap::new())
+                } else {
+                    Default::default()
+                }
+            }),
+            Box::new(|_, _, _, _, _, _, _| Ok(())),
+            home,
+        );
         let mut base = repo.request(Operation::Files, "example.txt");
         base.directory = Some(repo.0.to_string_lossy().into_owned());
         assert!(search.files(&base).ok, "warm parent");
@@ -725,10 +1759,18 @@ mod tests {
         loop {
             let recency = {
                 let guard = index.read().unwrap();
-                guard.as_ref().and_then(|p| p.get_file_by_path(&inside)).map(|f| f.git_recency_score)
+                guard
+                    .as_ref()
+                    .and_then(|p| p.get_file_by_path(&inside))
+                    .map(|f| f.git_recency_score)
             };
-            if recency.is_some_and(|s| s > 0) { break; }
-            assert!(Instant::now() < deadline, "git recency not ready for inside.txt (score={recency:?})");
+            if recency.is_some_and(|s| s > 0) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "git recency not ready for inside.txt (score={recency:?})"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
         let scoped = |search: &FileSearch, query: &str| {
@@ -741,31 +1783,96 @@ mod tests {
         };
         let before = scoped(&search, "txt");
         let files: Vec<_> = before.iter().filter(|h| h.path.ends_with(".txt")).collect();
-        let target = files.iter().skip(1).map(|h| h.path.clone()).find(|p| p.ends_with(".txt")).expect("non-first scoped txt");
-        assert!(!target.starts_with("src/"), "score key must be scope-relative, got {target}");
+        let target = files
+            .iter()
+            .skip(1)
+            .map(|h| h.path.clone())
+            .find(|p| p.ends_with(".txt"))
+            .expect("non-first scoped txt");
+        assert!(
+            !target.starts_with("src/"),
+            "score key must be scope-relative, got {target}"
+        );
         let before_pos = files.iter().position(|h| h.path == target).unwrap();
         scores.lock().unwrap().insert(target.clone(), 3.0);
         let after = scoped(&search, "txt");
         let after_files: Vec<_> = after.iter().filter(|h| h.path.ends_with(".txt")).collect();
-        let after_pos = after_files.iter().position(|h| h.path == target).expect("picked scoped file still listed");
-        assert!(after_files[after_pos].provenance.iter().any(|p| p == "picked"), "{:?}", after_files[after_pos].provenance);
-        assert!(after_pos < before_pos, "before_pos={before_pos} after_pos={after_pos} before={:?} after={:?}", files.iter().map(|h| &h.path).collect::<Vec<_>>(), after_files.iter().map(|h| &h.path).collect::<Vec<_>>());
+        let after_pos = after_files
+            .iter()
+            .position(|h| h.path == target)
+            .expect("picked scoped file still listed");
+        assert!(
+            after_files[after_pos]
+                .provenance
+                .iter()
+                .any(|p| p == "picked"),
+            "{:?}",
+            after_files[after_pos].provenance
+        );
+        assert!(
+            after_pos < before_pos,
+            "before_pos={before_pos} after_pos={after_pos} before={:?} after={:?}",
+            files.iter().map(|h| &h.path).collect::<Vec<_>>(),
+            after_files.iter().map(|h| &h.path).collect::<Vec<_>>()
+        );
         scores.lock().unwrap().clear();
         let blank_before = scoped(&search, "");
-        let nested = blank_before.iter().position(|h| h.path == "sub/inside.txt").expect("sub/inside.txt");
-        assert!(blank_before[nested].provenance.iter().any(|p| p == "suggested"), "{:?}", blank_before[nested].provenance);
-        assert!(nested > 0, "expected synthesized parent above {blank_before:?}");
+        let nested = blank_before
+            .iter()
+            .position(|h| h.path == "sub/inside.txt")
+            .expect("sub/inside.txt");
+        assert!(
+            blank_before[nested]
+                .provenance
+                .iter()
+                .any(|p| p == "suggested"),
+            "{:?}",
+            blank_before[nested].provenance
+        );
+        assert!(
+            nested > 0,
+            "expected synthesized parent above {blank_before:?}"
+        );
         assert_eq!(blank_before[nested - 1].path, "sub/");
-        assert!(blank_before[nested - 1].provenance.iter().any(|p| p == "suggested"), "{:?}", blank_before[nested - 1].provenance);
-        let dir_target = blank_before.iter().map(|h| h.path.clone()).find(|p| p.trim_end_matches('/') == "sub").expect("sub/");
-        let dir_before = blank_before.iter().position(|h| h.path == dir_target).unwrap();
+        assert!(
+            blank_before[nested - 1]
+                .provenance
+                .iter()
+                .any(|p| p == "suggested"),
+            "{:?}",
+            blank_before[nested - 1].provenance
+        );
+        let dir_target = blank_before
+            .iter()
+            .map(|h| h.path.clone())
+            .find(|p| p.trim_end_matches('/') == "sub")
+            .expect("sub/");
+        let dir_before = blank_before
+            .iter()
+            .position(|h| h.path == dir_target)
+            .unwrap();
         scores.lock().unwrap().insert("sub".into(), 3.0);
         let blank_after = scoped(&search, "");
-        let dir_hit = blank_after.iter().find(|h| h.path == dir_target).expect("picked dir still listed");
-        assert!(dir_hit.provenance.iter().any(|p| p == "picked"), "{:?}", dir_hit.provenance);
-        let dir_after = blank_after.iter().position(|h| h.path == dir_target).unwrap();
+        let dir_hit = blank_after
+            .iter()
+            .find(|h| h.path == dir_target)
+            .expect("picked dir still listed");
+        assert!(
+            dir_hit.provenance.iter().any(|p| p == "picked"),
+            "{:?}",
+            dir_hit.provenance
+        );
+        let dir_after = blank_after
+            .iter()
+            .position(|h| h.path == dir_target)
+            .unwrap();
         if dir_before > 0 {
-            assert!(dir_after < dir_before, "dir_before={dir_before} dir_after={dir_after} before={:?} after={:?}", blank_before.iter().map(|h| &h.path).collect::<Vec<_>>(), blank_after.iter().map(|h| &h.path).collect::<Vec<_>>());
+            assert!(
+                dir_after < dir_before,
+                "dir_before={dir_before} dir_after={dir_after} before={:?} after={:?}",
+                blank_before.iter().map(|h| &h.path).collect::<Vec<_>>(),
+                blank_after.iter().map(|h| &h.path).collect::<Vec<_>>()
+            );
         }
     }
     #[test]
@@ -776,48 +1883,102 @@ mod tests {
         }
         let scores = Arc::new(Mutex::new(HashMap::<String, f64>::new()));
         let s = scores.clone();
-        let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir());
-        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(move |_| s.lock().unwrap().clone()), Box::new(|_, _, _, _, _, _, _| Ok(())), home);
+        let home = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let search = FileSearch::new(
+            4,
+            Duration::from_secs(600),
+            Box::new(move |_| (s.lock().unwrap().clone(), HashMap::new())),
+            Box::new(|_, _, _, _, _, _, _| Ok(())),
+            home,
+        );
         let mut wide_req = repo.request(Operation::Files, "");
         wide_req.limit = Some(50);
         let wide = search.files(&wide_req);
         assert!(wide.ok, "{:?}", wide.error);
         let wide = wide.files.unwrap();
         assert!(wide.len() >= 2, "{wide:?}");
-        let outsider = wide.iter().skip(1).take(15).find(|h| !h.path.trim_end_matches('/').contains('/')).expect("top-level hit in boost window");
+        let outsider = wide
+            .iter()
+            .skip(1)
+            .take(15)
+            .find(|h| !h.path.trim_end_matches('/').contains('/'))
+            .expect("top-level hit in boost window");
         let mut page = repo.request(Operation::Files, "");
         page.limit = Some(1);
         let before = search.files(&page);
         assert!(before.ok, "{:?}", before.error);
         let before_files = before.files.unwrap();
-        assert!(!before_files.iter().any(|h| h.path == outsider.path), "outsider already on page: {before_files:?}");
-        scores.lock().unwrap().insert(outsider.path.trim_end_matches('/').to_string(), 3.0);
+        assert!(
+            !before_files.iter().any(|h| h.path == outsider.path),
+            "outsider already on page: {before_files:?}"
+        );
+        scores
+            .lock()
+            .unwrap()
+            .insert(outsider.path.trim_end_matches('/').to_string(), 3.0);
         let after = search.files(&page);
         assert!(after.ok, "{:?}", after.error);
         let after_files = after.files.unwrap();
-        assert!(after_files.iter().any(|h| h.path == outsider.path), "expected {} in {after_files:?}", outsider.path);
-        assert!(after_files.iter().find(|h| h.path == outsider.path).unwrap().provenance.iter().any(|p| p == "picked"));
+        assert!(
+            after_files.iter().any(|h| h.path == outsider.path),
+            "expected {} in {after_files:?}",
+            outsider.path
+        );
+        assert!(
+            after_files
+                .iter()
+                .find(|h| h.path == outsider.path)
+                .unwrap()
+                .provenance
+                .iter()
+                .any(|p| p == "picked")
+        );
     }
     #[test]
     fn capacity_reuse_and_idle_eviction() {
-        let a = Repo::new(); let b = Repo::new(); let search = search(1);
-        let first = search.files(&a.request(Operation::Files, "")); assert!(first.ok);
-        assert_eq!(search.files(&a.request(Operation::Files, "")).instance, first.instance);
+        let a = Repo::new();
+        let b = Repo::new();
+        let search = search(1);
+        let first = search.files(&a.request(Operation::Files, ""));
+        assert!(first.ok);
+        assert_eq!(
+            search.files(&a.request(Operation::Files, "")).instance,
+            first.instance
+        );
         assert!(search.files(&b.request(Operation::Files, "")).ok);
         assert_eq!(search.instances().len(), 1);
         assert_eq!(search.instances()[0].root, b.0.to_string_lossy());
-        for entry in search.pool.lock().unwrap().entries.values_mut() { entry.used = Instant::now() - Duration::from_secs(601); }
-        search.evict_idle(); assert!(search.instances().is_empty());
+        for entry in search.pool.lock().unwrap().entries.values_mut() {
+            entry.used = Instant::now() - Duration::from_secs(601);
+        }
+        search.evict_idle();
+        assert!(search.instances().is_empty());
     }
     #[test]
     fn validation_and_git_letters() {
-        let search = search(4); let mut r = ServiceRequest::new(Operation::Files);
-        assert_eq!(search.files(&r).error.unwrap().message, "files needs a query and an absolute directory.");
-        r.directory = Some("/".into()); r.query = Some("".into()); r.limit = Some(501);
-        assert_eq!(search.files(&r).error.unwrap().message, "limit must be 1 to 500.");
+        let search = search(4);
+        let mut r = ServiceRequest::new(Operation::Files);
+        assert_eq!(
+            search.files(&r).error.unwrap().message,
+            "files needs a query and an absolute directory."
+        );
+        r.directory = Some("/".into());
+        r.query = Some("".into());
+        r.limit = Some(501);
+        assert_eq!(
+            search.files(&r).error.unwrap().message,
+            "limit must be 1 to 500."
+        );
         r.limit = None;
-        assert_eq!(search.grep(&r).error.unwrap().message, "grep needs a query.");
-        assert_eq!(git("staged_new").as_deref(), Some("A ")); assert_eq!(git("clean"), None); assert_eq!(git("unknown").as_deref(), Some("~~"));
+        assert_eq!(
+            search.grep(&r).error.unwrap().message,
+            "grep needs a query."
+        );
+        assert_eq!(git("staged_new").as_deref(), Some("A "));
+        assert_eq!(git("clean"), None);
+        assert_eq!(git("unknown").as_deref(), Some("~~"));
     }
 
     #[test]
@@ -838,7 +1999,11 @@ mod tests {
         sub.scope = Some(true);
         let second = search.files(&sub);
         assert!(second.ok, "{:?}", second.error);
-        assert_eq!(second.instance, Some(first_id), "scoped search should reuse the ancestor index");
+        assert_eq!(
+            second.instance,
+            Some(first_id),
+            "scoped search should reuse the ancestor index"
+        );
         let hit = &second.files.as_ref().unwrap()[0];
         assert_eq!(hit.path, "example.txt");
         assert_eq!(hit.insert, "src/example.txt");
@@ -853,7 +2018,11 @@ mod tests {
         let third = search.files(&wide);
         assert!(third.ok, "{:?}", third.error);
         assert_ne!(third.instance, Some(first_id));
-        assert!(third.files.as_ref().unwrap().iter().any(|h| h.path == format!("{}/src/example.txt", repo.0.file_name().unwrap().to_string_lossy())));
+        assert!(third.files.as_ref().unwrap().iter().any(|h| h.path
+            == format!(
+                "{}/src/example.txt",
+                repo.0.file_name().unwrap().to_string_lossy()
+            )));
     }
 
     #[test]
@@ -869,14 +2038,22 @@ mod tests {
         let response = search.grep(&r);
         assert!(response.ok, "{:?}", response.error);
         let hits = response.files.unwrap();
-        assert_eq!(hits.len(), 1, "path filter should return only one file: {hits:?}");
+        assert_eq!(
+            hits.len(),
+            1,
+            "path filter should return only one file: {hits:?}"
+        );
         assert_eq!(hits[0].path, "example.txt");
         assert_eq!(hits[0].text.as_deref(), Some("hello needle"));
     }
 
     fn stamp(path: &std::path::Path, unix_secs: u64) {
-        std::fs::File::options().write(true).open(path).unwrap()
-            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(unix_secs)).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(unix_secs))
+            .unwrap();
     }
 
     #[test]
@@ -892,7 +2069,10 @@ mod tests {
         stamp(&repo.0.join("zzz/x29.txt"), 1_262_304_000);
         std::fs::write(repo.0.join("zzz/nested/y.txt"), "x\n").unwrap();
         stamp(&repo.0.join("zzz/nested/y.txt"), 1_577_836_800);
-        let inside: Vec<String> = (0..30).map(|i| format!("x{i:02}.txt")).chain(["nested/y.txt".into()]).collect();
+        let inside: Vec<String> = (0..30)
+            .map(|i| format!("x{i:02}.txt"))
+            .chain(["nested/y.txt".into()])
+            .collect();
         for i in 0..80 {
             let p = repo.0.join(format!("aaa/x{i:02}.txt"));
             std::fs::write(&p, "needle\n").unwrap();
@@ -910,7 +2090,10 @@ mod tests {
         files.limit = Some(10);
         let got = search.files(&files);
         assert!(got.ok, "{:?}", got.error);
-        assert_eq!(got.instance, parent, "scoped files should reuse the warm parent index");
+        assert_eq!(
+            got.instance, parent,
+            "scoped files should reuse the warm parent index"
+        );
         let hits = got.files.unwrap();
         assert_eq!(hits.len(), 10, "{hits:?}");
         assert!(hits.iter().all(|h| inside.contains(&h.path)), "{hits:?}");
@@ -938,9 +2121,19 @@ mod tests {
         assert!(got.ok, "{:?}", got.error);
         assert_eq!(got.instance, parent);
         let hits = got.files.unwrap();
-        assert!(hits.iter().all(|h| !h.path.is_empty()), "empty path: {hits:?}");
-        let dirs: Vec<_> = hits.iter().filter(|h| h.path.ends_with('/')).map(|h| h.path.as_str()).collect();
-        assert!(dirs.iter().any(|p| *p == "nested/"), "nested dir should keep trailing slash: {dirs:?}");
+        assert!(
+            hits.iter().all(|h| !h.path.is_empty()),
+            "empty path: {hits:?}"
+        );
+        let dirs: Vec<_> = hits
+            .iter()
+            .filter(|h| h.path.ends_with('/'))
+            .map(|h| h.path.as_str())
+            .collect();
+        assert!(
+            dirs.iter().any(|p| *p == "nested/"),
+            "nested dir should keep trailing slash: {dirs:?}"
+        );
     }
 
     #[test]
@@ -967,7 +2160,11 @@ mod tests {
         assert_eq!(got.instance, warmed.instance);
         let hits = got.files.unwrap();
         assert!(hits.iter().any(|h| h.path == "hit.txt"), "{hits:?}");
-        assert!(hits.iter().all(|h| h.path != "decoy.txt" && !h.path.contains("abc")), "{hits:?}");
+        assert!(
+            hits.iter()
+                .all(|h| h.path != "decoy.txt" && !h.path.contains("abc")),
+            "{hits:?}"
+        );
         let mut g = repo.request(Operation::Grep, "uniq");
         g.directory = Some(scope.to_string_lossy().into_owned());
         g.scope = Some(true);
@@ -1000,8 +2197,14 @@ mod tests {
         let home = std::env::temp_dir().join(format!("smcli-content-home-{}", std::process::id()));
         std::fs::create_dir_all(home.join("Dev/Apps/project")).unwrap();
         let home_str = home.to_string_lossy();
-        assert!(FileSearch::content_indexing_enabled(&home, &format!("{home_str}/Dev/Apps/project")));
-        assert!(!FileSearch::content_indexing_enabled(&home, &format!("{home_str}/Dev")));
+        assert!(FileSearch::content_indexing_enabled(
+            &home,
+            &format!("{home_str}/Dev/Apps/project")
+        ));
+        assert!(!FileSearch::content_indexing_enabled(
+            &home,
+            &format!("{home_str}/Dev")
+        ));
         assert!(!FileSearch::content_indexing_enabled(&home, &home_str));
         assert!(!FileSearch::content_indexing_enabled(&home, "/"));
         let _ = std::fs::remove_dir_all(&home);
@@ -1017,10 +2220,22 @@ mod tests {
         let near = base.join("wide/near");
         let launch = base.join("launch");
         std::fs::create_dir_all(&launch).unwrap();
-        let search = FileSearch::new(4, Duration::from_secs(600), Box::new(|_| HashMap::new()), Box::new(|_, _, _, _, _, _, _| Ok(())), launch);
+        let search = FileSearch::new(
+            4,
+            Duration::from_secs(600),
+            Box::new(|_| Default::default()),
+            Box::new(|_, _, _, _, _, _, _| Ok(())),
+            launch,
+        );
         let scope = std::fs::canonicalize(&project).unwrap();
-        assert!(FileSearch::content_indexing_enabled(&wide, scope.to_str().unwrap()));
-        assert!(!FileSearch::content_indexing_enabled(&near, scope.to_str().unwrap()));
+        assert!(FileSearch::content_indexing_enabled(
+            &wide,
+            scope.to_str().unwrap()
+        ));
+        assert!(!FileSearch::content_indexing_enabled(
+            &near,
+            scope.to_str().unwrap()
+        ));
         let mut first = ServiceRequest::new(Operation::Files);
         first.directory = Some(scope.to_string_lossy().into_owned());
         first.query = Some("note".into());
@@ -1032,9 +2247,15 @@ mod tests {
         second.home = Some(near.to_string_lossy().into_owned());
         let near_hit = search.files(&second);
         assert!(near_hit.ok, "{:?}", near_hit.error);
-        assert_ne!(wide_hit.instance, near_hit.instance, "different content policies must not share an index");
+        assert_ne!(
+            wide_hit.instance, near_hit.instance,
+            "different content policies must not share an index"
+        );
         let again = search.files(&first);
-        assert_eq!(again.instance, wide_hit.instance, "the same caller home reuses its own index");
+        assert_eq!(
+            again.instance, wide_hit.instance,
+            "the same caller home reuses its own index"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

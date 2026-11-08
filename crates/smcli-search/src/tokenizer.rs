@@ -11,7 +11,12 @@ impl ShellTokenizer {
         let lines: Vec<&str> = text
             .split('\n')
             .enumerate()
-            .filter(|(i, line)| *i == 0 || !Self::LABELS.iter().any(|l| line.to_lowercase().starts_with(l)))
+            .filter(|(i, line)| {
+                *i == 0
+                    || !Self::LABELS
+                        .iter()
+                        .any(|l| line.to_lowercase().starts_with(l))
+            })
             .map(|(_, line)| line)
             .collect();
         let joined = lines.join(" ");
@@ -19,7 +24,10 @@ impl ShellTokenizer {
         for word in joined.split_whitespace() {
             let lower = word.to_lowercase();
             tokens.push(lower.clone());
-            let pieces: Vec<&str> = word.split(|c: char| !c.is_alphanumeric()).filter(|p| !p.is_empty()).collect();
+            let pieces: Vec<&str> = word
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|p| !p.is_empty())
+                .collect();
             if pieces.len() != 1 || pieces[0] != word {
                 tokens.extend(pieces.iter().map(|p| p.to_lowercase()));
             }
@@ -30,7 +38,11 @@ impl ShellTokenizer {
                     let (_, previous) = chars[i - 1];
                     let (at, current) = chars[i];
                     let next_lower = chars.get(i + 1).is_some_and(|(_, c)| c.is_lowercase());
-                    if current.is_uppercase() && (previous.is_lowercase() || previous.is_numeric() || (previous.is_uppercase() && next_lower)) {
+                    if current.is_uppercase()
+                        && (previous.is_lowercase()
+                            || previous.is_numeric()
+                            || (previous.is_uppercase() && next_lower))
+                    {
                         tokens.push(piece[start..at].to_lowercase());
                         start = at;
                     }
@@ -48,7 +60,12 @@ impl ShellTokenizer {
     pub fn encoded(text: &str) -> String {
         Self::tokenize(text)
             .iter()
-            .map(|term| format!("t{}", term.bytes().map(|b| format!("{b:02x}")).collect::<String>()))
+            .map(|term| {
+                format!(
+                    "t{}",
+                    term.bytes().map(|b| format!("{b:02x}")).collect::<String>()
+                )
+            })
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -64,7 +81,10 @@ mod tests {
             ShellTokenizer::tokenize("git reset --soft HEAD~1"),
             ["git", "reset", "--soft", "soft", "head~1", "head", "1"]
         );
-        assert_eq!(ShellTokenizer::tokenize("git push -f\ncommand: git\nflags: -f"), ["git", "push", "-f", "f"]);
+        assert_eq!(
+            ShellTokenizer::tokenize("git push -f\ncommand: git\nflags: -f"),
+            ["git", "push", "-f", "f"]
+        );
         assert_eq!(
             ShellTokenizer::tokenize("ls\nflags: -a\nintent: list files"),
             ["ls", "intent:", "intent", "list", "files"]
@@ -73,8 +93,21 @@ mod tests {
 
     #[test]
     fn keeps_identifiers_and_emits_case_parts() {
-        assert_eq!(ShellTokenizer::tokenize("FooBarTests camelCase HTTPServer"),
-            ["foobartests", "foo", "bar", "tests", "camelcase", "camel", "case", "httpserver", "http", "server"]);
+        assert_eq!(
+            ShellTokenizer::tokenize("FooBarTests camelCase HTTPServer"),
+            [
+                "foobartests",
+                "foo",
+                "bar",
+                "tests",
+                "camelcase",
+                "camel",
+                "case",
+                "httpserver",
+                "http",
+                "server"
+            ]
+        );
     }
 
     #[test]

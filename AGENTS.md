@@ -70,7 +70,7 @@ pidflash=pi --model opencode-go/deepseek-v4.1-flash --thinking high
 
 ## Testing rules
 
-1. **Never run the full suite while work is in progress.** `make test` and `make linux` run once, and only after *all* the work is complete: every slice written, reviewed, and passing its own checks. This applies to everyone, including the main agent.
+1. **Never run the full suite while work is in progress.** `make test` runs once, and only after *all* the work is complete: every slice written, reviewed, and passing its own checks. This applies to everyone, including the main agent. Linux is on the backburner: do not run `make linux` unless asked, and put Linux issues in [the roadmap](agents/plans/roadmap.md) instead of fixing them.
 2. **During the work, verify with modular tests only.** Use unit tests (`make test-rust PKG=<crate> FILTER=<test>`) or the one focused slice that covers the change (`make test-picker`, `make test-shells`, and so on; see "Building").
 3. **Tests run only after the code is written, and only Kimi Team (kteam) runs them.** Coders, reviewers and other teams do not run tests.
 4. **When a test fails:** send the failing output and the code under test for review, fix it from the review, then have kteam rerun only that modular test. The full suite runs again only when all work is fixed and passing.
@@ -97,19 +97,20 @@ Use the Makefile for builds; don't hand-roll `cargo build` commands.
 - Focused slices of the gate (black-box targets build automatically): `make test-rust` (`PKG=smcli-core FILTER=history`
   narrows crate and test), `make test-cli` (CLI smoke), `make test-picker` (file + alias picker), `make test-shells` (runs checks in parallel; honors `SMCLI_TEST_ONLY`, and `SMCLI_TEST_JOBS=1` runs them one at a time), `make test-service`, `make test-install`. Match the slice to what changed: picker/menu -> `test-picker` + `test-rust PKG=smcli`, hooks -> `test-shells`, service -> `test-service`, install -> `test-install`.
 - `make ranking` — scores suggest/search ranking on the fixed query set (`crates/smcli-search/tests/ranking.rs`); run after ranking changes.
-- `make linux` — full test suite on Linux in Docker (needs a running daemon).
+- `make linux` — full test suite on Linux in Docker (needs a running daemon). On the backburner; run only when asked.
 - `make baseline` — black-box CLI/hook benchmark (`scripts/bench-baseline.py`, see `agents/reference/baseline.md`); never reads real history.
 - `make docs` — formats all hand-written markdown with iwe. `make notices` — regenerates `THIRD_PARTY_NOTICES.md`.
+- `make unused` — dead-code audit: compiler warnings plus `pub` items nothing uses or only tests use across crates (`scripts/unused-pub.py`). It matches by name, so check each hit, and a shared name such as `new` can hide dead code.
 - `make clean` — `cargo clean`, keeping the newest `dist/` CLI and service pair (live shell hooks may point at them).
 
 ## Architecture
 
-Cargo workspace (`crates/`), macOS and Linux, search included on both. Two executables sharing one copy of the potion-shell-16m model (fine-tuned potion-code-16M-v2, `Models/potion-shell-16m`), shipped as a `potion-shell-16m/` folder beside them (`make release` copies it into `dist/`, `install.sh` into the prefix; dev builds and tests fall back to the checkout's `Models/`). Only `smcli-service` loads it at runtime. The CLI reads the model's files for its identity (never building the model), and loads it only in `smcli init` when switching models and in `smcli reindex`, after stopping the service and taking the model lock (all in `crates/smcli/src/initialize.rs`):
+Cargo workspace (`crates/`), macOS today, Linux support coming soon (its code stays in place). Two executables sharing one copy of the potion-shell-16m model (fine-tuned potion-code-16M-v2, `Models/potion-shell-16m`), shipped as a `potion-shell-16m/` folder beside them (`make release` copies it into `dist/`, `install.sh` into the prefix; dev builds and tests fall back to the checkout's `Models/`). Only `smcli-service` loads it at runtime. The CLI reads the model's files for its identity (never building the model), and loads it only in `smcli init` when switching models and in `smcli reindex`, after stopping the service and taking the model lock (all in `crates/smcli/src/initialize.rs`):
 
 - `smcli` (`crates/smcli`) — clap CLI, ratatui picker and menu, `shell-init` hook generation (`shell_integration.rs`).
 - `smcli-service` (`crates/smcli-service`) — long-lived owner of history state and the open search index, serving clients over a Unix-domain socket. Only it depends on `fff-search` (file search); the CLI and `smcli-core` must never link fff.
 
-Libraries: `smcli-core` (sole owner of SQL on the history database at `~/.local/share/smcli/history.db`: capture, import, prune, export; capture filters, ranking/suggestions, config, socket client, protocol and caller context), `smcli-search` (hybrid BM25 + embedding search over captured and native history in a TalaDB index; Potion only). Only `smcli-search` opens, inspects or deletes index files; the `smcli` crate depends on neither `taladb` nor `rusqlite`.
+Libraries: `smcli-core` (sole owner of SQL on the history database at `~/.local/state/smcli/history.db`: capture, import, prune, export; capture filters, ranking/suggestions, config, socket client, protocol and caller context), `smcli-search` (hybrid BM25 + embedding search over captured and native history in a TalaDB index; Potion only). Only `smcli-search` opens, inspects or deletes index files; the `smcli` crate depends on neither `taladb` nor `rusqlite`.
 
 Client/service protocol (`smcli-core/src/service_protocol.rs`, frozen fixtures in `crates/smcli-core/tests/fixtures/service_protocol`): one newline-delimited JSON request and one response per connection, versioned. Each request carries its caller context (home, config, cwd, session, HISTFILE, SHELL, PATH, ranking switches); the service acts only on that and on launch settings, and is started with an allowlisted environment. On a version mismatch or no service, history, suggestions and files fall back in-process. Search falls back to keyword matching and `@@` to word ranking, never to the embedding model. Service-only file-search ranking evidence is unavailable. The service identifies its binary by path/mtime/size so a rebuilt binary is detected.
 

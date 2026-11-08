@@ -19,13 +19,33 @@ pub const NODE_MANAGERS: [&str; 4] = ["npm", "pnpm", "yarn", "bun"];
 
 /// Languages first, then task runners and containers, so a language decides the kind when there is one.
 const MANIFESTS: [(&[&str], &str); 19] = [
-    (&["Package.swift"], "swift"), (&["package.json"], "node"), (&["deno.json", "deno.jsonc"], "deno"),
-    (&["Cargo.toml"], "rust"), (&["pyproject.toml"], "python"), (&["go.mod"], "go"), (&["Gemfile"], "ruby"),
-    (&["composer.json"], "php"), (&["pom.xml"], "maven"), (&["build.gradle.kts", "build.gradle"], "gradle"),
-    (&["mix.exs"], "elixir"), (&["pubspec.yaml"], "dart"), (&["CMakeLists.txt"], "cmake"),
-    (&["Makefile", "makefile", "GNUmakefile"], "make"), (&["justfile", "Justfile", ".justfile"], "just"),
-    (&["Taskfile.yml", "Taskfile.yaml"], "task"), (&["Rakefile"], "rake"),
-    (&["compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"], "compose"), (&["Dockerfile"], "docker"),
+    (&["Package.swift"], "swift"),
+    (&["package.json"], "node"),
+    (&["deno.json", "deno.jsonc"], "deno"),
+    (&["Cargo.toml"], "rust"),
+    (&["pyproject.toml"], "python"),
+    (&["go.mod"], "go"),
+    (&["Gemfile"], "ruby"),
+    (&["composer.json"], "php"),
+    (&["pom.xml"], "maven"),
+    (&["build.gradle.kts", "build.gradle"], "gradle"),
+    (&["mix.exs"], "elixir"),
+    (&["pubspec.yaml"], "dart"),
+    (&["CMakeLists.txt"], "cmake"),
+    (&["Makefile", "makefile", "GNUmakefile"], "make"),
+    (&["justfile", "Justfile", ".justfile"], "just"),
+    (&["Taskfile.yml", "Taskfile.yaml"], "task"),
+    (&["Rakefile"], "rake"),
+    (
+        &[
+            "compose.yaml",
+            "compose.yml",
+            "docker-compose.yml",
+            "docker-compose.yaml",
+        ],
+        "compose",
+    ),
+    (&["Dockerfile"], "docker"),
 ];
 const MAX_LEVELS: usize = 64;
 
@@ -46,7 +66,9 @@ fn parent(path: &str) -> String {
 }
 
 pub fn real_path(path: &str) -> Option<String> {
-    std::fs::canonicalize(path).ok().map(|p| p.to_string_lossy().into_owned())
+    std::fs::canonicalize(path)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// The primary kind of the nearest project at or above `directory`: `discover(..).projects.first().kind` without
@@ -86,16 +108,23 @@ pub const KIND_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(6
 
 impl KindCache {
     pub fn new(ttl: std::time::Duration) -> Self {
-        Self { ttl, entries: HashMap::new() }
+        Self {
+            ttl,
+            entries: HashMap::new(),
+        }
     }
 
     /// A fresh entry's kind, or None when `directory` must be probed (and then `insert`ed).
     pub fn lookup(&self, directory: &str) -> Option<Option<String>> {
-        self.entries.get(directory).filter(|(_, at)| at.elapsed() < self.ttl).map(|(kind, _)| kind.clone())
+        self.entries
+            .get(directory)
+            .filter(|(_, at)| at.elapsed() < self.ttl)
+            .map(|(kind, _)| kind.clone())
     }
 
     pub fn insert(&mut self, directory: &str, kind: Option<String>) {
-        self.entries.insert(directory.into(), (kind, std::time::Instant::now()));
+        self.entries
+            .insert(directory.into(), (kind, std::time::Instant::now()));
     }
 
     pub fn get(&mut self, directory: &str) -> Option<String> {
@@ -109,7 +138,10 @@ impl KindCache {
 }
 
 /// `directory_kind` remembered in `memo`, for loops over many runs in few directories.
-pub fn directory_kind_memo(memo: &mut HashMap<String, Option<String>>, directory: &str) -> Option<String> {
+pub fn directory_kind_memo(
+    memo: &mut HashMap<String, Option<String>>,
+    directory: &str,
+) -> Option<String> {
     if let Some(kind) = memo.get(directory) {
         return kind.clone();
     }
@@ -119,9 +151,15 @@ pub fn directory_kind_memo(memo: &mut HashMap<String, Option<String>>, directory
 }
 
 pub(crate) fn read_small_file(path: &str, limit: u64) -> Option<String> {
-    if !regular_file(path) { return None; }
+    if !regular_file(path) {
+        return None;
+    }
     let mut data = Vec::new();
-    std::fs::File::open(path).ok()?.take(limit).read_to_end(&mut data).ok()?;
+    std::fs::File::open(path)
+        .ok()?
+        .take(limit)
+        .read_to_end(&mut data)
+        .ok()?;
     Some(String::from_utf8_lossy(&data).trim().to_string())
 }
 
@@ -129,12 +167,17 @@ fn relative(path: &str, root: &str) -> String {
     if path == root {
         return ".".into();
     }
-    path.strip_prefix(&format!("{root}/")).unwrap_or(path).to_string()
+    path.strip_prefix(&format!("{root}/"))
+        .unwrap_or(path)
+        .to_string()
 }
 
 impl ProjectContext {
     pub fn discover(directory: &str) -> Self {
-        let mut context = Self { directory: directory.into(), ..Default::default() };
+        let mut context = Self {
+            directory: directory.into(),
+            ..Default::default()
+        };
         let start = real_path(directory).unwrap_or_else(|| directory.to_string());
         let mut visited = vec![];
         let mut current = start.clone();
@@ -159,7 +202,10 @@ impl ProjectContext {
                 }
             }
         }
-        context.repo_relative = context.repository.as_ref().map(|r| relative(&start, &r.root));
+        context.repo_relative = context
+            .repository
+            .as_ref()
+            .map(|r| relative(&start, &r.root));
         context.project_relative = context.projects.first().map(|p| relative(&start, &p.root));
         context
     }
@@ -174,15 +220,25 @@ impl ProjectContext {
         } else {
             let text = read_small_file(&dot_git, 4096)?;
             let path = text.strip_prefix("gitdir:")?.trim();
-            if path.starts_with('/') { path.to_string() } else { format!("{directory}/{path}") }
+            if path.starts_with('/') {
+                path.to_string()
+            } else {
+                format!("{directory}/{path}")
+            }
         };
         let git_dir = real_path(&git_dir)?;
         let head = read_small_file(&format!("{git_dir}/HEAD"), 4096)?;
         let mut common_dir = git_dir.clone();
-        if let Some(common) = read_small_file(&format!("{git_dir}/commondir"), 4096).filter(|c| !c.is_empty())
-            && let Some(resolved) = real_path(&if common.starts_with('/') { common } else { format!("{git_dir}/{common}") }) {
-                common_dir = resolved;
-            }
+        if let Some(common) =
+            read_small_file(&format!("{git_dir}/commondir"), 4096).filter(|c| !c.is_empty())
+            && let Some(resolved) = real_path(&if common.starts_with('/') {
+                common
+            } else {
+                format!("{git_dir}/{common}")
+            })
+        {
+            common_dir = resolved;
+        }
         let mut repository = Repository {
             root: real_path(directory).unwrap_or_else(|| directory.into()),
             linked_worktree: git_dir != common_dir,
@@ -192,21 +248,37 @@ impl ProjectContext {
         };
         if let Some(reference) = head.strip_prefix("ref:") {
             let reference = reference.trim();
-            repository.branch = Some(reference.strip_prefix("refs/heads/").unwrap_or(reference).to_string());
+            repository.branch = Some(
+                reference
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(reference)
+                    .to_string(),
+            );
         } else {
             repository.head = Some(head.chars().take(7).collect());
         }
-        let markers = [("rebase-merge", "rebase"), ("rebase-apply/rebasing", "rebase"), ("rebase-apply", "am"),
-                       ("MERGE_HEAD", "merge"), ("CHERRY_PICK_HEAD", "cherry-pick"), ("REVERT_HEAD", "revert"),
-                       ("BISECT_LOG", "bisect")];
-        repository.operation = markers.iter().find(|m| exists(&format!("{git_dir}/{}", m.0))).map(|m| m.1.to_string());
+        let markers = [
+            ("rebase-merge", "rebase"),
+            ("rebase-apply/rebasing", "rebase"),
+            ("rebase-apply", "am"),
+            ("MERGE_HEAD", "merge"),
+            ("CHERRY_PICK_HEAD", "cherry-pick"),
+            ("REVERT_HEAD", "revert"),
+            ("BISECT_LOG", "bisect"),
+        ];
+        repository.operation = markers
+            .iter()
+            .find(|m| exists(&format!("{git_dir}/{}", m.0)))
+            .map(|m| m.1.to_string());
         Some(repository)
     }
 
     fn project(directory: &str) -> Option<Project> {
         let has = |file: &str| regular_file(&format!("{directory}/{file}"));
-        let found: Vec<(&str, &str)> =
-            MANIFESTS.iter().filter_map(|(names, kind)| names.iter().find(|n| has(n)).map(|n| (*n, *kind))).collect();
+        let found: Vec<(&str, &str)> = MANIFESTS
+            .iter()
+            .filter_map(|(names, kind)| names.iter().find(|n| has(n)).map(|n| (*n, *kind)))
+            .collect();
         let primary = *found.first()?;
         let mut project = Project {
             root: directory.into(),
@@ -219,13 +291,18 @@ impl ProjectContext {
             let text = text.as_deref();
             let names = match *kind {
                 // shortcut: literal name: "..." on target-like constructors only, upgrade to a structured reader for computed names and other declarations
-                "swift" => matches(r#"\.(?:executableTarget|target|testTarget|plugin|macro)\(\s*name:\s*"([^"]+)""#, text),
+                "swift" => matches(
+                    r#"\.(?:executableTarget|target|testTarget|plugin|macro)\(\s*name:\s*"([^"]+)""#,
+                    text,
+                ),
                 "node" => node_scripts(text, &mut project, &has),
                 "rust" => cargo_targets(text, &mut project),
                 "python" => python_scripts(text, &mut project, &has),
                 "go" => {
                     if project.name.is_none() {
-                        project.name = text.and_then(|t| t.lines().find(|l| l.starts_with("module "))).map(|l| l[7..].trim().to_string());
+                        project.name = text
+                            .and_then(|t| t.lines().find(|l| l.starts_with("module ")))
+                            .map(|l| l[7..].trim().to_string());
                     }
                     vec![]
                 }
@@ -238,15 +315,28 @@ impl ProjectContext {
                 _ => vec![],
             };
             if !names.is_empty() {
-                project.scripts.insert(file.to_string(), names.into_iter().take(200).collect());
+                project
+                    .scripts
+                    .insert(file.to_string(), names.into_iter().take(200).collect());
             }
         }
         // Wrappers pin the build tool's version, so commands use them when present.
-        project.manifests.extend(["gradlew", "mvnw"].into_iter().filter(|f| has(f)).map(String::from));
+        project.manifests.extend(
+            ["gradlew", "mvnw"]
+                .into_iter()
+                .filter(|f| has(f))
+                .map(String::from),
+        );
         if project.package_manager.is_none() {
             project.package_manager = match primary.1 {
-                "swift" => Some("swiftpm"), "rust" => Some("cargo"), "go" => Some("go"), "make" => Some("make"),
-                "ruby" => Some("bundler"), "php" => Some("composer"), "elixir" => Some("mix"), "deno" => Some("deno"),
+                "swift" => Some("swiftpm"),
+                "rust" => Some("cargo"),
+                "go" => Some("go"),
+                "make" => Some("make"),
+                "ruby" => Some("bundler"),
+                "php" => Some("composer"),
+                "elixir" => Some("mix"),
+                "deno" => Some("deno"),
                 _ => None,
             }
             .map(String::from);
@@ -256,7 +346,9 @@ impl ProjectContext {
 }
 
 fn matches(pattern: &str, text: Option<&str>) -> Vec<String> {
-    let Ok(expression) = Regex::new(pattern) else { return vec![] };
+    let Ok(expression) = Regex::new(pattern) else {
+        return vec![];
+    };
     let mut seen = HashSet::new();
     expression
         .captures_iter(text.unwrap_or(""))
@@ -273,42 +365,72 @@ fn json_object(text: Option<&str>) -> Option<serde_json::Map<String, serde_json:
 }
 
 fn json_keys(text: Option<&str>, field: &str) -> Vec<String> {
-    let mut keys: Vec<String> =
-        json_object(text).and_then(|j| j.get(field)?.as_object().map(|o| o.keys().cloned().collect())).unwrap_or_default();
+    let mut keys: Vec<String> = json_object(text)
+        .and_then(|j| {
+            j.get(field)?
+                .as_object()
+                .map(|o| o.keys().cloned().collect())
+        })
+        .unwrap_or_default();
     keys.sort();
     keys
 }
 
-fn node_scripts(text: Option<&str>, project: &mut Project, has: &dyn Fn(&str) -> bool) -> Vec<String> {
+fn node_scripts(
+    text: Option<&str>,
+    project: &mut Project,
+    has: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
     let json = json_object(text);
-    project.name = json.as_ref().and_then(|j| j.get("name")?.as_str().map(String::from));
+    project.name = json
+        .as_ref()
+        .and_then(|j| j.get("name")?.as_str().map(String::from));
     // The field is repository-controlled text that ends up in suggested commands, so only known names count.
-    let field = json.as_ref().and_then(|j| j.get("packageManager")?.as_str()).and_then(|f| f.split('@').next());
-    project.package_manager = Some(if let Some(name) = field.filter(|n| NODE_MANAGERS.contains(n)) {
-        name.to_string()
-    } else {
-        [("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"), ("bun.lock", "bun"), ("bun.lockb", "bun"), ("package-lock.json", "npm")]
+    let field = json
+        .as_ref()
+        .and_then(|j| j.get("packageManager")?.as_str())
+        .and_then(|f| f.split('@').next());
+    project.package_manager = Some(
+        if let Some(name) = field.filter(|n| NODE_MANAGERS.contains(n)) {
+            name.to_string()
+        } else {
+            [
+                ("pnpm-lock.yaml", "pnpm"),
+                ("yarn.lock", "yarn"),
+                ("bun.lock", "bun"),
+                ("bun.lockb", "bun"),
+                ("package-lock.json", "npm"),
+            ]
             .iter()
             .find(|l| has(l.0))
             .map_or("npm", |l| l.1)
             .to_string()
-    });
+        },
+    );
     json_keys(text, "scripts")
 }
 
 fn toml_lines(text: Option<&str>) -> Vec<&str> {
-    text.unwrap_or("").lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).collect()
+    text.unwrap_or("")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
 }
 
 /// `key = "value"`; with `any_value`, a key with any value (script tables map names to entry points).
 fn toml_pair(line: &str, any_value: bool) -> Option<(String, String)> {
     let equals = line.find('=')?;
-    let key = line[..equals].trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+    let key = line[..equals]
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .to_string();
     let value = line[equals + 1..].trim();
     if let Some(rest) = value.strip_prefix('"')
-        && let Some(end) = rest.find('"') {
-            return Some((key, rest[..end].to_string()));
-        }
+        && let Some(end) = rest.find('"')
+    {
+        return Some((key, rest[..end].to_string()));
+    }
     any_value.then(|| (key, value.to_string()))
 }
 
@@ -320,7 +442,9 @@ fn cargo_targets(text: Option<&str>, project: &mut Project) -> Vec<String> {
             section = line;
             continue;
         }
-        let Some((_, value)) = toml_pair(line, false).filter(|(k, _)| k == "name") else { continue };
+        let Some((_, value)) = toml_pair(line, false).filter(|(k, _)| k == "name") else {
+            continue;
+        };
         if section == "[package]" {
             project.name = Some(value);
         } else if section == "[[bin]]" {
@@ -331,18 +455,28 @@ fn cargo_targets(text: Option<&str>, project: &mut Project) -> Vec<String> {
     names
 }
 
-fn python_scripts(text: Option<&str>, project: &mut Project, has: &dyn Fn(&str) -> bool) -> Vec<String> {
+fn python_scripts(
+    text: Option<&str>,
+    project: &mut Project,
+    has: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
     let mut names = vec![];
     let mut section = "";
     let mut tools = HashSet::new();
     for line in toml_lines(text) {
         if line.starts_with('[') {
             section = line;
-            if section.starts_with("[tool.poetry") { tools.insert("poetry"); }
-            if section.starts_with("[tool.uv") { tools.insert("uv"); }
+            if section.starts_with("[tool.poetry") {
+                tools.insert("poetry");
+            }
+            if section.starts_with("[tool.uv") {
+                tools.insert("uv");
+            }
             continue;
         }
-        let Some((key, value)) = toml_pair(line, true) else { continue };
+        let Some((key, value)) = toml_pair(line, true) else {
+            continue;
+        };
         if section == "[project]" && key == "name" {
             project.name = Some(value);
         }
@@ -350,8 +484,17 @@ fn python_scripts(text: Option<&str>, project: &mut Project, has: &dyn Fn(&str) 
             names.push(key);
         }
     }
-    let locks = [("uv.lock", "uv"), ("poetry.lock", "poetry"), ("Pipfile.lock", "pipenv"), ("pdm.lock", "pdm")];
-    let manager = locks.iter().find(|l| has(l.0)).map(|l| l.1).or_else(|| ["uv", "poetry"].into_iter().find(|t| tools.contains(t)));
+    let locks = [
+        ("uv.lock", "uv"),
+        ("poetry.lock", "poetry"),
+        ("Pipfile.lock", "pipenv"),
+        ("pdm.lock", "pdm"),
+    ];
+    let manager = locks
+        .iter()
+        .find(|l| has(l.0))
+        .map(|l| l.1)
+        .or_else(|| ["uv", "poetry"].into_iter().find(|t| tools.contains(t)));
     project.package_manager = Some(manager.unwrap_or("pip").to_string());
     names
 }
@@ -360,13 +503,19 @@ fn python_scripts(text: Option<&str>, project: &mut Project, has: &dyn Fn(&str) 
 fn just_recipes(text: Option<&str>) -> Vec<String> {
     let mut names = vec![];
     for line in text.unwrap_or("").lines().filter(|l| !l.is_empty()) {
-        let Some(first) = line.chars().next() else { continue };
+        let Some(first) = line.chars().next() else {
+            continue;
+        };
         if !(first.is_alphabetic() || first == '_' || first == '@') || line.contains(":=") {
             continue;
         }
-        let Some(colon) = line.find(':') else { continue };
+        let Some(colon) = line.find(':') else {
+            continue;
+        };
         let head = line[..colon].trim_start_matches('@');
-        let Some(name) = head.split(' ').find(|w| !w.is_empty()) else { continue };
+        let Some(name) = head.split(' ').find(|w| !w.is_empty()) else {
+            continue;
+        };
         if !["set", "alias", "import", "mod", "export"].contains(&name) {
             names.push(name.to_string());
         }
@@ -390,7 +539,12 @@ fn taskfile_tasks(text: Option<&str>) -> Vec<String> {
         }
         if *indent.get_or_insert(depth) == depth {
             let name = line.trim();
-            names.push(name[..name.len() - 1].trim().trim_matches(|c| c == '"' || c == '\'').to_string());
+            names.push(
+                name[..name.len() - 1]
+                    .trim()
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .to_string(),
+            );
         }
     }
     names
@@ -404,20 +558,25 @@ fn make_targets(text: Option<&str>) -> Vec<String> {
         if matches!(line.chars().next(), Some('\t' | '#' | '.' | ' ')) {
             continue;
         }
-        let Some(colon) = line.find(':') else { continue };
+        let Some(colon) = line.find(':') else {
+            continue;
+        };
         let after = &line[colon + 1..];
         if after.starts_with('=') || after.starts_with(":=") {
             continue;
         }
         for word in line[..colon].split(' ').filter(|w| !w.is_empty()) {
-            if word.chars().all(|c| c.is_alphanumeric() || "_-./".contains(c)) && seen.insert(word.to_string()) {
+            if word
+                .chars()
+                .all(|c| c.is_alphanumeric() || "_-./".contains(c))
+                && seen.insert(word.to_string())
+            {
                 names.push(word.to_string());
             }
         }
     }
     names
 }
-
 
 impl GitStatus {
     pub fn clean(&self) -> bool {
@@ -578,18 +737,51 @@ mod tests {
         write("mono/inner/.git/HEAD");
         write("mono/inner/src/x");
         let mut memo = HashMap::new();
-        let kind = |memo: &mut HashMap<_, _>, d: &str| directory_kind_memo(memo, &format!("{root}/{d}"));
-        assert_eq!(kind(&mut memo, "crate/src/deep").as_deref(), Some("rust"), "nested, and a language beats make");
-        assert_eq!(kind(&mut memo, "mono/pkg").as_deref(), Some("make"), "nearest project wins");
+        let kind =
+            |memo: &mut HashMap<_, _>, d: &str| directory_kind_memo(memo, &format!("{root}/{d}"));
+        assert_eq!(
+            kind(&mut memo, "crate/src/deep").as_deref(),
+            Some("rust"),
+            "nested, and a language beats make"
+        );
+        assert_eq!(
+            kind(&mut memo, "mono/pkg").as_deref(),
+            Some("make"),
+            "nearest project wins"
+        );
         assert_eq!(kind(&mut memo, "mono").as_deref(), Some("node"));
-        assert_eq!(kind(&mut memo, "gone/away"), None, "a missing directory is unknown");
+        assert_eq!(
+            kind(&mut memo, "gone/away"),
+            None,
+            "a missing directory is unknown"
+        );
         assert_eq!(kind(&mut memo, "plain"), None, "no manifest is unknown");
         assert_eq!(memo.len(), 5);
-        assert_eq!(kind(&mut memo, "mono/inner/src"), None, "a project above the Git root does not count");
+        assert_eq!(
+            kind(&mut memo, "mono/inner/src"),
+            None,
+            "a project above the Git root does not count"
+        );
         // The cheap probe is exactly discover's first project kind.
-        for d in ["crate/src/deep", "crate", "mono/pkg", "mono", "mono/inner/src", "plain", "gone/away"] {
+        for d in [
+            "crate/src/deep",
+            "crate",
+            "mono/pkg",
+            "mono",
+            "mono/inner/src",
+            "plain",
+            "gone/away",
+        ] {
             let path = format!("{root}/{d}");
-            let expected = Path::new(&path).is_dir().then(|| ProjectContext::discover(&path).projects.first().map(|p| p.kind.clone())).flatten();
+            let expected = Path::new(&path)
+                .is_dir()
+                .then(|| {
+                    ProjectContext::discover(&path)
+                        .projects
+                        .first()
+                        .map(|p| p.kind.clone())
+                })
+                .flatten();
             assert_eq!(directory_kind(&path), expected, "{d}");
         }
     }
@@ -599,10 +791,17 @@ mod tests {
     fn symlinked_directory_probes_its_real_path() {
         let root = tempfile_dir();
         std::fs::create_dir_all(format!("{root}/real/crate/src")).unwrap();
-        std::fs::write(format!("{root}/real/Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(
+            format!("{root}/real/Cargo.toml"),
+            "[package]\nname = \"x\"\n",
+        )
+        .unwrap();
         std::os::unix::fs::symlink(format!("{root}/real/crate"), format!("{root}/link")).unwrap();
         let link = format!("{root}/link");
-        let expected = ProjectContext::discover(&link).projects.first().map(|p| p.kind.clone());
+        let expected = ProjectContext::discover(&link)
+            .projects
+            .first()
+            .map(|p| p.kind.clone());
         assert_eq!(directory_kind(&link), expected);
         assert_eq!(directory_kind(&link).as_deref(), Some("rust"));
         std::fs::remove_dir_all(root).unwrap();
@@ -618,7 +817,10 @@ mod tests {
         };
         write(".git/HEAD", "ref: refs/heads/main\n");
         write(".git/rebase-merge/done", "x");
-        write("package.json", r#"{"name":"web","scripts":{"test":"x","dev":"y"}}"#);
+        write(
+            "package.json",
+            r#"{"name":"web","scripts":{"test":"x","dev":"y"}}"#,
+        );
         write("yarn.lock", "");
         write("tools/Makefile", ".PHONY: a\nlint fmt:\n\techo\nX := 1\n");
         let context = ProjectContext::discover(&format!("{root}/tools"));
@@ -637,7 +839,9 @@ mod tests {
     #[test]
     fn swift_manifest_keeps_literal_target_names_only() {
         let root = tempfile_dir();
-        std::fs::write(format!("{root}/Package.swift"), r#"
+        std::fs::write(
+            format!("{root}/Package.swift"),
+            r#"
 // swift-tools-version: 6.0
 import PackageDescription
 let libName = "Computed"
@@ -660,11 +864,16 @@ let package = Package(
         .systemLibrary(name: "CLib"),
     ]
 )
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let context = ProjectContext::discover(&root);
         let project = &context.projects[0];
         assert_eq!(project.kind, "swift");
-        assert_eq!(project.scripts["Package.swift"], ["App", "Lib", "AppTests", "Gen", "Str"]);
+        assert_eq!(
+            project.scripts["Package.swift"],
+            ["App", "Lib", "AppTests", "Gen", "Str"]
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -680,7 +889,9 @@ let package = Package(
         std::thread::spawn(move || {
             tx.send(ProjectContext::discover(&dir).projects.len()).ok();
         });
-        let count = rx.recv_timeout(std::time::Duration::from_secs(2)).expect("FIFO Cargo.toml blocked discovery");
+        let count = rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("FIFO Cargo.toml blocked discovery");
         assert_eq!(count, 0);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -688,7 +899,11 @@ let package = Package(
     #[test]
     fn symlinked_manifest_is_read() {
         let root = tempfile_dir();
-        std::fs::write(format!("{root}/real.toml"), "[package]\nname = \"linked\"\n").unwrap();
+        std::fs::write(
+            format!("{root}/real.toml"),
+            "[package]\nname = \"linked\"\n",
+        )
+        .unwrap();
         std::os::unix::fs::symlink("real.toml", format!("{root}/Cargo.toml")).unwrap();
         let project = &ProjectContext::discover(&root).projects[0];
         assert_eq!(project.kind, "rust");
@@ -703,7 +918,14 @@ let package = Package(
             42.0,
         );
         assert_eq!(
-            (status.ahead, status.behind, status.staged, status.unstaged, status.conflicted, status.untracked),
+            (
+                status.ahead,
+                status.behind,
+                status.staged,
+                status.unstaged,
+                status.conflicted,
+                status.untracked
+            ),
             (2, 3, 1, 1, 1, 1)
         );
         assert_eq!(status.branch.as_deref(), Some("main"));
@@ -718,11 +940,17 @@ let package = Package(
     fn git_read_failure_and_timeout() {
         assert!(GitStatus::read("/smcli-does-not-exist", 1.0).is_none());
         assert!(GitStatus::run_git(&["--version"], 1.0).is_some());
-        assert!(GitStatus::run_git(&["-c", "alias.smclisleep=!sleep 2", "smclisleep"], 0.01).is_none());
+        assert!(
+            GitStatus::run_git(&["-c", "alias.smclisleep=!sleep 2", "smclisleep"], 0.01).is_none()
+        );
     }
 
     fn tempfile_dir() -> String {
-        let path = std::env::temp_dir().join(format!("smcli-context-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let path = std::env::temp_dir().join(format!(
+            "smcli-context-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::create_dir_all(&path).unwrap();
         real_path(path.to_str().unwrap()).unwrap()
     }

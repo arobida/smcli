@@ -27,7 +27,13 @@ pub(crate) use tldr::captured_programs;
 
 /// Stops a running service so the model it holds is freed; never starts one.
 pub(crate) fn stop_service(service: &ServiceClient) -> bool {
-    service.send(&ServiceRequest::new(Operation::Shutdown), Some(false), Duration::from_secs(10)).is_some_and(|r| r.ok)
+    service
+        .send(
+            &ServiceRequest::new(Operation::Shutdown),
+            Some(false),
+            Duration::from_secs(10),
+        )
+        .is_some_and(|r| r.ok)
 }
 
 #[derive(Parser)]
@@ -212,14 +218,26 @@ fn time(value: &str) -> Result<f64> {
 pub fn run() -> Result<()> {
     let env: HashMap<String, String> = std::env::vars().collect();
     let home = home_dir(&env);
-    let captured = CapturedHistory::new(CapturedHistory::location(&home, &env));
+    let mut captured = CapturedHistory::new(CapturedHistory::location(&home, &env));
     let executable = std::env::current_exe()?;
-    let service = ServiceClient::new(&captured.path, &env, &executable);
     let config_path = SmcliConfig::location(&home, &env);
+    let first_start = !captured.path.exists();
+    // First start (no database yet): say now if an XDG variable is ignored, before history goes somewhere unexpected.
+    if first_start {
+        for problem in smcli_core::paths::check(&home, &env) {
+            eprintln!("smcli: {problem}");
+        }
+    }
     let filter = || CaptureFilter::new(&SmcliConfig::load(&config_path)?);
     let mut args: Vec<String> = std::env::args().collect();
     if args.len() == 1 && crate::menu::is_interactive() {
-        let Some(chosen) = crate::menu::run(SmcliConfig::load(&config_path).unwrap_or_default().at_completion_inline != Some(false))? else {
+        let Some(chosen) = crate::menu::run(
+            SmcliConfig::load(&config_path)
+                .unwrap_or_default()
+                .at_completion_inline
+                != Some(false),
+        )?
+        else {
             return Ok(());
         };
         args.extend(chosen);
@@ -232,6 +250,21 @@ pub fn run() -> Result<()> {
         eprint!("{USAGE}");
         std::process::exit(2)
     });
+    // Only commands that open the database move it; `record` must, or it would create the new one and strand history.
+    if !matches!(cli.command, Command::ShellInit { .. }) {
+        if let Err(error) = captured.migrate_legacy(&home, &env, |old| {
+            stop_service(&ServiceClient::new(old, &env, &executable));
+        }) {
+            let old = CapturedHistory::legacy_location(&home);
+            eprintln!(
+                "smcli: could not move the database to {}: {error:#}; using {} for now",
+                captured.path.display(),
+                old.display()
+            );
+            captured = CapturedHistory::new(old);
+        }
+    }
+    let service = ServiceClient::new(&captured.path, &env, &executable);
     match cli.command {
         Command::Init(args) => crate::initialize::run(args, &config_path, &service, &captured)?,
         Command::ShellInit { shell } => {
@@ -250,8 +283,18 @@ pub fn run() -> Result<()> {
         Command::Context { json, dir } => {
             crate::context::run(&directory(dir, &env)?, json, &service)?
         }
-        Command::Record { fields, expanded } => history::record(&fields, expanded.as_deref(), &captured, &service, &filter()?)?,
-        Command::Complete { word, command, limit } => {
+        Command::Record { fields, expanded } => history::record(
+            &fields,
+            expanded.as_deref(),
+            &captured,
+            &service,
+            &filter()?,
+        )?,
+        Command::Complete {
+            word,
+            command,
+            limit,
+        } => {
             let word = word.strip_prefix('@').unwrap_or(&word);
             let dirs_only = command.as_deref().is_some_and(pick::is_directory_command);
             let cwd = working_directory(&env);
@@ -270,11 +313,20 @@ pub fn run() -> Result<()> {
                     let chosen = (hits.len() == 1).then(|| hits[0].path.clone());
                     let paths = hits
                         .into_iter()
-                        .map(|h| if h.insert.is_empty() { h.path } else { h.insert })
+                        .map(|h| {
+                            if h.insert.is_empty() {
+                                h.path
+                            } else {
+                                h.insert
+                            }
+                        })
                         .collect();
                     (paths, chosen)
                 }
-                None => (crate::complete::complete_local(Path::new(&cwd), word, dirs_only, limit), None),
+                None => (
+                    crate::complete::complete_local(Path::new(&cwd), word, dirs_only, limit),
+                    None,
+                ),
             };
             if let Some(path) = chosen {
                 let mut r = ServiceRequest::new(Operation::Select);
@@ -289,7 +341,12 @@ pub fn run() -> Result<()> {
             }
         }
         Command::Search(a) => search::search(a, &captured, &service, &env)?,
-        Command::Suggest { dir, limit, json, prefix } => {
+        Command::Suggest {
+            dir,
+            limit,
+            json,
+            prefix,
+        } => {
             search::suggest(dir, limit, json, prefix, &captured, &service, &env)?;
         }
         Command::Reindex => crate::initialize::reindex(&captured, &home, &env, &service)?,
@@ -297,11 +354,19 @@ pub fn run() -> Result<()> {
         Command::Health { json } => index::health(&captured, &home, &env, json)?,
         Command::Service { action } if action == "stop" => println!(
             "{}",
-            if stop_service(&service) { "smcli-service stopped." } else { "smcli-service was not running." }
+            if stop_service(&service) {
+                "smcli-service stopped."
+            } else {
+                "smcli-service was not running."
+            }
         ),
         Command::Service { action } => {
             let response = service
-                .send(&ServiceRequest::new(Operation::Ping), Some(action == "start"), Duration::from_secs(10))
+                .send(
+                    &ServiceRequest::new(Operation::Ping),
+                    Some(action == "start"),
+                    Duration::from_secs(10),
+                )
                 .filter(|r| r.ok);
             if let Some(pid) = response.and_then(|r| r.pid) {
                 println!(
@@ -355,16 +420,30 @@ mod tests {
         fn scan(directory: &Path) -> Result<()> {
             for file in std::fs::read_dir(directory)? {
                 let path = file?.path();
-                if path.is_dir() { scan(&path)?; }
-                else if path.extension().is_some_and(|ext| ext == "rs") {
+                if path.is_dir() {
+                    scan(&path)?;
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
                     let text = std::fs::read_to_string(&path)?;
                     let production = text.split("#[cfg(test)]").next().unwrap();
                     for forbidden in ["rusqlite::", "taladb::"] {
-                        assert!(!production.contains(forbidden), "{} accesses storage via {forbidden}", path.display());
+                        assert!(
+                            !production.contains(forbidden),
+                            "{} accesses storage via {forbidden}",
+                            path.display()
+                        );
                     }
                     if path.file_name().unwrap() != "initialize.rs" {
-                        for forbidden in ["search_engine(", "Potion::bundled(", "Potion::from_dir(", ".embed("] {
-                            assert!(!production.contains(forbidden), "{} loads the model via {forbidden}", path.display());
+                        for forbidden in [
+                            "search_engine(",
+                            "Potion::bundled(",
+                            "Potion::from_dir(",
+                            ".embed(",
+                        ] {
+                            assert!(
+                                !production.contains(forbidden),
+                                "{} loads the model via {forbidden}",
+                                path.display()
+                            );
                         }
                     }
                 }
@@ -379,9 +458,13 @@ mod tests {
         let manifest = include_str!("../../Cargo.toml");
         let mut dependencies = false;
         for line in manifest.lines().map(str::trim) {
-            if line.starts_with('[') { dependencies = line == "[dependencies]"; }
-            else if dependencies && let Some((name, _)) = line.split_once('=') {
-                assert!(!["rusqlite", "taladb"].contains(&name.trim()), "{name} must not be a production dependency");
+            if line.starts_with('[') {
+                dependencies = line == "[dependencies]";
+            } else if dependencies && let Some((name, _)) = line.split_once('=') {
+                assert!(
+                    !["rusqlite", "taladb"].contains(&name.trim()),
+                    "{name} must not be a production dependency"
+                );
             }
         }
     }
@@ -389,13 +472,28 @@ mod tests {
     #[test]
     fn parse_flags_and_times() {
         assert!(Cli::try_parse_from(["smcli", "search", "git", "--flag", "--all"]).is_ok());
-        assert!(Cli::try_parse_from(["smcli", "complete", "--word", "@foo", "--command", "cd", "--limit", "5"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "smcli",
+                "complete",
+                "--word",
+                "@foo",
+                "--command",
+                "cd",
+                "--limit",
+                "5"
+            ])
+            .is_ok()
+        );
         assert!(Cli::try_parse_from(["smcli", "suggest", "--limit", "0"]).is_err());
         assert!(Cli::try_parse_from(["smcli", "pick", "--tldr"]).is_ok());
         for flag in ["--suggest", "--files", "--grep"] {
             assert!(Cli::try_parse_from(["smcli", "pick", "--tldr", flag]).is_err());
         }
-        assert_eq!(time("2024-01-01").unwrap(), parse_iso8601("2024-01-01T00:00:00Z").unwrap());
+        assert_eq!(
+            time("2024-01-01").unwrap(),
+            parse_iso8601("2024-01-01T00:00:00Z").unwrap()
+        );
         assert!((now() - time("30m").unwrap() - 1800.0).abs() < 1.0);
         assert!(history::epoch("NaN").is_err());
         assert!(time("2024-02-31").is_err());

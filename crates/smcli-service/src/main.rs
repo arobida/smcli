@@ -1,7 +1,7 @@
 mod context_cache;
 mod file_search;
-mod test_candidates;
 mod service;
+mod test_candidates;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -17,7 +17,10 @@ use crate::service::Service;
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     if arguments.len() != 2 || arguments[0] != "--db" || !arguments[1].starts_with('/') {
-        let _ = writeln!(std::io::stderr(), "Usage: smcli-service --db <absolute path to history.db>");
+        let _ = writeln!(
+            std::io::stderr(),
+            "Usage: smcli-service --db <absolute path to history.db>"
+        );
         std::process::exit(2);
     }
     let environment: HashMap<String, String> = std::env::vars().collect();
@@ -45,7 +48,10 @@ fn start(database: &str, environment: HashMap<String, String>) -> anyhow::Result
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => std::process::exit(0),
         Err(std::fs::TryLockError::Error(e)) => {
-            return Err(anyhow::anyhow!("Cannot lock {}: {e}", location.lock.display()));
+            return Err(anyhow::anyhow!(
+                "Cannot lock {}: {e}",
+                location.lock.display()
+            ));
         }
     }
     // Never open (and so create or write) the database when it is the starting shell's native history.

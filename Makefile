@@ -2,7 +2,7 @@ PYTHON ?= python3
 DIST := dist
 STAMP := $(shell date +%Y%m%d-%H%M%S)-$(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)
 
-.PHONY: build release fresh install uninstall tldr cheat test test-rust test-cli test-picker test-shells test-service test-install clean run baseline ranking tldr-ranking linux docs notices
+.PHONY: build release fresh install uninstall tldr cheat test test-rust test-cli test-picker test-shells test-service test-install clean run baseline ranking tldr-ranking linux docs notices unused
 
 PKG ?=
 FILTER ?=
@@ -100,6 +100,11 @@ docs:
 
 notices:
 	$(PYTHON) scripts/gen-notices.py
+
+# Dead-code audit: the compiler reports unused private items, the script unused or test-only pub items across crates.
+unused:
+	cargo check --workspace
+	$(PYTHON) scripts/unused-pub.py
 
 run:
 	cargo run -p smcli -- $(ARGS)

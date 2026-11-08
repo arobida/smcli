@@ -7,10 +7,12 @@ use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OpenFlags, params, params_from_iter, types::Value};
 
 use crate::config::CaptureFilter;
-use crate::entry::{trim_slash, command_key, command_parts};
-use crate::parse::{CommandBreakdown, base_name, command_flags, is_smcli_command};
 use crate::context::directory_kind_memo;
-use crate::ranking::{RankingContext, SelectionLog, Signal, apply_ranking_signals, suggestion_why, uses};
+use crate::entry::{command_key, command_parts, trim_slash};
+use crate::parse::{CommandBreakdown, base_name, command_flags, is_smcli_command};
+use crate::ranking::{
+    RankingContext, SelectionLog, Signal, apply_ranking_signals, suggestion_why, uses,
+};
 use crate::time::{format_iso8601, now};
 
 pub use crate::service_protocol::Suggestion;
@@ -20,8 +22,24 @@ pub const USAGE_HALF_LIFE: f64 = 14.0 * 86_400.0;
 /// Exit codes that do not mean the command failed: stopped with Ctrl-C (130) or by a closed pipe (141).
 pub const INTERRUPTED_EXIT_CODES: [i64; 2] = [130, 141];
 /// Programs whose exit code 1 is an answer ("no match", "files differ", "false"), not an error.
-const ANSWERING_PROGRAMS: [&str; 16] =
-    ["grep", "egrep", "fgrep", "rg", "ag", "ack", "pgrep", "diff", "cmp", "colordiff", "test", "[", "which", "type", "command", "false"];
+const ANSWERING_PROGRAMS: [&str; 16] = [
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "ag",
+    "ack",
+    "pgrep",
+    "diff",
+    "cmp",
+    "colordiff",
+    "test",
+    "[",
+    "which",
+    "type",
+    "command",
+    "false",
+];
 
 pub const VERSION: i64 = 9;
 /// A short-lived build stored usage scores in a `usage` table at version 4. Usage is now computed when read,
@@ -92,13 +110,16 @@ const MIGRATION_TO_V9: &str = "
     ";
 
 pub fn answers_with_exit_code(command: &str) -> bool {
-    let program = CommandBreakdown::parse(command).map(|b| b.main_command).or_else(|| command.split_whitespace().next().map(String::from));
+    let program = CommandBreakdown::parse(command)
+        .map(|b| b.main_command)
+        .or_else(|| command.split_whitespace().next().map(String::from));
     program.is_some_and(|p| ANSWERING_PROGRAMS.contains(&base_name(&p)))
 }
 
 /// The user smcli records runs under, like Foundation's `NSUserName()`.
 pub fn user_name() -> String {
-    crate::passwd::current_user().map(|(name, _)| name.to_string_lossy().into_owned())
+    crate::passwd::current_user()
+        .map(|(name, _)| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| std::env::var("USER").unwrap_or_else(|_| "unknown".into()))
 }
 
@@ -163,7 +184,18 @@ pub struct NewRun<'a> {
 
 impl<'a> NewRun<'a> {
     pub fn new(command: &'a str, shell: &'a str, directory: &'a str, exit_code: i64) -> Self {
-        Self { command, expanded_command: None, shell, directory, exit_code, session: "unknown", started_at: None, ended_at: None, pipestatus: None, event: None }
+        Self {
+            command,
+            expanded_command: None,
+            shell,
+            directory,
+            exit_code,
+            session: "unknown",
+            started_at: None,
+            ended_at: None,
+            pipestatus: None,
+            event: None,
+        }
     }
 }
 
@@ -190,7 +222,14 @@ fn new_event_id() -> Result<String> {
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(format!("{}-{}-{}-{}-{}", &hex[0..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..32]))
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    ))
 }
 
 /// Parses a shell's `pipestatus` words ("0 1 0"). Empty means not reported.
@@ -200,7 +239,10 @@ pub fn parse_pipestatus(text: &str) -> Result<Option<Vec<i64>>> {
         return Ok(None);
     }
     let codes: Vec<i64> = words.iter().filter_map(|w| w.parse().ok()).collect();
-    if codes.len() != words.len() || codes.len() > 256 || !codes.iter().all(|c| (0..=255).contains(c)) {
+    if codes.len() != words.len()
+        || codes.len() > 256
+        || !codes.iter().all(|c| (0..=255).contains(c))
+    {
         bail!("Invalid pipestatus: {text}");
     }
     Ok(Some(codes))
@@ -212,24 +254,116 @@ pub struct CapturedHistory {
     pub path: PathBuf,
 }
 
+const DIRECTORY_SCORES_SQL: &str = "SELECT directory, sum(smcli_decay(?1 - started_at)) FROM commands
+             WHERE deleted_at IS NULL AND (?2 = '/' OR directory = ?2 OR (directory >= ?2 || '/' AND directory < ?2 || '0'))
+             GROUP BY directory ORDER BY 2 DESC LIMIT 200";
+
 impl CapturedHistory {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
     }
 
+    /// `SMCLI_DB`, else `$XDG_STATE_HOME/smcli/history.db` (XDG: history is state). The default `~/.local/state` is
+    /// also one of fff's ignored dirs, so a home file index never opens the live database (that would drop SQLite's
+    /// POSIX locks in the service). Shells hooked before the move still export the old default; it means the new one.
     pub fn location(home: &Path, environment: &HashMap<String, String>) -> PathBuf {
-        match environment.get("SMCLI_DB").filter(|p| !p.is_empty()) {
+        let state = crate::paths::Xdg::State.dir(home, environment);
+        match environment
+            .get("SMCLI_DB")
+            .filter(|p| !p.is_empty() && Path::new(p) != Self::legacy_location(home))
+        {
             Some(path) => {
                 let path = PathBuf::from(path);
                 // Service launch requires an absolute --db; resolve relative overrides against cwd.
                 if path.is_absolute() {
                     path
                 } else {
-                    std::env::current_dir().map(|cwd| cwd.join(&path)).unwrap_or(path)
+                    std::env::current_dir()
+                        .map(|cwd| cwd.join(&path))
+                        .unwrap_or(path)
                 }
             }
-            None => home.join(".local/share/smcli/history.db"),
+            None => state.join("smcli/history.db"),
         }
+    }
+
+    /// The default before it moved to XDG state; it was always this literal path, whatever XDG_DATA_HOME said.
+    pub fn legacy_location(home: &Path) -> PathBuf {
+        home.join(".local/share/smcli/history.db")
+    }
+
+    /// Moves a database at the legacy default to `self.path` once. The old folder holds only history.db, its
+    /// -wal/-shm, the .migration.lock and the history.db.search index (plus unrelated files, which stay). The copy is a consistent
+    /// `VACUUM INTO` renamed into place before any cleanup, so a failure leaves the old database intact and no new one;
+    /// the search index folder moves last.
+    /// `stop` shuts down a service still serving the old path first.
+    /// Only into the default location: an explicit SMCLI_DB elsewhere (a test, a second profile) must never take
+    /// the user's real history, so `self.path` has to be exactly the default for this home and environment.
+    pub fn migrate_legacy(
+        &self,
+        home: &Path,
+        environment: &HashMap<String, String>,
+        stop: impl FnOnce(&Path),
+    ) -> Result<()> {
+        let old = Self::legacy_location(home);
+        let default = crate::paths::Xdg::State
+            .dir(home, environment)
+            .join("smcli/history.db");
+        if self.path != default || self.path.exists() || !old.exists() {
+            return Ok(());
+        }
+        let (from, to) = (
+            old.parent().unwrap(),
+            self.path.parent().context("database has no parent")?,
+        );
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(to)?;
+        let lock = std::fs::File::create(to.join(".legacy-move.lock"))?;
+        lock.lock()?;
+        if self.path.exists() || !old.exists() {
+            return Ok(());
+        }
+        stop(&old);
+        let moving = to.join("history.db.moving");
+        match std::fs::remove_file(&moving) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        {
+            let db = Connection::open(&old)?;
+            db.execute("VACUUM INTO ?1", [moving.to_string_lossy().as_ref()])?;
+        }
+        std::fs::set_permissions(&moving, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        std::fs::File::open(&moving)?.sync_all()?;
+        std::fs::rename(&moving, &self.path)?;
+        // The new database is in place; what follows is cleanup and must not fail the move.
+        let name = |suffix: &str| format!("history.db{suffix}");
+        for suffix in ["", "-wal", "-shm", ".migration.lock"] {
+            let _ = std::fs::remove_file(from.join(name(suffix)));
+        }
+        let index = from.join(name(".search"));
+        if index.exists() && std::fs::rename(&index, to.join(name(".search"))).is_err() {
+            eprintln!("smcli: could not move the search index; run `smcli reindex` to rebuild it");
+            let _ = std::fs::remove_dir_all(&index);
+        }
+        let _ = std::fs::remove_dir(from);
+        Ok(())
+    }
+
+    /// The legacy database when it exists beside the default one: shells hooked to an older build keep recreating it,
+    /// and what they write there is not in the main history. None for any other path.
+    pub fn stranded_legacy(
+        &self,
+        home: &Path,
+        environment: &HashMap<String, String>,
+    ) -> Option<PathBuf> {
+        let old = Self::legacy_location(home);
+        let default = crate::paths::Xdg::State
+            .dir(home, environment)
+            .join("smcli/history.db");
+        (self.path == default && self.path.exists() && old.exists()).then_some(old)
     }
 
     fn exists(&self) -> bool {
@@ -255,16 +389,24 @@ impl CapturedHistory {
         {
             bail!("Invalid shell, directory, exit code, pipestatus, session, or empty command.");
         }
-        if run.expanded_command.is_some_and(|text| !crate::parse::safe_expansion(text) || text == run.command) {
+        if run
+            .expanded_command
+            .is_some_and(|text| !crate::parse::safe_expansion(text) || text == run.command)
+        {
             bail!("Invalid expanded command.");
         }
         self.check_separate(native_file)?;
         // Converting an unbounded float to an integer saturates silently, and these come from shells and service clients.
-        if ![run.started_at, run.ended_at].iter().all(|t| t.is_none_or(is_timestamp)) {
+        if ![run.started_at, run.ended_at]
+            .iter()
+            .all(|t| t.is_none_or(is_timestamp))
+        {
             bail!("Invalid start or end time.");
         }
         let start = run.started_at.unwrap_or_else(now);
-        let duration = run.ended_at.map(|end| (((end - start) * 1000.0).round() as i64).max(0));
+        let duration = run
+            .ended_at
+            .map(|end| (((end - start) * 1000.0).round() as i64).max(0));
         let event = run.event.clone().map(Ok).unwrap_or_else(new_event_id)?;
         if !is_event_id(&event) {
             bail!("Invalid event ID.");
@@ -277,11 +419,24 @@ impl CapturedHistory {
                 &owned
             }
         };
-        insert(db, &Insert {
-            session: run.session, user: &user_name(), host: &host_name(), shell: run.shell, started_at: start,
-            duration_ms: duration, directory: run.directory, command: run.command, exit_code: run.exit_code,
-            uuid: Some(&event), pipestatus: run.pipestatus.as_deref(), expanded_command: run.expanded_command,
-        }, true)
+        insert(
+            db,
+            &Insert {
+                session: run.session,
+                user: &user_name(),
+                host: &host_name(),
+                shell: run.shell,
+                started_at: start,
+                duration_ms: duration,
+                directory: run.directory,
+                command: run.command,
+                exit_code: run.exit_code,
+                uuid: Some(&event),
+                pipestatus: run.pipestatus.as_deref(),
+                expanded_command: run.expanded_command,
+            },
+            true,
+        )
     }
 
     /// Refuses a native history file that is this database, by path or by hard link. Checked before anything opens
@@ -294,15 +449,28 @@ impl CapturedHistory {
         if resolve(&self.path) == resolve(Path::new(native_file)) {
             bail!("SMCLI_DB must be separate from the shell's native HISTFILE.");
         }
-        if let (Ok(log), Ok(native)) = (std::fs::metadata(&self.path), std::fs::metadata(native_file))
-            && log.dev() == native.dev() && log.ino() == native.ino() {
-                bail!("SMCLI_DB must not be a hard link to native HISTFILE.");
-            }
+        if let (Ok(log), Ok(native)) = (
+            std::fs::metadata(&self.path),
+            std::fs::metadata(native_file),
+        ) && log.dev() == native.dev()
+            && log.ino() == native.ino()
+        {
+            bail!("SMCLI_DB must not be a hard link to native HISTFILE.");
+        }
         Ok(())
     }
 
     /// Records one explicit file selection.
-    pub fn record_selection(&self, root: &str, path: &str, mode: &str, query: &str, cwd: Option<&str>, time: f64, db: &Connection) -> Result<()> {
+    pub fn record_selection(
+        &self,
+        root: &str,
+        path: &str,
+        mode: &str,
+        query: &str,
+        cwd: Option<&str>,
+        time: f64,
+        db: &Connection,
+    ) -> Result<()> {
         db.execute(
             "INSERT INTO file_selections (root, path, mode, query, cwd, selected_at) VALUES (?, ?, ?, ?, ?, ?)",
             params![root, path, mode, query, cwd, time],
@@ -310,21 +478,95 @@ impl CapturedHistory {
         Ok(())
     }
 
-    /// Selection count per path under `root`, decayed like command usage, so recent picks outrank old ones.
-    pub fn selection_scores(&self, root: &str, now: f64, db: &Connection) -> Result<HashMap<String, f64>> {
-        let mut statement =
-            db.prepare("SELECT path, sum(smcli_decay(? - selected_at)) FROM file_selections WHERE root = ? GROUP BY path")?;
-        let rows = statement.query_map(params![now, root], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    /// Picks under any root, rebased to the literal scope (including picks from an ancestor root).
+    pub fn scope_selection_scores(
+        &self,
+        scope: &str,
+        now: f64,
+        db: &Connection,
+    ) -> Result<HashMap<String, f64>> {
+        let scope = if scope == "/" {
+            scope
+        } else {
+            scope.trim_end_matches('/')
+        };
+        let mut statement = db.prepare(
+            "WITH picks AS (SELECT rtrim(rtrim(root, '/') || '/' || path, '/') AS absolute, selected_at FROM file_selections
+             WHERE ?2 = '/' OR root = '/' OR root = ?2 OR (root >= ?2 || '/' AND root < ?2 || '0')
+                OR (?2 >= root || '/' AND ?2 < root || '0'))
+             SELECT absolute, sum(smcli_decay(?1 - selected_at)) FROM picks
+             WHERE ?2 = '/' OR absolute = ?2 OR (absolute >= ?2 || '/' AND absolute < ?2 || '0')
+             GROUP BY absolute")?;
+        let rows = statement.query_map(params![now, scope], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })?;
+        let mut scores = HashMap::new();
+        for row in rows {
+            let (absolute, score) = row?;
+            if let Ok(relative) = Path::new(&absolute).strip_prefix(scope) {
+                let path = relative.to_string_lossy();
+                let key = if path.is_empty() {
+                    ".".into()
+                } else {
+                    path.trim_end_matches('/').to_owned()
+                };
+                *scores.entry(key).or_insert(0.) += score;
+            }
+        }
+        Ok(scores)
+    }
+
+    /// Command frecency for the best 200 directories in the literal scope (not checked on disk).
+    pub fn directory_scores(
+        &self,
+        scope: &str,
+        now: f64,
+        db: &Connection,
+    ) -> Result<HashMap<String, f64>> {
+        let scope = if scope == "/" {
+            scope
+        } else {
+            scope.trim_end_matches('/')
+        };
+        let mut statement = db.prepare(DIRECTORY_SCORES_SQL)?;
+        let rows = statement.query_map(params![now, scope], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+        })?;
+        let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut scores = HashMap::new();
+        for (directory, score) in rows {
+            if let Ok(relative) = Path::new(&directory).strip_prefix(scope) {
+                let path = relative.to_string_lossy();
+                scores.insert(
+                    if path.is_empty() {
+                        "./".into()
+                    } else {
+                        format!("{path}/")
+                    },
+                    score,
+                );
+            }
+        }
+        Ok(scores)
     }
 
     /// Records that the user picked `command` after typing `query` (empty for the unfiltered list).
     /// A pick can come from native history, which never passed the capture filter, so it is applied here, to the
     /// command and to what was typed. Returns false when the filter kept it out.
-    pub fn record_pick(&self, query: &str, command: &str, kind: &str, directory: &str, filter: &CaptureFilter, time: f64,
-                       db: &Connection) -> Result<bool> {
+    pub fn record_pick(
+        &self,
+        query: &str,
+        command: &str,
+        kind: &str,
+        directory: &str,
+        filter: &CaptureFilter,
+        time: f64,
+        db: &Connection,
+    ) -> Result<bool> {
         let (typed, expanded) = command_parts(command);
-        if !filter.allows_run(&typed, expanded.as_deref(), directory) || (!query.is_empty() && !filter.allows(query, directory)) {
+        if !filter.allows_run(&typed, expanded.as_deref(), directory)
+            || (!query.is_empty() && !filter.allows(query, directory))
+        {
             return Ok(false);
         }
         db.execute(
@@ -336,9 +578,12 @@ impl CapturedHistory {
 
     /// The most recent picks, oldest first; older ones have faded anyway.
     pub fn picks(&self, limit: i64, db: &Connection) -> Result<SelectionLog> {
-        let mut statement = db.prepare("SELECT query, command, selected_at FROM command_selections ORDER BY id DESC LIMIT ?")?;
-        let rows: Vec<(String, String, f64)> =
-            statement.query_map([limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+        let mut statement = db.prepare(
+            "SELECT query, command, selected_at FROM command_selections ORDER BY id DESC LIMIT ?",
+        )?;
+        let rows: Vec<(String, String, f64)> = statement
+            .query_map([limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
         let mut log = SelectionLog::default();
         for (query, command, time) in rows.into_iter().rev() {
             log.add(&query, &command, time);
@@ -347,7 +592,12 @@ impl CapturedHistory {
     }
 
     /// The last command `session` ran (not counting smcli's own), for transitions.
-    pub fn previous_command(&self, session: &str, user: &str, db: &Connection) -> Result<Option<String>> {
+    pub fn previous_command(
+        &self,
+        session: &str,
+        user: &str,
+        db: &Connection,
+    ) -> Result<Option<String>> {
         let mut statement = db.prepare(
             "SELECT smcli_key(c.command,c.expanded_command) FROM commands c JOIN sessions s ON s.id = c.session
              WHERE c.session = ? AND s.user = ? AND c.deleted_at IS NULL AND NOT smcli_internal(COALESCE(c.expanded_command,c.command))
@@ -358,7 +608,12 @@ impl CapturedHistory {
     }
 
     /// How often each command directly followed `previous` within one session.
-    pub fn followers(&self, previous: &str, user: &str, db: &Connection) -> Result<HashMap<String, i64>> {
+    pub fn followers(
+        &self,
+        previous: &str,
+        user: &str,
+        db: &Connection,
+    ) -> Result<HashMap<String, i64>> {
         let mut statement = db.prepare(
             "SELECT command, count(*) FROM (
                 SELECT smcli_key(c.command,c.expanded_command) AS command,
@@ -380,14 +635,27 @@ impl CapturedHistory {
              ORDER BY c.started_at, c.id",
         )?;
         let rows = statement.query_map([user], |r| {
-            Ok(Run { command: r.get(0)?, expanded_command: r.get(5)?, directory: r.get(1)?, started_at: r.get(2)?, exit_code: r.get(3)?, session: r.get(4)? })
+            Ok(Run {
+                command: r.get(0)?,
+                expanded_command: r.get(5)?,
+                directory: r.get(1)?,
+                started_at: r.get(2)?,
+                exit_code: r.get(3)?,
+                session: r.get(4)?,
+            })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// One row per distinct command: run count, its flags, and the most recent run's time, directory, exit code,
     /// author, and intent, plus usage aggregates from the same grouped query; `directory` scopes `runs_here`.
-    pub fn command_stats(&self, directory: Option<&str>, project: Option<&str>, kind: Option<&str>, now: f64) -> Result<HashMap<String, CommandStats>> {
+    pub fn command_stats(
+        &self,
+        directory: Option<&str>,
+        project: Option<&str>,
+        kind: Option<&str>,
+        now: f64,
+    ) -> Result<HashMap<String, CommandStats>> {
         if !self.exists() {
             return Ok(HashMap::new());
         }
@@ -416,7 +684,12 @@ impl CapturedHistory {
              ) WHERE rn = 1"
         );
         let mut values = vec![Value::Real(now)];
-        values.extend([here; 5].iter().chain([root; 5].iter()).map(|s| Value::Text(s.to_string())));
+        values.extend(
+            [here; 5]
+                .iter()
+                .chain([root; 5].iter())
+                .map(|s| Value::Text(s.to_string())),
+        );
         let mut statement = db.prepare(&sql)?;
         let mut rows = statement.query(params_from_iter(values))?;
         let mut stats = HashMap::new();
@@ -424,22 +697,31 @@ impl CapturedHistory {
             let command: String = row.get(0)?;
             let ones: i64 = row.get(10)?;
             let expanded: Option<String> = row.get(13)?;
-            let answers = ones > 0 && answers_with_exit_code(expanded.as_deref().unwrap_or(&command));
+            let answers =
+                ones > 0 && answers_with_exit_code(expanded.as_deref().unwrap_or(&command));
             let flags: Option<String> = row.get(7)?;
-            stats.insert(command_key(&command, expanded.as_deref()), CommandStats {
-                runs: row.get(1)?,
-                last_run: row.get(2)?,
-                last_directory: row.get(3)?,
-                last_exit_code: row.get(4)?,
-                author: row.get(5)?,
-                intent: row.get(6)?,
-                flags: flags.unwrap_or_default().split(' ').filter(|f| !f.is_empty()).map(String::from).collect(),
-                frecency: row.get(8)?,
-                successes: row.get::<_, i64>(9)? + if answers { ones } else { 0 },
-                runs_here: row.get(11)?,
-                runs_project: row.get(12)?,
-                runs_kind: 0,
-            });
+            stats.insert(
+                command_key(&command, expanded.as_deref()),
+                CommandStats {
+                    runs: row.get(1)?,
+                    last_run: row.get(2)?,
+                    last_directory: row.get(3)?,
+                    last_exit_code: row.get(4)?,
+                    author: row.get(5)?,
+                    intent: row.get(6)?,
+                    flags: flags
+                        .unwrap_or_default()
+                        .split(' ')
+                        .filter(|f| !f.is_empty())
+                        .map(String::from)
+                        .collect(),
+                    frecency: row.get(8)?,
+                    successes: row.get::<_, i64>(9)? + if answers { ones } else { 0 },
+                    runs_here: row.get(11)?,
+                    runs_project: row.get(12)?,
+                    runs_kind: 0,
+                },
+            );
         }
         // Kinds are not stored: look each distinct run directory up once. `kind` None (no project kind, or the tier
         // switched off) skips this query.
@@ -451,9 +733,13 @@ impl CapturedHistory {
             )?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
-                let key = command_key(&row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?.as_deref());
+                let key = command_key(
+                    &row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?.as_deref(),
+                );
                 if let Some(stat) = stats.get_mut(&key)
-                    && directory_kind_memo(&mut kinds, &row.get::<_, String>(2)?).as_deref() == Some(kind)
+                    && directory_kind_memo(&mut kinds, &row.get::<_, String>(2)?).as_deref()
+                        == Some(kind)
                 {
                     stat.runs_kind += row.get::<_, i64>(3)?;
                 }
@@ -465,15 +751,30 @@ impl CapturedHistory {
     /// Ranks `user`'s distinct commands for `directory`: each run counts more when it is recent, ran in this
     /// directory (or in the same project, or above/below it), and succeeded. Only commands starting with `prefix`
     /// are considered. `context` adds the signals of the moment (see `apply_ranking_signals`); picks apply always.
-    pub fn suggestions(&self, user: &str, directory: &str, prefix: &str, limit: usize, now: f64,
-                       context: Option<&RankingContext>) -> Result<Vec<Suggestion>> {
+    pub fn suggestions(
+        &self,
+        user: &str,
+        directory: &str,
+        prefix: &str,
+        limit: usize,
+        now: f64,
+        context: Option<&RankingContext>,
+    ) -> Result<Vec<Suggestion>> {
         if !self.exists() {
             return Ok(vec![]);
         }
         let db = self.connect(false)?;
         let here = trim_slash(directory);
         #[derive(Default)]
-        struct Tally { score: f64, runs: i64, runs_here: i64, project_runs: i64, kind_runs: i64, last_run: f64, last_exit_code: i64 }
+        struct Tally {
+            score: f64,
+            runs: i64,
+            runs_here: i64,
+            project_runs: i64,
+            kind_runs: i64,
+            last_run: f64,
+            last_exit_code: i64,
+        }
         let mut tallies: HashMap<String, Tally> = HashMap::new();
         let mut answering: HashMap<String, bool> = HashMap::new();
         let mut kinds = HashMap::new();
@@ -484,7 +785,14 @@ impl CapturedHistory {
                  WHERE s.user = ? AND c.deleted_at IS NULL AND (substr(c.command, 1, length(?)) = ? OR (? AND substr(c.expanded_command, 1, length(?)) = ?))
                  ORDER BY c.started_at, c.id",
             )?;
-            let mut rows = statement.query(params![user, prefix, prefix, uses(context, Signal::Alias), prefix, prefix])?;
+            let mut rows = statement.query(params![
+                user,
+                prefix,
+                prefix,
+                uses(context, Signal::Alias),
+                prefix,
+                prefix
+            ])?;
             while let Some(row) = rows.next()? {
                 let command: String = row.get(0)?;
                 let expanded: Option<String> = row.get(4)?;
@@ -498,12 +806,20 @@ impl CapturedHistory {
                 let in_project = context.is_some_and(|c| c.in_project(&run_directory));
                 // Only runs elsewhere need a kind; the lookup is skipped when the tier is off or the cwd has none.
                 // shortcut: without the service every call re-probes every distinct non-project directory; cache across calls if the in-process path ever keeps a long-lived index.
-                let nested = here != "/" && run_directory != "/"
-                    && (run_directory.starts_with(&format!("{here}/")) || here.starts_with(&format!("{run_directory}/")));
+                let nested = here != "/"
+                    && run_directory != "/"
+                    && (run_directory.starts_with(&format!("{here}/"))
+                        || here.starts_with(&format!("{run_directory}/")));
                 // Same kind only when no stronger tier claims the run, matching the service index.
-                let same_kind = run_directory != here && !in_project && !nested && context.is_some_and(|c| {
-                    c.kind().is_some() && c.same_kind(directory_kind_memo(&mut kinds, &run_directory).as_deref())
-                });
+                let same_kind = run_directory != here
+                    && !in_project
+                    && !nested
+                    && context.is_some_and(|c| {
+                        c.kind().is_some()
+                            && c.same_kind(
+                                directory_kind_memo(&mut kinds, &run_directory).as_deref(),
+                            )
+                    });
                 // Halves every two weeks, so habits outweigh one-offs without old habits winning forever.
                 let mut weight = 0.5f64.powf((now - started).max(0.0) / USAGE_HALF_LIFE);
                 if run_directory == here {
@@ -516,24 +832,37 @@ impl CapturedHistory {
                     weight *= 1.5;
                 }
                 if exit_code != 0 && !INTERRUPTED_EXIT_CODES.contains(&exit_code) {
-                    let answers = *answering.entry(command_key(&command, expanded.as_deref())).or_insert_with(|| answers_with_exit_code(primary));
+                    let answers = *answering
+                        .entry(command_key(&command, expanded.as_deref()))
+                        .or_insert_with(|| answers_with_exit_code(primary));
                     if !(exit_code == 1 && answers) {
                         weight *= 0.25;
                     }
                 }
-                let tally = tallies.entry(command_key(&command, expanded.as_deref())).or_default();
+                let tally = tallies
+                    .entry(command_key(&command, expanded.as_deref()))
+                    .or_default();
                 tally.score += weight;
                 tally.runs += 1;
-                if run_directory == here { tally.runs_here += 1; }
-                if in_project { tally.project_runs += 1; }
-                if same_kind { tally.kind_runs += 1; }
+                if run_directory == here {
+                    tally.runs_here += 1;
+                }
+                if in_project {
+                    tally.project_runs += 1;
+                }
+                if same_kind {
+                    tally.kind_runs += 1;
+                }
                 tally.last_run = started;
                 tally.last_exit_code = exit_code;
             }
         }
-        let mut scores: HashMap<String, f64> = tallies.iter().map(|(k, t)| (k.clone(), t.score)).collect();
+        let mut scores: HashMap<String, f64> =
+            tallies.iter().map(|(k, t)| (k.clone(), t.score)).collect();
         let previous = match context.and_then(|c| c.session.as_deref()) {
-            Some(session) if uses(context, Signal::Transition) => self.previous_command(session, user, &db)?,
+            Some(session) if uses(context, Signal::Transition) => {
+                self.previous_command(session, user, &db)?
+            }
             _ => None,
         };
         let followers = match &previous {
@@ -541,24 +870,55 @@ impl CapturedHistory {
             None => HashMap::new(),
         };
         let picks = self.picks(5_000, &db)?.weights(prefix, now);
-        let why = apply_ranking_signals(&mut scores, prefix, context, previous.as_deref(), &followers, &picks);
+        let why = apply_ranking_signals(
+            &mut scores,
+            prefix,
+            context,
+            previous.as_deref(),
+            &followers,
+            &picks,
+        );
         let kind = context.and_then(|c| c.project_kind.as_deref());
         let mut ranked: Vec<(String, f64)> = scores.into_iter().collect();
-        let last = |command: &str| tallies.get(command).map_or(f64::NEG_INFINITY, |t| t.last_run);
+        let last = |command: &str| {
+            tallies
+                .get(command)
+                .map_or(f64::NEG_INFINITY, |t| t.last_run)
+        };
         ranked.sort_by(|a, b| {
-            b.1.total_cmp(&a.1).then_with(|| last(&b.0).total_cmp(&last(&a.0))).then_with(|| a.0.cmp(&b.0))
+            b.1.total_cmp(&a.1)
+                .then_with(|| last(&b.0).total_cmp(&last(&a.0)))
+                .then_with(|| a.0.cmp(&b.0))
         });
         Ok(ranked
             .into_iter()
             .take(limit)
             .map(|(command, score)| match tallies.get(&command) {
                 None => Suggestion {
-                    why: suggestion_why(0, 0, 0, None, why.get(&command)), expanded_command: command_parts(&command).1, command: command_parts(&command).0, score, runs: 0, runs_here: 0,
-                    last_run: String::new(), last_exit_code: 0,
+                    why: suggestion_why(0, 0, 0, None, why.get(&command)),
+                    expanded_command: command_parts(&command).1,
+                    command: command_parts(&command).0,
+                    score,
+                    runs: 0,
+                    runs_here: 0,
+                    last_run: String::new(),
+                    last_exit_code: 0,
                 },
                 Some(t) => Suggestion {
-                    why: suggestion_why(t.runs_here, t.project_runs, t.kind_runs, kind, why.get(&command)), expanded_command: command_parts(&command).1, command: command_parts(&command).0, score, runs: t.runs,
-                    runs_here: t.runs_here, last_run: format_iso8601(t.last_run, false), last_exit_code: t.last_exit_code,
+                    why: suggestion_why(
+                        t.runs_here,
+                        t.project_runs,
+                        t.kind_runs,
+                        kind,
+                        why.get(&command),
+                    ),
+                    expanded_command: command_parts(&command).1,
+                    command: command_parts(&command).0,
+                    score,
+                    runs: t.runs,
+                    runs_here: t.runs_here,
+                    last_run: format_iso8601(t.last_run, false),
+                    last_exit_code: t.last_exit_code,
                 },
             })
             .collect())
@@ -624,8 +984,10 @@ impl CapturedHistory {
                  ORDER BY c.started_at DESC, c.id DESC LIMIT 1",
             )
             .ok()?;
-        stmt.query_row(rusqlite::params![command_key, user], |r| r.get::<_, String>(0))
-            .ok()
+        stmt.query_row(rusqlite::params![command_key, user], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
     }
 
     pub fn recent_distinct(&self, user: &str) -> Result<Vec<String>> {
@@ -635,7 +997,9 @@ impl CapturedHistory {
              WHERE s.user = ? AND c.deleted_at IS NULL AND NOT smcli_internal(COALESCE(c.expanded_command,c.command))
              ORDER BY c.started_at DESC, c.id DESC",
         )?;
-        Ok(statement.query_map([user], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
+        Ok(statement
+            .query_map([user], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// VACUUM INTO includes committed WAL pages; a filesystem copy of history.db alone would not.
@@ -645,26 +1009,55 @@ impl CapturedHistory {
         let path = PathBuf::from(name);
         let validate = |path: &Path| -> Result<()> {
             let info = std::fs::symlink_metadata(path)?;
-            if !info.is_file() || info.uid() != unsafe { libc::getuid() } || info.mode() & 0o077 != 0 {
+            if !info.is_file()
+                || info.uid() != unsafe { libc::getuid() }
+                || info.mode() & 0o077 != 0
+            {
                 bail!("Migration backup must be a private regular file owned by you.");
             }
-            let parent = std::fs::canonicalize(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
-            let resolved = parent.join(path.file_name().ok_or_else(|| anyhow!("Invalid migration backup path"))?);
-            let backup = Connection::open_with_flags(resolved, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+            let parent = std::fs::canonicalize(
+                path.parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new(".")),
+            )?;
+            let resolved = parent.join(
+                path.file_name()
+                    .ok_or_else(|| anyhow!("Invalid migration backup path"))?,
+            );
+            let backup = Connection::open_with_flags(
+                resolved,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
             let check: String = backup.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
             let version: i64 = backup.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-            if check != "ok" || !(0..=7).contains(&version) || backup.prepare("SELECT command FROM commands LIMIT 0").is_err() {
+            if check != "ok"
+                || !(0..=7).contains(&version)
+                || backup
+                    .prepare("SELECT command FROM commands LIMIT 0")
+                    .is_err()
+            {
                 bail!("Migration backup is not a valid pre-v8 history database.");
             }
             Ok(())
         };
         if path.exists() {
-            return validate(&path).with_context(|| format!("Invalid migration backup {}; preserve or move it before retrying", path.display()));
+            return validate(&path).with_context(|| {
+                format!(
+                    "Invalid migration backup {}; preserve or move it before retrying",
+                    path.display()
+                )
+            });
         }
-        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
         let parent = std::fs::canonicalize(parent)?;
         let temporary = tempfile::NamedTempFile::new_in(&parent)?;
-        let destination = temporary.path().to_str().ok_or_else(|| anyhow!("Invalid migration backup path"))?;
+        let destination = temporary
+            .path()
+            .to_str()
+            .ok_or_else(|| anyhow!("Invalid migration backup path"))?;
         db.execute("VACUUM INTO ?", [destination])?;
         validate(temporary.path())?;
         temporary.as_file().sync_all()?;
@@ -678,7 +1071,10 @@ impl CapturedHistory {
         if write {
             self.check_separate(&std::env::var("HISTFILE").unwrap_or_default())?;
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)?;
             }
             // Create the file ourselves so it is private from the start; SQLite gives its WAL files the same mode.
             match std::fs::OpenOptions::new()
@@ -693,17 +1089,34 @@ impl CapturedHistory {
                 Err(e) => return Err(e.into()),
             }
         }
-        let info = std::fs::symlink_metadata(path).with_context(|| format!("Cannot open history database {}", path.display()))?;
+        let info = std::fs::symlink_metadata(path)
+            .with_context(|| format!("Cannot open history database {}", path.display()))?;
         // SAFETY: getuid has no preconditions.
-        if !info.file_type().is_file() || info.uid() != unsafe { libc::getuid() } || info.mode() & 0o077 != 0 {
-            bail!("History database must be a regular file owned by you with private permissions (chmod 600): {}", path.display());
+        if !info.file_type().is_file()
+            || info.uid() != unsafe { libc::getuid() }
+            || info.mode() & 0o077 != 0
+        {
+            bail!(
+                "History database must be a regular file owned by you with private permissions (chmod 600): {}",
+                path.display()
+            );
         }
         // SQLite's NOFOLLOW refuses symlinks anywhere in the path (e.g. macOS /var), so resolve parent directories;
         // the file itself must still not be a symlink.
-        let parent = std::fs::canonicalize(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))?;
-        let resolved = parent.join(path.file_name().ok_or_else(|| anyhow!("Invalid history path"))?);
-        let flags = if write { OpenFlags::SQLITE_OPEN_READ_WRITE } else { OpenFlags::SQLITE_OPEN_READ_ONLY }
-            | OpenFlags::SQLITE_OPEN_NOFOLLOW
+        let parent = std::fs::canonicalize(
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )?;
+        let resolved = parent.join(
+            path.file_name()
+                .ok_or_else(|| anyhow!("Invalid history path"))?,
+        );
+        let flags = if write {
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+        } else {
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+        } | OpenFlags::SQLITE_OPEN_NOFOLLOW
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let db = Connection::open_with_flags(&resolved, flags)
             .map_err(|e| anyhow!("Cannot open history database {}: {e}", path.display()))?;
@@ -715,15 +1128,23 @@ impl CapturedHistory {
             Ok(0.5f64.powf(c.get::<f64>(0)?.max(0.0) / USAGE_HALF_LIFE))
         })?;
         db.create_scalar_function("smcli_key", 2, deterministic, |c| {
-            Ok(command_key(&c.get::<String>(0)?, c.get::<Option<String>>(1)?.as_deref()))
+            Ok(command_key(
+                &c.get::<String>(0)?,
+                c.get::<Option<String>>(1)?.as_deref(),
+            ))
         })?;
         // Lets a query skip smcli's own commands the way `is_smcli_command` does everywhere else.
         db.create_scalar_function("smcli_internal", 1, deterministic, |c| {
-            Ok(is_smcli_command(&c.get::<Option<String>>(0)?.unwrap_or_default()))
+            Ok(is_smcli_command(
+                &c.get::<Option<String>>(0)?.unwrap_or_default(),
+            ))
         })?;
         let mut version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version > VERSION && version != DISCARDED_USAGE_VERSION {
-            bail!("History database was written by a newer smcli: {}", path.display());
+            bail!(
+                "History database was written by a newer smcli: {}",
+                path.display()
+            );
         }
         if !write && version != 0 && version != VERSION {
             // Readers need the current columns; upgrade once through a writable connection.
@@ -733,37 +1154,76 @@ impl CapturedHistory {
             if version != VERSION {
                 let mut lock_name = self.path.as_os_str().to_owned();
                 lock_name.push(".migration.lock");
-                let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(PathBuf::from(lock_name))?;
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(PathBuf::from(lock_name))?;
                 let info = lock.metadata()?;
-                if !info.is_file() || info.uid() != unsafe { libc::getuid() } || info.mode() & 0o077 != 0 {
+                if !info.is_file()
+                    || info.uid() != unsafe { libc::getuid() }
+                    || info.mode() & 0o077 != 0
+                {
                     bail!("Migration lock must be a private file owned by you.");
                 }
                 lock.lock()?;
                 version = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-                let tables: i64 = db.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
-                if tables > 0 && version < 8 { self.backup_before_v8(&db)?; }
+                let tables: i64 =
+                    db.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
+                if tables > 0 && version < 8 {
+                    self.backup_before_v8(&db)?;
+                }
                 db.execute_batch("BEGIN IMMEDIATE")?;
                 let migrated = (|| -> Result<()> {
                     // Another terminal may have created or upgraded the schema while this one waited for the lock.
-                    let tables: i64 = db.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
+                    let tables: i64 =
+                        db.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))?;
                     version = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
                     if tables == 0 {
-                        db.execute_batch(&[SCHEMA_V1, MIGRATION_TO_V2, MIGRATION_TO_V3, MIGRATION_TO_V5, MIGRATION_TO_V6, MIGRATION_TO_V7, MIGRATION_TO_V8, MIGRATION_TO_V9].concat())?;
+                        db.execute_batch(
+                            &[
+                                SCHEMA_V1,
+                                MIGRATION_TO_V2,
+                                MIGRATION_TO_V3,
+                                MIGRATION_TO_V5,
+                                MIGRATION_TO_V6,
+                                MIGRATION_TO_V7,
+                                MIGRATION_TO_V8,
+                                MIGRATION_TO_V9,
+                            ]
+                            .concat(),
+                        )?;
                     } else {
-                        if version == 1 { db.execute_batch(MIGRATION_TO_V2)?; }
+                        if version == 1 {
+                            db.execute_batch(MIGRATION_TO_V2)?;
+                        }
                         if version <= 2 {
                             db.execute_batch(MIGRATION_TO_V3)?;
                             backfill_flags(&db)?;
                         }
                         if version == DISCARDED_USAGE_VERSION {
-                            db.execute_batch("DROP TABLE IF EXISTS usage; PRAGMA user_version = 3;")?;
+                            db.execute_batch(
+                                "DROP TABLE IF EXISTS usage; PRAGMA user_version = 3;",
+                            )?;
                         }
-                        if version < 5 { db.execute_batch(MIGRATION_TO_V5)?; }
-                        if version < 6 { db.execute_batch(MIGRATION_TO_V6)?; }
-                        if version < 7 { db.execute_batch(MIGRATION_TO_V7)?; }
-                        if version < 8 { db.execute_batch(MIGRATION_TO_V8)?; }
-                        if version < 9 { db.execute_batch(MIGRATION_TO_V9)?; }
+                        if version < 5 {
+                            db.execute_batch(MIGRATION_TO_V5)?;
+                        }
+                        if version < 6 {
+                            db.execute_batch(MIGRATION_TO_V6)?;
+                        }
+                        if version < 7 {
+                            db.execute_batch(MIGRATION_TO_V7)?;
+                        }
+                        if version < 8 {
+                            db.execute_batch(MIGRATION_TO_V8)?;
+                        }
+                        if version < 9 {
+                            db.execute_batch(MIGRATION_TO_V9)?;
+                        }
                     }
                     Ok(())
                 })();
@@ -804,8 +1264,10 @@ fn insert(db: &Connection, row: &Insert, transaction: bool) -> Result<bool> {
         db.execute_batch("BEGIN IMMEDIATE")?;
     }
     let result = (|| -> Result<bool> {
-        db.execute("INSERT OR IGNORE INTO sessions (id, user, host, shell) VALUES (?, ?, ?, ?)",
-                   params![row.session, row.user, row.host, row.shell])?;
+        db.execute(
+            "INSERT OR IGNORE INTO sessions (id, user, host, shell) VALUES (?, ?, ?, ?)",
+            params![row.session, row.user, row.host, row.shell],
+        )?;
         // OR IGNORE skips a row whose uuid is already stored.
         let inserted = db.execute(
             "INSERT OR IGNORE INTO commands
@@ -839,7 +1301,10 @@ fn backfill_flags(db: &Connection) -> Result<()> {
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     for (id, command) in rows {
-        db.execute("UPDATE commands SET flags = ? WHERE id = ?", params![command_flags(&command).join(" "), id])?;
+        db.execute(
+            "UPDATE commands SET flags = ? WHERE id = ?",
+            params![command_flags(&command).join(" "), id],
+        )?;
     }
     Ok(())
 }
@@ -847,6 +1312,81 @@ fn backfill_flags(db: &Connection) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_scope_scores_are_literal_and_rebased() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let base = temporary.path();
+        let history = CapturedHistory::new(base.join("history.db"));
+        let db = history.open_connection()?;
+        db.execute(
+            "INSERT INTO sessions(id,user,host,shell) VALUES('s','test','host','zsh')",
+            [],
+        )?;
+        for name in [
+            "project_one",
+            "projectXone",
+            "Project_One",
+            "project%one",
+            "projectZone",
+        ] {
+            let scope = base.join(name);
+            std::fs::create_dir_all(scope.join("sub"))?;
+            let root = scope.to_str().unwrap();
+            history.record_selection(root, "sub/file", "files", "", None, 100., &db)?;
+            history.record_selection(
+                base.to_str().unwrap(),
+                &format!("{name}/ancestor"),
+                "files",
+                "",
+                None,
+                100.,
+                &db,
+            )?;
+            for directory in [scope.clone(), scope.join("sub"), scope.join("missing")] {
+                db.execute("INSERT INTO commands(session,started_at,directory,command,exit_code) VALUES('s',100,?1,'ls',0)", params![directory.to_str().unwrap()])?;
+            }
+        }
+        for name in ["project_one", "project%one"] {
+            let scope = base.join(name);
+            let picks = history.scope_selection_scores(scope.to_str().unwrap(), 100., &db)?;
+            assert_eq!(picks.len(), 2);
+            assert_eq!(picks["sub/file"], 1.);
+            assert_eq!(picks["ancestor"], 1.);
+            history.record_selection(base.to_str().unwrap(), name, "files", "", None, 100., &db)?;
+            assert_eq!(
+                history.scope_selection_scores(scope.to_str().unwrap(), 100., &db)?["."],
+                1.
+            );
+            let dirs = history.directory_scores(scope.to_str().unwrap(), 100., &db)?;
+            assert_eq!(dirs.len(), 3, "folders are not stat'ed");
+            assert_eq!(dirs["./"], 1.);
+            assert_eq!(dirs["sub/"], 1.);
+        }
+        let picks = history.scope_selection_scores("/", 100., &db)?;
+        assert_eq!(picks.len(), 12);
+        let dirs = history.directory_scores("/", 100., &db)?;
+        assert_eq!(dirs.len(), 15);
+        db.execute("UPDATE commands SET deleted_at = 101", [])?;
+        assert!(history.directory_scores("/", 100., &db)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn directory_scores_query_uses_directory_index() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let history = CapturedHistory::new(dir.path().join("history.db"));
+        let db = history.open_connection()?;
+        let plan: Vec<String> = db
+            .prepare(&format!("EXPLAIN QUERY PLAN {DIRECTORY_SCORES_SQL}"))?
+            .query_map(params![100., "/tmp/x"], |r| r.get::<_, String>(3))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert!(
+            plan.iter().any(|p| p.contains("commands_by_directory")),
+            "{plan:?}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn file_kind_rows_and_last_directory_are_user_scoped() -> Result<()> {
@@ -869,7 +1409,10 @@ mod tests {
         })?;
         assert_eq!(limited, [rows[0].clone()]);
         assert_eq!(seen, 1, "stop after the first accepted row");
-        assert_eq!(c.last_directory(&command_key("gl", Some("git log")), "test"), Some("/latest".into()));
+        assert_eq!(
+            c.last_directory(&command_key("gl", Some("git log")), "test"),
+            Some("/latest".into())
+        );
         assert_eq!(c.last_directory("gl", "test"), Some("/plain".into()));
         assert_eq!(c.last_directory("gl", "missing"), None);
         Ok(())
@@ -887,7 +1430,11 @@ mod tests {
             c.append(&run, "", None)?;
         }
         let recent = c.recent_distinct(&user_name())?;
-        assert!(recent.iter().any(|key| crate::entry::command_parts(key).0 == "command-00"));
+        assert!(
+            recent
+                .iter()
+                .any(|key| crate::entry::command_parts(key).0 == "command-00")
+        );
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }
@@ -896,6 +1443,170 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let history = CapturedHistory::new(dir.path().join("sub/history.db"));
         (dir, history)
+    }
+
+    #[test]
+    fn legacy_stranded_after_move_and_private_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let none = HashMap::new();
+        let legacy = CapturedHistory::legacy_location(home.path());
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        CapturedHistory::new(&legacy).open_connection().unwrap();
+        let new = CapturedHistory::new(CapturedHistory::location(home.path(), &none));
+        assert!(new.stranded_legacy(home.path(), &none).is_none());
+        new.migrate_legacy(home.path(), &none, |_| {}).unwrap();
+        let mode = std::fs::metadata(new.path.parent().unwrap())
+            .unwrap()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        assert!(new.stranded_legacy(home.path(), &none).is_none());
+        // An older hook recreates the legacy file.
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        CapturedHistory::new(&legacy).open_connection().unwrap();
+        assert_eq!(new.stranded_legacy(home.path(), &none), Some(legacy));
+    }
+
+    #[test]
+    fn default_location_is_xdg_state_and_legacy_moves_there() {
+        let home = tempfile::tempdir().unwrap();
+        let none = HashMap::new();
+        let target = home.path().join(".local/state/smcli/history.db");
+        assert_eq!(CapturedHistory::location(home.path(), &none), target);
+        let custom = HashMap::from([("XDG_STATE_HOME".into(), "/x/state".into())]);
+        assert_eq!(
+            CapturedHistory::location(home.path(), &custom),
+            PathBuf::from("/x/state/smcli/history.db")
+        );
+        // Hooks from before the move export the legacy default; it resolves to the new one.
+        let legacy = CapturedHistory::legacy_location(home.path());
+        let exported = HashMap::from([("SMCLI_DB".into(), legacy.to_string_lossy().into_owned())]);
+        assert_eq!(CapturedHistory::location(home.path(), &exported), target);
+
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let old = CapturedHistory::new(&legacy).open_connection().unwrap();
+        old.execute(
+            "INSERT INTO sessions(id,user,host,shell) VALUES('moved','test','host','zsh')",
+            [],
+        )
+        .unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target.parent().unwrap().join("kept-keys-zsh"), "").unwrap();
+        let new = CapturedHistory::new(&target);
+        let mut stopped = None;
+        // An explicit SMCLI_DB elsewhere (what tests do) never takes the real history.
+        let elsewhere = CapturedHistory::new(home.path().join("test-db/other.db"));
+        elsewhere
+            .migrate_legacy(home.path(), &none, |_| {
+                panic!("must not stop for a non-default database")
+            })
+            .unwrap();
+        assert!(legacy.exists() && !elsewhere.path.exists());
+        new.migrate_legacy(home.path(), &none, |p| stopped = Some(p.to_owned()))
+            .unwrap();
+        assert_eq!(stopped.as_deref(), Some(legacy.as_path()));
+        assert!(!legacy.exists() && !legacy.parent().unwrap().exists());
+        drop(old);
+        let moved: String = new
+            .open_connection()
+            .unwrap()
+            .query_row("SELECT id FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(moved, "moved");
+        new.migrate_legacy(home.path(), &none, |_| panic!("already moved"))
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_move_failures_keep_old_database() {
+        let seed = |home: &Path| {
+            let legacy = CapturedHistory::legacy_location(home);
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            let db = CapturedHistory::new(&legacy).open_connection().unwrap();
+            db.execute(
+                "INSERT INTO sessions(id,user,host,shell) VALUES('moved','test','host','zsh')",
+                [],
+            )
+            .unwrap();
+            legacy
+        };
+        let none = HashMap::new();
+        // Success: rows, index and unrelated files; stale .moving is replaced.
+        let home = tempfile::tempdir().unwrap();
+        let legacy = seed(home.path());
+        let (from, target) = (
+            legacy.parent().unwrap(),
+            home.path().join(".local/state/smcli/history.db"),
+        );
+        std::fs::create_dir_all(from.join("history.db.search")).unwrap();
+        std::fs::write(from.join("history.db.search/x"), "").unwrap();
+        std::fs::write(from.join("other"), "").unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target.parent().unwrap().join("history.db.moving"), "junk").unwrap();
+        let new = CapturedHistory::new(&target);
+        new.migrate_legacy(home.path(), &none, |_| {}).unwrap();
+        let id: String = new
+            .open_connection()
+            .unwrap()
+            .query_row("SELECT id FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(id, "moved");
+        assert!(
+            !legacy.exists()
+                && from.join("other").exists()
+                && !from.join("history.db.search").exists()
+        );
+        assert!(
+            target
+                .parent()
+                .unwrap()
+                .join("history.db.search/x")
+                .exists()
+                && !target.parent().unwrap().join("history.db.moving").exists()
+        );
+
+        // Index name clash: database still moves, old index dropped.
+        let home = tempfile::tempdir().unwrap();
+        let legacy = seed(home.path());
+        let target = home.path().join(".local/state/smcli/history.db");
+        std::fs::create_dir_all(legacy.parent().unwrap().join("history.db.search")).unwrap();
+        std::fs::create_dir_all(target.parent().unwrap().join("history.db.search/y")).unwrap();
+        let new = CapturedHistory::new(&target);
+        new.migrate_legacy(home.path(), &none, |_| {}).unwrap();
+        assert!(
+            target.exists()
+                && !legacy.exists()
+                && !legacy.parent().unwrap().join("history.db.search").exists()
+        );
+
+        // Failure before the rename: old intact, nothing at the new path.
+        let home = tempfile::tempdir().unwrap();
+        let legacy = seed(home.path());
+        let target = home.path().join(".local/state/smcli/history.db");
+        std::fs::create_dir_all(target.parent().unwrap().join("history.db.moving")).unwrap();
+        let new = CapturedHistory::new(&target);
+        assert!(new.migrate_legacy(home.path(), &none, |_| {}).is_err());
+        assert!(legacy.exists() && !target.exists());
+    }
+
+    #[test]
+    fn legacy_smcli_db_means_default_and_custom_never_migrates() {
+        let home = tempfile::tempdir().unwrap();
+        let legacy = CapturedHistory::legacy_location(home.path());
+        let env = HashMap::from([("SMCLI_DB".into(), legacy.to_string_lossy().into_owned())]);
+        assert_eq!(
+            CapturedHistory::location(home.path(), &env),
+            home.path().join(".local/state/smcli/history.db")
+        );
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        CapturedHistory::new(&legacy).open_connection().unwrap();
+        let custom = HashMap::from([(
+            "SMCLI_DB".into(),
+            home.path().join("c/h.db").to_string_lossy().into_owned(),
+        )]);
+        let db = CapturedHistory::new(CapturedHistory::location(home.path(), &custom));
+        db.migrate_legacy(home.path(), &custom, |_| panic!("must not stop"))
+            .unwrap();
+        assert!(legacy.exists() && !db.path.exists());
     }
 
     #[test]
@@ -930,23 +1641,54 @@ mod tests {
         run("grep x y", "/repo", now - 5.0, 1);
         run("smcli search x", "/repo", now - 1.0, 0);
         let user = user_name();
-        let suggestions = log.suggestions(&user, "/repo/", "git", 10, now, None).unwrap();
-        assert_eq!(suggestions.iter().map(|s| s.command.as_str()).collect::<Vec<_>>(), ["git status", "git stash"]);
+        let suggestions = log
+            .suggestions(&user, "/repo/", "git", 10, now, None)
+            .unwrap();
+        assert_eq!(
+            suggestions
+                .iter()
+                .map(|s| s.command.as_str())
+                .collect::<Vec<_>>(),
+            ["git status", "git stash"]
+        );
         assert_eq!(suggestions[0].runs_here, 2);
-        assert_eq!(suggestions[0].why.as_deref(), Some(&["used here".to_string()][..]));
+        assert_eq!(
+            suggestions[0].why.as_deref(),
+            Some(&["used here".to_string()][..])
+        );
         let stats = log.command_stats(Some("/repo"), None, None, now).unwrap();
         assert_eq!(stats["git status"].runs, 2);
         assert_eq!(stats["grep x y"].successes, 1);
         assert_eq!(stats["git stash"].successes, 0);
-        assert_eq!(log.previous_command("s1", &user, &db).unwrap().as_deref(), Some("grep x y"));
-        assert_eq!(log.followers("git status", &user, &db).unwrap(), HashMap::from([("git status".into(), 1), ("git stash".into(), 1)]));
+        assert_eq!(
+            log.previous_command("s1", &user, &db).unwrap().as_deref(),
+            Some("grep x y")
+        );
+        assert_eq!(
+            log.followers("git status", &user, &db).unwrap(),
+            HashMap::from([("git status".into(), 1), ("git stash".into(), 1)])
+        );
         // Retrying an event ID never adds a second row.
         let mut again = NewRun::new("ls", "zsh", "/", 0);
         again.event = Some("00000000-0000-4000-8000-000000000000".into());
         assert!(log.append(&again, "", Some(&db)).unwrap());
         assert!(!log.append(&again, "", Some(&db)).unwrap());
-        assert!(log.append(&NewRun::new("ls", "tcsh", "/", 0), "", Some(&db)).is_err());
-        assert!(!log.record_pick("x", "AKIAABCDEFGHIJKLMNOP", "suggest", "/", &CaptureFilter::standard(), now, &db).unwrap());
+        assert!(
+            log.append(&NewRun::new("ls", "tcsh", "/", 0), "", Some(&db))
+                .is_err()
+        );
+        assert!(
+            !log.record_pick(
+                "x",
+                "AKIAABCDEFGHIJKLMNOP",
+                "suggest",
+                "/",
+                &CaptureFilter::standard(),
+                now,
+                &db
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -960,7 +1702,15 @@ mod tests {
             log.append(&run, "", Some(&db)).unwrap();
         }
         let cat = &log.command_stats(None, None, None, at).unwrap()["cat"];
-        assert_eq!((cat.runs, cat.last_run, cat.last_directory.as_str(), cat.last_exit_code), (2, at, "/new", 1));
+        assert_eq!(
+            (
+                cat.runs,
+                cat.last_run,
+                cat.last_directory.as_str(),
+                cat.last_exit_code
+            ),
+            (2, at, "/new", 1)
+        );
     }
 
     #[test]
@@ -989,20 +1739,34 @@ mod tests {
         }
         let reader = Connection::open(&log.path).unwrap();
         reader.execute_batch("BEGIN").unwrap();
-        let _: i64 = reader.query_row("SELECT count(*) FROM commands", [], |r| r.get(0)).unwrap();
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM commands", [], |r| r.get(0))
+            .unwrap();
         let writer = Connection::open(&log.path).unwrap();
-        writer.busy_timeout(std::time::Duration::from_millis(100)).unwrap();
+        writer
+            .busy_timeout(std::time::Duration::from_millis(100))
+            .unwrap();
         let row = Insert {
-            session: "s1", user: "u", host: "h", shell: "zsh",
-            started_at: 1_700_000_000.0, duration_ms: None,
-            directory: "/tmp", command: "echo hi", exit_code: 0,
-            uuid: None, pipestatus: None, expanded_command: None,
+            session: "s1",
+            user: "u",
+            host: "h",
+            shell: "zsh",
+            started_at: 1_700_000_000.0,
+            duration_ms: None,
+            directory: "/tmp",
+            command: "echo hi",
+            exit_code: 0,
+            uuid: None,
+            pipestatus: None,
+            expanded_command: None,
         };
         assert!(insert(&writer, &row, true).is_err());
         reader.execute_batch("ROLLBACK").unwrap();
         // The same connection must be usable again, and the failed row must not exist.
         assert!(insert(&writer, &row, true).unwrap());
-        let rows: i64 = writer.query_row("SELECT count(*) FROM commands", [], |r| r.get(0)).unwrap();
+        let rows: i64 = writer
+            .query_row("SELECT count(*) FROM commands", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(rows, 1);
     }
 
@@ -1012,7 +1776,11 @@ mod tests {
         let (_dir, log) = temp_db();
         let db = log.open_connection().unwrap();
         let user = user_name();
-        db.execute("INSERT INTO sessions VALUES ('bench',?,'host','zsh')", [&user]).unwrap();
+        db.execute(
+            "INSERT INTO sessions VALUES ('bench',?,'host','zsh')",
+            [&user],
+        )
+        .unwrap();
         db.execute_batch("WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM seq WHERE n<100000)
             INSERT INTO commands(session,started_at,directory,command,exit_code)
             SELECT 'bench',1700000000.0-n,'/repo',CASE WHEN n%1000=0 THEN 'git status' ELSE 'tool '||n END,0 FROM seq;").unwrap();
@@ -1020,15 +1788,24 @@ mod tests {
         let mut full = vec![];
         for _ in 0..10 {
             let start = std::time::Instant::now();
-            let hits = log.suggestions(&user, "/repo", "git status", 10, 1_700_000_001.0, None).unwrap();
+            let hits = log
+                .suggestions(&user, "/repo", "git status", 10, 1_700_000_001.0, None)
+                .unwrap();
             assert_eq!(hits[0].runs, 100);
             scan.push(start.elapsed().as_micros());
             let start = std::time::Instant::now();
-            let _index = crate::suggestion_index::SuggestionIndex::new(log.runs(&user, &db).unwrap(), SelectionLog::default());
+            let _index = crate::suggestion_index::SuggestionIndex::new(
+                log.runs(&user, &db).unwrap(),
+                SelectionLog::default(),
+            );
             full.push(start.elapsed().as_micros());
         }
-        scan.sort(); full.sort();
-        println!("100k suggestions, 10 samples (us): prefix SQL p50={} p95={}; full scan/index p50={} p95={}", scan[4], scan[9], full[4], full[9]);
+        scan.sort();
+        full.sort();
+        println!(
+            "100k suggestions, 10 samples (us): prefix SQL p50={} p95={}; full scan/index p50={} p95={}",
+            scan[4], scan[9], full[4], full[9]
+        );
     }
 
     #[test]
@@ -1036,13 +1813,33 @@ mod tests {
         let (_dir, log) = temp_db();
         std::fs::create_dir_all(log.path.parent().unwrap()).unwrap();
         let old = Connection::open(&log.path).unwrap();
-        old.execute_batch(&[SCHEMA_V1, MIGRATION_TO_V2, MIGRATION_TO_V3, MIGRATION_TO_V5, MIGRATION_TO_V6, MIGRATION_TO_V7, MIGRATION_TO_V8].concat()).unwrap();
+        old.execute_batch(
+            &[
+                SCHEMA_V1,
+                MIGRATION_TO_V2,
+                MIGRATION_TO_V3,
+                MIGRATION_TO_V5,
+                MIGRATION_TO_V6,
+                MIGRATION_TO_V7,
+                MIGRATION_TO_V8,
+            ]
+            .concat(),
+        )
+        .unwrap();
         old.execute_batch("INSERT INTO file_selections(root,path,mode,query,selected_at) VALUES('/r','p','files','q',1.0);").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&log.path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let db = log.open_connection().unwrap();
-        assert_eq!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 9);
-        let row = db.query_row("SELECT path, cwd FROM file_selections", [], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))).unwrap();
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            9
+        );
+        let row = db
+            .query_row("SELECT path, cwd FROM file_selections", [], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            })
+            .unwrap();
         assert_eq!(row, ("p".into(), None));
     }
 
@@ -1051,21 +1848,63 @@ mod tests {
         let (_dir, log) = temp_db();
         std::fs::create_dir_all(log.path.parent().unwrap()).unwrap();
         let old = Connection::open(&log.path).unwrap();
-        old.execute_batch(&[SCHEMA_V1, MIGRATION_TO_V2, MIGRATION_TO_V3, MIGRATION_TO_V5, MIGRATION_TO_V6, MIGRATION_TO_V7].concat()).unwrap();
+        old.execute_batch(
+            &[
+                SCHEMA_V1,
+                MIGRATION_TO_V2,
+                MIGRATION_TO_V3,
+                MIGRATION_TO_V5,
+                MIGRATION_TO_V6,
+                MIGRATION_TO_V7,
+            ]
+            .concat(),
+        )
+        .unwrap();
         old.execute_batch("PRAGMA journal_mode=WAL; INSERT INTO sessions VALUES ('s','u','h','zsh'); INSERT INTO commands(session,started_at,directory,command,exit_code) VALUES('s',1,'/','gst',0);").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&log.path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let db = log.open_connection().unwrap();
-        assert_eq!(db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), VERSION);
+        assert_eq!(
+            db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            VERSION
+        );
         let backup_path = PathBuf::from(format!("{}.v7.bak", log.path.display()));
-        assert_eq!(std::fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            std::fs::metadata(&backup_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         let backup_bytes = std::fs::read(&backup_path).unwrap();
         let backup = Connection::open(&backup_path).unwrap();
-        assert_eq!(backup.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 7);
-        assert_eq!(backup.query_row("SELECT command FROM commands", [], |r| r.get::<_, String>(0)).unwrap(), "gst");
-        assert!(backup.prepare("SELECT expanded_command FROM commands").is_err());
+        assert_eq!(
+            backup
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            backup
+                .query_row("SELECT command FROM commands", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "gst"
+        );
+        assert!(
+            backup
+                .prepare("SELECT expanded_command FROM commands")
+                .is_err()
+        );
         drop(old);
-        assert_eq!(db.query_row("SELECT expanded_command FROM commands", [], |r| r.get::<_, Option<String>>(0)).unwrap(), None);
+        assert_eq!(
+            db.query_row("SELECT expanded_command FROM commands", [], |r| r
+                .get::<_, Option<String>>(0))
+                .unwrap(),
+            None
+        );
         let mut run = NewRun::new("gl", "bash", "/", 0);
         run.expanded_command = Some("git log");
         run.event = Some("00000000-0000-4000-8000-000000000000".into());
@@ -1076,7 +1915,11 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].expanded_command.as_deref(), Some("git log"));
         drop(log.open_connection().unwrap());
-        assert_eq!(std::fs::read(backup_path).unwrap(), backup_bytes, "the first backup is never overwritten");
+        assert_eq!(
+            std::fs::read(backup_path).unwrap(),
+            backup_bytes,
+            "the first backup is never overwritten"
+        );
     }
 
     #[test]
@@ -1093,15 +1936,29 @@ mod tests {
         std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(log.open_connection().is_err());
         assert_eq!(std::fs::read(&backup).unwrap(), b"partial");
-        assert_eq!(old.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(
+            old.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
         std::fs::remove_file(&backup).unwrap();
         assert!(log.open_connection().is_ok());
-        assert_eq!(Connection::open(&backup).unwrap().query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(
+            Connection::open(&backup)
+                .unwrap()
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
     fn bare_relative_database_path_opens() {
-        let name = format!("smcli-relative-{}-{}.db", std::process::id(), new_event_id().unwrap());
+        let name = format!(
+            "smcli-relative-{}-{}.db",
+            std::process::id(),
+            new_event_id().unwrap()
+        );
         let log = CapturedHistory::new(&name);
         drop(log.open_connection().unwrap());
         for suffix in ["", "-wal", "-shm", ".migration.lock"] {
@@ -1115,12 +1972,22 @@ mod tests {
         std::fs::create_dir_all(log.path.parent().unwrap()).unwrap();
         let old = Connection::open(&log.path).unwrap();
         old.execute_batch(SCHEMA_V1).unwrap();
-        old.execute_batch("ALTER TABLE commands ADD COLUMN expanded_command TEXT; PRAGMA user_version=1;").unwrap();
+        old.execute_batch(
+            "ALTER TABLE commands ADD COLUMN expanded_command TEXT; PRAGMA user_version=1;",
+        )
+        .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&log.path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(log.open_connection().is_err());
-        assert_eq!(old.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
-        assert!(old.prepare("SELECT uuid FROM commands").is_err(), "earlier ALTERs must roll back too");
+        assert_eq!(
+            old.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(
+            old.prepare("SELECT uuid FROM commands").is_err(),
+            "earlier ALTERs must roll back too"
+        );
         assert!(old.prepare("SELECT * FROM command_selections").is_err());
     }
 

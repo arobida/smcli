@@ -9,7 +9,7 @@ smcli is two executables that must stay side by side:
 
 Both depend only on system libraries; the fff file-search library is built in. The Potion search model is shipped separately in the `potion-shell-16m/` folder beside both executables.
 
-Requirements: macOS 14 or later, or Linux. Bash 4+ for the picker keys (macOS's `/bin/bash` 3.2 still records history, without
+Requirements: macOS 14 or later (Linux support coming soon!). Bash 4+ for the picker keys (macOS's `/bin/bash` 3.2 still records history, without
 keys), any recent Zsh, or Fish.
 
 - [Quick install with the script](#quick-install-with-the-script) (recommended)
@@ -84,11 +84,10 @@ Open a new terminal afterwards. The rest of this page is the same steps done by 
 
 Tools:
 
-- A C toolchain: Xcode or the Command Line Tools on macOS; `build-essential` on Debian/Ubuntu.
+- A C toolchain: Xcode or the Command Line Tools.
 - Rust via [rustup](https://rustup.rs) (`cargo`). `fff-search` and its vendored libgit2 are built from source:
   the first build downloads and compiles the locked crate sources; later builds reuse them.
-- On Linux, `pkg-config` and the SQLite development headers (e.g. `libsqlite3-dev` on Debian/Ubuntu).
-- `curl` and `git` (included with macOS and most Linux distributions).
+- `curl` and `git` (included with macOS).
 
 Build:
 
@@ -123,8 +122,7 @@ For development:
 | `make baseline`              | Black-box benchmark of the release build                                                        |
 
 `make test` uses throwaway homes and databases and never reads your real history. Shells that aren't installed are
-skipped and reported. On Linux, install the packages above, then run `make release`. `make linux` runs the full
-suite in a `rust:latest` Docker container (needs a running Docker daemon).
+skipped and reported.
 
 Then continue with [Set up your shell](#set-up-your-shell).
 
@@ -200,6 +198,8 @@ A running service from the previous build is stopped and replaced automatically 
 terminal so the shell reloads the new hooks; until then, inserting file paths from the picker is refused with a
 message asking you to reload.
 
+The history database moved from `~/.local/share/smcli/history.db` to `~/.local/state/smcli/history.db` (under `$XDG_STATE_HOME` if set). The first smcli command other than `shell-init` copies the old database there with `VACUUM INTO` and renames it into place; the old files and the search index are removed or moved only after that copy is in place. If the copy fails, smcli keeps using the old database and retries on the next command. An `SMCLI_DB` set to the old path is treated as unset. Shells still hooked to an old build keep recreating the old database; `smcli health` reports that.
+
 ## Uninstall
 
 ``` sh
@@ -243,8 +243,8 @@ By hand: run `smcli service stop`, remove the `shell-init` line, delete the exec
 
 | What             | Where                                                                           |
 | ---------------- | ------------------------------------------------------------------------------- |
-| Recorded history | `~/.local/share/smcli/history.db` (or `SMCLI_DB`)                               |
-| Search index     | `~/.local/share/smcli/history.db.search/`                                       |
+| Recorded history | `~/.local/state/smcli/history.db` (or `SMCLI_DB`)                               |
+| Search index     | `~/.local/state/smcli/history.db.search/`                                       |
 | Settings         | `~/.config/smcli/`                                                              |
 | Service socket   | `$SMCLI_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/smcli`, else `$TMPDIR/smcli-<uid>` |
 

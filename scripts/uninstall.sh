@@ -38,7 +38,11 @@ if [[ -z $prefix ]]; then
 fi
 smcli="$prefix/smcli"
 # Explicit SMCLI_DB is used as given (no canonicalize). Default matches Path::join (no // if HOME ends in /).
-if [[ -n ${SMCLI_DB:-} ]]; then db=$SMCLI_DB; else db="${HOME%/}/.local/share/smcli/history.db"; fi
+# Mirrors CapturedHistory::location: the old default (or an export of it) means XDG state, unless only the old one exists.
+legacy="${HOME%/}/.local/share/smcli/history.db"
+state=${XDG_STATE_HOME:-}; [[ $state == /* ]] || state="${HOME%/}/.local/state"
+if [[ -n ${SMCLI_DB:-} && $SMCLI_DB != "$legacy" ]]; then db=$SMCLI_DB; else db="$state/smcli/history.db"; fi
+if [[ $db == "$state/smcli/history.db" && ! -e $db && -e $legacy ]]; then db=$legacy; fi
 config="${SMCLI_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/smcli/config.json}"
 # A directory at any data path means misconfiguration; refuse before step 4 deletes anything.
 if [[ -z $keep_data ]]; then

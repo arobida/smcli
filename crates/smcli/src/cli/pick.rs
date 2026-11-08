@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -28,17 +28,33 @@ pub(super) fn is_directory_command(command: &str) -> bool {
 
 fn files_kind(c: &CapturedHistory, env: &HashMap<String, String>) -> u8 {
     let line = env.get("SMCLI_LBUFFER").map(String::as_str).unwrap_or("");
-    let Some(command) = smcli_core::parse::last_command_word(line, env.get("SMCLI_SHELL").map(String::as_str).unwrap_or("bash")) else { return 0 };
+    let Some(command) = smcli_core::parse::last_command_word(
+        line,
+        env.get("SMCLI_SHELL").map(String::as_str).unwrap_or("bash"),
+    ) else {
+        return 0;
+    };
     let command = command.rsplit('/').next().unwrap_or(&command).to_string();
-    if is_directory_command(&command) { return 1; }
+    if is_directory_command(&command) {
+        return 1;
+    }
     // Pre-C files_majority take(20) was on this same filtered stream, so the SQL cursor stops there too.
     let Ok(rows) = c.file_kind_rows(&user_name(), 20, |raw| {
-        smcli_core::parse::program_of(raw, smcli_core::parse::CommandBreakdown::parse(raw).as_ref()).as_deref() == Some(command.as_str())
-    }) else { return 0 };
+        smcli_core::parse::program_of(
+            raw,
+            smcli_core::parse::CommandBreakdown::parse(raw).as_ref(),
+        )
+        .as_deref()
+            == Some(command.as_str())
+    }) else {
+        return 0;
+    };
     files_majority(rows.into_iter().map(|(raw, expanded, cwd, shell)| {
         let (mut dirs, mut files) = (0, 0);
         let command = expanded.as_deref().unwrap_or(&raw);
-        for path in smcli_core::parse::path_arguments(command, &shell, |p| Path::new(&cwd).join(p).exists()) {
+        for path in
+            smcli_core::parse::path_arguments(command, &shell, |p| Path::new(&cwd).join(p).exists())
+        {
             let full = Path::new(&cwd).join(path);
             dirs += usize::from(full.is_dir());
             files += usize::from(full.is_file());
@@ -48,10 +64,18 @@ fn files_kind(c: &CapturedHistory, env: &HashMap<String, String>) -> u8 {
 }
 
 fn files_majority(rows: impl IntoIterator<Item = (usize, usize)>) -> u8 {
-    let (dirs, files) = rows.into_iter().take(20).fold((0, 0), |(d, f), (dirs, files)| (d + dirs, f + files));
-    if dirs > files { 1 } else if files > dirs { 2 } else { 0 }
+    let (dirs, files) = rows
+        .into_iter()
+        .take(20)
+        .fold((0, 0), |(d, f), (dirs, files)| (d + dirs, f + files));
+    if dirs > files {
+        1
+    } else if files > dirs {
+        2
+    } else {
+        0
+    }
 }
-
 
 pub(super) fn pick(
     c: &CapturedHistory,
@@ -100,7 +124,13 @@ pub(super) fn pick(
         recent,
         native,
         // Ctrl-T's query is the whole command line, so files mode starts empty unless `@` completion names a word.
-        if files { env.get("SMCLI_FILES_QUERY").cloned().unwrap_or_default() } else if grep { String::new() } else { query },
+        if files {
+            env.get("SMCLI_FILES_QUERY").cloned().unwrap_or_default()
+        } else if grep {
+            String::new()
+        } else {
+            query
+        },
     );
     picker.suggested_view = suggest;
     picker.title = Some(format!("Suggested for {d}"));
@@ -130,61 +160,83 @@ pub(super) fn pick(
         let caller = caller.clone();
         let service = ServiceClient::new(&c.path, &env, &std::env::current_exe()?);
         move |q: &str, _: bool| -> Result<Vec<String>> {
-        let mut r = ServiceRequest::new(Operation::Search);
-        r.query = Some(q.into());
-        r.directory = Some(d.clone());
-        r.limit = Some(100);
-        r.session = caller.session.clone();
-        r.histfile = caller.histfile.clone();
-        r.login_shell = caller.shell.clone();
-        let hits = match service
-            .send(&r, None, Duration::from_secs(600))
-            .filter(|r| r.ok)
-            .and_then(|r| r.hits)
-        {
-            Some(h) => h,
-            None => {
-                let native = caller.native_env();
-                let entries = corpus(&c, caller.home(), &native, context.project_root.as_deref(), context.kind(), now())?;
-                let signals = search_signals(&c, Some(context.clone()), &native)?;
-                lexical_search(q, &entries, 100, &SearchFilter::default(), &signals, now())?
-            }
-        };
-        Ok(hits.into_iter().map(|h| h.key()).collect())
+            let mut r = ServiceRequest::new(Operation::Search);
+            r.query = Some(q.into());
+            r.directory = Some(d.clone());
+            r.limit = Some(100);
+            r.session = caller.session.clone();
+            r.histfile = caller.histfile.clone();
+            r.login_shell = caller.shell.clone();
+            let hits = match service
+                .send(&r, None, Duration::from_secs(600))
+                .filter(|r| r.ok)
+                .and_then(|r| r.hits)
+            {
+                Some(h) => h,
+                None => {
+                    let native = caller.native_env();
+                    let entries = corpus(
+                        &c,
+                        caller.home(),
+                        &native,
+                        context.project_root.as_deref(),
+                        context.kind(),
+                        now(),
+                    )?;
+                    let signals = search_signals(&c, Some(context.clone()), &native)?;
+                    lexical_search(q, &entries, 100, &SearchFilter::default(), &signals, now())?
+                }
+            };
+            Ok(hits.into_iter().map(|h| h.key()).collect())
         }
     };
     let file_search = {
         let cwd = d.clone();
         let service = ServiceClient::new(&c.path, env, &std::env::current_exe()?);
         let fallback = std::cell::OnceCell::new();
-        move |mode: Mode, q: &str, kind: u8, scope: &str, path: Option<&str>| -> Result<FileResults> {
-        let mut r = ServiceRequest::new(if mode == Mode::Grep {
-            Operation::Grep
-        } else {
-            Operation::Files
-        });
-        r.directory = Some(scope.into());
-        r.query = Some(q.into());
-        r.limit = Some(100);
-        r.scope = Some(true);
-        r.cwd = Some(cwd.clone());
-        r.path = path.map(String::from);
-        let response = service
-            .send(&r, None, Duration::from_secs(10));
-        if let Some(response) = response.filter(|r| r.ok) {
-            return Ok(FileResults {
-                hits: response.files.unwrap_or_default(),
-                complete: !response.partial.unwrap_or(false),
+        let ignore = smcli_core::config::FileIgnore::load(&SmcliConfig::location(home, env), home);
+        move |mode: Mode,
+              q: &str,
+              kind: u8,
+              scope: &str,
+              path: Option<&str>|
+              -> Result<FileResults> {
+            let mut r = ServiceRequest::new(if mode == Mode::Grep {
+                Operation::Grep
+            } else {
+                Operation::Files
             });
-        }
-        let local = fallback.get_or_init(|| LocalFileSearch { cwd: cwd.clone().into() });
-        local.search(mode, q, kind, scope, path)
+            r.directory = Some(scope.into());
+            r.query = Some(q.into());
+            r.limit = Some(100);
+            r.scope = Some(true);
+            r.cwd = Some(cwd.clone());
+            r.path = path.map(String::from);
+            let response = service.send(&r, None, Duration::from_secs(10));
+            if let Some(response) = response.filter(|r| r.ok) {
+                return Ok(FileResults {
+                    hits: response.files.unwrap_or_default(),
+                    complete: !response.partial.unwrap_or(false),
+                });
+            }
+            let ignore = ignore.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
+            let local = fallback.get_or_init(|| LocalFileSearch {
+                cwd: cwd.clone().into(),
+                ignore: ignore.clone(),
+            });
+            local.search(mode, q, kind, scope, path)
         }
     };
     let config = SmcliConfig::load(&SmcliConfig::location(home, env)).unwrap_or_default();
     let inline = config.at_completion_inline != Some(false);
     picker.ls_colors = config.at_completion_ls_colors == Some(true);
-    if let Some(choice) = crate::picker::run(picker, Some(Box::new(search)), Some(Box::new(file_search)), inline)? {
+    if let Some(choice) = crate::picker::run(
+        picker,
+        Some(Box::new(search)),
+        Some(Box::new(file_search)),
+        inline,
+    )? {
+        let jump = matches!(&choice, Choice::Jump { .. });
         match choice {
             Choice::Command {
                 command,
@@ -224,17 +276,45 @@ pub(super) fn pick(
                 let typed = crate::picker::history_insert(&command);
                 if edit_paths {
                     let shell = env.get("SMCLI_SHELL").map(String::as_str).unwrap_or("bash");
-                    let dir = c.last_directory(&command, &user).unwrap_or_else(|| d.clone());
-                    if let Some((rewritten, pos)) = smcli_core::parse::path_placeholders(&typed, shell, |path| {
-                        std::path::Path::new(&dir).join(path).exists()
-                    }) {
+                    let dir = c
+                        .last_directory(&command, &user)
+                        .unwrap_or_else(|| d.clone());
+                    if let Some((rewritten, pos)) =
+                        smcli_core::parse::path_placeholders(&typed, shell, |path| {
+                            std::path::Path::new(&dir).join(path).exists()
+                        })
+                    {
                         print!("{}\x1f{}", &rewritten[..pos], &rewritten[pos + 1..]);
                         std::process::exit(11);
                     }
                 }
                 println!("{typed}");
             }
-            Choice::File { hit, mode, query, scope } => {
+            Choice::File {
+                hit,
+                mode,
+                query,
+                scope,
+            }
+            | Choice::Jump {
+                hit,
+                mode,
+                query,
+                scope,
+            } => {
+                if jump {
+                    let code = jump_pick(
+                        &hit,
+                        scope,
+                        mode,
+                        query,
+                        |r| {
+                            let _ = service.send(&r, None, Duration::from_secs(2));
+                        },
+                        &mut std::io::stdout(),
+                    )?;
+                    std::process::exit(code);
+                }
                 if hit.provenance != ["*"] {
                     let r = file_selection_request(scope, hit.path.clone(), mode, query);
                     let _ = service.send(&r, None, Duration::from_secs(2));
@@ -244,7 +324,11 @@ pub(super) fn pick(
                 if !before.is_some_and(|b| crate::shell_quoting::insertable(b, shell)) {
                     eprintln!(
                         "smcli: not inserting a path inside an open quote or substitution, or after here-document syntax; finish the command first{}.",
-                        if before.is_none() { " (or reload smcli's shell-init)" } else { "" }
+                        if before.is_none() {
+                            " (or reload smcli's shell-init)"
+                        } else {
+                            ""
+                        }
                     );
                     std::process::exit(1);
                 }
@@ -258,7 +342,32 @@ pub(super) fn pick(
     Ok(())
 }
 
-fn file_selection_request(scope: String, path: String, mode: Mode, query: String) -> ServiceRequest {
+fn jump_pick(
+    hit: &FileHit,
+    scope: String,
+    mode: Mode,
+    query: String,
+    record: impl FnOnce(ServiceRequest),
+    output: &mut impl std::io::Write,
+) -> Result<i32> {
+    if hit.provenance != ["*"] {
+        record(file_selection_request(
+            scope.clone(),
+            hit.path.clone(),
+            mode,
+            query,
+        ));
+    }
+    writeln!(output, "{}", Path::new(&scope).join(&hit.path).display())?;
+    Ok(12)
+}
+
+fn file_selection_request(
+    scope: String,
+    path: String,
+    mode: Mode,
+    query: String,
+) -> ServiceRequest {
     let mut request = ServiceRequest::new(Operation::Select);
     request.directory = Some(scope);
     request.path = Some(path);
@@ -270,10 +379,19 @@ fn file_selection_request(scope: String, path: String, mode: Mode, query: String
 
 struct LocalFileSearch {
     cwd: PathBuf,
+    /// The config's `ignoreFile`: matching entries are neither listed nor read, nor walked into.
+    ignore: Option<smcli_core::config::FileIgnore>,
 }
 
 impl LocalFileSearch {
-    fn search(&self, mode: Mode, query: &str, kind: u8, scope: &str, path: Option<&str>) -> Result<FileResults> {
+    fn search(
+        &self,
+        mode: Mode,
+        query: &str,
+        kind: u8,
+        scope: &str,
+        path: Option<&str>,
+    ) -> Result<FileResults> {
         let scope = Path::new(scope).canonicalize()?;
         let scope_str = scope.to_string_lossy().into_owned();
         let cwd_str = self.cwd.to_string_lossy().into_owned();
@@ -283,7 +401,11 @@ impl LocalFileSearch {
                 let mut entries = Vec::new();
                 let mut budget = 10_000;
                 self.walk(&scope, 0, &mut budget, &mut |p, is_dir| {
-                    let rel = p.strip_prefix(&scope).unwrap().to_string_lossy().into_owned();
+                    let rel = p
+                        .strip_prefix(&scope)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
                     if (query.is_empty() || rel.to_lowercase().contains(&query.to_lowercase()))
                         && (kind == 0 || is_dir == (kind == 1))
                     {
@@ -305,13 +427,25 @@ impl LocalFileSearch {
                     let mut files = Vec::new();
                     let mut budget = 10_000;
                     self.walk(&scope, 0, &mut budget, &mut |p, is_dir| {
-                        if !is_dir { files.push(p.to_path_buf()); }
+                        if !is_dir {
+                            files.push(p.to_path_buf());
+                        }
                     });
                     files
                 };
                 for file in sources {
-                    let rel = file.strip_prefix(&scope).unwrap().to_string_lossy().into_owned();
-                    if file.metadata().map(|m| m.len() > MAX_GREP_FILE_BYTES).unwrap_or(true) { continue; }
+                    let rel = file
+                        .strip_prefix(&scope)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    if file
+                        .metadata()
+                        .map(|m| m.len() > MAX_GREP_FILE_BYTES)
+                        .unwrap_or(true)
+                    {
+                        continue;
+                    }
                     let text = match std::fs::File::open(&file) {
                         Ok(f) => {
                             use std::io::Read as _;
@@ -331,32 +465,67 @@ impl LocalFileSearch {
                             hit.column = Some((pos + 1) as i64);
                             hit.text = Some(line.into());
                             hits.push(hit);
-                            if hits.len() >= 100 { break; }
+                            if hits.len() >= 100 {
+                                break;
+                            }
                         }
                     }
-                    if hits.len() >= 100 { break; }
+                    if hits.len() >= 100 {
+                        break;
+                    }
                 }
             }
             _ => {}
         }
-        Ok(FileResults { hits, complete: true })
+        Ok(FileResults {
+            hits,
+            complete: true,
+        })
     }
 
-    fn walk(&self, dir: &Path, depth: usize, budget: &mut usize, on_entry: &mut dyn FnMut(&Path, bool)) {
-        if depth >= 32 || *budget == 0 { return; }
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        for entry in entries {
-            if *budget == 0 { break; }
-            *budget -= 1;
-            let Ok(e) = entry else { continue };
-            let path = e.path();
-            if path.file_name().is_some_and(|n| n == ".git") { continue; }
-            let Ok(file_type) = e.file_type() else { continue };
-            if file_type.is_dir() {
-                on_entry(&path, true);
-                self.walk(&path, depth + 1, budget, on_entry);
-            } else if file_type.is_file() {
-                on_entry(&path, false);
+    fn walk(
+        &self,
+        dir: &Path,
+        depth: usize,
+        budget: &mut usize,
+        on_entry: &mut dyn FnMut(&Path, bool),
+    ) {
+        // Breadth-first: the budget cuts deeper levels, not whole top-level folders.
+        let root = dir;
+        let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::from([(dir.to_path_buf(), depth)]);
+        while let Some((dir, depth)) = queue.pop_front() {
+            if depth >= 32 || *budget == 0 {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries {
+                if *budget == 0 {
+                    break;
+                }
+                *budget -= 1;
+                let Ok(e) = entry else { continue };
+                let path = e.path();
+                if path.file_name().is_some_and(|n| n == ".git") {
+                    continue;
+                }
+                let Ok(file_type) = e.file_type() else {
+                    continue;
+                };
+                if self
+                    .ignore
+                    .as_ref()
+                    .is_some_and(|i| i.ignores(root, &path, file_type.is_dir()))
+                {
+                    continue;
+                }
+                if file_type.is_dir() {
+                    on_entry(&path, true);
+                    queue.push_back((path, depth + 1));
+                } else if file_type.is_file() {
+                    on_entry(&path, false);
+                }
             }
         }
     }
@@ -384,12 +553,18 @@ mod tests {
         std::fs::create_dir_all(root.join("folder")).unwrap();
         std::fs::write(root.join("file.txt"), "").unwrap();
         let history = super::CapturedHistory::new(root.join("history.db"));
-        let env = std::collections::HashMap::from([("SMCLI_LBUFFER".into(), "echo hi; tool @".into())]);
+        let env =
+            std::collections::HashMap::from([("SMCLI_LBUFFER".into(), "echo hi; tool @".into())]);
         assert_eq!(super::files_kind(&history, &env), 0);
         let db = history.open_connection().unwrap();
         for i in 0..21 {
-            let command = if i == 0 { "tool folder folder folder" } else { "tool file.txt" };
-            let mut run = smcli_core::history::NewRun::new(command, "bash", root.to_str().unwrap(), 0);
+            let command = if i == 0 {
+                "tool folder folder folder"
+            } else {
+                "tool file.txt"
+            };
+            let mut run =
+                smcli_core::history::NewRun::new(command, "bash", root.to_str().unwrap(), 0);
             run.started_at = Some(1_700_000_000.0 + i as f64);
             history.append(&run, "", Some(&db)).unwrap();
         }
@@ -407,9 +582,11 @@ mod tests {
         assert_eq!(super::files_majority([(2, 2)]), 0);
         assert_eq!(super::files_majority([(2, 1)]), 1);
         assert_eq!(super::files_majority([(1, 2)]), 2);
-        assert_eq!(super::files_majority(std::iter::repeat_n((1, 0), 20).chain([(0, 100)])), 1);
+        assert_eq!(
+            super::files_majority(std::iter::repeat_n((1, 0), 20).chain([(0, 100)])),
+            1
+        );
     }
-
 }
 
 #[cfg(test)]
@@ -426,10 +603,75 @@ mod walker_tests {
             std::os::unix::fs::symlink(&root, root.join("nested/back-one"))?;
             std::os::unix::fs::symlink(&root, root.join("nested/back-two"))?;
         }
-        let search = LocalFileSearch { cwd: root.clone() };
+        let search = LocalFileSearch {
+            cwd: root.clone(),
+            ignore: None,
+        };
         let result = search.search(Mode::Files, "", 0, root.to_str().unwrap(), None)?;
         assert!(result.hits.iter().any(|hit| hit.path == "nested/"));
-        assert!(!result.hits.iter().any(|hit| hit.path.contains("back-one") || hit.path.contains("back-two")));
+        assert!(
+            !result
+                .hits
+                .iter()
+                .any(|hit| hit.path.contains("back-one") || hit.path.contains("back-two"))
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_walker_reaches_target_past_deep_subtree() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("smcli-walk-bfs-{}", uuid::Uuid::new_v4()));
+        // a/ holds 120 entries within the depth cap, over the budget of 100, so a
+        // depth-first walk exhausts the budget inside a/ no matter the readdir order.
+        for i in 0..60 {
+            std::fs::create_dir_all(root.join(format!("a/c{i:02}")))?;
+            std::fs::write(root.join(format!("a/c{i:02}/f{i:02}.txt")), "")?;
+        }
+        std::fs::create_dir_all(root.join("b"))?;
+        std::fs::write(root.join("b/target.txt"), "")?;
+        let search = LocalFileSearch {
+            cwd: root.clone(),
+            ignore: None,
+        };
+        let mut budget = 100;
+        let mut seen = Vec::new();
+        search.walk(&root, 0, &mut budget, &mut |path, _| {
+            seen.push(path.to_path_buf())
+        });
+        assert!(seen.iter().any(|p| p.ends_with("b/target.txt")));
+        // Level order: DFS that reached b/ first would still visit a/ deeper
+        // entries before a/'s remaining depth-2 children.
+        let depths: Vec<_> = seen
+            .iter()
+            .map(|p| p.strip_prefix(&root).unwrap().components().count())
+            .collect();
+        let mut sorted = depths.clone();
+        sorted.sort();
+        assert_eq!(depths, sorted);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_walker_visits_entries_level_by_level() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("smcli-walk-levels-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("one/nested"))?;
+        std::fs::create_dir_all(root.join("two"))?;
+        std::fs::write(root.join("one/nested/leaf.txt"), "")?;
+        std::fs::write(root.join("two/shallow.txt"), "")?;
+        let search = LocalFileSearch {
+            cwd: root.clone(),
+            ignore: None,
+        };
+        let mut budget = 10_000;
+        let mut depths = Vec::new();
+        search.walk(&root, 0, &mut budget, &mut |path, _| {
+            depths.push(path.strip_prefix(&root).unwrap().components().count());
+        });
+        let mut sorted = depths.clone();
+        sorted.sort();
+        assert_eq!(depths, sorted);
         std::fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -438,11 +680,18 @@ mod walker_tests {
     fn fallback_walker_obeys_entry_budget() -> Result<()> {
         let root = std::env::temp_dir().join(format!("smcli-walk-budget-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root)?;
-        for name in ["one", "two", "three"] { std::fs::write(root.join(name), "")?; }
-        let search = LocalFileSearch { cwd: root.clone() };
+        for name in ["one", "two", "three"] {
+            std::fs::write(root.join(name), "")?;
+        }
+        let search = LocalFileSearch {
+            cwd: root.clone(),
+            ignore: None,
+        };
         let mut budget = 1;
         let mut seen = Vec::new();
-        search.walk(&root, 0, &mut budget, &mut |path, _| seen.push(path.to_path_buf()));
+        search.walk(&root, 0, &mut budget, &mut |path, _| {
+            seen.push(path.to_path_buf())
+        });
         assert_eq!(seen.len(), 1);
         assert_eq!(budget, 0);
         std::fs::remove_dir_all(root)?;
@@ -453,9 +702,14 @@ mod walker_tests {
     fn fallback_walker_obeys_depth_limit() -> Result<()> {
         let root = std::env::temp_dir().join(format!("smcli-walk-depth-{}", uuid::Uuid::new_v4()));
         let mut leaf = root.clone();
-        for _ in 0..33 { leaf.push("d"); }
+        for _ in 0..33 {
+            leaf.push("d");
+        }
         std::fs::create_dir_all(&leaf)?;
-        let search = LocalFileSearch { cwd: root.clone() };
+        let search = LocalFileSearch {
+            cwd: root.clone(),
+            ignore: None,
+        };
         let mut budget = 10_000;
         let mut deepest = 0;
         search.walk(&root, 0, &mut budget, &mut |path, _| {
@@ -470,7 +724,10 @@ mod walker_tests {
     fn fallback_folder_picker_lists_empty_directories() -> Result<()> {
         let root = std::env::temp_dir().join(format!("smcli-walk-empty-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("empty"))?;
-        let search = LocalFileSearch { cwd: root.clone() };
+        let search = LocalFileSearch {
+            cwd: root.clone(),
+            ignore: None,
+        };
         std::fs::write(root.join("visible.txt"), "file")?;
         let result = search.search(Mode::Files, "", 1, root.to_str().unwrap(), None)?;
         assert!(result.hits.iter().any(|hit| hit.path == "empty/"));
@@ -487,8 +744,14 @@ mod walker_tests {
         std::fs::create_dir_all(&root)?;
         std::fs::write(root.join("small.txt"), "needle")?;
         std::fs::write(root.join("big.txt"), "needle")?;
-        std::fs::File::options().write(true).open(root.join("big.txt"))?.set_len(MAX_GREP_FILE_BYTES + (1 << 20))?;
-        let search = LocalFileSearch { cwd: root.clone() };
+        std::fs::File::options()
+            .write(true)
+            .open(root.join("big.txt"))?
+            .set_len(MAX_GREP_FILE_BYTES + (1 << 20))?;
+        let search = LocalFileSearch {
+            cwd: root.clone(),
+            ignore: None,
+        };
         let result = search.search(Mode::Grep, "needle", 0, root.to_str().unwrap(), None)?;
         assert_eq!(result.hits.len(), 1);
         assert_eq!(result.hits[0].path, "small.txt");
@@ -497,11 +760,60 @@ mod walker_tests {
     }
 
     #[test]
+    fn pick_jump_prints_absolute_directory_and_records_selection() -> Result<()> {
+        const CHILD: &str = "SMCLI_TEST_PICK_JUMP_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "cli::pick::walker_tests::pick_jump_prints_absolute_directory_and_records_selection", "--nocapture"])
+                .env(CHILD, "1")
+                .output()?;
+            assert_eq!(
+                output.status.code(),
+                Some(12),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.stdout.ends_with(b"/repo/scope/nested/\n"));
+            return Ok(());
+        }
+        let search = LocalFileSearch {
+            cwd: "/repo".into(),
+            ignore: None,
+        };
+        let hit = search.file_hit("nested/", "/repo/scope", "/repo", "files");
+        let mut recorded = None;
+        let mut output = Vec::new();
+        let code = jump_pick(
+            &hit,
+            "/repo/scope".into(),
+            Mode::Files,
+            "nest".into(),
+            |request| recorded = Some(request),
+            &mut output,
+        )?;
+        assert_eq!(code, 12);
+        assert_eq!(std::str::from_utf8(&output)?, "/repo/scope/nested/\n");
+        let request = recorded.expect("jump must record the selection");
+        assert_eq!(request.op, Operation::Select);
+        assert_eq!(request.directory.as_deref(), Some("/repo/scope"));
+        assert_eq!(request.path.as_deref(), Some("nested/"));
+        assert_eq!(request.mode.as_deref(), Some("files"));
+        assert_eq!(request.query.as_deref(), Some("nest"));
+        assert_eq!(request.scope, Some(true));
+        std::io::Write::write_all(&mut std::io::stdout(), &output)?;
+        std::process::exit(code);
+    }
+
+    #[test]
     fn scoped_file_selection_request_sets_scope() {
-        let request = file_selection_request("/repo/sub".into(), "needle.rs".into(), Mode::Files, "needle".into());
+        let request = file_selection_request(
+            "/repo/sub".into(),
+            "needle.rs".into(),
+            Mode::Files,
+            "needle".into(),
+        );
         assert_eq!(request.scope, Some(true));
         assert_eq!(request.directory.as_deref(), Some("/repo/sub"));
         assert_eq!(request.path.as_deref(), Some("needle.rs"));
     }
-
 }

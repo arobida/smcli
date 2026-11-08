@@ -124,7 +124,7 @@ bash scripts/install.sh --from "$from" --prefix "$home/bin" --shells zsh --keys 
 
 "$home/bin/smcli" service status > /dev/null || fail "service not running after install"
 SMCLI_SYNC=1 "$home/bin/smcli" record zsh s1 /tmp 0 "" "" "" "" "echo exported-marker"
-[[ -f $home/.local/share/smcli/history.db ]] || fail "no database"
+[[ -f $home/.local/state/smcli/history.db ]] || fail "no database"
 
 # Malformed blocks are also rejected during uninstall.
 printf 'pre\n# >>> smcli >>>\npartial\n' > "$home/.zshrc"
@@ -160,7 +160,7 @@ for tool in dirname date; do ln -s "$(command -v "$tool")" "$home/no-sqlite/$too
 PATH="$home/no-sqlite" "$home/bin/smcli-uninstall" --yes --export "$home/export" > "$home/out" 2>&1 \
     && fail "uninstall without sqlite3 should refuse"
 grep -q 'sqlite3 is needed to export history' "$home/out" || fail "missing sqlite3 diagnostic"
-[[ -x $home/bin/smcli && -f $home/.local/share/smcli/history.db && ! -e $home/export ]] || fail "refused uninstall changed files"
+[[ -x $home/bin/smcli && -f $home/.local/state/smcli/history.db && ! -e $home/export ]] || fail "refused uninstall changed files"
 grep -q '^# >>> smcli >>>$' "$home/.zshrc" || fail "refused uninstall removed hooks"
 
 # A directory at the database, its WAL or the config path must be refused, not rm -rf'd.
@@ -177,7 +177,7 @@ for spec in "SMCLI_DB=$home/db-dir:$home/db-dir" \
 done
 
 # Uninstalling database A must leave database B's runtime files alone (finding #8).
-db_a=$home/.local/share/smcli/history.db
+db_a=$home/.local/state/smcli/history.db
 db_b=$home/other-history.db
 fnv_fp() { # bytes via LC_ALL=C, same as uninstall.sh / service_location.rs
     local text=$1 h=$((0xcbf29ce484222325)) i c
@@ -238,7 +238,7 @@ PY
 [[ $(sqlite3 "$home/export/history.db" "SELECT count(*) FROM commands WHERE command = 'echo exported-marker'") == 1 ]] \
     || fail "database copy is missing the recorded command"
 [[ -f $home/export/config.json ]] || fail "settings not exported"
-for f in bin/smcli bin/smcli-service bin/smcli-uninstall bin/potion-shell-16m .local/share/smcli .config/smcli; do
+for f in bin/smcli bin/smcli-service bin/smcli-uninstall bin/potion-shell-16m .local/state/smcli .config/smcli; do
     [[ ! -e $home/$f ]] || fail "$f was not removed"
 done
 for f in .zshrc .bashrc .config/fish/config.fish; do

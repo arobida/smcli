@@ -138,15 +138,17 @@ fn arguments(command: &str, input: &str, shell: &str) -> Vec<String> {
 }
 
 fn choose(mut selected: usize, inline: bool) -> Result<Option<usize>> {
-    let rows = ratatui::crossterm::terminal::size().ok().filter(|&(_, rows)| rows > 0).map_or(24, |(_, rows)| rows);
+    let rows = ratatui::crossterm::terminal::size()
+        .ok()
+        .filter(|&(_, rows)| rows > 0)
+        .map_or(24, |(_, rows)| rows);
     // Title, two rows per item, hints.
     let mut terminal = TerminalSession::open(inline, ITEMS.len() as u16 * 2 + 2, rows)?;
     loop {
         terminal.terminal.draw(|frame| {
             let area = frame.area();
             frame.render_widget(
-                Paragraph::new("smcli — shell history, remembered")
-                    .style(crate::picker::ACCENT),
+                Paragraph::new("smcli — shell history, remembered").style(crate::picker::ACCENT),
                 Rect::new(area.x, area.y, area.width, 1),
             );
             let items: Vec<_> = ITEMS

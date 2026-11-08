@@ -10,29 +10,32 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use crate::context_cache::ContextCache;
 use anyhow::Result;
 use rusqlite::Connection;
 use smcli_core::caller::{CallerContext, LaunchSettings};
-use smcli_core::request::{Embed as EmbedQuery, Ranked, Record as RecordQuery, Request, Search as SearchQuery, Select as SelectQuery};
 use smcli_core::command_source::CommandSource;
 use smcli_core::config::{CaptureFilter, SmcliConfig};
-use crate::context_cache::ContextCache;
 use smcli_core::entry::SearchEntry;
 use smcli_core::history::{CapturedHistory, NewRun, Run, user_name};
 use smcli_core::ranking::{RankingContext, Signal};
+use smcli_core::request::{
+    Embed as EmbedQuery, Ranked, Record as RecordQuery, Request, Search as SearchQuery,
+    Select as SelectQuery,
+};
 use smcli_core::service_location::{ServiceLocation, build};
 use smcli_core::service_protocol::{
-    FailureCode, IO_TIMEOUT, MAX_CONNECTIONS, MAX_MESSAGE_BYTES, Operation, ServiceRequest, ServiceResponse,
-    VERSION, decode_line, encode_line,
+    FailureCode, IO_TIMEOUT, MAX_CONNECTIONS, MAX_MESSAGE_BYTES, Operation, ServiceRequest,
+    ServiceResponse, VERSION, decode_line, encode_line,
 };
 use smcli_core::suggestion_index::SuggestionIndex;
 use smcli_core::time::now;
 use smcli_core::unix_socket::{SocketConnection, SocketError, listen_unix};
-use smcli_search::{HistorySearch, ModelId, Potion};
 use smcli_search::commands::CommandIndex;
 use smcli_search::corpus::{CorpusState, SearchSignals};
 use smcli_search::native::history_files;
 use smcli_search::setup::index_directory;
+use smcli_search::{HistorySearch, ModelId, Potion};
 
 use crate::file_search::FileSearch;
 
@@ -52,7 +55,15 @@ impl FileStats {
         let mut stats = [(0, 0, 0, 0, 0, 0, 0); 3];
         for (stamp, path) in stats.iter_mut().zip(files) {
             let m = std::fs::metadata(path)?;
-            *stamp = (m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec());
+            *stamp = (
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            );
         }
         Ok(Self(stats))
     }
@@ -119,7 +130,11 @@ fn recorded_program(command: &str, expanded: Option<&str>) -> Option<String> {
 }
 
 impl Service {
-    pub fn new(history: CapturedHistory, location: ServiceLocation, launch: LaunchSettings) -> Result<Arc<Self>> {
+    pub fn new(
+        history: CapturedHistory,
+        location: ServiceLocation,
+        launch: LaunchSettings,
+    ) -> Result<Arc<Self>> {
         let db = history.open_connection()?;
         let version = data_version(&db)?;
         let home = launch.home.clone();
@@ -130,21 +145,44 @@ impl Service {
                 launch.fff_max,
                 launch.fff_idle,
                 Box::new(move |root| {
-                    let Some(service) = scores_handle.upgrade() else { return HashMap::new() };
+                    let Some(service) = scores_handle.upgrade() else {
+                        return Default::default();
+                    };
                     let state = service.lock();
-                    service.history.selection_scores(root, now(), &state.db).unwrap_or_default()
+                    let time = now();
+                    let picks = service
+                        .history
+                        .scope_selection_scores(root, time, &state.db)
+                        .unwrap_or_default();
+                    let visits = service
+                        .history
+                        .directory_scores(root, time, &state.db)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(path, score)| (path.trim_end_matches('/').to_owned(), score))
+                        .collect();
+                    (picks, visits)
                 }),
                 Box::new(move |root, path, mode, query, directory, cwd, config| {
-                    let Some(service) = record_handle.upgrade() else { return Ok(()) };
+                    let Some(service) = record_handle.upgrade() else {
+                        return Ok(());
+                    };
                     let filter = CaptureFilter::new(&(SmcliConfig::load(config)?))?;
-                    if !filter.allows(query, directory) || cwd.is_some_and(|cwd| !filter.allows(query, cwd)) {
+                    if !filter.allows(query, directory)
+                        || cwd.is_some_and(|cwd| !filter.allows(query, cwd))
+                    {
                         return Ok(());
                     }
                     let mut state = service.lock();
                     state.last_activity = Instant::now();
-                    service.history.record_selection(root, path, mode, query, cwd, now(), &state.db)
+                    service
+                        .history
+                        .record_selection(root, path, mode, query, cwd, now(), &state.db)
                 }),
                 home.clone(),
+            )
+            .refuse_roots_holding(
+                std::fs::canonicalize(&history.path).unwrap_or_else(|_| history.path.clone()),
             );
             Service {
                 build: std::env::current_exe().ok().and_then(|exe| build(&exe)),
@@ -153,13 +191,27 @@ impl Service {
                 idle: launch.idle,
                 user: user_name(),
                 launch,
-                state: Mutex::new(State { db, index: None, data_version: version, history_revision: 0, last_activity: Instant::now(), engine: None, corpus: None, model_lock: None }),
+                state: Mutex::new(State {
+                    db,
+                    index: None,
+                    data_version: version,
+                    history_revision: 0,
+                    last_activity: Instant::now(),
+                    engine: None,
+                    corpus: None,
+                    model_lock: None,
+                }),
                 model_ids: Mutex::new(HashMap::new()),
                 searching: Mutex::new(()),
                 active: AtomicUsize::new(0),
                 contexts: ContextCache::new(),
                 file_search,
-                command_sync: Mutex::new(CommandSync { index: None, known: HashSet::new(), last_path: None, running: false }),
+                command_sync: Mutex::new(CommandSync {
+                    index: None,
+                    known: HashSet::new(),
+                    last_path: None,
+                    running: false,
+                }),
             }
         });
         Ok(service)
@@ -179,7 +231,9 @@ impl Service {
         if state.last_activity.elapsed() <= self.idle {
             return false;
         }
-        self.active.compare_exchange(0, MAX_CONNECTIONS, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+        self.active
+            .compare_exchange(0, MAX_CONNECTIONS, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
     }
 
     pub fn run(self: &Arc<Self>) -> Result<()> {
@@ -187,12 +241,15 @@ impl Service {
         let socket_inode = inode(&self.location.socket);
         signals::install(&self.location.socket, socket_inode);
         let watcher = Arc::clone(self);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(15));
-            // Idle too long, or our socket was removed or replaced: let a fresh service take over.
-            watcher.file_search.evict_idle();
-            if watcher.claim_idle_shutdown() || inode(&watcher.location.socket) != socket_inode {
-                watcher.stop(socket_inode);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(15));
+                // Idle too long, or our socket was removed or replaced: let a fresh service take over.
+                watcher.file_search.evict_idle();
+                if watcher.claim_idle_shutdown() || inode(&watcher.location.socket) != socket_inode
+                {
+                    watcher.stop(socket_inode);
+                }
             }
         });
         self.warm_search();
@@ -212,7 +269,9 @@ impl Service {
                     }
                 }
                 // Out of descriptors: back off instead of spinning until one frees up.
-                Err(e) if matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) if matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
                 Err(_) => {}
             }
         }
@@ -248,18 +307,24 @@ impl Service {
         let timeout = Duration::from_secs_f64(IO_TIMEOUT);
         let mut shutdown = false;
         let mut response = match connection.read_line(MAX_MESSAGE_BYTES, timeout) {
-                Ok(None) => return,
-                Ok(Some(line)) => match decode_line::<ServiceRequest>(&line) {
-                    Ok(request) => {
-                        shutdown = request.op == Operation::Shutdown && request.v == VERSION;
-                        self.dispatch(&request)
-                    }
-                    Err(_) => ServiceResponse::failure("bad_request", "Malformed request."),
-                },
-                Err(SocketError::TooLarge) => ServiceResponse::failure("too_large", format!("Request exceeds {MAX_MESSAGE_BYTES} bytes.")),
-                Err(SocketError::Timeout) => ServiceResponse::failure("timeout", format!("Request not received within {IO_TIMEOUT} s.")),
-                Err(_) => return,
-            };
+            Ok(None) => return,
+            Ok(Some(line)) => match decode_line::<ServiceRequest>(&line) {
+                Ok(request) => {
+                    shutdown = request.op == Operation::Shutdown && request.v == VERSION;
+                    self.dispatch(&request)
+                }
+                Err(_) => ServiceResponse::failure("bad_request", "Malformed request."),
+            },
+            Err(SocketError::TooLarge) => ServiceResponse::failure(
+                "too_large",
+                format!("Request exceeds {MAX_MESSAGE_BYTES} bytes."),
+            ),
+            Err(SocketError::Timeout) => ServiceResponse::failure(
+                "timeout",
+                format!("Request not received within {IO_TIMEOUT} s."),
+            ),
+            Err(_) => return,
+        };
         response.build = self.build.clone();
         if let Ok(data) = encode_line(&response) {
             let _ = connection.write(&data, timeout);
@@ -273,7 +338,10 @@ impl Service {
     fn dispatch(self: &Arc<Self>, request: &ServiceRequest) -> ServiceResponse {
         if request.v != VERSION {
             // A rejected version must not refresh idle time, or an old service never exits.
-            return ServiceResponse::fail(smcli_core::service_protocol::FailureCode::Version, format!("Protocol version {VERSION} required."));
+            return ServiceResponse::fail(
+                smcli_core::service_protocol::FailureCode::Version,
+                format!("Protocol version {VERSION} required."),
+            );
         }
         let request = match Request::try_from(request) {
             Ok(request) => request,
@@ -286,8 +354,22 @@ impl Service {
             Request::Files(query) => return self.files(|f| f.files_typed(query)),
             Request::Grep(query) => return self.files(|f| f.grep_typed(query)),
             Request::Complete(query) => return self.files(|f| f.complete_typed(query)),
-            Request::Select(SelectQuery::Command { command, expanded_command, directory, mode, query, config }) => {
-                return self.select_command(command, expanded_command, directory, mode, query, config);
+            Request::Select(SelectQuery::Command {
+                command,
+                expanded_command,
+                directory,
+                mode,
+                query,
+                config,
+            }) => {
+                return self.select_command(
+                    command,
+                    expanded_command,
+                    directory,
+                    mode,
+                    query,
+                    config,
+                );
             }
             Request::Select(file) => return self.files(|f| f.select_file(file)),
             Request::Ping | Request::Shutdown => {
@@ -301,7 +383,9 @@ impl Service {
             Request::Suggest(ranked) => self.ranked(ranked, false),
             Request::Pick(ranked) => self.ranked(ranked, true),
         };
-        result.unwrap_or_else(|e| ServiceResponse::failure(FailureCode::Failed.as_str(), e.to_string()))
+        result.unwrap_or_else(|e| {
+            ServiceResponse::failure(FailureCode::Failed.as_str(), e.to_string())
+        })
     }
 
     /// Runs a file operation outside `state`, keeping the service alive while it works.
@@ -319,7 +403,12 @@ impl Service {
         response
     }
 
-    fn ranking_context(&self, directory: &str, session: Option<String>, ranking_off: Option<&str>) -> RankingContext {
+    fn ranking_context(
+        &self,
+        directory: &str,
+        session: Option<String>,
+        ranking_off: Option<&str>,
+    ) -> RankingContext {
         let off = ranking_off.filter(|s| s.len() <= 256);
         RankingContext::new(&self.contexts.context(directory), session, off)
     }
@@ -347,7 +436,21 @@ impl Service {
 
     /// Acknowledged only after the insert commits. A retried event ID is acknowledged again without a new row.
     fn record(self: &Arc<Self>, record: RecordQuery) -> Result<ServiceResponse> {
-        let RecordQuery { event, command, shell, session, directory, exit_code, expanded_command, started_at, ended_at, pipestatus, native_file, config, shell_path } = record;
+        let RecordQuery {
+            event,
+            command,
+            shell,
+            session,
+            directory,
+            exit_code,
+            expanded_command,
+            started_at,
+            ended_at,
+            pipestatus,
+            native_file,
+            config,
+            shell_path,
+        } = record;
         let filter = CaptureFilter::new(&(SmcliConfig::load(&config)?))?;
         if !filter.allows_run(&command, expanded_command.as_deref(), &directory) {
             let mut response = ServiceResponse::new(true);
@@ -360,13 +463,30 @@ impl Service {
         Self::refresh(&mut state)?;
         let started = started_at.unwrap_or_else(now);
         let run = NewRun {
-            command: &command, expanded_command: expanded_command.as_deref(), shell: &shell, directory: &directory, exit_code, session: &session, started_at: Some(started), ended_at,
-            pipestatus: pipestatus.clone(), event: Some(event.clone()),
+            command: &command,
+            expanded_command: expanded_command.as_deref(),
+            shell: &shell,
+            directory: &directory,
+            exit_code,
+            session: &session,
+            started_at: Some(started),
+            ended_at,
+            pipestatus: pipestatus.clone(),
+            event: Some(event.clone()),
         };
-        let inserted = self.history.append(&run, native_file.as_deref().unwrap_or(""), Some(&state.db))?;
+        let inserted =
+            self.history
+                .append(&run, native_file.as_deref().unwrap_or(""), Some(&state.db))?;
         if inserted {
             state.history_revision += 1;
-            let run = Run { command: command.clone(), expanded_command: expanded_command.clone(), directory: directory.clone(), started_at: started, exit_code, session: session.clone() };
+            let run = Run {
+                command: command.clone(),
+                expanded_command: expanded_command.clone(),
+                directory: directory.clone(),
+                started_at: started,
+                exit_code,
+                session: session.clone(),
+            };
             if let Some(index) = state.index.as_mut() {
                 if !index.add(&run) {
                     state.index = None;
@@ -380,9 +500,7 @@ impl Service {
         let mut response = ServiceResponse::new(true);
         response.event = Some(event.clone());
         response.duplicate = Some(!inserted);
-        if inserted
-            && let Some(program) = recorded_program(&command, expanded_command.as_deref())
-        {
+        if inserted && let Some(program) = recorded_program(&command, expanded_command.as_deref()) {
             // Off the reply path: sync the command index in the background when the program
             // is unknown or this shell's PATH was not synced yet.
             self.maybe_sync_commands(program, shell_path, config);
@@ -391,11 +509,20 @@ impl Service {
     }
 
     /// Spawn a background sync unless one is running or the program is known on this PATH.
-    fn maybe_sync_commands(self: &Arc<Self>, program: String, shell_path: Option<String>, config: PathBuf) {
-        let shell_path = smcli_core::service_protocol::shell_path_snapshot(shell_path.as_deref()).unwrap_or_default();
+    fn maybe_sync_commands(
+        self: &Arc<Self>,
+        program: String,
+        shell_path: Option<String>,
+        config: PathBuf,
+    ) {
+        let shell_path = smcli_core::service_protocol::shell_path_snapshot(shell_path.as_deref())
+            .unwrap_or_default();
         {
             let mut sync = self.command_sync.lock().unwrap_or_else(|e| e.into_inner());
-            if sync.running || (sync.known.contains(&program) && sync.last_path.as_deref() == Some(shell_path.as_str())) {
+            if sync.running
+                || (sync.known.contains(&program)
+                    && sync.last_path.as_deref() == Some(shell_path.as_str()))
+            {
                 return;
             }
             sync.running = true;
@@ -405,7 +532,10 @@ impl Service {
             .spawn(move || service.finish_sync(shell_path, config))
             .is_err()
         {
-            self.command_sync.lock().unwrap_or_else(|e| e.into_inner()).running = false;
+            self.command_sync
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .running = false;
         }
     }
 
@@ -416,7 +546,9 @@ impl Service {
     /// programs, so nothing is remembered here and the next capture retries.
     fn finish_sync(&self, shell_path: String, config: PathBuf) {
         let result = (|| -> Result<()> {
-            let Ok(_searching) = self.searching.try_lock() else { return Ok(()) };
+            let Ok(_searching) = self.searching.try_lock() else {
+                return Ok(());
+            };
             let platform = smcli_search::tldr::current_platform();
             let Some(sources) = smcli_search::commands::bundled_sources() else {
                 return Ok(());
@@ -427,7 +559,10 @@ impl Service {
             if !index.path().exists() {
                 return Ok(());
             }
-            let mut wanted = smcli_search::commands::os_programs(&smcli_search::commands::system_dirs(), &shell_path);
+            let mut wanted = smcli_search::commands::os_programs(
+                &smcli_search::commands::system_dirs(),
+                &shell_path,
+            );
             let runs = self.history.runs(&self.user, &self.lock().db)?;
             let history: HashSet<String> = runs
                 .iter()
@@ -440,13 +575,20 @@ impl Service {
             sync.last_path = Some(shell_path);
             Ok(())
         })();
-        self.command_sync.lock().unwrap_or_else(|e| e.into_inner()).running = false;
+        self.command_sync
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .running = false;
         // A failed sync stays unremembered (known/last_path untouched) so the next capture retries.
         let _ = result;
     }
 
     /// Caller holds `searching` through every use of the returned model-owning index.
-    fn command_index_locked(&self, engine: &HistorySearch, sources: &[&dyn CommandSource]) -> Arc<CommandIndex> {
+    fn command_index_locked(
+        &self,
+        engine: &HistorySearch,
+        sources: &[&dyn CommandSource],
+    ) -> Arc<CommandIndex> {
         let index = CommandIndex::new(engine.directory.clone(), engine.potion.clone(), sources);
         let mut sync = self.command_sync.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = &sync.index
@@ -462,7 +604,13 @@ impl Service {
     fn embed(&self, embed: EmbedQuery) -> ServiceResponse {
         let _searching = self.searching.lock().unwrap_or_else(|e| e.into_inner());
         self.touch();
-        let EmbedQuery { query, commands, command, shell_path, config } = embed;
+        let EmbedQuery {
+            query,
+            commands,
+            command,
+            shell_path,
+            config,
+        } = embed;
         let result = (|| -> Result<ServiceResponse> {
             let engine = self.current_engine(&config)?;
             let sources = smcli_search::commands::bundled_sources()
@@ -471,11 +619,23 @@ impl Service {
             let index = self.command_index_locked(&engine, &refs);
             if commands {
                 let runs = self.history.runs(&self.user, &self.lock().db)?;
-                let programs = runs.iter()
-                    .filter_map(|run| recorded_program(&run.command, run.expanded_command.as_deref())).collect();
-                let path = smcli_core::service_protocol::shell_path_snapshot(shell_path.as_deref()).unwrap_or_default();
-                smcli_search::commands::prepare(&index, &refs, smcli_search::tldr::current_platform(),
-                    &path, &programs, false, command.as_deref())?;
+                let programs = runs
+                    .iter()
+                    .filter_map(|run| {
+                        recorded_program(&run.command, run.expanded_command.as_deref())
+                    })
+                    .collect();
+                let path = smcli_core::service_protocol::shell_path_snapshot(shell_path.as_deref())
+                    .unwrap_or_default();
+                smcli_search::commands::prepare(
+                    &index,
+                    &refs,
+                    smcli_search::tldr::current_platform(),
+                    &path,
+                    &programs,
+                    false,
+                    command.as_deref(),
+                )?;
             }
             let mut response = ServiceResponse::new(true);
             if !query.is_empty() {
@@ -491,40 +651,98 @@ impl Service {
     /// Suggest, and the picker's first draw (this directory's suggestions, then all history by last run).
     /// Directory context is read before taking `state`, so a record never waits behind discovery.
     fn ranked(&self, ranked: Ranked, pick: bool) -> Result<ServiceResponse> {
-        let Ranked { directory, limit, prefix, session, ranking_off } = ranked;
+        let Ranked {
+            directory,
+            limit,
+            prefix,
+            session,
+            ranking_off,
+        } = ranked;
         let mut context = self.ranking_context(&directory, session, ranking_off.as_deref());
         if context.uses(Signal::Tests) {
             if let Some(root) = FileSearch::root(&directory) {
-                context.candidates.extend(crate::test_candidates::test_candidates(&self.file_search, &root));
+                context
+                    .candidates
+                    .extend(crate::test_candidates::test_candidates(
+                        &self.file_search,
+                        &root,
+                    ));
             }
         }
-        let evidence = FileSearch::root(&directory).and_then(|root| self.file_search.ready(&root))
+        let evidence = FileSearch::root(&directory)
+            .and_then(|root| self.file_search.ready(&root))
             .map(crate::file_search::evidence::IndexEvidence);
-        let presence = |commands: &[String]| smcli_search::command_file_presence(commands, &directory, evidence.as_ref().unwrap());
-        let git = |commands: &[String]| smcli_search::command_git_activity(commands, &directory, evidence.as_ref().unwrap());
-        let idents = |commands: &[String]| crate::file_search::evidence::identifier_flags(evidence.as_ref().unwrap(), commands);
+        let presence = |commands: &[String]| {
+            smcli_search::command_file_presence(commands, &directory, evidence.as_ref().unwrap())
+        };
+        let git = |commands: &[String]| {
+            smcli_search::command_git_activity(commands, &directory, evidence.as_ref().unwrap())
+        };
+        let idents = |commands: &[String]| {
+            crate::file_search::evidence::identifier_flags(evidence.as_ref().unwrap(), commands)
+        };
         let (index, recent) = self.suggestion_snapshot(&prefix, &context, pick)?;
         let mut response = ServiceResponse::new(true);
-        response.suggestions = Some(index.suggestions_with_evidence(&directory, &prefix, limit as usize, now(), Some(&context),
-            evidence.as_ref().map(|_| &presence as &dyn Fn(&[String]) -> Vec<bool>),
-            evidence.as_ref().map(|_| &idents as &dyn Fn(&[String]) -> Vec<(bool, bool)>),
-            evidence.as_ref().map(|_| &git as &dyn Fn(&[String]) -> Vec<f64>)));
+        response.suggestions = Some(
+            index.suggestions_with_evidence(
+                &directory,
+                &prefix,
+                limit as usize,
+                now(),
+                Some(&context),
+                evidence
+                    .as_ref()
+                    .map(|_| &presence as &dyn Fn(&[String]) -> Vec<bool>),
+                evidence
+                    .as_ref()
+                    .map(|_| &idents as &dyn Fn(&[String]) -> Vec<(bool, bool)>),
+                evidence
+                    .as_ref()
+                    .map(|_| &git as &dyn Fn(&[String]) -> Vec<f64>),
+            ),
+        );
         if let Some(recent) = recent {
-            response.recent_entries = Some(recent.iter().map(|key| smcli_core::entry::SearchEntry::from_key(key)).collect());
-            response.recent = Some(recent.iter().map(|key| smcli_core::entry::command_parts(key).0).collect());
+            response.recent_entries = Some(
+                recent
+                    .iter()
+                    .map(|key| smcli_core::entry::SearchEntry::from_key(key))
+                    .collect(),
+            );
+            response.recent = Some(
+                recent
+                    .iter()
+                    .map(|key| smcli_core::entry::command_parts(key).0)
+                    .collect(),
+            );
         }
         Ok(response)
     }
 
-    fn suggestion_snapshot(&self, prefix: &str, context: &RankingContext, pick: bool) -> Result<(SuggestionIndex, Option<Vec<String>>)> {
+    fn suggestion_snapshot(
+        &self,
+        prefix: &str,
+        context: &RankingContext,
+        pick: bool,
+    ) -> Result<(SuggestionIndex, Option<Vec<String>>)> {
         let mut state = self.lock();
         state.last_activity = Instant::now();
         let index = self.current_index(&mut state)?;
-        Ok((index.snapshot(prefix, Some(context)), pick.then(|| index.recent())))
+        Ok((
+            index.snapshot(prefix, Some(context)),
+            pick.then(|| index.recent()),
+        ))
     }
 
     /// Remembers which suggestion or search result the user chose for what they typed. Best effort for the picker.
-    fn select_command(&self, command: String, expanded_command: Option<String>, directory: String, mode: String, query: String, config: PathBuf) -> ServiceResponse {
+    fn select_command(
+        &self,
+        command: String,
+        expanded_command: Option<String>,
+        directory: String,
+        mode: String,
+        query: String,
+        config: PathBuf,
+    ) -> ServiceResponse {
         let command = smcli_core::entry::command_key(&command, expanded_command.as_deref());
         let mut state = self.lock();
         state.last_activity = Instant::now();
@@ -533,7 +751,9 @@ impl Service {
             let filter = CaptureFilter::new(&(SmcliConfig::load(&config)?))?;
             Self::refresh(&mut state)?;
             let time = now();
-            if self.history.record_pick(&query, &command, &mode, &directory, &filter, time, &state.db)? {
+            if self.history.record_pick(
+                &query, &command, &mode, &directory, &filter, time, &state.db,
+            )? {
                 state.data_version = data_version(&state.db)?;
                 if let Some(index) = state.index.as_mut() {
                     index.add_pick(&query, &command, time);
@@ -581,8 +801,11 @@ impl Service {
                 return Ok(Arc::clone(engine));
             }
             if state.model_lock.is_none() {
-                state.model_lock = Some(smcli_search::model_lock(&self.history, Duration::ZERO)?
-                    .ok_or_else(|| anyhow::anyhow!("the model is in use by smcli reindex or smcli init"))?);
+                state.model_lock = Some(
+                    smcli_search::model_lock(&self.history, Duration::ZERO)?.ok_or_else(|| {
+                        anyhow::anyhow!("the model is in use by smcli reindex or smcli init")
+                    })?,
+                );
             }
             let mut sync = self.command_sync.lock().unwrap_or_else(|e| e.into_inner());
             sync.index = None;
@@ -608,7 +831,10 @@ impl Service {
         let service = Arc::clone(self);
         std::thread::spawn(move || {
             let _searching = service.searching.lock();
-            let caller = CallerContext::from_request(&ServiceRequest::new(Operation::Search), &service.launch);
+            let caller = CallerContext::from_request(
+                &ServiceRequest::new(Operation::Search),
+                &service.launch,
+            );
             let _ = service.current_engine(&caller.config);
         });
     }
@@ -617,11 +843,34 @@ impl Service {
     fn search(&self, search: SearchQuery) -> ServiceResponse {
         let _searching = self.searching.lock().unwrap_or_else(|e| e.into_inner());
         self.touch();
-        let SearchQuery { query, directory, limit, filter, home, config, session, histfile, shell, path, ranking_off } = search;
-        let caller = self.caller(home, config, session.clone(), histfile, shell, path.clone(), ranking_off.clone());
+        let SearchQuery {
+            query,
+            directory,
+            limit,
+            filter,
+            home,
+            config,
+            session,
+            histfile,
+            shell,
+            path,
+            ranking_off,
+        } = search;
+        let caller = self.caller(
+            home,
+            config,
+            session.clone(),
+            histfile,
+            shell,
+            path.clone(),
+            ranking_off.clone(),
+        );
         let result = (|| -> Result<ServiceResponse> {
             let context = self.ranking_context(&directory, session.clone(), ranking_off.as_deref());
-            let project = context.project_root.clone().filter(|_| context.uses(Signal::Project));
+            let project = context
+                .project_root
+                .clone()
+                .filter(|_| context.uses(Signal::Project));
             let engine = self.current_engine(&caller.config)?;
             let signals = {
                 let mut state = self.lock();
@@ -634,7 +883,8 @@ impl Service {
                     ..Default::default()
                 };
                 if context.uses(Signal::Transition)
-                    && let Some(previous) = session.as_deref().and_then(|s| index.previous_command(s))
+                    && let Some(previous) =
+                        session.as_deref().and_then(|s| index.previous_command(s))
                 {
                     signals.followers = index.following(&previous);
                     signals.previous = Some(previous);
@@ -646,18 +896,41 @@ impl Service {
             let lock = engine.lock_index(20)?;
             // Read native history files and stats outside `state` so records don't wait on I/O.
             let kind = context.kind().map(String::from);
-            let (entries, programs) = self.current_corpus(&caller, &directory, project.as_deref(), kind.as_deref())?;
-            let evidence = FileSearch::root(&directory).and_then(|root| self.file_search.ready(&root))
+            let (entries, programs) =
+                self.current_corpus(&caller, &directory, project.as_deref(), kind.as_deref())?;
+            let evidence = FileSearch::root(&directory)
+                .and_then(|root| self.file_search.ready(&root))
                 .map(crate::file_search::evidence::IndexEvidence);
             // Bundled sources are fixed for this binary, so a cached index for this model is current; parsing them costs ~5MB per search.
-            let cached = self.command_sync.lock().unwrap_or_else(|e| e.into_inner()).index.clone()
-                .filter(|index| index.model == engine.potion.model_id() && index.directory == engine.directory);
-            let command_index = cached.or_else(|| smcli_search::commands::bundled_sources().map(|sources| {
-                let refs = smcli_search::commands::source_refs(&sources);
-                self.command_index_locked(&engine, &refs)
-            }));
-            let hits = engine.search_with_command_index(&query, &entries, limit as usize, &filter, Some(&programs), &signals, now(),
-                evidence.as_ref().map(|e| e as &dyn smcli_search::ProjectEvidence), lock.as_ref(), command_index.as_deref())?;
+            let cached = self
+                .command_sync
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .index
+                .clone()
+                .filter(|index| {
+                    index.model == engine.potion.model_id() && index.directory == engine.directory
+                });
+            let command_index = cached.or_else(|| {
+                smcli_search::commands::bundled_sources().map(|sources| {
+                    let refs = smcli_search::commands::source_refs(&sources);
+                    self.command_index_locked(&engine, &refs)
+                })
+            });
+            let hits = engine.search_with_command_index(
+                &query,
+                &entries,
+                limit as usize,
+                &filter,
+                Some(&programs),
+                &signals,
+                now(),
+                evidence
+                    .as_ref()
+                    .map(|e| e as &dyn smcli_search::ProjectEvidence),
+                lock.as_ref(),
+                command_index.as_deref(),
+            )?;
             let mut response = ServiceResponse::new(true);
             response.hits = Some(hits);
             Ok(response)
@@ -668,7 +941,16 @@ impl Service {
     /// The caller's view of the environment: its HISTFILE and SHELL pick the native history files.
     /// Copies of the corpus entries and programs, so the search runs outside `state`.
     // shortcut: copies the corpus per search; share it (Arc + copy-on-record) if it shows up in profiles.
-    fn caller(&self, home: Option<String>, config: PathBuf, session: Option<String>, histfile: Option<String>, shell: Option<String>, path: Option<String>, ranking_off: Option<String>) -> CallerContext {
+    fn caller(
+        &self,
+        home: Option<String>,
+        config: PathBuf,
+        session: Option<String>,
+        histfile: Option<String>,
+        shell: Option<String>,
+        path: Option<String>,
+        ranking_off: Option<String>,
+    ) -> CallerContext {
         let mut request = ServiceRequest::new(Operation::Search);
         request.home = home;
         request.config = Some(config.to_string_lossy().into_owned());
@@ -680,36 +962,65 @@ impl Service {
         CallerContext::from_request(&request, &self.launch)
     }
 
-    fn current_corpus(&self, caller: &CallerContext, directory: &str, project: Option<&str>, kind: Option<&str>)
-        -> Result<(HashMap<String, SearchEntry>, HashMap<String, HashSet<String>>)> {
+    fn current_corpus(
+        &self,
+        caller: &CallerContext,
+        directory: &str,
+        project: Option<&str>,
+        kind: Option<&str>,
+    ) -> Result<(
+        HashMap<String, SearchEntry>,
+        HashMap<String, HashSet<String>>,
+    )> {
         self.build_corpus(caller, directory, project, kind, || {})
     }
 
-    fn build_corpus(&self, caller: &CallerContext, directory: &str, project: Option<&str>, kind: Option<&str>, before_publish: impl FnOnce())
-        -> Result<(HashMap<String, SearchEntry>, HashMap<String, HashSet<String>>)> {
+    fn build_corpus(
+        &self,
+        caller: &CallerContext,
+        directory: &str,
+        project: Option<&str>,
+        kind: Option<&str>,
+        before_publish: impl FnOnce(),
+    ) -> Result<(
+        HashMap<String, SearchEntry>,
+        HashMap<String, HashSet<String>>,
+    )> {
         let files = history_files(caller.home(), &caller.native_env())?;
         let stamp: Vec<String> = files
             .iter()
             .map(|f| {
                 let meta = std::fs::metadata(&f.path).ok();
-                format!("{} {:?}", f.path.display(), meta.map(|m| (m.len(), m.mtime(), m.mtime_nsec(), m.dev(), m.ino())))
+                format!(
+                    "{} {:?}",
+                    f.path.display(),
+                    meta.map(|m| (m.len(), m.mtime(), m.mtime_nsec(), m.dev(), m.ino()))
+                )
             })
             .collect();
         let version = {
             let mut state = self.lock();
             Self::refresh(&mut state)?;
             if let Some(c) = state.corpus.as_ref().filter(|c| {
-                c.state.directory == directory && c.state.project.as_deref() == project && c.state.kind.as_deref() == kind && c.native == stamp
+                c.state.directory == directory
+                    && c.state.project.as_deref() == project
+                    && c.state.kind.as_deref() == kind
+                    && c.native == stamp
                     && c.built.elapsed() < Duration::from_secs(300)
             }) {
                 return Ok((c.state.entries.clone(), c.state.programs.clone()));
             }
             (state.data_version, state.history_revision)
         };
-        let native: Vec<String> =
-            files.iter().filter_map(|f| f.read().ok()).flat_map(|t| t.split('\n').map(String::from).collect::<Vec<_>>()).collect();
+        let native: Vec<String> = files
+            .iter()
+            .filter_map(|f| f.read().ok())
+            .flat_map(|t| t.split('\n').map(String::from).collect::<Vec<_>>())
+            .collect();
         let as_of = now();
-        let captured = self.history.command_stats(Some(directory), project, kind, as_of)?;
+        let captured = self
+            .history
+            .command_stats(Some(directory), project, kind, as_of)?;
         let mut corpus = CorpusState::new(captured, &native, directory, project, as_of);
         corpus.kind = kind.map(String::from);
         let copies = (corpus.entries.clone(), corpus.programs.clone());
@@ -718,7 +1029,11 @@ impl Service {
         Self::refresh(&mut state)?;
         // Never replace an updated cache with a snapshot taken before a committed record.
         if (state.data_version, state.history_revision) == version {
-            state.corpus = Some(SearchCorpus { native: stamp, built: Instant::now(), state: corpus });
+            state.corpus = Some(SearchCorpus {
+                native: stamp,
+                built: Instant::now(),
+                state: corpus,
+            });
         }
         Ok(copies)
     }
@@ -728,14 +1043,29 @@ impl Service {
 mod tests {
     use super::*;
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    struct Fixture { service: Arc<Service>, home: PathBuf }
+    struct Fixture {
+        service: Arc<Service>,
+        home: PathBuf,
+    }
     impl Fixture {
-        fn new() -> Self { Self::with_idle(Duration::from_secs(600)) }
+        fn new() -> Self {
+            Self::with_idle(Duration::from_secs(600))
+        }
         fn with_idle(idle: Duration) -> Self {
-            let home = std::env::temp_dir().join(format!("smcli-service-c-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let home = std::env::temp_dir().join(format!(
+                "smcli-service-c-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
             std::fs::create_dir_all(&home).unwrap();
             let history = CapturedHistory::new(home.join("history.db"));
-            let environment = HashMap::from([("HOME".into(), home.to_string_lossy().into_owned()), ("SMCLI_CONFIG".into(), home.join("config.toml").to_string_lossy().into_owned())]);
+            let environment = HashMap::from([
+                ("HOME".into(), home.to_string_lossy().into_owned()),
+                (
+                    "SMCLI_CONFIG".into(),
+                    home.join("config.toml").to_string_lossy().into_owned(),
+                ),
+            ]);
             let location = ServiceLocation::new(&history.path, &environment);
             let mut launch = LaunchSettings::from_env(&environment);
             launch.idle = idle;
@@ -753,13 +1083,21 @@ mod tests {
             let directory = self.home.join(name);
             std::fs::create_dir(&directory).unwrap();
             let files = Potion::model_files(None).unwrap();
-            for (source, name) in files.iter().zip(["config.json", "tokenizer.json", "model.safetensors"]) {
+            for (source, name) in
+                files
+                    .iter()
+                    .zip(["config.json", "tokenizer.json", "model.safetensors"])
+            {
                 std::fs::copy(source, directory.join(name)).unwrap();
             }
             directory
         }
         fn use_model(&self, directory: &Path) {
-            std::fs::write(self.home.join("config.toml"), format!("{{\"potionPath\":\"{}\"}}", directory.display())).unwrap();
+            std::fs::write(
+                self.home.join("config.toml"),
+                format!("{{\"potionPath\":\"{}\"}}", directory.display()),
+            )
+            .unwrap();
         }
         fn search(&self) -> ServiceResponse {
             let mut r = self.request(Operation::Search);
@@ -771,14 +1109,20 @@ mod tests {
         fn command_index(&self, sources: &[&dyn CommandSource]) -> Arc<CommandIndex> {
             let _searching = self.service.searching.lock().unwrap();
             let request = self.request(Operation::Embed);
-            let engine = self.service.current_engine(&self.config_path(&request)).unwrap();
+            let engine = self
+                .service
+                .current_engine(&self.config_path(&request))
+                .unwrap();
             self.service.command_index_locked(&engine, sources)
         }
         fn config_path(&self, request: &ServiceRequest) -> PathBuf {
             PathBuf::from(request.config.clone().unwrap())
         }
         fn as_record(&self, request: &ServiceRequest) -> RecordQuery {
-            match Request::try_from(request) { Ok(Request::Record(record)) => record, other => panic!("{other:?}") }
+            match Request::try_from(request) {
+                Ok(Request::Record(record)) => record,
+                other => panic!("{other:?}"),
+            }
         }
         fn as_caller(&self, request: &ServiceRequest) -> CallerContext {
             CallerContext::from_request(request, &self.service.launch)
@@ -801,7 +1145,11 @@ mod tests {
             assert_eq!(self.service.lock().history_revision, 1);
         }
     }
-    impl Drop for Fixture { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.home); } }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
 
     #[test]
     fn embed_returns_vector_and_command_index_name() {
@@ -817,7 +1165,13 @@ mod tests {
         assert!(vector.iter().all(|v| v.is_finite()));
         let sources = smcli_search::commands::bundled_sources().unwrap();
         let refs = smcli_search::commands::source_refs(&sources);
-        assert_eq!(response.model, Some(CommandIndex::new(engine.directory.clone(), engine.potion.clone(), &refs).index_name()));
+        assert_eq!(
+            response.model,
+            Some(
+                CommandIndex::new(engine.directory.clone(), engine.potion.clone(), &refs)
+                    .index_name()
+            )
+        );
     }
 
     #[test]
@@ -848,7 +1202,14 @@ mod tests {
     #[test]
     fn missing_config_is_bad_request() {
         let f = Fixture::new();
-        for op in [Operation::Record, Operation::Select, Operation::Search, Operation::Suggest, Operation::Pick, Operation::Embed] {
+        for op in [
+            Operation::Record,
+            Operation::Select,
+            Operation::Search,
+            Operation::Suggest,
+            Operation::Pick,
+            Operation::Embed,
+        ] {
             let mut request = ServiceRequest::new(op);
             request.directory = Some("/tmp".into());
             request.query = Some("x".into());
@@ -867,7 +1228,11 @@ mod tests {
     fn command_bridge_search_uses_current_index_without_building_it() {
         let f = Fixture::new();
         let histfile = f.home.join("bridge_history");
-        std::fs::write(&histfile, "git reset --soft HEAD~1\ngit status\ngit commit -m update\n").unwrap();
+        std::fs::write(
+            &histfile,
+            "git reset --soft HEAD~1\ngit status\ngit commit -m update\n",
+        )
+        .unwrap();
         let mut request = f.request(Operation::Search);
         request.query = Some("undo last commit".into());
         request.histfile = Some(histfile.to_string_lossy().into_owned());
@@ -877,16 +1242,30 @@ mod tests {
         let index = f.command_index(&refs);
         assert!(!index.path().exists());
         assert!(f.service.dispatch(&request).ok);
-        assert!(!index.path().exists(), "ordinary search never builds the command index");
-        index.add_all(&[smcli_core::command_source::CommandExample {
-            program: "git".into(), description: "undo last commit".into(),
-            template: "git reset --soft {{revision}}".into(), source: "fixture".into(),
-        }]).unwrap();
+        assert!(
+            !index.path().exists(),
+            "ordinary search never builds the command index"
+        );
+        index
+            .add_all(&[smcli_core::command_source::CommandExample {
+                program: "git".into(),
+                description: "undo last commit".into(),
+                template: "git reset --soft {{revision}}".into(),
+                source: "fixture".into(),
+            }])
+            .unwrap();
         let response = f.service.dispatch(&request);
         assert!(response.ok, "{response:?}");
         let hits = response.hits.unwrap();
         assert_eq!(hits[0].command, "git reset --soft HEAD~1");
-        assert!(hits[0].why.as_ref().unwrap().iter().any(|reason| reason == "command-index affinity"));
+        assert!(
+            hits[0]
+                .why
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|reason| reason == "command-index affinity")
+        );
         assert!(hits.iter().all(|hit| !hit.command.contains("{{")));
     }
 
@@ -906,9 +1285,24 @@ mod tests {
         request.limit = Some(10);
         let response = f.service.dispatch(&request);
         assert!(response.ok, "{response:?}");
-        let commands: Vec<_> = response.hits.unwrap().iter().map(|hit| hit.command.clone()).collect();
-        assert!(commands.iter().any(|command| command == "zzcaller-only-hist"), "{commands:?}");
-        assert!(commands.iter().all(|command| command != "zzlaunch-only-hist"), "{commands:?}");
+        let commands: Vec<_> = response
+            .hits
+            .unwrap()
+            .iter()
+            .map(|hit| hit.command.clone())
+            .collect();
+        assert!(
+            commands
+                .iter()
+                .any(|command| command == "zzcaller-only-hist"),
+            "{commands:?}"
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|command| command != "zzlaunch-only-hist"),
+            "{commands:?}"
+        );
         let _ = std::fs::remove_dir_all(caller);
     }
 
@@ -925,7 +1319,14 @@ mod tests {
         let response = f.service.dispatch(&r);
         assert!(response.ok, "{response:?}");
         assert!(response.embedding.is_none());
-        let index = f.service.command_sync.lock().unwrap().index.clone().unwrap();
+        let index = f
+            .service
+            .command_sync
+            .lock()
+            .unwrap()
+            .index
+            .clone()
+            .unwrap();
         assert!(index.path().exists());
         assert!(!index.programs().unwrap().contains("jq"));
         std::fs::write(bin.join("jq"), "").unwrap();
@@ -941,7 +1342,8 @@ mod tests {
         let f = Fixture::new();
         let _searching = f.service.searching.lock().unwrap();
         f.service.command_sync.lock().unwrap().running = true;
-        f.service.finish_sync(String::new(), f.config_path(&f.request(Operation::Record)));
+        f.service
+            .finish_sync(String::new(), f.config_path(&f.request(Operation::Record)));
         let sync = f.service.command_sync.lock().unwrap();
         assert!(!sync.running);
         assert!(sync.index.is_none());
@@ -960,9 +1362,18 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let background = Arc::clone(&service);
         let sync_request = r.clone();
-        let sync = std::thread::spawn(move || background.finish_sync(String::new(), PathBuf::from(sync_request.config.clone().unwrap())));
-        let embed = std::thread::spawn(move || { tx.send(service.dispatch(&r)).unwrap(); });
-        let response = rx.recv_timeout(Duration::from_secs(30)).expect("embed deadlocked with sync");
+        let sync = std::thread::spawn(move || {
+            background.finish_sync(
+                String::new(),
+                PathBuf::from(sync_request.config.clone().unwrap()),
+            )
+        });
+        let embed = std::thread::spawn(move || {
+            tx.send(service.dispatch(&r)).unwrap();
+        });
+        let response = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("embed deadlocked with sync");
         assert!(response.ok, "{response:?}");
         embed.join().unwrap();
         sync.join().unwrap();
@@ -971,7 +1382,9 @@ mod tests {
     #[test]
     fn load_engine_refuses_while_model_lock_held() {
         let f = Fixture::new();
-        let lock = smcli_search::model_lock(&f.service.history, Duration::ZERO).unwrap().unwrap();
+        let lock = smcli_search::model_lock(&f.service.history, Duration::ZERO)
+            .unwrap()
+            .unwrap();
         let mut r = f.request(Operation::Embed);
         r.query = Some("list files".into());
         let response = f.service.dispatch(&r);
@@ -985,7 +1398,11 @@ mod tests {
         drop(lock);
         r.op = Operation::Embed;
         assert!(f.service.dispatch(&r).ok);
-        assert!(smcli_search::model_lock(&f.service.history, Duration::ZERO).unwrap().is_none());
+        assert!(
+            smcli_search::model_lock(&f.service.history, Duration::ZERO)
+                .unwrap()
+                .is_none()
+        );
         // A reload must reuse the process's descriptor, rather than conflict with its own lock.
         f.service.lock().engine = None;
         assert!(f.service.dispatch(&r).ok);
@@ -998,28 +1415,65 @@ mod tests {
         r.query = Some("list files".into());
         let first = f.service.dispatch(&r);
         assert!(first.ok, "{first:?}");
-        let old = Arc::downgrade(f.service.command_sync.lock().unwrap().index.as_ref().unwrap());
+        let old = Arc::downgrade(
+            f.service
+                .command_sync
+                .lock()
+                .unwrap()
+                .index
+                .as_ref()
+                .unwrap(),
+        );
         let model = f.copy_model("other-model");
         let tokenizer = model.join("tokenizer.json");
         let text = std::fs::read_to_string(&tokenizer).unwrap();
-        std::fs::write(&tokenizer, text.replace("\"max_length\":512", "\"max_length\":513")).unwrap();
+        std::fs::write(
+            &tokenizer,
+            text.replace("\"max_length\":512", "\"max_length\":513"),
+        )
+        .unwrap();
         f.use_model(&model);
         {
             let mut sync = f.service.command_sync.lock().unwrap();
             sync.known.insert("stale".into());
             sync.last_path = Some("stale".into());
         }
-        f.service.load_engine(&f.config_path(&r), || {
-            assert!(old.upgrade().is_none(), "old command index retains its model");
-            let sync = f.service.command_sync.lock().unwrap();
-            assert!(sync.known.is_empty());
-            assert!(sync.last_path.is_none());
-        }).unwrap();
+        f.service
+            .load_engine(&f.config_path(&r), || {
+                assert!(
+                    old.upgrade().is_none(),
+                    "old command index retains its model"
+                );
+                let sync = f.service.command_sync.lock().unwrap();
+                assert!(sync.known.is_empty());
+                assert!(sync.last_path.is_none());
+            })
+            .unwrap();
         let second = f.service.dispatch(&r);
         assert!(second.ok, "{second:?}");
         assert_ne!(first.model, second.model);
-        assert_eq!(second.model, Some(f.service.command_sync.lock().unwrap().index.as_ref().unwrap().index_name()));
-        let old = Arc::downgrade(f.service.command_sync.lock().unwrap().index.as_ref().unwrap());
+        assert_eq!(
+            second.model,
+            Some(
+                f.service
+                    .command_sync
+                    .lock()
+                    .unwrap()
+                    .index
+                    .as_ref()
+                    .unwrap()
+                    .index_name()
+            )
+        );
+        let old = Arc::downgrade(
+            f.service
+                .command_sync
+                .lock()
+                .unwrap()
+                .index
+                .as_ref()
+                .unwrap(),
+        );
         std::fs::write(f.home.join("config.toml"), "{}").unwrap();
         let third = f.service.dispatch(&r);
         assert!(third.ok, "{third:?}");
@@ -1035,7 +1489,9 @@ mod tests {
         let (server, client) = UnixStream::pair().unwrap();
         f.service.reject_busy(server);
         let mut line = String::new();
-        std::io::BufReader::new(client).read_line(&mut line).unwrap();
+        std::io::BufReader::new(client)
+            .read_line(&mut line)
+            .unwrap();
         let response: ServiceResponse = decode_line(line.as_bytes()).unwrap();
         assert!(!response.ok);
         assert_eq!(response.build, f.service.build);
@@ -1065,7 +1521,9 @@ mod tests {
     #[test]
     fn admission_is_bounded_and_released_on_drop() {
         let f = Fixture::new();
-        let mut guards: Vec<_> = (0..MAX_CONNECTIONS).map(|_| Leave::admit(Arc::clone(&f.service)).unwrap()).collect();
+        let mut guards: Vec<_> = (0..MAX_CONNECTIONS)
+            .map(|_| Leave::admit(Arc::clone(&f.service)).unwrap())
+            .collect();
         assert!(Leave::admit(Arc::clone(&f.service)).is_none());
         drop(guards.pop());
         assert!(Leave::admit(Arc::clone(&f.service)).is_some());
@@ -1081,7 +1539,15 @@ mod tests {
         r.mode = Some("grep".into());
         r.query = Some("AKIAIOSFODNN7EXAMPLE".into());
         f.service.file_search.select(&r);
-        let count = || f.service.lock().db.query_row("SELECT count(*) FROM file_selections", [], |row| row.get::<_, i64>(0)).unwrap();
+        let count = || {
+            f.service
+                .lock()
+                .db
+                .query_row("SELECT count(*) FROM file_selections", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
         assert_eq!(count(), 0);
         std::fs::write(f.home.join("config.toml"), r#"{"cwdFilter":[".*"]}"#).unwrap();
         r.query = Some("ordinary".into());
@@ -1107,13 +1573,21 @@ mod tests {
         let refs = smcli_search::commands::source_refs(&sources);
         // Pre-existing index with one program, so discovery adds incrementally instead of waiting for a full build.
         let index = f.command_index(&refs);
-        index.add("tar", &CommandIndex::gather(&refs, "tar", platform).expect("tar examples")).unwrap();
+        index
+            .add(
+                "tar",
+                &CommandIndex::gather(&refs, "tar", platform).expect("tar examples"),
+            )
+            .unwrap();
         // A fake jq executable on the request's PATH.
         let bin = f.home.join("bin");
         std::fs::create_dir(&bin).unwrap();
         std::fs::write(bin.join("jq"), "").unwrap();
         std::fs::set_permissions(bin.join("jq"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(CommandIndex::gather(&refs, "jq", platform).is_some(), "test needs jq pages in the bundled tldr");
+        assert!(
+            CommandIndex::gather(&refs, "jq", platform).is_some(),
+            "test needs jq pages in the bundled tldr"
+        );
         let mut r = f.request(Operation::Record);
         r.event = Some("12345678-89ab-4cde-8012-3456789abcde".into());
         r.command = Some("jq . file.json".into());
@@ -1123,14 +1597,17 @@ mod tests {
         smcli_core::caller::CallerContext::from_env(&HashMap::from([
             ("HOME".into(), f.home.to_string_lossy().into_owned()),
             ("PATH".into(), bin.to_string_lossy().into_owned()),
-        ])).apply(&mut r);
+        ]))
+        .apply(&mut r);
         f.service.record(f.as_record(&r)).unwrap();
         // The sync thread finishes: jq examples land in the index (what bare `@@` reads).
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             {
                 let sync = f.service.command_sync.lock().unwrap();
-                if sync.known.contains("jq") && sync.last_path.as_deref() == Some(bin.to_string_lossy().as_ref()) {
+                if sync.known.contains("jq")
+                    && sync.last_path.as_deref() == Some(bin.to_string_lossy().as_ref())
+                {
                     break;
                 }
             }
@@ -1151,7 +1628,12 @@ mod tests {
         let sources = smcli_search::commands::bundled_sources().expect("bundled tldr data");
         let refs = smcli_search::commands::source_refs(&sources);
         let index = f.command_index(&refs);
-        index.add("tar", &CommandIndex::gather(&refs, "tar", platform).expect("tar examples")).unwrap();
+        index
+            .add(
+                "tar",
+                &CommandIndex::gather(&refs, "tar", platform).expect("tar examples"),
+            )
+            .unwrap();
         let bin = f.home.join("bin");
         std::fs::create_dir(&bin).unwrap();
         std::fs::write(bin.join("jq"), "").unwrap();
@@ -1179,18 +1661,24 @@ mod tests {
         assert!(index.examples("jq").unwrap().is_some());
         // Uninstall: the exe is gone. A record with a different PATH re-triggers the sync.
         std::fs::remove_file(bin.join("jq")).unwrap();
-        record("52345678-89ab-4cde-8012-3456789abcde", &format!("{bin_path}:"));
+        record(
+            "52345678-89ab-4cde-8012-3456789abcde",
+            &format!("{bin_path}:"),
+        );
         // Poll only the sync state: the index file is single-open, so reading it here would
         // race the sync thread's open and fail the sync.
         let changed = format!("{bin_path}:");
         loop {
-            if f.service.command_sync.lock().unwrap().last_path.as_deref() == Some(changed.as_str()) {
+            if f.service.command_sync.lock().unwrap().last_path.as_deref() == Some(changed.as_str())
+            {
                 break;
             }
             assert!(Instant::now() < deadline, "sync did not run");
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(index.examples("jq").unwrap().is_some() && index.examples("tar").unwrap().is_some());
+        assert!(
+            index.examples("jq").unwrap().is_some() && index.examples("tar").unwrap().is_some()
+        );
     }
 
     /// A program no source has examples for is remembered: a repeat capture writes nothing to the index.
@@ -1202,12 +1690,21 @@ mod tests {
         let sources = smcli_search::commands::bundled_sources().expect("bundled tldr data");
         let refs = smcli_search::commands::source_refs(&sources);
         let index = f.command_index(&refs);
-        index.add("tar", &CommandIndex::gather(&refs, "tar", platform).expect("tar examples")).unwrap();
+        index
+            .add(
+                "tar",
+                &CommandIndex::gather(&refs, "tar", platform).expect("tar examples"),
+            )
+            .unwrap();
         assert!(CommandIndex::gather(&refs, "zzz-smcli-noexamples", platform).is_none());
         let bin = f.home.join("bin");
         std::fs::create_dir(&bin).unwrap();
         std::fs::write(bin.join("zzz-smcli-noexamples"), "").unwrap();
-        std::fs::set_permissions(bin.join("zzz-smcli-noexamples"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            bin.join("zzz-smcli-noexamples"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         let record = |event: &str| {
             let mut r = f.request(Operation::Record);
             r.event = Some(event.into());
@@ -1221,10 +1718,19 @@ mod tests {
         record("22345678-89ab-4cde-8012-3456789abcde");
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            if f.service.command_sync.lock().unwrap().known.contains("zzz-smcli-noexamples") {
+            if f.service
+                .command_sync
+                .lock()
+                .unwrap()
+                .known
+                .contains("zzz-smcli-noexamples")
+            {
                 break;
             }
-            assert!(Instant::now() < deadline, "sync did not remember the empty program");
+            assert!(
+                Instant::now() < deadline,
+                "sync did not remember the empty program"
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(index.examples("zzz-smcli-noexamples").unwrap().is_none());
@@ -1232,7 +1738,10 @@ mod tests {
         let modified = std::fs::metadata(index.path()).unwrap().modified().unwrap();
         record("32345678-89ab-4cde-8012-3456789abcde");
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(std::fs::metadata(index.path()).unwrap().modified().unwrap(), modified);
+        assert_eq!(
+            std::fs::metadata(index.path()).unwrap().modified().unwrap(),
+            modified
+        );
     }
 
     #[test]
@@ -1251,10 +1760,22 @@ mod tests {
                     wait.recv().unwrap();
                     vec![false; commands.len()]
                 };
-                snapshot.suggestions_with_evidence(&directory, "", 10, now(), Some(&context), Some(&slow), None, None);
+                snapshot.suggestions_with_evidence(
+                    &directory,
+                    "",
+                    10,
+                    now(),
+                    Some(&context),
+                    Some(&slow),
+                    None,
+                    None,
+                );
             });
             started.recv_timeout(Duration::from_secs(2)).unwrap();
-            scope.spawn(|| { f.record(); done.send(()).unwrap(); });
+            scope.spawn(|| {
+                f.record();
+                done.send(()).unwrap();
+            });
             let completed = recorded.recv_timeout(Duration::from_secs(2)).is_ok();
             release.send(()).unwrap();
             completed
@@ -1267,9 +1788,14 @@ mod tests {
         let f = Fixture::new();
         let r = f.request(Operation::Search);
         let directory = r.directory.as_deref().unwrap();
-        f.service.build_corpus(&f.as_caller(&r), directory, None, None, || f.record()).unwrap();
+        f.service
+            .build_corpus(&f.as_caller(&r), directory, None, None, || f.record())
+            .unwrap();
         assert!(f.service.lock().corpus.is_none());
-        let (entries, _) = f.service.current_corpus(&f.as_caller(&r), directory, None, None).unwrap();
+        let (entries, _) = f
+            .service
+            .current_corpus(&f.as_caller(&r), directory, None, None)
+            .unwrap();
         assert!(entries.contains_key("echo concurrent"));
     }
 
@@ -1283,13 +1809,31 @@ mod tests {
         r.histfile = Some(path.to_string_lossy().into_owned());
         r.login_shell = Some("/bin/zsh".into());
         let directory = r.directory.as_deref().unwrap();
-        f.service.current_corpus(&f.as_caller(&r), directory, None, None).unwrap();
+        f.service
+            .current_corpus(&f.as_caller(&r), directory, None, None)
+            .unwrap();
         std::fs::write(&path, "echo after!\n").unwrap();
-        let seconds = first.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let nanos = (first.duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() + 1) % 1_000_000_000;
+        let seconds = first
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let nanos = (first
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+            + 1)
+            % 1_000_000_000;
         let modified = std::time::UNIX_EPOCH + Duration::new(seconds, nanos);
-        std::fs::File::options().write(true).open(&path).unwrap().set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
-        let (entries, _) = f.service.current_corpus(&f.as_caller(&r), directory, None, None).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let (entries, _) = f
+            .service
+            .current_corpus(&f.as_caller(&r), directory, None, None)
+            .unwrap();
         assert!(entries.contains_key("echo after!"));
         assert!(!entries.contains_key("echo before"));
     }
@@ -1299,9 +1843,18 @@ mod tests {
         let f = Fixture::new();
         f.search();
         let old = f.service.lock().engine.as_ref().unwrap().1.clone();
-        std::fs::write(f.home.join("config.toml"), "{\"historyFilter\":[\"secret\"]}").unwrap();
+        std::fs::write(
+            f.home.join("config.toml"),
+            "{\"historyFilter\":[\"secret\"]}",
+        )
+        .unwrap();
         f.search();
-        let current = f.service.load_engine(&f.config_path(&f.request(Operation::Search)), || panic!("unnecessary reload")).unwrap();
+        let current = f
+            .service
+            .load_engine(&f.config_path(&f.request(Operation::Search)), || {
+                panic!("unnecessary reload")
+            })
+            .unwrap();
         assert!(Arc::ptr_eq(&old, &current));
     }
 
@@ -1336,7 +1889,10 @@ mod tests {
         let model = f.copy_model("same-model");
         f.use_model(&model);
         f.search();
-        assert!(Arc::ptr_eq(&old, &f.service.lock().engine.as_ref().unwrap().1));
+        assert!(Arc::ptr_eq(
+            &old,
+            &f.service.lock().engine.as_ref().unwrap().1
+        ));
     }
 
     #[test]
@@ -1362,8 +1918,12 @@ mod tests {
         assert_eq!(changed.len(), text.len());
         std::thread::sleep(Duration::from_millis(10));
         std::fs::write(&tokenizer, changed).unwrap();
-        std::fs::File::options().write(true).open(&tokenizer).unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(modified)).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&tokenizer)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
         let after = FileStats::read(&files).unwrap();
         assert_eq!(before.0[1].2, after.0[1].2);
         assert_eq!((before.0[1].3, before.0[1].4), (after.0[1].3, after.0[1].4));
@@ -1376,8 +1936,19 @@ mod tests {
         r.query = Some("list files".into());
         let response = f.service.dispatch(&r);
         assert!(response.ok, "{response:?}");
-        let model = smcli_search::configured_model(&f.home, &HashMap::from([("SMCLI_CONFIG".into(), f.home.join("config.toml").to_string_lossy().into_owned())])).unwrap();
-        let reader = CommandIndex::reader(smcli_search::setup::index_directory(&f.service.history), model, &refs);
+        let model = smcli_search::configured_model(
+            &f.home,
+            &HashMap::from([(
+                "SMCLI_CONFIG".into(),
+                f.home.join("config.toml").to_string_lossy().into_owned(),
+            )]),
+        )
+        .unwrap();
+        let reader = CommandIndex::reader(
+            smcli_search::setup::index_directory(&f.service.history),
+            model,
+            &refs,
+        );
         assert_eq!(response.model, Some(reader.index_name()));
     }
 
@@ -1386,12 +1957,14 @@ mod tests {
         let f = Fixture::new();
         let model = f.copy_model("model");
         f.use_model(&model);
-        f.service.load_engine(&f.config_path(&f.request(Operation::Search)), || {
-            let tokenizer = model.join("tokenizer.json");
-            let mut text = std::fs::read_to_string(&tokenizer).unwrap();
-            text.push('\n');
-            std::fs::write(tokenizer, text).unwrap();
-        }).unwrap();
+        f.service
+            .load_engine(&f.config_path(&f.request(Operation::Search)), || {
+                let tokenizer = model.join("tokenizer.json");
+                let mut text = std::fs::read_to_string(&tokenizer).unwrap();
+                text.push('\n');
+                std::fs::write(tokenizer, text).unwrap();
+            })
+            .unwrap();
         assert!(f.service.lock().engine.is_none());
         f.search();
         assert!(f.service.lock().engine.is_some());
@@ -1401,10 +1974,12 @@ mod tests {
     fn engine_reload_does_not_hold_state_lock() {
         let f = Fixture::new();
         let r = f.request(Operation::Search);
-        f.service.load_engine(&f.config_path(&r), || {
-            assert!(f.service.state.try_lock().is_ok());
-            f.record();
-        }).unwrap();
+        f.service
+            .load_engine(&f.config_path(&r), || {
+                assert!(f.service.state.try_lock().is_ok());
+                f.record();
+            })
+            .unwrap();
         assert!(f.service.lock().engine.is_some());
     }
 
@@ -1414,39 +1989,88 @@ mod tests {
         let r = f.request(Operation::Search);
         let old = f.service.current_engine(&f.config_path(&r)).unwrap();
         f.service.lock().engine.as_mut().unwrap().0.identity = "stale".into();
-        f.service.load_engine(&f.config_path(&r), || assert!(f.service.lock().engine.is_none())).unwrap();
-        assert!(!Arc::ptr_eq(&old, &f.service.lock().engine.as_ref().unwrap().1));
+        f.service
+            .load_engine(&f.config_path(&r), || {
+                assert!(f.service.lock().engine.is_none())
+            })
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &old,
+            &f.service.lock().engine.as_ref().unwrap().1
+        ));
     }
 
     #[test]
     fn suggest_includes_project_test_candidates() {
         let f = Fixture::new();
         let project = tempfile::tempdir().unwrap();
-        std::fs::write(project.path().join("Cargo.toml"), "[package]\nname = \"testproj\"\nversion = \"0.1.0\"\n").unwrap();
+        std::fs::write(
+            project.path().join("Cargo.toml"),
+            "[package]\nname = \"testproj\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
         std::fs::create_dir(project.path().join("src")).unwrap();
-        std::fs::write(project.path().join("src/lib.rs"), "#[test]\nfn my_test() {}\n").unwrap();
-        assert!(std::process::Command::new("git").args(["init", "-q"]).arg(project.path()).status().unwrap().success());
+        std::fs::write(
+            project.path().join("src/lib.rs"),
+            "#[test]\nfn my_test() {}\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(project.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         let mut warm = f.request(Operation::Files);
         warm.directory = Some(project.path().to_string_lossy().into_owned());
         warm.query = Some("".into());
         assert!(f.service.file_search.files(&warm).ok);
         let root = FileSearch::root(project.path().to_str().unwrap()).unwrap();
-        let test_candidates = crate::test_candidates::test_candidates(&f.service.file_search, &root);
-        assert!(test_candidates.iter().any(|c| c.command == "cargo test my_test"), "{test_candidates:?}");
+        let test_candidates =
+            crate::test_candidates::test_candidates(&f.service.file_search, &root);
+        assert!(
+            test_candidates
+                .iter()
+                .any(|c| c.command == "cargo test my_test"),
+            "{test_candidates:?}"
+        );
         let mut r = f.request(Operation::Suggest);
         r.directory = Some(project.path().to_string_lossy().into_owned());
         r.prefix = Some("cargo test".into());
-        let response = f.service.ranked(f.as_ranked(&r).0, f.as_ranked(&r).1).unwrap();
+        let response = f
+            .service
+            .ranked(f.as_ranked(&r).0, f.as_ranked(&r).1)
+            .unwrap();
         let suggestions: Vec<_> = response.suggestions.unwrap();
-        let test = suggestions.iter().find(|s| s.command == "cargo test my_test").expect("{suggestions:?}");
-        assert!(test.why.as_ref().unwrap().iter().any(|w| w == "project test"), "{test:?}");
+        let test = suggestions
+            .iter()
+            .find(|s| s.command == "cargo test my_test")
+            .expect("{suggestions:?}");
+        assert!(
+            test.why
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|w| w == "project test"),
+            "{test:?}"
+        );
         let mut off = f.request(Operation::Suggest);
         off.directory = Some(project.path().to_string_lossy().into_owned());
         off.prefix = Some("cargo test".into());
         off.ranking_off = Some("tests".into());
-        let response = f.service.ranked(f.as_ranked(&off).0, f.as_ranked(&off).1).unwrap();
+        let response = f
+            .service
+            .ranked(f.as_ranked(&off).0, f.as_ranked(&off).1)
+            .unwrap();
         let suggestions: Vec<_> = response.suggestions.unwrap();
-        assert!(!suggestions.iter().any(|s| s.command == "cargo test my_test"), "{suggestions:?}");
+        assert!(
+            !suggestions
+                .iter()
+                .any(|s| s.command == "cargo test my_test"),
+            "{suggestions:?}"
+        );
     }
 }
 
@@ -1454,7 +2078,12 @@ struct Leave(Arc<Service>);
 
 impl Leave {
     fn admit(service: Arc<Service>) -> Option<Self> {
-        service.active.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_CONNECTIONS).then_some(n + 1)).ok()?;
+        service
+            .active
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < MAX_CONNECTIONS).then_some(n + 1)
+            })
+            .ok()?;
         Some(Self(service))
     }
 }
@@ -1495,7 +2124,12 @@ mod signals {
         }
         for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
             // SAFETY: `stop` has the signature signal(3) expects.
-            unsafe { libc::signal(signal, stop as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+            unsafe {
+                libc::signal(
+                    signal,
+                    stop as extern "C" fn(libc::c_int) as libc::sighandler_t,
+                )
+            };
         }
     }
 }

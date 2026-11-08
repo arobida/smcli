@@ -62,14 +62,25 @@ pub struct LaunchSettings {
 
 impl LaunchSettings {
     pub fn from_env(env: &HashMap<String, String>) -> Self {
-        let idle = env.get("SMCLI_SERVICE_IDLE").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(1800.0);
-        let fff_idle = env.get("SMCLI_FFF_IDLE").and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(600.0);
+        let idle = env
+            .get("SMCLI_SERVICE_IDLE")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(1800.0);
+        let fff_idle = env
+            .get("SMCLI_FFF_IDLE")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(600.0);
         let home = PathBuf::from(env.get("HOME").cloned().unwrap_or_else(|| "/".into()));
         Self {
             config: SmcliConfig::location(&home, env),
             home,
             idle: Duration::from_secs_f64(idle),
-            fff_max: env.get("SMCLI_FFF_MAX").and_then(|v| v.parse().ok()).unwrap_or(4),
+            fff_max: env
+                .get("SMCLI_FFF_MAX")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4),
             fff_idle: Duration::from_secs_f64(fff_idle),
         }
     }
@@ -79,9 +90,15 @@ impl CallerContext {
     /// Same inputs for the request and the in-process fallback.
     pub fn from_env(env: &HashMap<String, String>) -> Self {
         let home = home_dir(env);
-        let cwd = env.get("PWD").filter(|p| p.starts_with('/')).cloned().unwrap_or_else(|| {
-            std::env::current_dir().map(|d| d.to_string_lossy().into_owned()).unwrap_or_else(|_| "/".into())
-        });
+        let cwd = env
+            .get("PWD")
+            .filter(|p| p.starts_with('/'))
+            .cloned()
+            .unwrap_or_else(|| {
+                std::env::current_dir()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "/".into())
+            });
         Self {
             home: home.clone(),
             config: SmcliConfig::location(&home, env),
@@ -90,27 +107,47 @@ impl CallerContext {
             histfile: env.get("HISTFILE").filter(|s| !s.is_empty()).cloned(),
             shell: env.get("SHELL").filter(|s| !s.is_empty()).cloned(),
             path: service_protocol::shell_path_snapshot(env.get("PATH").map(String::as_str)),
-            ranking_off: env.get("SMCLI_RANKING_OFF").filter(|s| s.len() <= 256).cloned(),
+            ranking_off: env
+                .get("SMCLI_RANKING_OFF")
+                .filter(|s| s.len() <= 256)
+                .cloned(),
         }
     }
 
     /// Rebuilds the context a client applied. Missing home uses the service's launch home.
     pub fn from_request(request: &ServiceRequest, launch: &LaunchSettings) -> Self {
-        let caller_home = request.home.as_deref().filter(|p| !p.is_empty()).map(PathBuf::from);
-        let config = request.config.as_deref().filter(|p| !p.is_empty()).map(PathBuf::from).unwrap_or_else(|| match &caller_home {
-            Some(home) => SmcliConfig::location(home, &HashMap::new()),
-            None => launch.config.clone(),
-        });
+        let caller_home = request
+            .home
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from);
+        let config = request
+            .config
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| match &caller_home {
+                Some(home) => SmcliConfig::location(home, &HashMap::new()),
+                None => launch.config.clone(),
+            });
         let home = caller_home.unwrap_or_else(|| launch.home.clone());
         Self {
             home,
             config,
-            cwd: request.cwd.clone().filter(|p| !p.is_empty()).unwrap_or_else(|| "/".into()),
+            cwd: request
+                .cwd
+                .clone()
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| "/".into()),
             session: request.session.clone().filter(|s| !s.is_empty()),
             histfile: request.histfile.clone().filter(|s| !s.is_empty()),
             shell: request.login_shell.clone().filter(|s| !s.is_empty()),
             path: service_protocol::shell_path_snapshot(request.shell_path.as_deref()),
-            ranking_off: request.ranking_off.as_ref().filter(|s| !s.is_empty() && s.len() <= 256).cloned(),
+            ranking_off: request
+                .ranking_off
+                .as_ref()
+                .filter(|s| !s.is_empty() && s.len() <= 256)
+                .cloned(),
         }
     }
 
@@ -180,9 +217,18 @@ mod tests {
     fn caller_fields_table_is_applied() {
         let caller = CallerContext::from_env(&env());
         for op in [
-            Operation::Ping, Operation::Record, Operation::Suggest, Operation::Pick, Operation::Search,
-            Operation::Context, Operation::Files, Operation::Grep, Operation::Complete, Operation::Select,
-            Operation::Shutdown, Operation::Embed,
+            Operation::Ping,
+            Operation::Record,
+            Operation::Suggest,
+            Operation::Pick,
+            Operation::Search,
+            Operation::Context,
+            Operation::Files,
+            Operation::Grep,
+            Operation::Complete,
+            Operation::Select,
+            Operation::Shutdown,
+            Operation::Embed,
         ] {
             let mut request = ServiceRequest::new(op);
             request.home = Some("sentinel-home".into());
@@ -204,14 +250,46 @@ mod tests {
             }
             caller.apply(&mut request);
             let carries = |field| listed.contains(&field);
-            assert_eq!(request.home.as_deref() == Some("/caller-home"), carries(CallerField::Home), "{op:?}");
-            assert_eq!(request.config.as_deref() == Some("/caller-home/config.json"), carries(CallerField::Config), "{op:?}");
-            assert_eq!(request.cwd.as_deref() == Some("/caller-home/proj"), carries(CallerField::Cwd), "{op:?}");
-            assert_eq!(request.session.as_deref() == Some("sess"), carries(CallerField::Session), "{op:?}");
-            assert_eq!(request.histfile.as_deref() == Some("/caller-home/.zsh_history"), carries(CallerField::Histfile), "{op:?}");
-            assert_eq!(request.login_shell.as_deref() == Some("/bin/zsh"), carries(CallerField::Shell), "{op:?}");
-            assert_eq!(request.shell_path.as_deref() == Some("/usr/bin:/caller/bin"), carries(CallerField::Path), "{op:?}");
-            assert_eq!(request.ranking_off.as_deref() == Some("path,files"), carries(CallerField::RankingOff), "{op:?}");
+            assert_eq!(
+                request.home.as_deref() == Some("/caller-home"),
+                carries(CallerField::Home),
+                "{op:?}"
+            );
+            assert_eq!(
+                request.config.as_deref() == Some("/caller-home/config.json"),
+                carries(CallerField::Config),
+                "{op:?}"
+            );
+            assert_eq!(
+                request.cwd.as_deref() == Some("/caller-home/proj"),
+                carries(CallerField::Cwd),
+                "{op:?}"
+            );
+            assert_eq!(
+                request.session.as_deref() == Some("sess"),
+                carries(CallerField::Session),
+                "{op:?}"
+            );
+            assert_eq!(
+                request.histfile.as_deref() == Some("/caller-home/.zsh_history"),
+                carries(CallerField::Histfile),
+                "{op:?}"
+            );
+            assert_eq!(
+                request.login_shell.as_deref() == Some("/bin/zsh"),
+                carries(CallerField::Shell),
+                "{op:?}"
+            );
+            assert_eq!(
+                request.shell_path.as_deref() == Some("/usr/bin:/caller/bin"),
+                carries(CallerField::Path),
+                "{op:?}"
+            );
+            assert_eq!(
+                request.ranking_off.as_deref() == Some("path,files"),
+                carries(CallerField::RankingOff),
+                "{op:?}"
+            );
             assert_eq!(request.shell.as_deref(), Some("recorded-shell"), "{op:?}");
         }
     }
@@ -235,9 +313,15 @@ mod tests {
 
     #[test]
     fn launch_config_honors_xdg_config_home() {
-        let env = HashMap::from([("HOME".to_string(), "/h".to_string()), ("XDG_CONFIG_HOME".to_string(), "/x".to_string())]);
+        let env = HashMap::from([
+            ("HOME".to_string(), "/h".to_string()),
+            ("XDG_CONFIG_HOME".to_string(), "/x".to_string()),
+        ]);
         let launch = LaunchSettings::from_env(&env);
         assert_eq!(launch.config, PathBuf::from("/x/smcli/config.json"));
-        assert_eq!(CallerContext::from_request(&ServiceRequest::new(Operation::Search), &launch).config, launch.config);
+        assert_eq!(
+            CallerContext::from_request(&ServiceRequest::new(Operation::Search), &launch).config,
+            launch.config
+        );
     }
 }

@@ -4,7 +4,7 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// Where a service for one history database listens. Each database gets its own socket, so tests and
 /// `SMCLI_DB` users never reach a service that owns another file.
@@ -17,9 +17,7 @@ pub struct ServiceLocation {
 
 impl ServiceLocation {
     pub fn new(database: &Path, environment: &HashMap<String, String>) -> Self {
-        let absolute = |key: &str| {
-            environment.get(key).filter(|path| path.starts_with('/'))
-        };
+        let absolute = |key: &str| environment.get(key).filter(|path| path.starts_with('/'));
         let directory = if let Some(path) = absolute("SMCLI_RUNTIME_DIR") {
             PathBuf::from(path)
         } else if let Some(path) = absolute("XDG_RUNTIME_DIR") {
@@ -51,9 +49,11 @@ impl ServiceLocation {
     /// owned by us, with no group or other access.
     pub fn prepare(&self) -> Result<()> {
         if let Err(error) = DirBuilder::new().mode(0o700).create(&self.directory)
-            && error.kind() != io::ErrorKind::AlreadyExists {
-                return Err(error).with_context(|| format!("Cannot create {}", self.directory.display()));
-            }
+            && error.kind() != io::ErrorKind::AlreadyExists
+        {
+            return Err(error)
+                .with_context(|| format!("Cannot create {}", self.directory.display()));
+        }
         let private = fs::symlink_metadata(&self.directory).is_ok_and(|info| {
             info.is_dir() && info.uid() == unsafe { libc::getuid() } && info.mode() & 0o077 == 0
         });
@@ -84,12 +84,15 @@ pub fn build(executable: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
     #[test]
     fn fingerprint_known_path() {
         // Independently computed with Python's bytewise FNV-1a and a 64-bit mask.
-        assert_eq!(ServiceLocation::fingerprint("/tmp/history.db"), "e325ec6f80fdf18c");
+        assert_eq!(
+            ServiceLocation::fingerprint("/tmp/history.db"),
+            "e325ec6f80fdf18c"
+        );
         assert_eq!(ServiceLocation::fingerprint(""), "cbf29ce484222325");
     }
 
@@ -97,17 +100,41 @@ mod tests {
     fn socket_locations() {
         let uid = unsafe { libc::getuid() };
         let cases = [
-            (vec![("SMCLI_RUNTIME_DIR", "/runtime"), ("XDG_RUNTIME_DIR", "/xdg")], "/runtime".to_owned()),
-            (vec![("SMCLI_RUNTIME_DIR", "relative"), ("XDG_RUNTIME_DIR", "/xdg")], "/xdg/smcli".to_owned()),
-            (vec![("XDG_RUNTIME_DIR", "relative"), ("TMPDIR", "/temporary")], format!("/temporary/smcli-{uid}")),
+            (
+                vec![
+                    ("SMCLI_RUNTIME_DIR", "/runtime"),
+                    ("XDG_RUNTIME_DIR", "/xdg"),
+                ],
+                "/runtime".to_owned(),
+            ),
+            (
+                vec![
+                    ("SMCLI_RUNTIME_DIR", "relative"),
+                    ("XDG_RUNTIME_DIR", "/xdg"),
+                ],
+                "/xdg/smcli".to_owned(),
+            ),
+            (
+                vec![("XDG_RUNTIME_DIR", "relative"), ("TMPDIR", "/temporary")],
+                format!("/temporary/smcli-{uid}"),
+            ),
             (vec![("TMPDIR", "relative")], format!("/tmp/smcli-{uid}")),
         ];
         for (variables, base) in cases {
-            let environment = variables.into_iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect();
+            let environment = variables
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .collect();
             let location = ServiceLocation::new(Path::new("/tmp/history.db"), &environment);
             assert_eq!(location.directory, Path::new(&base));
-            assert_eq!(location.socket, Path::new(&base).join("service-e325ec6f80fdf18c.sock"));
-            assert_eq!(location.lock, Path::new(&base).join("service-e325ec6f80fdf18c.lock"));
+            assert_eq!(
+                location.socket,
+                Path::new(&base).join("service-e325ec6f80fdf18c.sock")
+            );
+            assert_eq!(
+                location.lock,
+                Path::new(&base).join("service-e325ec6f80fdf18c.lock")
+            );
         }
     }
 
@@ -115,7 +142,10 @@ mod tests {
     fn prepare_checks_private_directory() {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("runtime");
-        let environment = HashMap::from([("SMCLI_RUNTIME_DIR".to_owned(), directory.to_str().unwrap().to_owned())]);
+        let environment = HashMap::from([(
+            "SMCLI_RUNTIME_DIR".to_owned(),
+            directory.to_str().unwrap().to_owned(),
+        )]);
         let location = ServiceLocation::new(Path::new("/tmp/history.db"), &environment);
         location.prepare().unwrap();
         location.prepare().unwrap();
@@ -136,13 +166,20 @@ mod tests {
         let executable = temporary.path().join("binary");
         fs::write(&executable, "abc").unwrap();
         let file = fs::File::open(&executable).unwrap();
-        file.set_times(fs::FileTimes::new().set_modified(
-            std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123),
-        )).unwrap();
+        file.set_times(
+            fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::new(1_700_000_000, 123)),
+        )
+        .unwrap();
         let alias = temporary.path().join("alias");
         symlink(&executable, &alias).unwrap();
-        assert_eq!(build(&alias), Some(format!("{}|1700000000.123|3", fs::canonicalize(&executable).unwrap().display())));
+        assert_eq!(
+            build(&alias),
+            Some(format!(
+                "{}|1700000000.123|3",
+                fs::canonicalize(&executable).unwrap().display()
+            ))
+        );
         assert_eq!(build(&temporary.path().join("missing")), None);
     }
-
 }

@@ -20,7 +20,7 @@ ansi = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
 with tempfile.TemporaryDirectory(prefix="smcli-alias.", dir="/tmp") as directory:
     root = Path(directory)
     env = {k: v for k, v in os.environ.items() if not k.startswith("SMCLI_") and not k.startswith("XDG_")}
-    env.update(HOME=directory, PWD=directory, HISTFILE="", SMCLI_DB=str(root / "history.db"),
+    env.update(HOME=directory, PWD=directory, HISTFILE="", SMCLI_DB=str(root / ".local/state/test-db/history.db"),
                SMCLI_RUNTIME_DIR=str(root / "run"), SMCLI_CONFIG=str(root / "config.json"), TERM="xterm-256color")
     marker = root / "must-not-execute"
     expansion = f"touch {marker}"

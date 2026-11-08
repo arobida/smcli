@@ -90,7 +90,9 @@ impl CapturedHistory {
             })? {
                 let (id, query, root, cwd) = row?;
                 // Blank-query picks still carry a root; cwd filters must remove them too. NULL cwd predates v9.
-                if !filter.allows(&query, &root) || cwd.is_some_and(|cwd| !filter.allows(&query, &cwd)) {
+                if !filter.allows(&query, &root)
+                    || cwd.is_some_and(|cwd| !filter.allows(&query, &cwd))
+                {
                     file_picks.push(id);
                 }
             }
@@ -247,14 +249,23 @@ mod tests {
             ..Default::default()
         })?;
         let failed = c.prune(&filter, false, || bail!("boom")).unwrap_err();
-        let committed = failed.downcast_ref::<PruneError>().expect("post-commit error");
+        let committed = failed
+            .downcast_ref::<PruneError>()
+            .expect("post-commit error");
         assert_eq!(committed.removed_commands, 1);
         assert_eq!(committed.backup.as_deref(), Some(backup.as_path()));
         let message = failed.to_string();
-        assert!(message.contains("index cleanup failed") && message.contains("boom"), "{message}");
-        assert!(!message.contains("migration backup"), "caller prints the warning; {message}");
+        assert!(
+            message.contains("index cleanup failed") && message.contains("boom"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("migration backup"),
+            "caller prints the warning; {message}"
+        );
         assert_eq!(
-            c.open_connection()?.query_row("SELECT count(*) FROM commands", [], |r| r.get::<_, i64>(0))?,
+            c.open_connection()?
+                .query_row("SELECT count(*) FROM commands", [], |r| r.get::<_, i64>(0))?,
             0
         );
         Ok(())
@@ -310,10 +321,16 @@ mod tests {
             "INSERT INTO file_selections(root,path,mode,query,cwd,selected_at) VALUES
                ('/ok','a','files','q','/private',1.0), ('/ok','b','files','q','/ok',2.0), ('/ok','c','files','q',NULL,3.0)",
         )?;
-        let filter = CaptureFilter::new(&SmcliConfig { cwd_filter: Some(vec!["/private".into()]), ..Default::default() })?;
+        let filter = CaptureFilter::new(&SmcliConfig {
+            cwd_filter: Some(vec!["/private".into()]),
+            ..Default::default()
+        })?;
         c.prune(&filter, false, || Ok(()))?;
-        let paths: Vec<String> = c.open_connection()?.prepare("SELECT path FROM file_selections ORDER BY id")?
-            .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let paths: Vec<String> = c
+            .open_connection()?
+            .prepare("SELECT path FROM file_selections ORDER BY id")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
         assert_eq!(paths, ["b", "c"]);
         Ok(())
     }

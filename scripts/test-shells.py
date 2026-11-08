@@ -232,10 +232,14 @@ def variants():
     return found, skipped
 
 
+# Under ~/.local/state like the real default: fff's home index skips it, so it never opens the live database.
+DB = ".local/state/test-db/captured.db"
+
+
 def new_environment(home, runtime, variant, **extra):
-    env = dict(os.environ, HOME=str(home), HISTFILE=str(home / "native"), SMCLI_DB=str(home / "captured.db"),
+    env = dict(os.environ, HOME=str(home), HISTFILE=str(home / "native"), SMCLI_DB=str(home / DB),
                SMCLI_RUNTIME_DIR=runtime, SMCLI_CONFIG=str(home / "config.json"), SMCLI_SYNC="1",
-               SHELL=variant.path, TERM="dumb", SMCLI_CANARY="canary-secret-4242", XDG_CONFIG_HOME=str(home / "config"), XDG_STATE_HOME=str(home / "state"))
+               SHELL=variant.path, TERM="dumb", SMCLI_CANARY="canary-secret-4242", XDG_CONFIG_HOME=str(home / "config"), XDG_STATE_HOME=str(home / ".local/state"))
     for name in ("SMCLI_SERVICE", "SMCLI_BASH_HOOK", "SMCLI_NO_KEYS", "SMCLI_EXTRA_KEYS", "SMCLI_SERVICE_BIN", "ZDOTDIR"):
         env.pop(name, None)
     env.update(variant.extra_env)
@@ -365,11 +369,11 @@ def check(t, variant, env, home, directory):
     # A recording error must be visible without changing the command's status.
     # (The service would keep working on its open file, so this goes straight to the database.)
     t.send("set -gx SMCLI_SERVICE 0" if kind == "fish" else "export SMCLI_SERVICE=0")
-    os.chmod(home / "captured.db", 0o644)
+    os.chmod(home / DB, 0o644)
     output = t.send("false")
     assert "metadata was not saved" in output, output
     assert last_prompt_status(variant, home) == "1"
-    os.chmod(home / "captured.db", 0o600)
+    os.chmod(home / DB, 0o600)
     t.send("set -e SMCLI_SERVICE" if kind == "fish" else "unset SMCLI_SERVICE")
 
     # Multiline commands and Unicode are stored whole.
@@ -436,7 +440,7 @@ def rest(t, variant, env, home, log):
     kind = variant.kind
     # No environment is sent along with a command.
     t.send("printf '%s' \"$SMCLI_CANARY\" > /dev/null")
-    database = (home / "captured.db").read_bytes() + (home / "captured.db-wal").read_bytes() if (home / "captured.db-wal").exists() else (home / "captured.db").read_bytes()
+    database = (home / DB).read_bytes() + (home / (DB + "-wal")).read_bytes() if (home / (DB + "-wal")).exists() else (home / DB).read_bytes()
     assert b"canary-secret-4242" not in database, "environment leaked into the database"
 
     # Default mode records in the background: the prompt returns before the write finishes.
@@ -1252,6 +1256,7 @@ def run_at_completion(variant):
             t.type("printf '%s\\n' @zz")
             t.type("\t")
             t.until_text("zz space.txt")
+            t.type("\r")
             t.type("\n")
             out = t.until_prompt()
             assert "zz space.txt" in out, (variant.label, out)
@@ -1375,12 +1380,17 @@ for name in skipped:
     print(f"SKIPPED (not installed): {name}")
 
 
+def isolated(home, **extra):
+    """The caller's environment with a throwaway HOME and none of its SMCLI_/XDG_ settings, so no check reaches real data."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("SMCLI_", "XDG_"))}
+    return dict(env, HOME=str(home), **extra)
+
+
 # --- Without shells ---------------------------------------------------------------------------------------------------
 
 with tempfile.TemporaryDirectory() as directory:
     runtime = tempfile.mkdtemp(prefix="smcli-sh.", dir="/tmp")
-    env = dict(os.environ, SMCLI_DB=str(Path(directory) / "concurrent.db"), SMCLI_RUNTIME_DIR=runtime)
-    env.pop("SMCLI_SERVICE", None)
+    env = isolated(directory, SMCLI_DB=str(Path(directory) / ".local/state/test-db/concurrent.db"), SMCLI_RUNTIME_DIR=runtime)
     try:
         writers = [subprocess.Popen([binary, "record", "bash", f"s{i}", directory, "0", str(1_700_000_000 + i), "", "", "echo shared"], env=env)
                    for i in range(12)]
@@ -1417,7 +1427,7 @@ with tempfile.TemporaryDirectory() as directory:
     source = root / "source.json"
     source.write_text("[]")
     for destination in (native, linked):
-        env = dict(os.environ, HOME=directory, HISTFILE=str(native), SMCLI_DB=str(destination), SMCLI_SERVICE="0")
+        env = isolated(directory, HISTFILE=str(native), SMCLI_DB=str(destination), SMCLI_SERVICE="0")
         result = subprocess.run([binary, "import", str(source)], env=env, capture_output=True, text=True)
         assert result.returncode != 0 and "HISTFILE" in result.stderr, result
         assert native.read_bytes() == b"", destination
@@ -1425,7 +1435,7 @@ with tempfile.TemporaryDirectory() as directory:
 
 # fish and bash both parse what shell-init prints.
 with tempfile.TemporaryDirectory() as directory:
-    env = dict(os.environ, HOME=directory)
+    env = isolated(directory)
     for kind, check_command in (("bash", ["/bin/bash", "-n"]), ("zsh", [shutil.which("zsh") or "/bin/zsh", "-n"]),
                                 ("fish", [shutil.which("fish") or "", "--no-execute"])):
         if not check_command[0]:

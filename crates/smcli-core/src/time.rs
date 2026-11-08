@@ -3,7 +3,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn now() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 // Howard Hinnant's days_from_civil / civil_from_days.
@@ -33,8 +36,17 @@ pub fn format_iso8601(epoch: f64, fractional: bool) -> String {
     let secs = millis.div_euclid(1000);
     let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
     let t = secs.rem_euclid(86_400);
-    let base = format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}", t / 3600, t % 3600 / 60, t % 60);
-    if fractional { format!("{base}.{:03}Z", millis.rem_euclid(1000)) } else { format!("{base}Z") }
+    let base = format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}",
+        t / 3600,
+        t % 3600 / 60,
+        t % 60
+    );
+    if fractional {
+        format!("{base}.{:03}Z", millis.rem_euclid(1000))
+    } else {
+        format!("{base}Z")
+    }
 }
 
 fn days_in_month(y: i64, mo: i64) -> i64 {
@@ -61,10 +73,23 @@ pub fn parse_iso8601(text: &str) -> Option<f64> {
         }
         s.parse().ok()
     };
-    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+    {
         return None;
     }
-    let (y, mo, d, h, mi, s) = (num(0..4)?, num(5..7)?, num(8..10)?, num(11..13)?, num(14..16)?, num(17..19)?);
+    let (y, mo, d, h, mi, s) = (
+        num(0..4)?,
+        num(5..7)?,
+        num(8..10)?,
+        num(11..13)?,
+        num(14..16)?,
+        num(17..19)?,
+    );
     if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || s > 60 {
         return None;
     }
@@ -80,9 +105,16 @@ pub fn parse_iso8601(text: &str) -> Option<f64> {
     }
     let offset = match rest {
         "Z" => 0,
-        _ if rest.len() == 6 && (rest.starts_with('+') || rest.starts_with('-')) && rest.as_bytes()[3] == b':' => {
+        _ if rest.len() == 6
+            && (rest.starts_with('+') || rest.starts_with('-'))
+            && rest.as_bytes()[3] == b':' =>
+        {
             let digits2 = |s: &str| -> Option<i64> {
-                if s.len() == 2 && s.bytes().all(|c| c.is_ascii_digit()) { s.parse().ok() } else { None }
+                if s.len() == 2 && s.bytes().all(|c| c.is_ascii_digit()) {
+                    s.parse().ok()
+                } else {
+                    None
+                }
             };
             let (oh, om) = (digits2(&rest[1..3])?, digits2(&rest[4..6])?);
             if oh > 23 || om > 59 {
@@ -102,11 +134,20 @@ mod tests {
 
     #[test]
     fn round_trip_iso8601() {
-        assert_eq!(format_iso8601(1_700_000_000.0, false), "2023-11-14T22:13:20Z");
-        assert_eq!(format_iso8601(1_700_000_000.25, true), "2023-11-14T22:13:20.250Z");
+        assert_eq!(
+            format_iso8601(1_700_000_000.0, false),
+            "2023-11-14T22:13:20Z"
+        );
+        assert_eq!(
+            format_iso8601(1_700_000_000.25, true),
+            "2023-11-14T22:13:20.250Z"
+        );
         assert_eq!(format_iso8601(0.0, false), "1970-01-01T00:00:00Z");
         assert_eq!(parse_iso8601("2023-11-14T22:13:20Z"), Some(1_700_000_000.0));
-        assert_eq!(parse_iso8601("2023-11-14T23:13:20.5+01:00"), Some(1_700_000_000.5));
+        assert_eq!(
+            parse_iso8601("2023-11-14T23:13:20.5+01:00"),
+            Some(1_700_000_000.5)
+        );
         assert_eq!(parse_iso8601("2024-02-29T00:00:00Z"), Some(1_709_164_800.0));
         assert_eq!(parse_iso8601("2023-11-14"), None);
     }

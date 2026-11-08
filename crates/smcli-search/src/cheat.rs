@@ -35,10 +35,19 @@ pub fn bundled_dir() -> Option<PathBuf> {
 
 /// Parse cheat.jsonl: header, then one example per command line. Every entry is platform `common`.
 pub fn load(dir: &Path) -> Result<Corpus> {
-    let text = std::fs::read_to_string(dir.join("cheat.jsonl")).context("failed to read cheat.jsonl")?;
+    let text =
+        std::fs::read_to_string(dir.join("cheat.jsonl")).context("failed to read cheat.jsonl")?;
     let mut lines = text.lines().filter(|line| !line.trim().is_empty());
-    let header: DataHeader = serde_json::from_str(lines.next().ok_or_else(|| anyhow::anyhow!("cheat.jsonl is empty"))?)?;
-    ensure!(header.version == 1, "unsupported cheat data version {}", header.version);
+    let header: DataHeader = serde_json::from_str(
+        lines
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("cheat.jsonl is empty"))?,
+    )?;
+    ensure!(
+        header.version == 1,
+        "unsupported cheat data version {}",
+        header.version
+    );
     ensure!(!header.cheat_commit.is_empty(), "cheat commit is empty");
     let mut entries = Vec::new();
     for line in lines {
@@ -49,7 +58,10 @@ pub fn load(dir: &Path) -> Result<Corpus> {
             template: entry.template,
         });
     }
-    Ok(Corpus { commit: header.cheat_commit, entries })
+    Ok(Corpus {
+        commit: header.cheat_commit,
+        entries,
+    })
 }
 
 /// cheat/cheatsheets as a `CommandSource`: the fallback behind tldr. Templates keep their
@@ -66,7 +78,11 @@ impl CheatSource {
 
     /// All programs with a sheet.
     pub fn programs(&self) -> HashSet<String> {
-        self.corpus.entries.iter().map(|entry| entry.program.clone()).collect()
+        self.corpus
+            .entries
+            .iter()
+            .map(|entry| entry.program.clone())
+            .collect()
     }
 }
 
@@ -79,7 +95,11 @@ impl smcli_core::command_source::CommandSource for CheatSource {
         &self.corpus.commit
     }
 
-    fn examples(&self, program: &str, _platform: &str) -> Vec<smcli_core::command_source::CommandExample> {
+    fn examples(
+        &self,
+        program: &str,
+        _platform: &str,
+    ) -> Vec<smcli_core::command_source::CommandExample> {
         self.corpus
             .entries
             .iter()
@@ -107,7 +127,10 @@ mod tests {
     #[test]
     fn load_parses_header_and_entries() {
         let root = tempfile::tempdir().unwrap();
-        fixture(root.path(), "{\"version\": 1, \"cheat_commit\": \"abc123\", \"license\": \"CC0-1.0\"}\n{\"program\": \"fd\", \"platform\": \"common\", \"description\": \"Find files\", \"template\": \"fd pattern\"}\n");
+        fixture(
+            root.path(),
+            "{\"version\": 1, \"cheat_commit\": \"abc123\", \"license\": \"CC0-1.0\"}\n{\"program\": \"fd\", \"platform\": \"common\", \"description\": \"Find files\", \"template\": \"fd pattern\"}\n",
+        );
         let corpus = load(root.path()).unwrap();
         assert_eq!(corpus.commit, "abc123");
         assert_eq!(corpus.entries.len(), 1);
@@ -117,7 +140,10 @@ mod tests {
     #[test]
     fn source_serves_only_its_programs() {
         let root = tempfile::tempdir().unwrap();
-        fixture(root.path(), "{\"version\": 1, \"cheat_commit\": \"abc123\", \"license\": \"CC0-1.0\"}\n{\"program\": \"fd\", \"platform\": \"common\", \"description\": \"Find files\", \"template\": \"fd pattern\"}\n");
+        fixture(
+            root.path(),
+            "{\"version\": 1, \"cheat_commit\": \"abc123\", \"license\": \"CC0-1.0\"}\n{\"program\": \"fd\", \"platform\": \"common\", \"description\": \"Find files\", \"template\": \"fd pattern\"}\n",
+        );
         let source = CheatSource::new(root.path()).unwrap();
         assert_eq!(source.name(), "cheat");
         assert_eq!(source.version(), "abc123");

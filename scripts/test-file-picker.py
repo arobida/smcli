@@ -83,7 +83,7 @@ def run(shell, path):
     for cmd in (["init", "-q"], ["add", "."], ["-c", "user.name=t", "-c", "user.email=t@e.x", "commit", "-q", "-m", "one"]):
         subprocess.run(["git", "-C", repo, *cmd], check=True, capture_output=True)
     args, extra = shell_setup(shell, home)
-    env = dict(os.environ, HOME=home, TERM="xterm", SMCLI_DB=f"{home}/h.db", SMCLI_RUNTIME_DIR=f"{home}/run",
+    env = dict(os.environ, HOME=home, TERM="xterm", SMCLI_DB=f"{home}/.local/state/test-db/h.db", SMCLI_RUNTIME_DIR=f"{home}/run",
                SMCLI_CONFIG=f"{home}/config.json", **extra)
     env.pop("SMCLI_SERVICE", None)
     subprocess.run([binary, "record", shell, repo, "0", "cp notes/a.md backup/", "test-session"], env=env, check=True)

@@ -75,6 +75,7 @@ pub struct FileQuery {
     pub cwd: String,
     pub path: Option<String>,
     pub home: Option<PathBuf>,
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -84,6 +85,7 @@ pub struct Complete {
     pub limit: i64,
     pub dirs_only: bool,
     pub home: Option<PathBuf>,
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -121,7 +123,12 @@ fn reject(message: impl Into<String>) -> (FailureCode, String) {
 }
 
 fn config_of(request: &ServiceRequest) -> Result<PathBuf, (FailureCode, String)> {
-    request.config.as_deref().filter(|p| !p.is_empty()).map(PathBuf::from).ok_or_else(|| reject("config is required"))
+    request
+        .config
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| reject("config is required"))
 }
 
 fn absolute<'a>(value: Option<&'a str>) -> Option<&'a str> {
@@ -132,7 +139,15 @@ impl TryFrom<&ServiceRequest> for Request {
     type Error = (FailureCode, String);
 
     fn try_from(request: &ServiceRequest) -> Result<Self, Self::Error> {
-        if matches!(request.op, Operation::Record | Operation::Select | Operation::Search | Operation::Suggest | Operation::Pick | Operation::Embed) {
+        if matches!(
+            request.op,
+            Operation::Record
+                | Operation::Select
+                | Operation::Search
+                | Operation::Suggest
+                | Operation::Pick
+                | Operation::Embed
+        ) {
             let _ = config_of(request)?;
         }
         Ok(match request.op {
@@ -143,7 +158,9 @@ impl TryFrom<&ServiceRequest> for Request {
             Operation::Pick => Self::Pick(ranked(request, true)?),
             Operation::Search => Self::Search(search(request)?),
             Operation::Context => Self::Context(Context {
-                directory: absolute(request.directory.as_deref()).ok_or_else(|| reject("context needs an absolute directory."))?.to_owned(),
+                directory: absolute(request.directory.as_deref())
+                    .ok_or_else(|| reject("context needs an absolute directory."))?
+                    .to_owned(),
             }),
             Operation::Files => Self::Files(file_query(request, false)?),
             Operation::Grep => Self::Grep(file_query(request, true)?),
@@ -163,7 +180,9 @@ fn record(request: &ServiceRequest) -> Result<Record, (FailureCode, String)> {
         request.directory.clone(),
         request.exit_code,
     ) else {
-        return Err(reject("record needs event, command, shell, session, directory and exitCode."));
+        return Err(reject(
+            "record needs event, command, shell, session, directory and exitCode.",
+        ));
     };
     Ok(Record {
         event,
@@ -194,14 +213,21 @@ fn ranked(request: &ServiceRequest, pick: bool) -> Result<Ranked, (FailureCode, 
     Ok(Ranked {
         directory: directory.to_owned(),
         limit,
-        prefix: if pick { String::new() } else { request.prefix.clone().unwrap_or_default() },
+        prefix: if pick {
+            String::new()
+        } else {
+            request.prefix.clone().unwrap_or_default()
+        },
         session: request.session.clone(),
         ranking_off: request.ranking_off.clone(),
     })
 }
 
 fn search(request: &ServiceRequest) -> Result<Search, (FailureCode, String)> {
-    let (Some(query), Some(directory)) = (request.query.clone(), absolute(request.directory.as_deref()).map(str::to_owned)) else {
+    let (Some(query), Some(directory)) = (
+        request.query.clone(),
+        absolute(request.directory.as_deref()).map(str::to_owned),
+    ) else {
         return Err(reject("search needs a query and an absolute directory."));
     };
     let limit = request.limit.unwrap_or(10);
@@ -225,8 +251,13 @@ fn search(request: &ServiceRequest) -> Result<Search, (FailureCode, String)> {
 
 fn file_query(request: &ServiceRequest, grep: bool) -> Result<FileQuery, (FailureCode, String)> {
     let name = if grep { "grep" } else { "files" };
-    let (Some(directory), Some(query)) = (absolute(request.directory.as_deref()), request.query.as_deref()) else {
-        return Err(reject(format!("{name} needs a query and an absolute directory.")));
+    let (Some(directory), Some(query)) = (
+        absolute(request.directory.as_deref()),
+        request.query.as_deref(),
+    ) else {
+        return Err(reject(format!(
+            "{name} needs a query and an absolute directory."
+        )));
     };
     let limit = request.limit.unwrap_or(50);
     if !(1..=500).contains(&limit) {
@@ -243,12 +274,24 @@ fn file_query(request: &ServiceRequest, grep: bool) -> Result<FileQuery, (Failur
         scope: request.scope == Some(true),
         cwd,
         path: request.path.clone(),
-        home: request.home.clone().filter(|p| !p.is_empty()).map(PathBuf::from),
+        home: request
+            .home
+            .clone()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from),
+        config: request
+            .config
+            .clone()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from),
     })
 }
 
 fn complete(request: &ServiceRequest) -> Result<Complete, (FailureCode, String)> {
-    let (Some(directory), Some(query)) = (absolute(request.directory.as_deref()), request.query.as_deref()) else {
+    let (Some(directory), Some(query)) = (
+        absolute(request.directory.as_deref()),
+        request.query.as_deref(),
+    ) else {
         return Err(reject("complete needs a query and an absolute directory."));
     };
     let limit = request.limit.unwrap_or(50);
@@ -260,20 +303,45 @@ fn complete(request: &ServiceRequest) -> Result<Complete, (FailureCode, String)>
         query: query.to_owned(),
         limit,
         dirs_only: request.dirs_only.unwrap_or(false),
-        home: request.home.clone().filter(|p| !p.is_empty()).map(PathBuf::from),
+        home: request
+            .home
+            .clone()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from),
+        config: request
+            .config
+            .clone()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from),
     })
 }
 
 fn select(request: &ServiceRequest) -> Result<Select, (FailureCode, String)> {
     let config = config_of(request)?;
     if matches!(request.mode.as_deref(), Some("suggest" | "search")) {
-        let (Some(command), Some(directory), Some(mode)) = (request.command.as_deref(), request.directory.as_deref(), request.mode.as_deref()) else {
-            return Err(reject("select needs a command, a directory and a mode of suggest or search."));
+        let (Some(command), Some(directory), Some(mode)) = (
+            request.command.as_deref(),
+            request.directory.as_deref(),
+            request.mode.as_deref(),
+        ) else {
+            return Err(reject(
+                "select needs a command, a directory and a mode of suggest or search.",
+            ));
         };
-        if !directory.starts_with('/') || command.is_empty() || command.len() > 1 << 16 || is_smcli_command(command) {
-            return Err(reject("select needs a command, a directory and a mode of suggest or search."));
+        if !directory.starts_with('/')
+            || command.is_empty()
+            || command.len() > 1 << 16
+            || is_smcli_command(command)
+        {
+            return Err(reject(
+                "select needs a command, a directory and a mode of suggest or search.",
+            ));
         }
-        if request.expanded_command.as_deref().is_some_and(|e| !safe_expansion(e) || is_smcli_command(e)) {
+        if request
+            .expanded_command
+            .as_deref()
+            .is_some_and(|e| !safe_expansion(e) || is_smcli_command(e))
+        {
             return Err(reject("Invalid expanded command."));
         }
         return Ok(Select::Command {
@@ -281,19 +349,35 @@ fn select(request: &ServiceRequest) -> Result<Select, (FailureCode, String)> {
             expanded_command: request.expanded_command.clone(),
             directory: directory.to_owned(),
             mode: mode.to_owned(),
-            query: request.query.as_deref().unwrap_or("").chars().take(1000).collect(),
+            query: request
+                .query
+                .as_deref()
+                .unwrap_or("")
+                .chars()
+                .take(1000)
+                .collect(),
             config,
         });
     }
     let (Some(directory), Some(path), Some(mode)) = (
         absolute(request.directory.as_deref()),
         request.path.as_deref(),
-        request.mode.as_deref().filter(|m| matches!(*m, "files" | "grep")),
+        request
+            .mode
+            .as_deref()
+            .filter(|m| matches!(*m, "files" | "grep")),
     ) else {
-        return Err(reject("select needs a directory, a path and a mode of files or grep."));
+        return Err(reject(
+            "select needs a directory, a path and a mode of files or grep.",
+        ));
     };
     let path = path.trim_end_matches('/');
-    if path.is_empty() || path.starts_with('/') || path.len() > 4096 || path.contains('\0') || path.split('/').any(|p| p == ".." || p.is_empty()) {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.len() > 4096
+        || path.contains('\0')
+        || path.split('/').any(|p| p == ".." || p.is_empty())
+    {
         return Err(reject("select needs a path relative to the searched root."));
     }
     Ok(Select::File {
@@ -301,7 +385,13 @@ fn select(request: &ServiceRequest) -> Result<Select, (FailureCode, String)> {
         directory: directory.to_owned(),
         path: path.to_owned(),
         mode: mode.to_owned(),
-        query: request.query.as_deref().unwrap_or("").chars().take(1000).collect(),
+        query: request
+            .query
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(1000)
+            .collect(),
         scope: request.scope == Some(true),
         config,
     })

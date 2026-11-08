@@ -15,7 +15,10 @@ pub(crate) fn complete_local(cwd: &Path, word: &str, dirs_only: bool, limit: usi
     let mut hits: Vec<String> = if word.is_empty() {
         paths
     } else if glob {
-        paths.into_iter().filter(|p| smcli_core::parse::glob_match(word, p)).collect()
+        paths
+            .into_iter()
+            .filter(|p| smcli_core::parse::glob_match(word, p))
+            .collect()
     } else {
         paths.into_iter().filter(|p| subsequence(word, p)).collect()
     };
@@ -26,14 +29,25 @@ pub(crate) fn complete_local(cwd: &Path, word: &str, dirs_only: bool, limit: usi
     }
     hits.truncate(limit);
     // Directories end in `/`, as the service's do.
-    hits.into_iter().map(|p| if cwd.join(&p).is_dir() { p + "/" } else { p }).collect()
+    hits.into_iter()
+        .map(|p| if cwd.join(&p).is_dir() { p + "/" } else { p })
+        .collect()
 }
 
-fn walk(cwd: &Path, dir: &Path, depth: usize, dirs_only: bool, n: &mut usize, out: &mut Vec<String>) {
+fn walk(
+    cwd: &Path,
+    dir: &Path,
+    depth: usize,
+    dirs_only: bool,
+    n: &mut usize,
+    out: &mut Vec<String>,
+) {
     if depth >= MAX_DEPTH || *n >= MAX_ENTRIES {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         if *n >= MAX_ENTRIES {
             return;
@@ -66,7 +80,8 @@ fn rank(word: &str, path: &str) -> (u8, usize) {
 
 fn subsequence(q: &str, s: &str) -> bool {
     let mut chars = s.chars();
-    q.chars().all(|qc| chars.any(|sc| sc.eq_ignore_ascii_case(&qc)))
+    q.chars()
+        .all(|qc| chars.any(|sc| sc.eq_ignore_ascii_case(&qc)))
 }
 
 #[cfg(test)]
@@ -139,10 +154,17 @@ mod tests {
         let nested = complete_local(&dir, "src/**/*.rs", false, 8);
         assert_eq!(nested, ["src/lib.rs", "src/main.rs"]);
         assert!(complete_local(&dir, "*.md", false, 8).contains(&"README.md".into()));
-        assert!(!complete_local(&dir, "*.rs", false, 8).iter().any(|p| p.contains('/')));
+        assert!(
+            !complete_local(&dir, "*.rs", false, 8)
+                .iter()
+                .any(|p| p.contains('/'))
+        );
         let ranking = complete_local(&dir, "crates/**/*.rs", false, 8);
         assert!(ranking.contains(&"crates/smcli-search/tests/ranking.rs".into()));
-        assert_eq!(complete_local(&dir, "src/main.r[s]", false, 8), ["src/main.rs"]);
+        assert_eq!(
+            complete_local(&dir, "src/main.r[s]", false, 8),
+            ["src/main.rs"]
+        );
         assert_eq!(complete_local(&dir, "src/??b.rs", false, 8), ["src/lib.rs"]);
         assert_eq!(complete_local(&dir, "", false, 3).len(), 3);
         std::fs::remove_dir_all(dir).unwrap();

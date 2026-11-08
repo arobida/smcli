@@ -11,7 +11,11 @@ pub fn home_dir(environment: &HashMap<String, String>) -> PathBuf {
         .get("HOME")
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| crate::passwd::current_user().map(|(_, home)| PathBuf::from(home)).unwrap_or_else(|| PathBuf::from("/")))
+        .unwrap_or_else(|| {
+            crate::passwd::current_user()
+                .map(|(_, home)| PathBuf::from(home))
+                .unwrap_or_else(|| PathBuf::from("/"))
+        })
 }
 
 /// User settings written by `smcli init`.
@@ -62,6 +66,74 @@ pub struct SmcliConfig {
     /// Skip commands containing likely API keys and tokens; on unless set to false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secrets_filter: Option<bool>,
+    /// A gitignore-syntax file whose matches every file search and `@` completion leaves out, in any folder.
+    /// Absolute, `~/`, or relative to this config's folder; a leading `/` in a pattern means your home.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignore_file: Option<String>,
+}
+
+/// The patterns of `ignoreFile`, rooted at home. Unmatched paths, and every path when no file is set, are kept.
+#[derive(Clone)]
+pub struct FileIgnore {
+    matcher: ignore::gitignore::Gitignore,
+    /// The home the matcher is rooted at, and its canonical path (service scopes are canonical).
+    home: PathBuf,
+    canonical_home: PathBuf,
+}
+
+impl FileIgnore {
+    /// The configured ignore file, if any. A configured file that is missing or unreadable is an error.
+    pub fn load(config_path: &Path, home: &Path) -> Result<Option<Self>> {
+        let Some(file) = SmcliConfig::load(config_path)?
+            .ignore_file
+            .filter(|f| !f.is_empty())
+        else {
+            return Ok(None);
+        };
+        let path = Self::resolve(&file, config_path, home);
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(home);
+        if let Some(error) = builder.add(&path) {
+            return Err(anyhow!("ignoreFile {}: {error}", path.display()));
+        }
+        let matcher = builder
+            .build()
+            .with_context(|| format!("ignoreFile {}", path.display()))?;
+        Ok(Some(Self {
+            matcher,
+            home: home.to_path_buf(),
+            canonical_home: std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf()),
+        }))
+    }
+
+    pub fn resolve(file: &str, config_path: &Path, home: &Path) -> PathBuf {
+        if let Some(rest) = file.strip_prefix("~/") {
+            return home.join(rest);
+        }
+        config_path.parent().unwrap_or(Path::new("/")).join(file)
+    }
+
+    /// Whether `path` (absolute) or any folder above it matches. Outside home the walk
+    /// up stops at the search `root`, like git at the repo root.
+    pub fn ignores(&self, root: &Path, path: &Path, is_dir: bool) -> bool {
+        let mapped;
+        let path = match path.strip_prefix(&self.canonical_home) {
+            Ok(rest) if !path.starts_with(&self.home) => {
+                mapped = self.home.join(rest);
+                mapped.as_path()
+            }
+            _ => path,
+        };
+        if path.starts_with(&self.home) {
+            return self
+                .matcher
+                .matched_path_or_any_parents(path, is_dir)
+                .is_ignore();
+        }
+        // Outside home `matched` checks only the leaf: test each ancestor as a folder.
+        path.ancestors()
+            .take_while(|a| *a != root)
+            .any(|a| self.matcher.matched(a, is_dir || a != path).is_ignore())
+    }
 }
 
 impl SmcliConfig {
@@ -72,16 +144,16 @@ impl SmcliConfig {
                 return path;
             }
             // No usable cwd (e.g. deleted directory): keep the relative path rather than panic.
-            let cwd = environment.get("PWD").map(PathBuf::from).filter(|p| p.is_absolute())
+            let cwd = environment
+                .get("PWD")
+                .map(PathBuf::from)
+                .filter(|p| p.is_absolute())
                 .or_else(|| std::env::current_dir().ok());
             return cwd.map_or(path.clone(), |cwd| cwd.join(&path));
         }
-        let base = environment
-            .get("XDG_CONFIG_HOME")
-            .filter(|p| p.starts_with('/'))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config"));
-        base.join("smcli/config.json")
+        crate::paths::Xdg::Config
+            .dir(home, environment)
+            .join("smcli/config.json")
     }
 
     /// A missing file means defaults; a malformed one is an error rather than silently ignored.
@@ -89,17 +161,28 @@ impl SmcliConfig {
         match std::fs::read(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(anyhow!("Invalid config {}: {e}", path.display())),
-            Ok(data) => serde_json::from_slice(&data).with_context(|| format!("Invalid config {}", path.display())),
+            Ok(data) => serde_json::from_slice(&data)
+                .with_context(|| format!("Invalid config {}", path.display())),
         }
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
         use std::os::unix::fs::DirBuilderExt;
-        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
         // Unique tempfile beside the destination: a planted `config.json.tmp` symlink must not be followed.
-        let temporary = tempfile::NamedTempFile::new_in(parent)
-            .with_context(|| format!("Failed to create temporary config beside {}", path.display()))?;
+        let temporary = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+            format!(
+                "Failed to create temporary config beside {}",
+                path.display()
+            )
+        })?;
         serde_json::to_writer_pretty(temporary.as_file(), self)
             .with_context(|| format!("Failed to write config {}", path.display()))?;
         temporary.as_file().sync_all()?;
@@ -136,13 +219,22 @@ const SECRET_PATTERNS: [&str; 10] = [
 
 fn secret_patterns() -> &'static [Regex] {
     static PATTERNS: std::sync::OnceLock<Vec<Regex>> = std::sync::OnceLock::new();
-    PATTERNS.get_or_init(|| SECRET_PATTERNS.iter().map(|p| Regex::new(p).unwrap()).collect())
+    PATTERNS.get_or_init(|| {
+        SECRET_PATTERNS
+            .iter()
+            .map(|p| Regex::new(p).unwrap())
+            .collect()
+    })
 }
 
 impl CaptureFilter {
     /// Secrets filter on, no user patterns.
     pub fn standard() -> Self {
-        Self { history_filter: vec![], cwd_filter: vec![], secrets_filter: true }
+        Self {
+            history_filter: vec![],
+            cwd_filter: vec![],
+            secrets_filter: true,
+        }
     }
 
     pub fn new(config: &SmcliConfig) -> Result<Self> {
@@ -172,13 +264,76 @@ impl CaptureFilter {
         if self.secrets_filter && secret_patterns().iter().any(|p| p.is_match(command)) {
             return false;
         }
-        !self.history_filter.iter().any(|p| p.is_match(command)) && !self.cwd_filter.iter().any(|p| p.is_match(directory))
+        !self.history_filter.iter().any(|p| p.is_match(command))
+            && !self.cwd_filter.iter().any(|p| p.is_match(directory))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ignore_file_resolves_and_matches_anywhere_or_from_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, config) = (dir.path().join("home"), dir.path().join("cfg/config.json"));
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        assert!(FileIgnore::load(&config, &home).unwrap().is_none());
+        std::fs::write(&config, r#"{"ignoreFile":"ignore"}"#).unwrap();
+        assert!(
+            FileIgnore::load(&config, &home).is_err(),
+            "a configured file that is missing is an error"
+        );
+        std::fs::write(
+            config.parent().unwrap().join("ignore"),
+            "*.log\nnode_modules/\n/Secrets\n",
+        )
+        .unwrap();
+        let ignore = FileIgnore::load(&config, &home).unwrap().unwrap();
+        assert!(ignore.ignores(Path::new("/"), &home.join("a/b/x.log"), false));
+        assert!(ignore.ignores(Path::new("/"), &home.join("p/node_modules/m/i.js"), false));
+        assert!(ignore.ignores(Path::new("/"), &home.join("Secrets/key"), false));
+        assert!(!ignore.ignores(Path::new("/"), &home.join("p/Secrets"), true));
+        assert!(ignore.ignores(Path::new("/"), Path::new("/elsewhere/y.log"), false));
+        assert!(!ignore.ignores(Path::new("/"), &home.join("a/main.rs"), false));
+        assert_eq!(FileIgnore::resolve("~/i", &config, &home), home.join("i"));
+        assert!(ignore.ignores(
+            Path::new("/srv/p"),
+            Path::new("/srv/p/node_modules/m/i.js"),
+            false
+        ));
+        assert!(!ignore.ignores(Path::new("/srv/p"), Path::new("/srv/p/src/i.js"), false));
+    }
+
+    #[test]
+    fn ignore_outside_home_stops_at_search_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (home, config) = (dir.path().join("home"), dir.path().join("config.json"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(&config, r#"{"ignoreFile":"ignore"}"#).unwrap();
+        std::fs::write(dir.path().join("ignore"), "build\n").unwrap();
+        let ignore = FileIgnore::load(&config, &home).unwrap().unwrap();
+        let root = Path::new("/x/build/proj");
+        assert!(!ignore.ignores(root, &root.join("f"), false));
+        assert!(ignore.ignores(root, &root.join("build/f"), false));
+    }
+
+    #[test]
+    fn ignore_file_follows_a_symlinked_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = std::fs::canonicalize(dir.path()).unwrap().join("real");
+        let link = real.parent().unwrap().join("link");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let config = real.join("config.json");
+        std::fs::write(&config, r#"{"ignoreFile":"ignore"}"#).unwrap();
+        std::fs::write(real.join("ignore"), "/Secrets\n").unwrap();
+        let ignore = FileIgnore::load(&config, &link).unwrap().unwrap();
+        assert!(ignore.ignores(Path::new("/"), &real.join("Secrets/key"), false));
+        assert!(ignore.ignores(Path::new("/"), &link.join("Secrets/key"), false));
+        assert!(!ignore.ignores(Path::new("/"), &real.join("p/Secrets"), true));
+    }
 
     #[test]
     fn filter_secrets_spaces_and_patterns() {
@@ -193,7 +348,13 @@ mod tests {
         assert!(!filter.allows("export KEY=AKIAABCDEFGHIJKLMNOP", "/repo"));
         assert!(!filter.allows("secret thing", "/repo"));
         assert!(!filter.allows("ls", "/private/x"));
-        assert!(CaptureFilter::new(&SmcliConfig { history_filter: Some(vec!["(".into()]), ..Default::default() }).is_err());
+        assert!(
+            CaptureFilter::new(&SmcliConfig {
+                history_filter: Some(vec!["(".into()]),
+                ..Default::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -203,11 +364,23 @@ mod tests {
         assert_eq!(config.potion_path.as_deref(), Some("/m"));
         assert_eq!(config.ctrl_r_key, Some(false));
         let saved = serde_json::to_string(&config).unwrap();
-        assert_eq!(saved, r#"{"ctrlRKey":false,"historyFilter":["x"],"potionPath":"/m"}"#);
-        let inline: SmcliConfig = serde_json::from_str(r#"{"atCompletionInline":false,"atCompletionLsColors":true}"#).unwrap();
-        assert_eq!((inline.at_completion_inline, inline.at_completion_ls_colors), (Some(false), Some(true)));
-        assert_eq!(serde_json::to_string(&inline).unwrap(), r#"{"atCompletionInline":false,"atCompletionLsColors":true}"#);
-        let arrows: SmcliConfig = serde_json::from_str(r#"{"leftKey":false,"rightKey":true}"#).unwrap();
+        assert_eq!(
+            saved,
+            r#"{"ctrlRKey":false,"historyFilter":["x"],"potionPath":"/m"}"#
+        );
+        let inline: SmcliConfig =
+            serde_json::from_str(r#"{"atCompletionInline":false,"atCompletionLsColors":true}"#)
+                .unwrap();
+        assert_eq!(
+            (inline.at_completion_inline, inline.at_completion_ls_colors),
+            (Some(false), Some(true))
+        );
+        assert_eq!(
+            serde_json::to_string(&inline).unwrap(),
+            r#"{"atCompletionInline":false,"atCompletionLsColors":true}"#
+        );
+        let arrows: SmcliConfig =
+            serde_json::from_str(r#"{"leftKey":false,"rightKey":true}"#).unwrap();
         assert_eq!(arrows.left_key, Some(false));
         assert_eq!(arrows.right_key, Some(true));
         assert_eq!(
@@ -216,10 +389,19 @@ mod tests {
         );
         let picker: SmcliConfig = serde_json::from_str(r#"{"ctrlOKey":false}"#).unwrap();
         assert_eq!(picker.ctrl_o_key, Some(false));
-        assert_eq!(serde_json::to_string(&picker).unwrap(), r#"{"ctrlOKey":false}"#);
+        assert_eq!(
+            serde_json::to_string(&picker).unwrap(),
+            r#"{"ctrlOKey":false}"#
+        );
         let environment = HashMap::from([("XDG_CONFIG_HOME".to_string(), "/x".to_string())]);
-        assert_eq!(SmcliConfig::location(Path::new("/h"), &environment), PathBuf::from("/x/smcli/config.json"));
-        assert_eq!(SmcliConfig::location(Path::new("/h"), &HashMap::new()), PathBuf::from("/h/.config/smcli/config.json"));
+        assert_eq!(
+            SmcliConfig::location(Path::new("/h"), &environment),
+            PathBuf::from("/x/smcli/config.json")
+        );
+        assert_eq!(
+            SmcliConfig::location(Path::new("/h"), &HashMap::new()),
+            PathBuf::from("/h/.config/smcli/config.json")
+        );
     }
 
     #[test]
@@ -228,9 +410,15 @@ mod tests {
             ("SMCLI_CONFIG".into(), "config.json".into()),
             ("PWD".into(), "/a".into()),
         ]);
-        assert_eq!(SmcliConfig::location(Path::new("/h"), &environment), PathBuf::from("/a/config.json"));
+        assert_eq!(
+            SmcliConfig::location(Path::new("/h"), &environment),
+            PathBuf::from("/a/config.json")
+        );
         environment.insert("PWD".into(), "relative".into());
-        assert_eq!(SmcliConfig::location(Path::new("/h"), &environment), std::env::current_dir().unwrap().join("config.json"));
+        assert_eq!(
+            SmcliConfig::location(Path::new("/h"), &environment),
+            std::env::current_dir().unwrap().join("config.json")
+        );
     }
 
     #[test]
@@ -240,10 +428,16 @@ mod tests {
         let victim = dir.path().join("victim.txt");
         std::fs::write(&victim, "DO NOT OVERWRITE").unwrap();
         std::os::unix::fs::symlink(&victim, dir.path().join("config.json.tmp")).unwrap();
-        SmcliConfig { ctrl_r_key: Some(true), ..Default::default() }
-            .save(&config_path)
-            .unwrap();
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "DO NOT OVERWRITE");
+        SmcliConfig {
+            ctrl_r_key: Some(true),
+            ..Default::default()
+        }
+        .save(&config_path)
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "DO NOT OVERWRITE"
+        );
         let loaded = SmcliConfig::load(&config_path).unwrap();
         assert_eq!(loaded.ctrl_r_key, Some(true));
     }

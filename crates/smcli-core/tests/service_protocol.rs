@@ -19,7 +19,9 @@ fn assert_wire_value(actual: &Value, expected: &Value) {
         }
         (Value::Object(a), Value::Object(b)) => {
             // Key order is not part of the contract (and serde_json's `preserve_order` may be on via other crates).
-            let sorted = |m: &serde_json::Map<String, Value>| m.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+            let sorted = |m: &serde_json::Map<String, Value>| {
+                m.keys().cloned().collect::<std::collections::BTreeSet<_>>()
+            };
             assert_eq!(sorted(a), sorted(b));
             for (key, value) in a {
                 assert_wire_value(value, &b[key]);
@@ -48,9 +50,13 @@ fn swift_service_protocol_fixtures_round_trip() {
     round_trip::<ServiceRequest>(REQUESTS_V4);
     round_trip::<ServiceRequest>(include_str!("fixtures/service_protocol/requests-v2.jsonl"));
     round_trip::<ServiceRequest>(include_str!("fixtures/service_protocol/requests-v3.jsonl"));
-    round_trip::<ServiceRequest>(include_str!("fixtures/service_protocol/alias-records-v2.jsonl"));
+    round_trip::<ServiceRequest>(include_str!(
+        "fixtures/service_protocol/alias-records-v2.jsonl"
+    ));
     round_trip::<ServiceResponse>(RESPONSES);
-    round_trip::<ServiceResponse>(include_str!("fixtures/service_protocol/alias-results-v2.jsonl"));
+    round_trip::<ServiceResponse>(include_str!(
+        "fixtures/service_protocol/alias-results-v2.jsonl"
+    ));
     let operations: Vec<_> = REQUESTS
         .lines()
         .chain(REQUESTS_V4.lines())
@@ -134,13 +140,19 @@ fn service_protocol_defaults_omissions_and_versions() {
 
 #[test]
 fn shell_path_is_optional_bounded_and_separate_from_selected_path() {
-    let request: ServiceRequest = decode_line(br#"{"v":2,"op":"search","path":"/selected/file","shellPath":"/bin:/usr/bin"}"#).unwrap();
+    let request: ServiceRequest = decode_line(
+        br#"{"v":2,"op":"search","path":"/selected/file","shellPath":"/bin:/usr/bin"}"#,
+    )
+    .unwrap();
     assert_eq!(request.path.as_deref(), Some("/selected/file"));
     assert_eq!(request.shell_path.as_deref(), Some("/bin:/usr/bin"));
     assert!(decode_line::<ServiceRequest>(br#"{"v":2,"op":"search","shellPath":123}"#).is_err());
     assert_eq!(shell_path_snapshot(None), None);
     assert_eq!(shell_path_snapshot(Some("/bin")), Some("/bin".into()));
-    assert_eq!(shell_path_snapshot(Some(&"x".repeat(MAX_SHELL_PATH_BYTES + 1))), None);
+    assert_eq!(
+        shell_path_snapshot(Some(&"x".repeat(MAX_SHELL_PATH_BYTES + 1))),
+        None
+    );
     assert_eq!(shell_path_snapshot(Some("/bin\0/secret")), None);
 }
 
@@ -248,10 +260,17 @@ fn every_v4_fixture_request_converts() {
         if request.config.is_none() {
             request.config = Some("/tmp/config.json".into());
         }
-        if request.op == Operation::Search && request.directory.as_deref().filter(|d| d.starts_with('/')).is_none() {
+        if request.op == Operation::Search
+            && request
+                .directory
+                .as_deref()
+                .filter(|d| d.starts_with('/'))
+                .is_none()
+        {
             request.directory = Some("/tmp".into());
         }
-        smcli_core::request::Request::try_from(&request).unwrap_or_else(|error| panic!("{line}: {error:?}"));
+        smcli_core::request::Request::try_from(&request)
+            .unwrap_or_else(|error| panic!("{line}: {error:?}"));
     }
 }
 
@@ -266,7 +285,10 @@ fn validation_table() {
     };
     let mut record = ServiceRequest::new(Operation::Record);
     record.config = Some("/tmp/config.json".into());
-    reject(record, "record needs event, command, shell, session, directory and exitCode.");
+    reject(
+        record,
+        "record needs event, command, shell, session, directory and exitCode.",
+    );
     reject(ServiceRequest::new(Operation::Record), "config is required");
     reject(ServiceRequest::new(Operation::Search), "config is required");
     let mut search = ServiceRequest::new(Operation::Search);
@@ -291,9 +313,18 @@ fn validation_table() {
     let mut embed = ServiceRequest::new(Operation::Embed);
     embed.config = Some("/tmp/config.json".into());
     reject(embed, "embed needs a query.");
-    reject(ServiceRequest::new(Operation::Context), "context needs an absolute directory.");
-    reject(ServiceRequest::new(Operation::Files), "files needs a query and an absolute directory.");
-    reject(ServiceRequest::new(Operation::Grep), "grep needs a query and an absolute directory.");
+    reject(
+        ServiceRequest::new(Operation::Context),
+        "context needs an absolute directory.",
+    );
+    reject(
+        ServiceRequest::new(Operation::Files),
+        "files needs a query and an absolute directory.",
+    );
+    reject(
+        ServiceRequest::new(Operation::Grep),
+        "grep needs a query and an absolute directory.",
+    );
     let mut grep = ServiceRequest::new(Operation::Grep);
     grep.directory = Some("/tmp".into());
     grep.query = Some(String::new());
@@ -303,11 +334,17 @@ fn validation_table() {
     wide.query = Some("a".into());
     wide.limit = Some(501);
     reject(wide, "limit must be 1 to 500.");
-    reject(ServiceRequest::new(Operation::Complete), "complete needs a query and an absolute directory.");
+    reject(
+        ServiceRequest::new(Operation::Complete),
+        "complete needs a query and an absolute directory.",
+    );
     let mut select = ServiceRequest::new(Operation::Select);
     select.config = Some("/tmp/config.json".into());
     select.mode = Some("suggest".into());
-    reject(select, "select needs a command, a directory and a mode of suggest or search.");
+    reject(
+        select,
+        "select needs a command, a directory and a mode of suggest or search.",
+    );
     let mut expanded = ServiceRequest::new(Operation::Select);
     expanded.config = Some("/tmp/config.json".into());
     expanded.mode = Some("search".into());
@@ -318,18 +355,31 @@ fn validation_table() {
     let mut file = ServiceRequest::new(Operation::Select);
     file.config = Some("/tmp/config.json".into());
     file.mode = Some("files".into());
-    reject(file, "select needs a directory, a path and a mode of files or grep.");
+    reject(
+        file,
+        "select needs a directory, a path and a mode of files or grep.",
+    );
     let mut escaped = ServiceRequest::new(Operation::Select);
     escaped.config = Some("/tmp/config.json".into());
     escaped.mode = Some("grep".into());
     escaped.directory = Some("/tmp".into());
     escaped.path = Some("../secret".into());
-    reject(escaped, "select needs a path relative to the searched root.");
+    reject(
+        escaped,
+        "select needs a path relative to the searched root.",
+    );
 }
 
 #[test]
 fn failure_codes_round_trip_as_strings() {
-    for code in [FailureCode::Version, FailureCode::BadRequest, FailureCode::Busy, FailureCode::Failed, FailureCode::Timeout, FailureCode::TooLarge] {
+    for code in [
+        FailureCode::Version,
+        FailureCode::BadRequest,
+        FailureCode::Busy,
+        FailureCode::Failed,
+        FailureCode::Timeout,
+        FailureCode::TooLarge,
+    ] {
         let response = ServiceResponse::fail(code, "example");
         let encoded = encode_line(&response).unwrap();
         let decoded = decode_line::<ServiceResponse>(&encoded).unwrap();
@@ -339,5 +389,12 @@ fn failure_codes_round_trip_as_strings() {
     let mut open = ServiceResponse::fail(FailureCode::Failed, "later");
     open.error.as_mut().unwrap().code = "future_error".into();
     let encoded = encode_line(&open).unwrap();
-    assert!(decode_line::<ServiceResponse>(&encoded).unwrap().error.unwrap().code().is_none());
+    assert!(
+        decode_line::<ServiceResponse>(&encoded)
+            .unwrap()
+            .error
+            .unwrap()
+            .code()
+            .is_none()
+    );
 }

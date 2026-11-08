@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::context::{KIND_CACHE_TTL, KindCache, directory_kind};
+use crate::entry::{command_key, command_parts};
 use crate::history::{
     INTERRUPTED_EXIT_CODES, Run, Suggestion, USAGE_HALF_LIFE, answers_with_exit_code,
 };
 use crate::parse::is_smcli_command;
-use crate::entry::{command_key, command_parts};
 use crate::ranking::{
     RankingContext, SelectionLog, Signal, apply_ranking_signals, has_prefix, suggestion_why, uses,
 };
@@ -29,7 +29,11 @@ impl CommandAffinity {
     /// Returns false when `started_at` is older than the last run in this session, which means the
     /// caller's arrival order no longer matches chronological order and the index should be rebuilt.
     pub fn add(&mut self, session: &str, command: &str, started_at: f64) -> bool {
-        if self.last_start.get(session).is_some_and(|&t| started_at < t) {
+        if self
+            .last_start
+            .get(session)
+            .is_some_and(|&t| started_at < t)
+        {
             return false;
         }
         if let Some(previous) = self.last.get(session) {
@@ -121,13 +125,25 @@ impl SuggestionIndex {
         let mut commands = self.commands.clone();
         commands.retain(|key, _| {
             let (typed, expanded) = command_parts(key);
-            has_prefix(&typed, prefix) || (uses(context, Signal::Alias) && expanded.is_some_and(|e| has_prefix(&e, prefix)))
+            has_prefix(&typed, prefix)
+                || (uses(context, Signal::Alias)
+                    && expanded.is_some_and(|e| has_prefix(&e, prefix)))
         });
         // Keep directory iteration order so floating-point accumulation is identical.
         let mut directories = self.directories.clone();
-        for tallies in directories.values_mut() { tallies.retain(|key, _| commands.contains_key(key)); }
-        Self { base: self.base, commands, directories, kinds: Arc::clone(&self.kinds), answering: HashMap::new(), history: vec![],
-            affinity: self.affinity.clone(), picks: self.picks.clone() }
+        for tallies in directories.values_mut() {
+            tallies.retain(|key, _| commands.contains_key(key));
+        }
+        Self {
+            base: self.base,
+            commands,
+            directories,
+            kinds: Arc::clone(&self.kinds),
+            answering: HashMap::new(),
+            history: vec![],
+            affinity: self.affinity.clone(),
+            picks: self.picks.clone(),
+        }
     }
 
     /// Remembers that `command` was picked for `query`, as `record_pick` stored it.
@@ -143,7 +159,11 @@ impl SuggestionIndex {
             return true;
         }
         let started_at = run.started_at.min(now());
-        if !self.affinity.add(&run.session, &command_key(&run.command, run.expanded_command.as_deref()), started_at) {
+        if !self.affinity.add(
+            &run.session,
+            &command_key(&run.command, run.expanded_command.as_deref()),
+            started_at,
+        ) {
             return false;
         }
         let mut run = run.clone();
@@ -215,10 +235,17 @@ impl SuggestionIndex {
         self.suggestions_with_evidence(directory, prefix, limit, now, context, None, None, None)
     }
 
-    pub fn suggestions_with_evidence(&self, directory: &str, prefix: &str, limit: usize, now: f64,
-        context: Option<&RankingContext>, evidence: Option<&dyn Fn(&[String]) -> Vec<bool>>,
+    pub fn suggestions_with_evidence(
+        &self,
+        directory: &str,
+        prefix: &str,
+        limit: usize,
+        now: f64,
+        context: Option<&RankingContext>,
+        evidence: Option<&dyn Fn(&[String]) -> Vec<bool>>,
         identifiers: Option<&dyn Fn(&[String]) -> Vec<(bool, bool)>>,
-        git_activity: Option<&dyn Fn(&[String]) -> Vec<f64>>) -> Vec<Suggestion> {
+        git_activity: Option<&dyn Fn(&[String]) -> Vec<f64>>,
+    ) -> Vec<Suggestion> {
         let here = if directory.len() > 1 {
             directory.strip_suffix('/').unwrap_or(directory)
         } else {
@@ -230,7 +257,9 @@ impl SuggestionIndex {
             .iter()
             .filter(|(c, _)| {
                 let (typed, expanded) = command_parts(c);
-                has_prefix(&typed, prefix) || (uses(context, Signal::Alias) && expanded.is_some_and(|e| has_prefix(&e, prefix)))
+                has_prefix(&typed, prefix)
+                    || (uses(context, Signal::Alias)
+                        && expanded.is_some_and(|e| has_prefix(&e, prefix)))
             })
             .map(|(c, t)| (c.clone(), t.score))
             .collect();
@@ -288,41 +317,79 @@ impl SuggestionIndex {
             &followers,
             &self.picks.weights(prefix, now),
         );
-        if uses(context, Signal::Files) && uses(context, Signal::Index) && let Some(evidence) = evidence {
+        if uses(context, Signal::Files)
+            && uses(context, Signal::Index)
+            && let Some(evidence) = evidence
+        {
             let keys: Vec<String> = scores.keys().cloned().collect();
-            let commands: Vec<String> = keys.iter().map(|key| {
-                if uses(context, Signal::Alias) { key.clone() } else { command_parts(key).0 }
-            }).collect();
+            let commands: Vec<String> = keys
+                .iter()
+                .map(|key| {
+                    if uses(context, Signal::Alias) {
+                        key.clone()
+                    } else {
+                        command_parts(key).0
+                    }
+                })
+                .collect();
             for (command, present) in keys.iter().zip(evidence(&commands)) {
                 if present {
                     *scores.get_mut(command).unwrap() += 0.08;
-                    why.entry(command.clone()).or_default().push("input file exists".into());
+                    why.entry(command.clone())
+                        .or_default()
+                        .push("input file exists".into());
                 }
             }
         }
-        if uses(context, Signal::Git) && let Some(git_activity) = git_activity {
+        if uses(context, Signal::Git)
+            && let Some(git_activity) = git_activity
+        {
             let keys: Vec<String> = scores.keys().cloned().collect();
-            let commands: Vec<String> = keys.iter().map(|key| {
-                if uses(context, Signal::Alias) { key.clone() } else { command_parts(key).0 }
-            }).collect();
+            let commands: Vec<String> = keys
+                .iter()
+                .map(|key| {
+                    if uses(context, Signal::Alias) {
+                        key.clone()
+                    } else {
+                        command_parts(key).0
+                    }
+                })
+                .collect();
             for (command, activity) in keys.iter().zip(git_activity(&commands)) {
                 if activity > 0.0 {
                     *scores.get_mut(command).unwrap() += 0.04 * activity;
-                    why.entry(command.clone()).or_default().push(if activity >= 1.0 { "edited".into() } else { "recently changed".into() });
+                    why.entry(command.clone())
+                        .or_default()
+                        .push(if activity >= 1.0 {
+                            "edited".into()
+                        } else {
+                            "recently changed".into()
+                        });
                 }
             }
         }
-        if uses(context, Signal::Evidence) && let Some(identifiers) = identifiers {
+        if uses(context, Signal::Evidence)
+            && let Some(identifiers) = identifiers
+        {
             let mut keys: Vec<String> = scores.keys().cloned().collect();
             keys.sort_by(|a, b| scores[b].total_cmp(&scores[a]).then_with(|| a.cmp(b)));
-            let commands: Vec<String> = keys.iter().map(|key| {
-                let (typed, expanded) = command_parts(key);
-                if uses(context, Signal::Alias) { expanded.unwrap_or(typed) } else { typed }
-            }).collect();
+            let commands: Vec<String> = keys
+                .iter()
+                .map(|key| {
+                    let (typed, expanded) = command_parts(key);
+                    if uses(context, Signal::Alias) {
+                        expanded.unwrap_or(typed)
+                    } else {
+                        typed
+                    }
+                })
+                .collect();
             for (key, (seen, defined)) in keys.into_iter().zip(identifiers(&commands)) {
                 if defined {
                     *scores.get_mut(&key).unwrap() += 0.06;
-                    why.entry(key).or_default().push("defined in project".into());
+                    why.entry(key)
+                        .or_default()
+                        .push("defined in project".into());
                 } else if seen {
                     *scores.get_mut(&key).unwrap() += 0.03;
                     why.entry(key).or_default().push("found in project".into());
@@ -416,24 +483,59 @@ mod tests {
         std::fs::create_dir_all(&sibling)?;
         std::fs::write(format!("{sibling}/Cargo.toml"), "{}")?;
         let run = Run {
-            command: "kt nextest".into(), expanded_command: None, directory: sibling.clone(),
-            started_at: 1_700_000_000.0, exit_code: 0, session: "s".into(),
+            command: "kt nextest".into(),
+            expanded_command: None,
+            directory: sibling.clone(),
+            started_at: 1_700_000_000.0,
+            exit_code: 0,
+            session: "s".into(),
         };
         let index = SuggestionIndex::new(vec![run.clone()], SelectionLog::default());
-        let on = RankingContext { project_kind: Some("rust".into()), ..Default::default() };
-        let first = index.snapshot("kt ", Some(&on)).suggestions_at(&here, "kt ", 10, run.started_at, Some(&on));
+        let on = RankingContext {
+            project_kind: Some("rust".into()),
+            ..Default::default()
+        };
+        let first = index.snapshot("kt ", Some(&on)).suggestions_at(
+            &here,
+            "kt ",
+            10,
+            run.started_at,
+            Some(&on),
+        );
         assert_eq!(first[0].why, Some(vec!["used in a rust project".into()]));
         std::fs::remove_dir_all(&sibling)?;
-        let second = index.snapshot("kt ", Some(&on)).suggestions_at(&here, "kt ", 10, run.started_at, Some(&on));
-        assert_eq!(second, first, "the second request must use the first snapshot's cached probe");
+        let second = index.snapshot("kt ", Some(&on)).suggestions_at(
+            &here,
+            "kt ",
+            10,
+            run.started_at,
+            Some(&on),
+        );
+        assert_eq!(
+            second, first,
+            "the second request must use the first snapshot's cached probe"
+        );
 
         for context in [
             RankingContext::default(),
-            RankingContext { project_kind: Some("rust".into()), off: [Signal::Kind].into(), ..Default::default() },
+            RankingContext {
+                project_kind: Some("rust".into()),
+                off: [Signal::Kind].into(),
+                ..Default::default()
+            },
         ] {
             let cold = SuggestionIndex::new(vec![run.clone()], SelectionLog::default());
-            cold.snapshot("kt ", Some(&context)).suggestions_at(&here, "kt ", 10, run.started_at, Some(&context));
-            assert!(cold.kinds.lock().unwrap().lookup(&sibling).is_none(), "kind lookup must be skipped");
+            cold.snapshot("kt ", Some(&context)).suggestions_at(
+                &here,
+                "kt ",
+                10,
+                run.started_at,
+                Some(&context),
+            );
+            assert!(
+                cold.kinds.lock().unwrap().lookup(&sibling).is_none(),
+                "kind lookup must be skipped"
+            );
         }
         Ok(())
     }
@@ -444,7 +546,11 @@ mod tests {
     fn same_kind_tier_agrees_between_scan_and_index() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let root = crate::context::real_path(temp.path().to_str().unwrap()).unwrap();
-        for (dir, manifest) in [("here", "Cargo.toml"), ("sibling", "Cargo.toml"), ("web", "package.json")] {
+        for (dir, manifest) in [
+            ("here", "Cargo.toml"),
+            ("sibling", "Cargo.toml"),
+            ("web", "package.json"),
+        ] {
             std::fs::create_dir_all(format!("{root}/{dir}"))?;
             std::fs::write(format!("{root}/{dir}/{manifest}"), "{}")?;
         }
@@ -452,8 +558,15 @@ mod tests {
         let db = history.open_connection()?;
         let now = 1_700_000_000.0;
         // The other-kind run is fresher than the sibling's, so only the tier can put the sibling's habit ahead of it.
-        for (i, (command, directory)) in [("kt gone", "gone"), ("kt nextest", "sibling"), ("kt own", "here"), ("kt newthing", "web")]
-            .into_iter().enumerate() {
+        for (i, (command, directory)) in [
+            ("kt gone", "gone"),
+            ("kt nextest", "sibling"),
+            ("kt own", "here"),
+            ("kt newthing", "web"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             for n in 0..3 {
                 let directory = format!("{root}/{directory}");
                 let mut run = NewRun::new(command, "zsh", &directory, 0);
@@ -464,21 +577,41 @@ mod tests {
         }
         let here = format!("{root}/here");
         let project = crate::context::ProjectContext::discover(&here);
-        let ranked = |off: &str| -> anyhow::Result<(Vec<String>, Vec<String>, Option<Vec<String>>)> {
-            let context = RankingContext::new(&project, None, Some(off));
-            let scan = history.suggestions(&user_name(), &here, "kt ", 10, now, Some(&context))?;
-            let index = SuggestionIndex::new(history.runs(&user_name(), &db)?, history.picks(100, &db)?)
+        let ranked =
+            |off: &str| -> anyhow::Result<(Vec<String>, Vec<String>, Option<Vec<String>>)> {
+                let context = RankingContext::new(&project, None, Some(off));
+                let scan =
+                    history.suggestions(&user_name(), &here, "kt ", 10, now, Some(&context))?;
+                let index = SuggestionIndex::new(
+                    history.runs(&user_name(), &db)?,
+                    history.picks(100, &db)?,
+                )
                 .suggestions_at(&here, "kt ", 10, now, Some(&context));
-            let names = |v: &[crate::history::Suggestion]| v.iter().map(|s| s.command.clone()).collect::<Vec<_>>();
-            Ok((names(&scan), names(&index), scan.iter().find(|s| s.command == "kt nextest").and_then(|s| s.why.clone())))
-        };
+                let names = |v: &[crate::history::Suggestion]| {
+                    v.iter().map(|s| s.command.clone()).collect::<Vec<_>>()
+                };
+                Ok((
+                    names(&scan),
+                    names(&index),
+                    scan.iter()
+                        .find(|s| s.command == "kt nextest")
+                        .and_then(|s| s.why.clone()),
+                ))
+            };
         let (scan, index, why) = ranked("")?;
-        assert_eq!(scan[..2], ["kt own", "kt nextest"], "here > same kind > other kinds");
+        assert_eq!(
+            scan[..2],
+            ["kt own", "kt nextest"],
+            "here > same kind > other kinds"
+        );
         assert_eq!(scan, index);
         assert_eq!(why, Some(vec!["used in a rust project".to_string()]));
         let (scan, index, why) = ranked("kind")?;
         assert_eq!(scan[0], "kt own");
-        assert_ne!(scan[1], "kt nextest", "off: the fresher runs win; a gone directory gets no boost");
+        assert_ne!(
+            scan[1], "kt nextest",
+            "off: the fresher runs win; a gone directory gets no boost"
+        );
         assert_eq!(scan, index);
         assert_eq!(why, None);
         Ok(())
@@ -502,11 +635,15 @@ mod tests {
         let project = crate::context::ProjectContext::discover(&here);
         let context = RankingContext::new(&project, None, None);
         let scan = history.suggestions(&user_name(), &here, "kt ", 10, now, Some(&context))?;
-        let index = SuggestionIndex::new(history.runs(&user_name(), &db)?, history.picks(100, &db)?)
-            .suggestions_at(&here, "kt ", 10, now, Some(&context));
+        let index =
+            SuggestionIndex::new(history.runs(&user_name(), &db)?, history.picks(100, &db)?)
+                .suggestions_at(&here, "kt ", 10, now, Some(&context));
         // The ancestor tier claims the run, so neither path explains it as a same-kind habit.
         assert_eq!(scan[0].why, index[0].why);
-        assert_ne!(scan[0].why, Some(vec!["used in a rust project".to_string()]));
+        assert_ne!(
+            scan[0].why,
+            Some(vec!["used in a rust project".to_string()])
+        );
         Ok(())
     }
 
@@ -516,14 +653,21 @@ mod tests {
     fn deleted_directory_loses_its_boost() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let root = crate::context::real_path(temp.path().to_str().unwrap()).unwrap();
-        for (dir, manifest) in [("here", "Cargo.toml"), ("sibling", "Cargo.toml"), ("web", "package.json")] {
+        for (dir, manifest) in [
+            ("here", "Cargo.toml"),
+            ("sibling", "Cargo.toml"),
+            ("web", "package.json"),
+        ] {
             std::fs::create_dir_all(format!("{root}/{dir}"))?;
             std::fs::write(format!("{root}/{dir}/{manifest}"), "{}")?;
         }
         let history = CapturedHistory::new(temp.path().join("history.db"));
         let db = history.open_connection()?;
         let now = 1_700_000_000.0;
-        for (i, (command, directory)) in [("kt nextest", "sibling"), ("kt newthing", "web")].into_iter().enumerate() {
+        for (i, (command, directory)) in [("kt nextest", "sibling"), ("kt newthing", "web")]
+            .into_iter()
+            .enumerate()
+        {
             for n in 0..3 {
                 let directory = format!("{root}/{directory}");
                 let mut run = NewRun::new(command, "zsh", &directory, 0);
@@ -533,18 +677,44 @@ mod tests {
             }
         }
         let here = format!("{root}/here");
-        let context = RankingContext::new(&crate::context::ProjectContext::discover(&here), None, None);
-        let index = SuggestionIndex::new(history.runs(&user_name(), &db)?, history.picks(100, &db)?);
-        let first = |v: Vec<crate::history::Suggestion>| (v[0].command.clone(), v.iter().find(|s| s.command == "kt nextest").unwrap().why.clone());
+        let context =
+            RankingContext::new(&crate::context::ProjectContext::discover(&here), None, None);
+        let index =
+            SuggestionIndex::new(history.runs(&user_name(), &db)?, history.picks(100, &db)?);
+        let first = |v: Vec<crate::history::Suggestion>| {
+            (
+                v[0].command.clone(),
+                v.iter()
+                    .find(|s| s.command == "kt nextest")
+                    .unwrap()
+                    .why
+                    .clone(),
+            )
+        };
         let boosted = Some(vec!["used in a rust project".to_string()]);
-        assert_eq!(first(index.suggestions_at(&here, "kt ", 10, now, Some(&context))), ("kt nextest".into(), boosted.clone()));
+        assert_eq!(
+            first(index.suggestions_at(&here, "kt ", 10, now, Some(&context))),
+            ("kt nextest".into(), boosted.clone())
+        );
 
         std::fs::remove_dir_all(format!("{root}/sibling"))?;
         let scan = history.suggestions(&user_name(), &here, "kt ", 10, now, Some(&context))?;
-        assert_eq!(first(scan), ("kt newthing".into(), None), "in-process: no boost at once");
-        assert_eq!(first(index.suggestions_at(&here, "kt ", 10, now, Some(&context))), ("kt nextest".into(), boosted), "cached kind until it expires");
+        assert_eq!(
+            first(scan),
+            ("kt newthing".into(), None),
+            "in-process: no boost at once"
+        );
+        assert_eq!(
+            first(index.suggestions_at(&here, "kt ", 10, now, Some(&context))),
+            ("kt nextest".into(), boosted),
+            "cached kind until it expires"
+        );
         index.kinds.lock().unwrap().ttl = std::time::Duration::ZERO;
-        assert_eq!(first(index.suggestions_at(&here, "kt ", 10, now, Some(&context))), ("kt newthing".into(), None), "expired: re-probed as gone");
+        assert_eq!(
+            first(index.suggestions_at(&here, "kt ", 10, now, Some(&context))),
+            ("kt newthing".into(), None),
+            "expired: re-probed as gone"
+        );
         Ok(())
     }
 
@@ -603,15 +773,38 @@ mod tests {
         };
         let present = |commands: &[String]| vec![true; commands.len()];
         let plain = index.suggestions_at("/p", "", 100, now, None);
-        let boosted = index.suggestions_with_evidence("/p", "", 100, now, None, Some(&present), None, None);
+        let boosted =
+            index.suggestions_with_evidence("/p", "", 100, now, None, Some(&present), None, None);
         for before in plain {
-            let after = boosted.iter().find(|s| s.command == before.command && s.expanded_command == before.expanded_command).unwrap();
+            let after = boosted
+                .iter()
+                .find(|s| {
+                    s.command == before.command && s.expanded_command == before.expanded_command
+                })
+                .unwrap();
             assert!((after.score - before.score - 0.08).abs() < 1e-10);
         }
-        let disabled = RankingContext { off: [Signal::Index].into(), ..Default::default() };
-        assert_eq!(index.suggestions_with_evidence("/p", "", 100, now, Some(&disabled), Some(&present), None, None),
-            index.suggestions_at("/p", "", 100, now, Some(&disabled)));
-        let alias_off = RankingContext { off: [Signal::Alias].into(), ..Default::default() };
+        let disabled = RankingContext {
+            off: [Signal::Index].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            index.suggestions_with_evidence(
+                "/p",
+                "",
+                100,
+                now,
+                Some(&disabled),
+                Some(&present),
+                None,
+                None
+            ),
+            index.suggestions_at("/p", "", 100, now, Some(&disabled))
+        );
+        let alias_off = RankingContext {
+            off: [Signal::Alias].into(),
+            ..Default::default()
+        };
         let typed_presence = |commands: &[String]| {
             assert_eq!(commands, ["gl", "gl"]);
             vec![false; commands.len()]
@@ -620,7 +813,16 @@ mod tests {
             assert_eq!(commands, ["gl", "gl"]);
             vec![(false, false); commands.len()]
         };
-        index.suggestions_with_evidence("/p", "gl", 100, now, Some(&alias_off), Some(&typed_presence), Some(&typed_identifiers), None);
+        index.suggestions_with_evidence(
+            "/p",
+            "gl",
+            100,
+            now,
+            Some(&alias_off),
+            Some(&typed_presence),
+            Some(&typed_identifiers),
+            None,
+        );
         for directory in ["/p", "/p/", "/p/sub", "/", "/else"] {
             for prefix in ["", "git", "gl", "cargo", "missing"] {
                 for context in [None, Some(&context)] {
@@ -629,11 +831,39 @@ mod tests {
                     let indexed = index.suggestions_at(directory, prefix, 20, now, context);
                     let snapshot = index.snapshot(prefix, context);
                     assert!(snapshot.history.is_empty());
-                    assert_eq!(indexed, snapshot.suggestions_at(directory, prefix, 20, now, context));
-                    let idents = |commands: &[String]| commands.iter().map(|c| (true, c.contains("test"))).collect();
+                    assert_eq!(
+                        indexed,
+                        snapshot.suggestions_at(directory, prefix, 20, now, context)
+                    );
+                    let idents = |commands: &[String]| {
+                        commands
+                            .iter()
+                            .map(|c| (true, c.contains("test")))
+                            .collect()
+                    };
                     let git = |commands: &[String]| vec![0.5; commands.len()];
-                    assert_eq!(index.suggestions_with_evidence(directory, prefix, 20, now, context, Some(&present), Some(&idents), Some(&git)),
-                        snapshot.suggestions_with_evidence(directory, prefix, 20, now, context, Some(&present), Some(&idents), Some(&git)));
+                    assert_eq!(
+                        index.suggestions_with_evidence(
+                            directory,
+                            prefix,
+                            20,
+                            now,
+                            context,
+                            Some(&present),
+                            Some(&idents),
+                            Some(&git)
+                        ),
+                        snapshot.suggestions_with_evidence(
+                            directory,
+                            prefix,
+                            20,
+                            now,
+                            context,
+                            Some(&present),
+                            Some(&idents),
+                            Some(&git)
+                        )
+                    );
                     assert_eq!(indexed.len(), scan.len());
                     for (mut a, b) in indexed.into_iter().zip(scan) {
                         assert!((a.score - b.score).abs() < 1e-10);
@@ -723,9 +953,30 @@ mod tests {
 
         // A fresh index built from chronologically sorted runs keeps the latest previous command.
         let sorted = vec![
-            Run { command: "first".into(), expanded_command: None, directory: "/p".into(), started_at: 100.0, exit_code: 0, session: "s".into() },
-            Run { command: "second".into(), expanded_command: None, directory: "/p".into(), started_at: 200.0, exit_code: 0, session: "s".into() },
-            Run { command: "third".into(), expanded_command: None, directory: "/p".into(), started_at: 300.0, exit_code: 0, session: "s".into() },
+            Run {
+                command: "first".into(),
+                expanded_command: None,
+                directory: "/p".into(),
+                started_at: 100.0,
+                exit_code: 0,
+                session: "s".into(),
+            },
+            Run {
+                command: "second".into(),
+                expanded_command: None,
+                directory: "/p".into(),
+                started_at: 200.0,
+                exit_code: 0,
+                session: "s".into(),
+            },
+            Run {
+                command: "third".into(),
+                expanded_command: None,
+                directory: "/p".into(),
+                started_at: 300.0,
+                exit_code: 0,
+                session: "s".into(),
+            },
         ];
         let fresh = SuggestionIndex::new(sorted, SelectionLog::default());
         assert_eq!(fresh.previous_command("s").as_deref(), Some("third"));
@@ -735,28 +986,95 @@ mod tests {
     fn defined_test_outranks_an_equal_habit_and_a_missed_budget_does_not() {
         let now = 1_700_000_000.0;
         let run = |command: &str, at: f64| Run {
-            command: command.into(), expanded_command: None, directory: "/p".into(),
-            started_at: at, exit_code: 0, session: "s".into(),
+            command: command.into(),
+            expanded_command: None,
+            directory: "/p".into(),
+            started_at: at,
+            exit_code: 0,
+            session: "s".into(),
         };
-        let index = SuggestionIndex::new(vec![
-            run("cargo test dedup_keeps_latest", now - 10.0),
-            run("cargo test old_removed_case", now - 1.0),
-        ], SelectionLog::default());
-        let defined = |commands: &[String]| commands.iter().map(|c| {
-            if c.contains("dedup_keeps_latest") { (true, true) } else { (false, false) }
-        }).collect();
-        let plain = index.suggestions_with_evidence("/p", "cargo test", 10, now, None, None, None, None);
-        let boosted = index.suggestions_with_evidence("/p", "cargo test", 10, now, None, None, Some(&defined), None);
+        let index = SuggestionIndex::new(
+            vec![
+                run("cargo test dedup_keeps_latest", now - 10.0),
+                run("cargo test old_removed_case", now - 1.0),
+            ],
+            SelectionLog::default(),
+        );
+        let defined = |commands: &[String]| {
+            commands
+                .iter()
+                .map(|c| {
+                    if c.contains("dedup_keeps_latest") {
+                        (true, true)
+                    } else {
+                        (false, false)
+                    }
+                })
+                .collect()
+        };
+        let plain =
+            index.suggestions_with_evidence("/p", "cargo test", 10, now, None, None, None, None);
+        let boosted = index.suggestions_with_evidence(
+            "/p",
+            "cargo test",
+            10,
+            now,
+            None,
+            None,
+            Some(&defined),
+            None,
+        );
         assert_eq!(plain[0].command, "cargo test old_removed_case");
         assert_eq!(boosted[0].command, "cargo test dedup_keeps_latest");
-        assert!(boosted[0].why.as_ref().unwrap().iter().any(|w| w == "defined in project"));
+        assert!(
+            boosted[0]
+                .why
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|w| w == "defined in project")
+        );
         let timed_out = |_: &[String]| Vec::<(bool, bool)>::new();
-        assert_eq!(index.suggestions_with_evidence("/p", "cargo test", 10, now, None, None, Some(&timed_out), None), plain);
-        let off = RankingContext { off: [Signal::Evidence].into(), ..Default::default() };
+        assert_eq!(
+            index.suggestions_with_evidence(
+                "/p",
+                "cargo test",
+                10,
+                now,
+                None,
+                None,
+                Some(&timed_out),
+                None
+            ),
+            plain
+        );
+        let off = RankingContext {
+            off: [Signal::Evidence].into(),
+            ..Default::default()
+        };
         let boom = |_: &[String]| -> Vec<(bool, bool)> { panic!("evidence off") };
         assert_eq!(
-            index.suggestions_with_evidence("/p", "cargo test", 10, now, Some(&off), None, Some(&boom), None),
-            index.suggestions_with_evidence("/p", "cargo test", 10, now, Some(&off), None, None, None));
+            index.suggestions_with_evidence(
+                "/p",
+                "cargo test",
+                10,
+                now,
+                Some(&off),
+                None,
+                Some(&boom),
+                None
+            ),
+            index.suggestions_with_evidence(
+                "/p",
+                "cargo test",
+                10,
+                now,
+                Some(&off),
+                None,
+                None,
+                None
+            )
+        );
     }
 
     #[test]
@@ -773,7 +1091,17 @@ mod tests {
             ..Default::default()
         };
         let suggestions = index.suggestions_at("/p", "cargo test", 10, 0.0, Some(&context));
-        let test = suggestions.iter().find(|s| s.command == "cargo test my_test").unwrap();
-        assert!(test.why.as_ref().unwrap().iter().any(|w| w == "project test"), "{test:?}");
+        let test = suggestions
+            .iter()
+            .find(|s| s.command == "cargo test my_test")
+            .unwrap();
+        assert!(
+            test.why
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|w| w == "project test"),
+            "{test:?}"
+        );
     }
 }
