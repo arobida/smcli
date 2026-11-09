@@ -1,5 +1,7 @@
 # Discover double-quoted JS and TS tests
 
+**Status:** Replaced by Slice 3C of the [audit fixes plan](audit-fixes-2026-11-08.md#slice-3c-ranking-details-26-27). The tasks below are historical; implementation and verification are tracked there.
+
 ## Outcome
 
 Project test suggestions include JS and TS tests written with double quotes, such as `it("name")` and `test("name")`, not only single-quoted ones.

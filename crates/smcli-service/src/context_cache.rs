@@ -33,10 +33,9 @@ struct Inner {
 /// files), while Git status is cached per worktree and refreshed on a background thread. A request never waits
 /// for Git; it gets the last status and `status_pending` while a refresh is running.
 ///
-/// A refresh starts when the status is missing, a file-system event touched the worktree or its Git directory,
-/// or the status is older than `max_age` (events can be missed or coalesced, and `.git/index` timestamps miss
-/// working-tree edits). Refreshes of one worktree start at least `min_interval` apart, so a noisy build
-/// directory can't make the service run Git continuously.
+/// A request starts a refresh when status is missing, dirty from a file-system event, or older than
+/// `max_age` (events can be missed or coalesced). Events alone never start refreshes. Refreshes of one
+/// worktree start at least `min_interval` apart.
 #[derive(Clone)]
 pub struct ContextCache {
     inner: Arc<Inner>,
@@ -110,9 +109,6 @@ impl ContextCache {
             return;
         };
         entry.dirty = true;
-        if !entry.refreshing {
-            self.start_refresh(&mut state, root);
-        }
     }
 
     /// Called with the lock held.
@@ -193,9 +189,6 @@ impl ContextCache {
                 entry.status = status;
             }
             entry.refreshing = false;
-            if entry.dirty {
-                cache.start_refresh(&mut state, &root);
-            }
         });
     }
 }
@@ -295,7 +288,10 @@ mod tests {
         release_tx.send(()).unwrap();
         let context = wait(&cache, directory);
         assert_eq!(context.status.unwrap().branch.as_deref(), Some("main"));
-        cache.invalidate(&context.repository.unwrap().root);
+        let root = context.repository.unwrap().root;
+        cache.invalidate(&root);
+        assert!(!cache.inner.state.lock().unwrap().entries[&root].refreshing);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(cache.context(directory).status_pending);
         assert!(wait(&cache, directory).status.is_some());
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -351,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_refresh_retries_and_recreated_entries_have_new_generations() {
+    fn dirty_refresh_waits_for_request_and_recreated_entries_have_new_generations() {
         use std::sync::mpsc;
         let temp = tempfile::tempdir().unwrap();
         repository(temp.path());
@@ -382,6 +378,19 @@ mod tests {
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         cache.invalidate(&root);
         release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let state = cache.inner.state.lock().unwrap();
+            let entry = &state.entries[&root];
+            if !entry.refreshing {
+                assert!(entry.dirty);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                break;
+            }
+            assert!(Instant::now() < deadline, "refresh did not finish");
+            drop(state);
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(
             wait(&cache, directory).status.unwrap().branch.as_deref(),
             Some("read1")
@@ -418,6 +427,7 @@ mod tests {
         std::fs::write(temp.path().join("tracked"), "edit").unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while calls.load(Ordering::SeqCst) <= before {
+            cache.context(directory);
             assert!(
                 Instant::now() < deadline,
                 "file event did not invalidate status"

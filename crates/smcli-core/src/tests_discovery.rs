@@ -29,9 +29,14 @@ pub fn test_names(file_name: &str, text: &str) -> Vec<String> {
     } else if js {
         for line in lines {
             let line = line.trim();
-            for prefix in ["it('", "test('"] {
+            for (prefix, quote) in [
+                ("it('", '\''),
+                ("test('", '\''),
+                ("it(\"", '"'),
+                ("test(\"", '"'),
+            ] {
                 if let Some(rest) = line.strip_prefix(prefix) {
-                    if let Some(name) = rest.split('\'').next() {
+                    if let Some(name) = rest.split(quote).next() {
                         push_valid(&mut names, name);
                     }
                 }
@@ -57,7 +62,10 @@ pub fn fn_test_command(manifest_kind: &str, name: &str) -> Option<String> {
 }
 
 fn fn_name(line: &str) -> Option<&str> {
-    let rest = line.strip_prefix("fn ")?;
+    let rest = line
+        .strip_prefix("async ")
+        .unwrap_or(line)
+        .strip_prefix("fn ")?;
     let end = rest.find('(')?;
     let name = &rest[..end];
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -91,9 +99,9 @@ mod tests {
         assert_eq!(
             test_names(
                 "x.rs",
-                "#[test]\nfn good_case() {}\n#[tokio::test]\nfn bad;$(id)() {}"
+                "#[test]\nfn good_case() {}\n#[tokio::test]\nasync fn async_case() {}\n#[tokio::test]\nfn bad;$(id)() {}"
             ),
-            ["good_case"]
+            ["async_case", "good_case"]
         );
         assert_eq!(
             test_names("x.py", "def test_ok():\ndef test_bad;():"),
@@ -102,9 +110,9 @@ mod tests {
         assert_eq!(
             test_names(
                 "x.ts",
-                "it('plain_name', () => {});\ntest('bad;$(id)', () => {});"
+                "it('plain_name', () => {});\nit(\"double_it\", () => {});\ntest(\"double_test\", () => {});\ntest('bad;$(id)', () => {});\nit(\"bad;$(id)\", () => {});"
             ),
-            ["plain_name"]
+            ["double_it", "double_test", "plain_name"]
         );
     }
 

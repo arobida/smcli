@@ -137,9 +137,6 @@ impl CapturedHistory {
             for id in file_picks {
                 tx.execute("DELETE FROM file_selections WHERE id=?", [id])?;
             }
-            for command in &commands {
-                tx.execute("DELETE FROM command_selections WHERE command=?", [command])?;
-            }
             tx.commit()?;
             for suffix in [".v7.bak", ".pre-xdg"] {
                 let mut name = self.path.as_os_str().to_owned();

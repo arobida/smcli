@@ -107,6 +107,21 @@ mod tests {
     }
 
     #[test]
+    fn double_quoted_test_candidates() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(root.join("it.js"), "it(\"double_it\", () => {});\n").unwrap();
+        std::fs::write(root.join("test.ts"), "test(\"double_test\", () => {});\n").unwrap();
+        let search = warm(&root);
+        let found = test_candidates(&search, root.to_str().unwrap());
+        let commands: Vec<&str> = found.iter().map(|c| c.command.as_str()).collect();
+        assert_eq!(
+            commands,
+            ["npm test -- -t double_it", "npm test -- -t double_test"]
+        );
+    }
+
+    #[test]
     fn watcher_invalidates_test_definitions_before_ttl() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -179,7 +194,15 @@ pub fn test_candidates(search: &FileSearch, root: &str) -> Vec<Candidate> {
         return vec![];
     };
     let mut found = vec![];
-    for pattern in ["#[test]", "#[tokio::test]", "def test_", "it('", "test('"] {
+    for pattern in [
+        "#[test]",
+        "#[tokio::test]",
+        "def test_",
+        "it('",
+        "test('",
+        "it(\"",
+        "test(\"",
+    ] {
         let query = parse_grep_query(pattern);
         let page = picker.grep(
             &query,

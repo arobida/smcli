@@ -232,6 +232,9 @@ All 29 findings from the 2026-11-08 review are fixed on macOS, or closed with a 
 - Search adds the project-file boost, at half the script weight times query coverage, because a 1.25 multiple could outrank an exact project script. Suggestions keep 1.25.
 - `npm run x` gets no project-file boost when the project lists its scripts and x is not one of them, so the ranking floor holds.
 - A `dist/` build that keeps a newer installed service can differ from it in bundled model or tldr data, which degrades `@@` ranking until they match.
+- #18 keeps the planned optimization and is closed over its 5 ms planning budget: 9.4 ms with a prefix and 41.2 ms with an empty prefix at 100,000 distinct commands.
+- #15 uses the planned projection, which saves only part of the cost because TalaDB decodes the document first.
+- Wave 3 was written and reviewed by oteam (the person asked on 2026-11-09), with kik3 still running tests.
 
 ## Tasks
 
@@ -243,13 +246,13 @@ All 29 findings from the 2026-11-08 review are fixed on macOS, or closed with a 
 - [x] Slice 1D: database move and uninstall `#slice-1d`
 - [x] Slice 1E: lazy-fetch hardening and uninstall follow-ups `#slice-1e`
 - [x] Wave 2 slices 2A to 2E `#wave-2`
-- [ ] Wave 3 slices 3A to 3D `#wave-3`
+- [x] Wave 3 slices 3A to 3D `#wave-3`
 
 ### Test
 
 - [x] Wave 1 gate `#wave-1-test`
 - [x] Wave 2 gate `#wave-2-test`
-- [ ] Wave 3 gate `#wave-3-test`
+- [x] Wave 3 gate `#wave-3-test`
 
 ### Review
 
@@ -257,35 +260,50 @@ All 29 findings from the 2026-11-08 review are fixed on macOS, or closed with a 
 
 ## Test log
 
-| Date       | Wave or slice   | Command                                                                           | Result         | Notes                                                                                        |
-| ---------- | --------------- | --------------------------------------------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------- |
-| 2026-11-09 | Slice 1A        | `make test-rust PKG=smcli-core FILTER=git_status_ignores_repo_fsmonitor`          | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
-| 2026-11-09 | Slice 1A        | `make test-rust PKG=smcli-core FILTER=git_status_skips_repo_filters`              | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
-| 2026-11-09 | Slice 1B        | `make test-rust PKG=smcli FILTER=record_stdin`                                    | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
-| 2026-11-09 | Slice 1B        | `make test-rust PKG=smcli FILTER=complete_allowed`                                | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
-| 2026-11-09 | Slice 1B        | `make test-rust PKG=smcli FILTER=hooks_send_record_on_stdin`                      | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
-| 2026-11-09 | Slice 1C        | `make test-rust PKG=smcli-core FILTER=atuin_import_applies_filters`               | Pass (2 tests) | Run by `kik3` after review fixes                                                             |
-| 2026-11-09 | Slice 1C        | `make test-rust PKG=smcli FILTER=complete_local_honors_ignore`                    | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
-| 2026-11-09 | Slice 1D        | `make test-rust PKG=smcli-core FILTER=legacy`                                     | Fail (6 of 7)  | `legacy_existing_pre_xdg_blocks_all_renames` failed at `legacy.exists() && ...-wal.exists()` |
-| 2026-11-09 | Slice 1D        | `make test-rust PKG=smcli-core FILTER=prune_reports`                              | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
-| 2026-11-09 | Slice 1D rerun  | `make test-rust PKG=smcli-core FILTER=legacy_existing_pre_xdg_blocks_all_renames` | Pass (1 test)  | Test bug fixed; migration unchanged                                                          |
-| 2026-11-09 | Wave 1 gate     | `make test`                                                                       | Fail           | nextest 379 passed; install section: `legacy only: a location was left behind`               |
-| 2026-11-09 | Wave 1 gate fix | `make test-install`                                                               | Fail           | Case `both`: export refused `history.db` permissions; `make test` not run                    |
-| 2026-11-09 | Wave 1 gate fix | `make test-install`                                                               | Fail           | Case `both`: `-wal or -shm was exported` after fixture `chmod 600`; `make test` not run      |
-| 2026-11-09 | Wave 1 gate fix | `make test-install`                                                               | Pass           | Exports converted out of WAL mode                                                            |
-| 2026-11-09 | Wave 1 gate     | `make test`                                                                       | Pass           | nextest 379 passed, 9 skipped; all black-box sections passed                                 |
-| 2026-11-09 | Slice 1E        | `make test-install`                                                               | Pass           | Lazy-fetch hardening and uninstall follow-ups                                                |
-| 2026-11-09 | Wave 1 gate     | `make test`                                                                       | Pass           | Final tree: nextest 379 passed, 9 skipped; all black-box sections passed                     |
-| 2026-11-09 | Slice 2A        | `make test-rust PKG=smcli-core FILTER=write_connection_enables_wal`               | Pass (1 test)  | Run by `kik3` after review                                                                   |
-| 2026-11-09 | Slice 2A        | `make test-rust PKG=smcli-core FILTER=recent_distinct_orders_by_latest_run`       | Pass (1 test)  | Run by `kik3` after review                                                                   |
-| 2026-11-09 | Slice 2B        | `make test-rust PKG=smcli-core FILTER=service_replacement`                        | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
-| 2026-11-09 | Slice 2C        | `make test-rust PKG=smcli-core FILTER=relative_insert_keeps_final_symlink`        | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
-| 2026-11-09 | Slice 2C        | `make test-rust PKG=smcli-core FILTER=import_reports_missing_source`              | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
-| 2026-11-09 | Slice 2D        | `make test-rust PKG=smcli FILTER=parse_flags_and_times`                           | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
-| 2026-11-09 | Slice 2E        | `make test-rust PKG=smcli-core FILTER=history_commands_boosted_by_project_file`   | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
-| 2026-11-09 | Slice 2E        | `make test-rust PKG=smcli-search FILTER=search_boosts_history_with_project_file`  | Fail           | Order assertion at `corpus.rs:1392`: `make -j4 test` first without the project file          |
-| 2026-11-09 | Slice 2E rerun  | `make test-rust PKG=smcli-search FILTER=search_boosts_history_with_project_file`  | Pass (1 test)  | Test isolated the boost                                                                      |
-| 2026-11-09 | Slice 2E        | `make ranking`                                                                    | Fail (3 of 5)  | Suggest MRR 0.972 below floor 1 (`npm run `); NL `npm run sto` rank 5; `make test` not run   |
-| 2026-11-09 | Slice 2E        | `make test-rust PKG=smcli-core FILTER=project_file`                               | Pass (2 tests) | Includes the unlisted `npm run` guard                                                        |
-| 2026-11-09 | Slice 2E        | `make ranking`                                                                    | Pass (5 of 5)  | Suggest MRR back to 1.000                                                                    |
-| 2026-11-09 | Wave 2 gate     | `make test`                                                                       | Pass           | nextest 387 passed, 9 skipped; all black-box sections passed                                 |
+| Date       | Wave or slice   | Command                                                                           | Result                                     | Notes                                                                                               |
+| ---------- | --------------- | --------------------------------------------------------------------------------- | ------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| 2026-11-09 | Slice 1A        | `make test-rust PKG=smcli-core FILTER=git_status_ignores_repo_fsmonitor`          | Pass (1 test)                              | Run by `kik3` after review fixes                                                                    |
+| 2026-11-09 | Slice 1A        | `make test-rust PKG=smcli-core FILTER=git_status_skips_repo_filters`              | Pass (1 test)                              | Run by `kik3` after review fixes                                                                    |
+| 2026-11-09 | Slice 1B        | `make test-rust PKG=smcli FILTER=record_stdin`                                    | Pass (1 test)                              | Run by `kik3` after review fixes                                                                    |
+| 2026-11-09 | Slice 1B        | `make test-rust PKG=smcli FILTER=complete_allowed`                                | Pass (1 test)                              | Run by `kik3` after review fixes                                                                    |
+| 2026-11-09 | Slice 1B        | `make test-rust PKG=smcli FILTER=hooks_send_record_on_stdin`                      | Pass (1 test)                              | Run by `kik3` after review fixes                                                                    |
+| 2026-11-09 | Slice 1C        | `make test-rust PKG=smcli-core FILTER=atuin_import_applies_filters`               | Pass (2 tests)                             | Run by `kik3` after review fixes                                                                    |
+| 2026-11-09 | Slice 1C        | `make test-rust PKG=smcli FILTER=complete_local_honors_ignore`                    | Pass (1 test)                              | Run by `kik3` after review fixes                                                                    |
+| 2026-11-09 | Slice 1D        | `make test-rust PKG=smcli-core FILTER=legacy`                                     | Fail (6 of 7)                              | `legacy_existing_pre_xdg_blocks_all_renames` failed at `legacy.exists() && ...-wal.exists()`        |
+| 2026-11-09 | Slice 1D        | `make test-rust PKG=smcli-core FILTER=prune_reports`                              | Pass (1 test)                              | Run by `kik3` after review fixes                                                                    |
+| 2026-11-09 | Slice 1D rerun  | `make test-rust PKG=smcli-core FILTER=legacy_existing_pre_xdg_blocks_all_renames` | Pass (1 test)                              | Test bug fixed; migration unchanged                                                                 |
+| 2026-11-09 | Wave 1 gate     | `make test`                                                                       | Fail                                       | nextest 379 passed; install section: `legacy only: a location was left behind`                      |
+| 2026-11-09 | Wave 1 gate fix | `make test-install`                                                               | Fail                                       | Case `both`: export refused `history.db` permissions; `make test` not run                           |
+| 2026-11-09 | Wave 1 gate fix | `make test-install`                                                               | Fail                                       | Case `both`: `-wal or -shm was exported` after fixture `chmod 600`; `make test` not run             |
+| 2026-11-09 | Wave 1 gate fix | `make test-install`                                                               | Pass                                       | Exports converted out of WAL mode                                                                   |
+| 2026-11-09 | Wave 1 gate     | `make test`                                                                       | Pass                                       | nextest 379 passed, 9 skipped; all black-box sections passed                                        |
+| 2026-11-09 | Slice 1E        | `make test-install`                                                               | Pass                                       | Lazy-fetch hardening and uninstall follow-ups                                                       |
+| 2026-11-09 | Wave 1 gate     | `make test`                                                                       | Pass                                       | Final tree: nextest 379 passed, 9 skipped; all black-box sections passed                            |
+| 2026-11-09 | Slice 2A        | `make test-rust PKG=smcli-core FILTER=write_connection_enables_wal`               | Pass (1 test)                              | Run by `kik3` after review                                                                          |
+| 2026-11-09 | Slice 2A        | `make test-rust PKG=smcli-core FILTER=recent_distinct_orders_by_latest_run`       | Pass (1 test)                              | Run by `kik3` after review                                                                          |
+| 2026-11-09 | Slice 2B        | `make test-rust PKG=smcli-core FILTER=service_replacement`                        | Pass (1 test)                              | Run by `kik3` after review fixes                                                                    |
+| 2026-11-09 | Slice 2C        | `make test-rust PKG=smcli-core FILTER=relative_insert_keeps_final_symlink`        | Pass (1 test)                              | Run by `kik3` after review fixes                                                                    |
+| 2026-11-09 | Slice 2C        | `make test-rust PKG=smcli-core FILTER=import_reports_missing_source`              | Pass (1 test)                              | Run by `kik3` after review fixes                                                                    |
+| 2026-11-09 | Slice 2D        | `make test-rust PKG=smcli FILTER=parse_flags_and_times`                           | Pass (1 test)                              | Run by `kik3` after review fixes                                                                    |
+| 2026-11-09 | Slice 2E        | `make test-rust PKG=smcli-core FILTER=history_commands_boosted_by_project_file`   | Pass (1 test)                              | Run by `kik3` after review fixes                                                                    |
+| 2026-11-09 | Slice 2E        | `make test-rust PKG=smcli-search FILTER=search_boosts_history_with_project_file`  | Fail                                       | Order assertion at `corpus.rs:1392`: `make -j4 test` first without the project file                 |
+| 2026-11-09 | Slice 2E rerun  | `make test-rust PKG=smcli-search FILTER=search_boosts_history_with_project_file`  | Pass (1 test)                              | Test isolated the boost                                                                             |
+| 2026-11-09 | Slice 2E        | `make ranking`                                                                    | Fail (3 of 5)                              | Suggest MRR 0.972 below floor 1 (`npm run `); NL `npm run sto` rank 5; `make test` not run          |
+| 2026-11-09 | Slice 2E        | `make test-rust PKG=smcli-core FILTER=project_file`                               | Pass (2 tests)                             | Includes the unlisted `npm run` guard                                                               |
+| 2026-11-09 | Slice 2E        | `make ranking`                                                                    | Pass (5 of 5)                              | Suggest MRR back to 1.000                                                                           |
+| 2026-11-09 | Wave 2 gate     | `make test`                                                                       | Pass                                       | nextest 387 passed, 9 skipped; all black-box sections passed                                        |
+| 2026-11-09 | Slice 3A        | `make test-rust PKG=smcli-service FILTER=sync_remembers_history_programs`         | Pass (2 tests)                             | Written and reviewed by oteam, run by `kik3`                                                        |
+| 2026-11-09 | Slice 3A        | `make test-rust PKG=smcli-service FILTER=context_cache`                           | Pass (4 tests)                             | Run by `kik3`                                                                                       |
+| 2026-11-09 | Slice 3A        | `make test-rust PKG=smcli-core FILTER=rebases_and_keeps_latest_fields`            | Pass (1 test)                              | Run by `kik3`                                                                                       |
+| 2026-11-09 | Slice 3B        | `make test-rust PKG=smcli-search FILTER=programs`                                 | Pass (4 tests)                             | #15 saves only part of the cost: TalaDB decodes the document before projecting                      |
+| 2026-11-09 | Slice 3B        | `snapshot_timing` (release, 100,000 synthetic commands)                           | 39.9 ms, over the 5 ms limit               | #18 needs the planned optimization                                                                  |
+| 2026-11-09 | Slice 3B        | `blocked_search_timing` (release, 100,000 synthetic commands)                     | 1.04 s, under the 2 s limit                | Closes #28                                                                                          |
+| 2026-11-09 | Slice 3B        | `make test-rust PKG=smcli-core FILTER=snapshot`                                   | Pass (2 tests)                             | Optimized snapshot keeps results                                                                    |
+| 2026-11-09 | Slice 3B        | `snapshot_timing` after the #18 optimization                                      | 9.4 ms with a prefix, 41.2 ms empty prefix | Planned fix applied; still over the 5 ms planning budget at 100,000 distinct commands               |
+| 2026-11-09 | Slice 3C        | `make test-rust PKG=smcli-core FILTER=discovers_language_test_names`              | Pass (1 test)                              | Written and reviewed by oteam, run by `kik3`                                                        |
+| 2026-11-09 | Slice 3C        | `make test-rust PKG=smcli-service FILTER=double_quoted_test_candidates`           | Pass (1 test)                              | Run by `kik3`                                                                                       |
+| 2026-11-09 | Slice 3C        | `make test-rust PKG=smcli-service FILTER=declares_name`                           | Pass (2 tests)                             | Added `object` and a generic-group skip after review                                                |
+| 2026-11-09 | Wave 3          | `make ranking`                                                                    | Pass (5 of 5)                              | Suggest MRR 1.000                                                                                   |
+| 2026-11-09 | Wave 3 gate     | `make test`                                                                       | Fail                                       | nextest 391 passed, 11 skipped; shells: `run_at_completion(zsh)` timed out waiting for a new prompt |
+| 2026-11-09 | Wave 3 gate fix | `make test-shells`                                                                | Pass                                       | `run_at_completion` waits for the picker to close before the second Enter                           |
+| 2026-11-09 | Wave 3 gate     | `make test`                                                                       | Pass                                       | nextest 391 passed, 11 skipped; all black-box sections passed                                       |

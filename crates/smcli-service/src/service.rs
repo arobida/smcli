@@ -104,11 +104,12 @@ pub struct Service {
 }
 
 /// State for the service-owned `@@` index sync (design: "Sync, not per-program add").
-/// `known` is the union of indexed and example-less programs from the last sync, so a record
-/// only re-triggers when its program is new or the shell's PATH changed.
+/// `known` includes indexed, example-less and history programs from the last sync; a record
+/// re-triggers for a new program, a changed PATH, or an absent program now resolving on PATH.
 struct CommandSync {
     index: Option<Arc<CommandIndex>>,
     known: HashSet<String>,
+    absent: HashSet<String>,
     last_path: Option<String>,
     running: bool,
 }
@@ -121,12 +122,13 @@ fn inode(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.ino())
 }
 
-/// Program name from a captured command: the first word of its key, basename only (`/usr/bin/tar` -> `tar`).
+/// Program actually run, using the alias expansion when present.
 fn recorded_program(command: &str, expanded: Option<&str>) -> Option<String> {
-    // The program actually run: the alias expansion when there is one.
-    let word = expanded.unwrap_or(command).split_whitespace().next()?;
-    let program = word.rsplit('/').next().unwrap_or(word);
-    (!program.is_empty()).then(|| program.to_owned())
+    let command = expanded.unwrap_or(command);
+    smcli_core::parse::program_of(
+        command,
+        smcli_core::parse::CommandBreakdown::parse(command).as_ref(),
+    )
 }
 
 impl Service {
@@ -209,6 +211,7 @@ impl Service {
                 command_sync: Mutex::new(CommandSync {
                     index: None,
                     known: HashSet::new(),
+                    absent: HashSet::new(),
                     last_path: None,
                     running: false,
                 }),
@@ -351,9 +354,9 @@ impl Service {
             Request::Search(search) => return self.search(search),
             Request::Embed(embed) => return self.embed(embed),
             Request::Context(context) => return self.context(&context.directory),
-            Request::Files(query) => return self.files(|f| f.files_typed(query)),
-            Request::Grep(query) => return self.files(|f| f.grep_typed(query)),
-            Request::Complete(query) => return self.files(|f| f.complete_typed(query)),
+            Request::Files(query) => return self.files(|f| f.search(query, false)),
+            Request::Grep(query) => return self.files(|f| f.search(query, true)),
+            Request::Complete(query) => return self.files(|f| f.complete_query(query)),
             Request::Select(SelectQuery::Command {
                 command,
                 expanded_command,
@@ -503,6 +506,7 @@ impl Service {
         if inserted && let Some(program) = recorded_program(&command, expanded_command.as_deref()) {
             // Off the reply path: sync the command index in the background when the program
             // is unknown or this shell's PATH was not synced yet.
+            drop(state);
             self.maybe_sync_commands(program, shell_path, config);
         }
         Ok(response)
@@ -517,11 +521,22 @@ impl Service {
     ) {
         let shell_path = smcli_core::service_protocol::shell_path_snapshot(shell_path.as_deref())
             .unwrap_or_default();
+        let absent = {
+            let sync = self.command_sync.lock().unwrap_or_else(|e| e.into_inner());
+            if sync.running {
+                return;
+            }
+            sync.absent.contains(&program)
+        };
+        let newly_installed = absent
+            && !smcli_search::tldr::installed(&HashSet::from([program.clone()]), &shell_path)
+                .is_empty();
         {
             let mut sync = self.command_sync.lock().unwrap_or_else(|e| e.into_inner());
             if sync.running
                 || (sync.known.contains(&program)
-                    && sync.last_path.as_deref() == Some(shell_path.as_str()))
+                    && sync.last_path.as_deref() == Some(shell_path.as_str())
+                    && !newly_installed)
             {
                 return;
             }
@@ -572,6 +587,8 @@ impl Service {
             let (indexed, empty) = smcli_search::commands::sync(&index, &refs, platform, &wanted)?;
             let mut sync = self.command_sync.lock().unwrap_or_else(|e| e.into_inner());
             sync.known = indexed.union(&empty).cloned().collect();
+            sync.absent = history.difference(&sync.known).cloned().collect();
+            sync.known.extend(history);
             sync.last_path = Some(shell_path);
             Ok(())
         })();
@@ -810,6 +827,7 @@ impl Service {
             let mut sync = self.command_sync.lock().unwrap_or_else(|e| e.into_inner());
             sync.index = None;
             sync.known.clear();
+            sync.absent.clear();
             sync.last_path = None;
             // Free the old model before loading the new one, so two are never resident; callers hold `searching`.
             state.engine = None;
@@ -1681,10 +1699,17 @@ mod tests {
         );
     }
 
-    /// A program no source has examples for is remembered: a repeat capture writes nothing to the index.
+    /// History programs absent from PATH are remembered after a sync too.
     #[test]
-    fn record_sync_remembers_programs_with_no_examples() {
-        use std::os::unix::fs::PermissionsExt;
+    fn sync_remembers_history_programs() {
+        assert_eq!(
+            recorded_program("FOO=1 make", None).as_deref(),
+            Some("make")
+        );
+        assert_eq!(
+            recorded_program("alias", Some("FOO=1 make")).as_deref(),
+            Some("make")
+        );
         let f = Fixture::new();
         let platform = smcli_search::tldr::current_platform();
         let sources = smcli_search::commands::bundled_sources().expect("bundled tldr data");
@@ -1699,12 +1724,7 @@ mod tests {
         assert!(CommandIndex::gather(&refs, "zzz-smcli-noexamples", platform).is_none());
         let bin = f.home.join("bin");
         std::fs::create_dir(&bin).unwrap();
-        std::fs::write(bin.join("zzz-smcli-noexamples"), "").unwrap();
-        std::fs::set_permissions(
-            bin.join("zzz-smcli-noexamples"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        // Deliberately absent from PATH: shell functions and local scripts need no executable here.
         let record = |event: &str| {
             let mut r = f.request(Operation::Record);
             r.event = Some(event.into());
@@ -1734,14 +1754,92 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert!(index.examples("zzz-smcli-noexamples").unwrap().is_none());
-        // Second capture: remembered, so no index write (the taladb file is untouched).
-        let modified = std::fs::metadata(index.path()).unwrap().modified().unwrap();
+        // A completed rescan replaces known, so it would remove this sentinel.
+        f.service
+            .command_sync
+            .lock()
+            .unwrap()
+            .known
+            .insert("__no_rescan_sentinel".into());
         record("32345678-89ab-4cde-8012-3456789abcde");
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            std::fs::metadata(index.path()).unwrap().modified().unwrap(),
-            modified
+        assert!(
+            f.service
+                .command_sync
+                .lock()
+                .unwrap()
+                .known
+                .contains("__no_rescan_sentinel")
         );
+    }
+
+    #[test]
+    fn sync_remembers_history_programs_retries_newly_installed() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        let platform = smcli_search::tldr::current_platform();
+        let sources = smcli_search::commands::bundled_sources().expect("bundled tldr data");
+        let refs = smcli_search::commands::source_refs(&sources);
+        let index = f.command_index(&refs);
+        index
+            .add(
+                "tar",
+                &CommandIndex::gather(&refs, "tar", platform).expect("tar examples"),
+            )
+            .unwrap();
+        let bin = f.home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let path = bin.to_string_lossy().into_owned();
+        let record = |event: &str| {
+            let mut r = f.request(Operation::Record);
+            r.event = Some(event.into());
+            r.command = Some("jq . file.json".into());
+            r.shell = Some("zsh".into());
+            r.session = Some("test".into());
+            r.exit_code = Some(0);
+            r.shell_path = Some(path.clone());
+            f.service.record(f.as_record(&r)).unwrap();
+        };
+        let wait_for_sync = || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let sync = f.service.command_sync.lock().unwrap();
+                if !sync.running && sync.known.contains("jq") {
+                    break;
+                }
+                drop(sync);
+                assert!(Instant::now() < deadline, "sync did not finish");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        record("62345678-89ab-4cde-8012-3456789abcde");
+        wait_for_sync();
+        assert!(f.service.command_sync.lock().unwrap().absent.contains("jq"));
+        assert!(index.examples("jq").unwrap().is_none());
+        // An unresolved program must return before attempting to spawn a sync.
+        f.service
+            .command_sync
+            .lock()
+            .unwrap()
+            .known
+            .insert("__no_rescan_sentinel".into());
+        record("72345678-89ab-4cde-8012-3456789abcde");
+        assert!(!f.service.command_sync.lock().unwrap().running);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            f.service
+                .command_sync
+                .lock()
+                .unwrap()
+                .known
+                .contains("__no_rescan_sentinel")
+        );
+        std::fs::write(bin.join("jq"), "").unwrap();
+        std::fs::set_permissions(bin.join("jq"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        record("82345678-89ab-4cde-8012-3456789abcde");
+        wait_for_sync();
+        assert!(!f.service.command_sync.lock().unwrap().absent.contains("jq"));
+        assert!(index.examples("jq").unwrap().is_some());
     }
 
     #[test]

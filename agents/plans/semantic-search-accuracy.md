@@ -1,7 +1,7 @@
 # Accurate natural-language history search
 
 - **Author:** Andrew Robida
-- **Status:** Draft
+- **Status:** Shipped (vector-first)
 - **Date:** 2026-11-01
 
 ------------------------------------------------------------------------

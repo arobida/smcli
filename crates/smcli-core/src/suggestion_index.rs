@@ -89,15 +89,14 @@ struct DirectoryTally {
 /// where the scan clamps its age to zero.
 #[derive(Debug)]
 pub struct SuggestionIndex {
-    /// Reference time for stored weights; moved forward before 2^((t − base)/h) could overflow.
+    /// Reference time for stored weights; rebuild before 2^((t − base)/h) could overflow.
     base: f64,
     commands: HashMap<String, Tally>,
-    directories: HashMap<String, HashMap<String, DirectoryTally>>,
+    directories: HashMap<String, Arc<HashMap<String, DirectoryTally>>>,
     /// Project kind of each run directory, re-probed when an entry is older than its ttl (up to 60 s of lag).
     /// Shared with snapshots and behind a mutex because ranking only borrows the index.
     kinds: Arc<Mutex<KindCache>>,
     answering: HashMap<String, bool>,
-    history: Vec<Run>,
     affinity: CommandAffinity,
     picks: SelectionLog,
 }
@@ -110,7 +109,6 @@ impl SuggestionIndex {
             directories: HashMap::new(),
             kinds: Arc::new(Mutex::new(KindCache::new(KIND_CACHE_TTL))),
             answering: HashMap::new(),
-            history: vec![],
             affinity: CommandAffinity::new(),
             picks,
         };
@@ -122,17 +120,44 @@ impl SuggestionIndex {
 
     /// Request-local ranking data, without the run log; use only for reading suggestions.
     pub fn snapshot(&self, prefix: &str, context: Option<&RankingContext>) -> Self {
-        let mut commands = self.commands.clone();
-        commands.retain(|key, _| {
-            let (typed, expanded) = command_parts(key);
-            has_prefix(&typed, prefix)
+        let commands: HashMap<_, _> = self
+            .commands
+            .iter()
+            .filter(|(key, _)| {
+                let (typed, expanded) = command_parts(key);
+                has_prefix(&typed, prefix)
                 || (uses(context, Signal::Alias)
                     && expanded.is_some_and(|e| has_prefix(&e, prefix)))
-        });
-        // Keep directory iteration order so floating-point accumulation is identical.
+                // Ranking can add candidates after the prefix and scope filters.
+                || context.is_some_and(|c| c.candidates.iter().any(|c| &c.command == *key))
+            })
+            .map(|(key, tally)| (key.clone(), tally.clone()))
+            .collect();
+        // Clone only the outer map to preserve floating-point accumulation order.
         let mut directories = self.directories.clone();
         for tallies in directories.values_mut() {
-            tallies.retain(|key, _| commands.contains_key(key));
+            *tallies = Arc::new(
+                tallies
+                    .iter()
+                    .filter(|(key, _)| commands.contains_key(*key))
+                    .map(|(key, tally)| (key.clone(), tally.clone()))
+                    .collect(),
+            );
+        }
+        let mut affinity = CommandAffinity::new();
+        if let Some(session) = context.and_then(|c| c.session.as_ref()) {
+            if let Some(previous) = self.affinity.last.get(session) {
+                affinity.last.insert(session.clone(), previous.clone());
+                // Nonmatching followers still contribute to the transition denominator.
+                if let Some(followers) = self.affinity.followers.get(previous) {
+                    affinity
+                        .followers
+                        .insert(previous.clone(), followers.clone());
+                }
+            }
+            if let Some(start) = self.affinity.last_start.get(session) {
+                affinity.last_start.insert(session.clone(), *start);
+            }
         }
         Self {
             base: self.base,
@@ -140,8 +165,7 @@ impl SuggestionIndex {
             directories,
             kinds: Arc::clone(&self.kinds),
             answering: HashMap::new(),
-            history: vec![],
-            affinity: self.affinity.clone(),
+            affinity,
             picks: self.picks.clone(),
         }
     }
@@ -153,12 +177,15 @@ impl SuggestionIndex {
 
     /// Adds one run. Runs are expected in (started_at, id) order; an older one still counts, but doesn't
     /// replace the last-run fields. Returns false when the run is older than its session's last run,
-    /// signalling that the index should be rebuilt from the database.
+    /// or the base time is too old, signalling a rebuild from the database.
     pub fn add(&mut self, run: &Run) -> bool {
         if is_smcli_command(run.expanded_command.as_deref().unwrap_or(&run.command)) {
             return true;
         }
         let started_at = run.started_at.min(now());
+        if (started_at - self.base) / USAGE_HALF_LIFE > 500.0 {
+            return false;
+        }
         if !self.affinity.add(
             &run.session,
             &command_key(&run.command, run.expanded_command.as_deref()),
@@ -168,17 +195,7 @@ impl SuggestionIndex {
         }
         let mut run = run.clone();
         run.started_at = started_at;
-        self.history.push(run.clone());
-        if (started_at - self.base) / USAGE_HALF_LIFE > 500.0 {
-            self.base = started_at;
-            self.commands.clear();
-            self.directories.clear();
-            for old in self.history.clone() {
-                self.tally(&old);
-            }
-        } else {
-            self.tally(&run);
-        }
+        self.tally(&run);
         true
     }
 
@@ -202,10 +219,7 @@ impl SuggestionIndex {
             tally.last_run = run.started_at;
             tally.last_exit_code = run.exit_code;
         }
-        let directory = self
-            .directories
-            .entry(run.directory.clone())
-            .or_default()
+        let directory = Arc::make_mut(self.directories.entry(run.directory.clone()).or_default())
             .entry(key)
             .or_default();
         directory.score += weight;
@@ -288,7 +302,7 @@ impl SuggestionIndex {
             } else {
                 continue;
             };
-            for (command, tally) in tallies {
+            for (command, tally) in tallies.iter() {
                 if let Some(score) = scores.get_mut(command) {
                     *score += bonus * tally.score;
                     if in_project {
@@ -473,6 +487,93 @@ mod tests {
     use crate::config::CaptureFilter;
     use crate::history::{CapturedHistory, NewRun, user_name};
     use crate::ranking::{Candidate, CandidateKind};
+
+    #[test]
+    fn snapshot_keeps_request_ranking_data() {
+        let runs = [
+            ("s", "previous"),
+            ("s", "git status"),
+            ("s", "previous"),
+            ("s", "other follower"),
+            ("s", "previous"),
+            ("other", "unrelated"),
+            ("other", "git log"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (session, command))| Run {
+            command: command.into(),
+            expanded_command: None,
+            directory: "/repo".into(),
+            started_at: 1_700_000_000.0 + i as f64,
+            exit_code: 0,
+            session: session.into(),
+        })
+        .collect();
+        let mut index = SuggestionIndex::new(runs, SelectionLog::default());
+        index.add_pick("git", "git status", 1_700_000_007.0);
+        let context = RankingContext {
+            session: Some("s".into()),
+            candidates: vec![Candidate::new(
+                "other follower".into(),
+                CandidateKind::Script,
+                "script",
+            )],
+            ..Default::default()
+        };
+        for prefix in ["git", ""] {
+            let snapshot = index.snapshot(prefix, Some(&context));
+            assert_eq!(snapshot.affinity.last.len(), 1);
+            assert_eq!(snapshot.previous_command("s").as_deref(), Some("previous"));
+            assert_eq!(snapshot.previous_command("other"), None);
+            assert_eq!(snapshot.affinity.last_start.len(), 1);
+            assert_eq!(snapshot.affinity.followers.len(), 1);
+            assert_eq!(snapshot.following("previous"), index.following("previous"));
+            assert!(snapshot.commands.contains_key("other follower"));
+            assert_eq!(
+                snapshot.suggestions_at("/repo", prefix, 20, 1_700_000_008.0, Some(&context)),
+                index.suggestions_at("/repo", prefix, 20, 1_700_000_008.0, Some(&context))
+            );
+        }
+        let snapshot = index.snapshot("git", Some(&context));
+        assert!(!snapshot.commands.contains_key("unrelated"));
+        assert!(
+            snapshot
+                .directories
+                .values()
+                .all(|d| !d.contains_key("unrelated"))
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn snapshot_timing() {
+        let runs = (0..100_000)
+            .map(|i| Run {
+                command: format!("cargo test synthetic_{i}"),
+                expanded_command: None,
+                directory: format!("/synthetic/project_{}", i % 100),
+                started_at: 1_700_000_000.0 + f64::from(i),
+                exit_code: 0,
+                session: format!("session_{}", i % 100),
+            })
+            .collect();
+        let index = SuggestionIndex::new(runs, SelectionLog::default());
+        let context = RankingContext {
+            session: Some("session_0".into()),
+            ..Default::default()
+        };
+        for (prefix, expected) in [("cargo test synthetic_999", 111), ("", 100_000)] {
+            let start = std::time::Instant::now();
+            let snapshot = index.snapshot(prefix, Some(&context));
+            let elapsed = start.elapsed();
+            std::hint::black_box(&snapshot);
+            eprintln!(
+                "snapshot_timing: 100000 synthetic commands, session_0, prefix {prefix:?}: {elapsed:?}"
+            );
+            assert_eq!(snapshot.commands.len(), expected);
+        }
+    }
 
     #[test]
     fn snapshots_share_kind_cache_and_disabled_tiers_do_not_probe() -> anyhow::Result<()> {
@@ -830,7 +931,6 @@ mod tests {
                         history.suggestions(&user_name(), directory, prefix, 20, now, context)?;
                     let indexed = index.suggestions_at(directory, prefix, 20, now, context);
                     let snapshot = index.snapshot(prefix, context);
-                    assert!(snapshot.history.is_empty());
                     assert_eq!(
                         indexed,
                         snapshot.suggestions_at(directory, prefix, 20, now, context)
@@ -880,7 +980,6 @@ mod tests {
 
     #[test]
     fn rebases_and_keeps_latest_fields() {
-        let mut index = SuggestionIndex::new(vec![], SelectionLog::default());
         let mut run = Run {
             command: "echo hi".into(),
             expanded_command: None,
@@ -889,9 +988,11 @@ mod tests {
             exit_code: 0,
             session: "s".into(),
         };
-        index.add(&run);
-        run.started_at = 1000.0 * USAGE_HALF_LIFE;
-        index.add(&run);
+        let mut index = SuggestionIndex::new(vec![run.clone()], SelectionLog::default());
+        run.started_at = 501.0 * USAGE_HALF_LIFE;
+        assert!(!index.add(&run));
+        // The caller rebuilds using the latest run as its base.
+        index = SuggestionIndex::new(vec![run.clone()], SelectionLog::default());
         // Older than the last run, from another session (the same session would ask for a rebuild).
         run.started_at -= 1.0;
         run.exit_code = 2;
@@ -900,7 +1001,7 @@ mod tests {
         index.add_pick("echo", "echo hi", run.started_at);
         assert_eq!(index.picks().picks.len(), 1);
         let result = index.suggestions_at("/p", "", 1, run.started_at + 1.0, None);
-        assert_eq!(result[0].runs, 3);
+        assert_eq!(result[0].runs, 2);
         assert_eq!(result[0].last_exit_code, 0);
         assert!(result[0].score.is_finite());
         assert_eq!(index.recent(), vec!["echo hi"]);

@@ -36,6 +36,12 @@ Open work, not scheduled. macOS is the current target. Linux is still wanted, bu
   window (noted at the code); re-run `make ranking` after touching them.
 - **Service-off picker:** recents are bounded and the search engine is reused per session; not yet
   benchmarked on a large history.
+- **Picker typeahead:** input read together with the selecting Enter is dropped when the picker exits,
+  because crossterm has already queued it. A very fast second Enter can be lost.
+- **Suggestion snapshot:** at 100,000 distinct commands it takes 9.4 ms with a prefix and 41.2 ms with an
+  empty prefix, over the 5 ms planning budget. Going lower needs a shared structure instead of a copy.
+- **Project-file boost:** the unlisted-script rule covers `<tool> run x` only, so `yarn x` can still be
+  boosted when `x` is not a listed script.
 
 ## Release
 

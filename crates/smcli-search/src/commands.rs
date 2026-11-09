@@ -289,10 +289,24 @@ impl CommandIndex {
 
     /// Programs currently in the index.
     pub fn programs(&self) -> Result<HashSet<String>> {
-        Ok(self
-            .all()?
-            .into_iter()
-            .map(|example| example.program)
+        if !self.path().exists() {
+            return Ok(HashSet::new());
+        }
+        let db = self.open()?;
+        let rows = db
+            .typed::<IndexedExample>("examples")?
+            .raw()
+            .aggregate(vec![taladb::Stage::Project {
+                fields: vec!["program".into()],
+                include: true,
+                keep_id: false,
+            }])?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| match row.get("program") {
+                Some(taladb::Value::Str(program)) => Some(program.clone()),
+                _ => None,
+            })
             .collect())
     }
 

@@ -198,7 +198,7 @@ A running service from the previous build is stopped and replaced automatically 
 terminal so the shell reloads the new hooks; until then, inserting file paths from the picker is refused with a
 message asking you to reload.
 
-The history database moved from `~/.local/share/smcli/history.db` to `~/.local/state/smcli/history.db` (under `$XDG_STATE_HOME` if set). The first smcli command other than `shell-init` copies the old database there with `VACUUM INTO` and renames it into place; the old files and the search index are removed or moved only after that copy is in place. If the copy fails, smcli keeps using the old database and retries on the next command. An `SMCLI_DB` set to the old path is treated as unset. Shells still hooked to an old build keep recreating the old database; `smcli health` reports that.
+The history database moved from `~/.local/share/smcli/history.db` to `~/.local/state/smcli/history.db` (under `$XDG_STATE_HOME` if set). The first smcli command other than `shell-init` copies the old database there with `VACUUM INTO` and renames it into place; the old files are kept as `history.db.pre-xdg` beside the new database, and the search index is moved, only after that copy is in place. A database on another volume stays where it was. If the copy fails, smcli keeps using the old database and retries on the next command. An `SMCLI_DB` set to the old path is treated as unset. Shells still hooked to an old build keep recreating the old database; `smcli health` reports that.
 
 ## Uninstall
 
@@ -214,8 +214,9 @@ It asks once, then:
      `sqlite3`.
    - `history.json` holds every recorded command with its directory, exit code, times and session.
    - `config.json` is your settings.
+   - `history-legacy.db`, `history-pre-xdg.db` or `history-state.db` hold any other default-location databases.
 
-   Export requires `sqlite3`; install it or pass `--no-export` to skip the export. The export directory is private
+   Commands run in open terminals during the uninstall may be missing from the export. Export requires `sqlite3`; install it or pass `--no-export` to skip the export. The export directory is private
    (`0700`), and exported history and config files are owner-readable/writable only (`0600`), including existing
    destinations. If the export fails, nothing is removed.
 
@@ -224,9 +225,11 @@ It asks once, then:
 3. Removes the smcli block from each startup file and leaves the rest of the file as it was. It warns about
    `shell-init` lines you added by hand, which it doesn't touch.
 
-4. Deletes the history database, search index, settings and service socket.
+4. Deletes `smcli` and `smcli-service`, so an open terminal can't recreate the data.
 
-5. Deletes `smcli`, `smcli-service` and itself.
+5. Deletes the history database, including the old location and `history.db.pre-xdg`, then the search index, settings and service socket. A custom `SMCLI_DB` is handled alone and the default locations are left untouched.
+
+6. Deletes the rest of the install and itself.
 
 | Option         | Meaning                                                             |
 | -------------- | ------------------------------------------------------------------- |

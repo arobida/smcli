@@ -48,13 +48,64 @@ mod tests {
     }
 
     #[test]
-    fn find_identifiers_marks_a_definition_and_a_zero_budget_checks_nothing() {
+    fn declares_name() {
+        for keyword in [
+            "fn",
+            "def",
+            "func",
+            "function",
+            "class",
+            "struct",
+            "enum",
+            "trait",
+            "type",
+            "interface",
+            "impl",
+            "const",
+            "let",
+            "var",
+            "mod",
+            "module",
+        ] {
+            assert!(super::declares_name(
+                &format!("{keyword} live_case()"),
+                "live_case"
+            ));
+        }
+        assert!(super::declares_name(
+            "pub async fn live_case() {}",
+            "live_case"
+        ));
+        assert!(super::declares_name("object Build", "Build"));
+        assert!(super::declares_name("impl<T> Widget<T>", "Widget"));
+        assert!(!super::declares_name(
+            "fn live_case() { println!(\"fn old_removed_case\"); }",
+            "old_removed_case"
+        ));
+        assert!(super::declares_name(
+            "fn real() { println!(\"x\"); }",
+            "real"
+        ));
+        assert!(!super::declares_name("fn live_case() {}", "live"));
+        assert!(!super::declares_name(
+            "fn live_case() { old_removed_case(); }",
+            "old_removed_case"
+        ));
+        assert!(!super::declares_name(
+            "let live_case = old_removed_case;",
+            "old_removed_case"
+        ));
+        assert!(!super::declares_name("live_case()", "live_case"));
+    }
+
+    #[test]
+    fn declares_name_marks_only_the_definition_and_a_zero_budget_checks_nothing() {
         use fff_search::{FilePicker, FilePickerOptions, SharedFilePicker, SharedFrecency};
         use std::{sync::Arc, time::Duration};
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join("lib.rs"),
-            "fn dedup_keeps_latest() {}\nlet _ = old_removed_case;\n",
+            "fn dedup_keeps_latest() { println!(\"old_removed_case\"); }\n",
         )
         .unwrap();
         let shared = SharedFilePicker::default();
@@ -121,6 +172,53 @@ fn contains_ident(line: &str, name: &str) -> bool {
             return true;
         }
         start = abs + 1;
+    }
+    false
+}
+
+fn declares_name(line: &str, name: &str) -> bool {
+    let mut line = line
+        .split('"')
+        .next()
+        .unwrap_or("")
+        .split("//")
+        .next()
+        .unwrap_or("");
+    let mut previous_is_keyword = false;
+    while !line.is_empty() {
+        if previous_is_keyword && line.starts_with('<') {
+            if let Some(end) = line.find('>') {
+                line = &line[end + 1..];
+            }
+        }
+        line = line.trim_start_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+        let end = line
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(line.len());
+        let word = &line[..end];
+        if word == name && previous_is_keyword {
+            return true;
+        }
+        previous_is_keyword = matches!(
+            word,
+            "fn" | "def"
+                | "func"
+                | "function"
+                | "class"
+                | "struct"
+                | "enum"
+                | "trait"
+                | "type"
+                | "interface"
+                | "impl"
+                | "const"
+                | "let"
+                | "var"
+                | "mod"
+                | "module"
+                | "object"
+        );
+        line = &line[end..];
     }
     false
 }
@@ -273,7 +371,7 @@ impl ProjectEvidence for IndexEvidence {
                         continue;
                     }
                     seen = true;
-                    defined |= hit.is_definition;
+                    defined |= hit.is_definition && declares_name(&hit.line_content, name);
                     if defined {
                         break;
                     }

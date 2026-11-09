@@ -1863,6 +1863,35 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn blocked_search_timing() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let engine = HistorySearch::new(root.path().join("index"), Potion::bundled()?);
+        let corpus = (0..100_000)
+            .map(|i| {
+                let entry = SearchEntry::new(&format!("cargo test synthetic_{i}"), 1, "native");
+                (entry.key(), entry)
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let hits = engine.search_with_evidence_using_lock(
+            "run the tests",
+            &corpus,
+            10,
+            &SearchFilter::default(),
+            None,
+            &SearchSignals::default(),
+            0.0,
+            None,
+            None,
+        )?;
+        let elapsed = start.elapsed();
+        eprintln!("blocked_search_timing: 100000 synthetic commands, no index lock: {elapsed:?}");
+        assert!(!hits.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn vector_intent_uses_no_grep_expansion_and_keeps_absolute_cosine() {
         struct NoExpansion;
         impl crate::ProjectEvidence for NoExpansion {

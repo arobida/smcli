@@ -154,8 +154,14 @@ impl FileSearch {
     ) -> Result<(Index, i64)> {
         let key = (root.to_string(), enable_content_indexing);
         loop {
+            let mut evicted = Vec::new();
             let mut pool = self.pool.lock().unwrap();
-            pool.entries.retain(|_, e| e.used.elapsed() <= self.idle);
+            evicted.extend(pool.entries.extract_if(|_, e| e.used.elapsed() > self.idle));
+            if !evicted.is_empty() {
+                drop(pool);
+                drop(evicted);
+                continue;
+            }
             if let Some(e) = pool.entries.get_mut(&key) {
                 e.used = Instant::now();
                 return Ok((e.index.clone(), e.id));
@@ -194,6 +200,7 @@ impl FileSearch {
             }))
             .unwrap_or_else(|_| Err(anyhow!("file index build panicked")))
             .map_err(|e| e.to_string());
+            let mut evicted = Vec::new();
             let mut pool = self.pool.lock().unwrap();
             pool.building -= 1;
             pool.pending.remove(&key);
@@ -206,7 +213,7 @@ impl FileSearch {
                         .unwrap()
                         .0
                         .clone();
-                    pool.entries.remove(&oldest);
+                    evicted.extend(pool.entries.remove(&oldest));
                 }
                 pool.next += 1;
                 let id = pool.next;
@@ -223,6 +230,8 @@ impl FileSearch {
             *pending.0.lock().unwrap() = Some(result);
             pending.1.notify_all();
             self.available.notify_all();
+            drop(pool);
+            drop(evicted);
             return answer.map_err(|e| anyhow!(e));
         }
     }
@@ -270,15 +279,6 @@ impl FileSearch {
                 "grep needs a query and an absolute directory.",
             ),
         }
-    }
-    pub(crate) fn files_typed(&self, query: FileQuery) -> ServiceResponse {
-        self.search(query, false)
-    }
-    pub(crate) fn grep_typed(&self, query: FileQuery) -> ServiceResponse {
-        self.search(query, true)
-    }
-    pub(crate) fn complete_typed(&self, query: CompleteQuery) -> ServiceResponse {
-        self.complete_query(query)
     }
 
     fn content_indexing_enabled(home: &std::path::Path, scope: &str) -> bool {
@@ -332,7 +332,7 @@ impl FileSearch {
         Ok((index, id, None))
     }
 
-    fn search(&self, parsed: FileQuery, grep: bool) -> ServiceResponse {
+    pub(crate) fn search(&self, parsed: FileQuery, grep: bool) -> ServiceResponse {
         let name = if grep { "grep" } else { "files" };
         let FileQuery {
             directory,
@@ -652,7 +652,7 @@ impl FileSearch {
         self.complete_query(parsed)
     }
 
-    fn complete_query(&self, parsed: CompleteQuery) -> ServiceResponse {
+    pub(crate) fn complete_query(&self, parsed: CompleteQuery) -> ServiceResponse {
         let CompleteQuery {
             directory,
             query,
@@ -895,11 +895,13 @@ impl FileSearch {
 
     /// Drops instances unused for the idle timeout.
     pub fn evict_idle(&self) {
-        self.pool
-            .lock()
-            .unwrap()
+        let mut pool = self.pool.lock().unwrap();
+        let evicted: Vec<_> = pool
             .entries
-            .retain(|_, e| e.used.elapsed() <= self.idle);
+            .extract_if(|_, e| e.used.elapsed() > self.idle)
+            .collect();
+        drop(pool);
+        drop(evicted);
     }
     /// Live instances, oldest id first.
     pub fn instances(&self) -> Vec<FileIndexInfo> {

@@ -89,6 +89,17 @@ class Terminal:
         busy = "\n".join(line for line in processes.splitlines() if "smcli" in line or "sleep" in line)
         raise AssertionError(f"{self.shell}: timeout waiting for {what}: {data.decode(errors='replace')!r}\nprocesses:\n{busy}")
 
+    def until_picker_closed(self, timeout=20):
+        """Waits until the picker leaves the alternate screen, so later input reaches the shell."""
+        deadline = time.monotonic() + timeout
+        data, self.pending = self.pending, b""
+        while time.monotonic() < deadline:
+            chunk = self.read(0.1)
+            data += chunk
+            if b"\x1b[?1049l" in data and not chunk:
+                return
+        raise AssertionError(f"{self.shell}: timeout waiting for the picker to close: {data.decode(errors='replace')!r}")
+
     def until_prompt(self, timeout=20, redrawn=False):
         """Waits for the prompt after a command. A cancelled line may redraw the prompt it already had (Fish does)."""
         def fresh(clean):
@@ -1258,6 +1269,7 @@ def run_at_completion(variant):
             t.type("\t")
             t.until_text("twin-b.txt")
             t.type("\r")
+            t.until_picker_closed()
             t.type("\n")
             out = t.until_prompt()
             assert "twin-" in out, (variant.label, out)
@@ -1265,6 +1277,7 @@ def run_at_completion(variant):
             t.type("\t")
             t.until_text("zz space.txt")
             t.type("\r")
+            t.until_picker_closed()
             t.type("\n")
             out = t.until_prompt()
             assert "zz space.txt" in out, (variant.label, out)

@@ -1156,7 +1156,7 @@ impl CapturedHistory {
             ))
         })?;
         let mut version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > VERSION && version != DISCARDED_USAGE_VERSION {
+        if version > VERSION {
             bail!(
                 "History database was written by a newer smcli: {}",
                 path.display()
