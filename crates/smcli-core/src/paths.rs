@@ -89,7 +89,15 @@ pub fn relative_insert(path: &str, root: &str, cwd: &str) -> String {
         return String::new();
     }
     let dir = path.ends_with('/');
-    let Ok(target) = fs::canonicalize(Path::new(root).join(path)) else {
+    let joined = Path::new(root).join(path);
+    // Keep a final symlink as written; `..` has no file name, so it resolves fully.
+    let target = match (joined.parent(), joined.file_name()) {
+        (Some(parent), Some(name)) if joined.symlink_metadata().is_ok() => {
+            fs::canonicalize(parent).map(|p| p.join(name))
+        }
+        _ => fs::canonicalize(&joined),
+    };
+    let Ok(target) = target else {
         return path.to_owned();
     };
     let cwd = fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
@@ -184,6 +192,16 @@ mod tests {
             relative_insert("x/a.swift", root, &format!("{root}/alias")),
             "a.swift"
         );
+    }
+
+    #[test]
+    fn relative_insert_keeps_final_symlink() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temporary.path()).unwrap();
+        fs::write(root.join("real.txt"), "").unwrap();
+        symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+        let root = root.to_str().unwrap();
+        assert_eq!(relative_insert("link.txt", root, root), "link.txt");
     }
 
     #[test]

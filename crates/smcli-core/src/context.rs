@@ -47,6 +47,13 @@ const MANIFESTS: [(&[&str], &str); 19] = [
     ),
     (&["Dockerfile"], "docker"),
 ];
+/// The project kind a manifest file name stands for.
+pub fn manifest_kind(file: &str) -> Option<&'static str> {
+    MANIFESTS
+        .iter()
+        .find(|(names, _)| names.contains(&file))
+        .map(|(_, kind)| *kind)
+}
 const MAX_LEVELS: usize = 64;
 
 fn exists(path: &str) -> bool {

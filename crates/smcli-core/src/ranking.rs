@@ -84,6 +84,8 @@ pub struct RankingContext {
     /// The shell session asking, whose previous command selects transitions.
     pub session: Option<String>,
     pub candidates: Vec<Candidate>,
+    /// Programs the project's files point to (`make` for a Makefile), each with the reason it is boosted.
+    pub project_programs: HashMap<String, String>,
     pub off: HashSet<Signal>,
 }
 
@@ -99,6 +101,7 @@ impl RankingContext {
             project_kind: project.projects.first().map(|p| p.kind.clone()),
             session,
             candidates: candidates(project),
+            project_programs: project_programs(project),
             off: Self::disabled(ranking_off),
         }
     }
@@ -138,6 +141,30 @@ impl RankingContext {
         run_kind.is_some() && run_kind == self.kind()
     }
 
+    /// Why a command's program matches a file of the project (`Makefile in project`), unless scripts are off.
+    pub fn project_file_reason(&self, command: &str) -> Option<&str> {
+        if !self.uses(Signal::Script) || self.project_programs.is_empty() {
+            return None;
+        }
+        let (command, expanded) = crate::entry::command_parts(command);
+        let text = expanded.as_deref().unwrap_or(&command);
+        let program =
+            crate::parse::program_of(text, crate::parse::CommandBreakdown::parse(text).as_ref())?;
+        // `npm run x` names a script, and this project lists its own: an unlisted x gets no project evidence.
+        if self.candidates.iter().any(|c| {
+            c.reason == "package.json script"
+                && c.command.rsplit_once(' ').is_some_and(|(runner, _)| {
+                    runner.ends_with(" run")
+                        && text
+                            .strip_prefix(runner)
+                            .is_some_and(|rest| rest.starts_with(' '))
+                })
+        }) {
+            return None;
+        }
+        self.project_programs.get(&program).map(String::as_str)
+    }
+
     pub fn candidates_of(&self, kind: CandidateKind) -> Vec<&Candidate> {
         if !self.uses(match kind {
             CandidateKind::Script => Signal::Script,
@@ -153,6 +180,44 @@ impl RankingContext {
 /// `context.map_or(true, |c| c.uses(signal))`: no context means every signal is on.
 pub fn uses(context: Option<&RankingContext>, signal: Signal) -> bool {
     context.is_none_or(|c| c.uses(signal))
+}
+
+/// Programs each project kind is driven by, keyed to the reason a history command using one is boosted.
+fn project_programs(context: &ProjectContext) -> HashMap<String, String> {
+    let mut found = HashMap::new();
+    for (file, kind) in context
+        .projects
+        .iter()
+        .flat_map(|p| &p.manifests)
+        .filter_map(|m| Some((m, crate::context::manifest_kind(m)?)))
+    {
+        let programs: &[&str] = match kind {
+            "make" => &["make"],
+            "node" => &["npm", "npx", "pnpm", "yarn", "bun"],
+            "rust" => &["cargo"],
+            "python" => &["python", "python3", "pip", "pytest", "uv", "poetry"],
+            "go" => &["go"],
+            "swift" => &["swift"],
+            "deno" => &["deno"],
+            "ruby" | "rake" => &["bundle", "rake", "ruby"],
+            "php" => &["composer", "php"],
+            "maven" => &["mvn", "mvnw"],
+            "gradle" => &["gradle", "gradlew"],
+            "elixir" => &["mix"],
+            "dart" => &["dart", "flutter"],
+            "cmake" => &["cmake"],
+            "just" => &["just"],
+            "task" => &["task"],
+            "compose" | "docker" => &["docker", "docker-compose"],
+            _ => &[],
+        };
+        for program in programs {
+            found
+                .entry(program.to_string())
+                .or_insert_with(|| format!("{file} in project"));
+        }
+    }
+    found
 }
 
 /// Commands the directory's project and Git state point to. Only names present in a manifest are produced
@@ -519,6 +584,7 @@ impl SelectionLog {
 /// - A command that often follows the session's previous one is multiplied by up to 7 (its share of that
 ///   command's followers, discounted until it has been seen three times).
 /// - A command picked for a similar query is multiplied by up to 5 (each recent pick of the same query counts 2).
+/// - A history command run by a program the project's files point to (`make` with a Makefile) is multiplied by 1.25.
 /// - A project script already in history is multiplied by 1.5; one that never ran enters at 0.3, below any habit.
 /// - A Git-state hint is lifted just above the best score, so the way out of a rebase is the first suggestion.
 pub fn apply_ranking_signals(
@@ -532,6 +598,17 @@ pub fn apply_ranking_signals(
     let mut why: HashMap<String, Vec<String>> = HashMap::new();
     let empty = vec![];
     let scripts = context.map_or(empty.clone(), |c| c.candidates_of(CandidateKind::Script));
+    let tests = context.map_or(empty.clone(), |c| c.candidates_of(CandidateKind::Test));
+    if let Some(context) = context {
+        for (command, score) in scores.iter_mut() {
+            if let Some(reason) = context.project_file_reason(command)
+                && !scripts.iter().chain(&tests).any(|c| &c.command == command)
+            {
+                *score *= 1.25;
+                why.entry(command.clone()).or_default().push(reason.into());
+            }
+        }
+    }
     for script in scripts.iter().filter(|s| has_prefix(&s.command, prefix)) {
         scores
             .entry(script.command.clone())
@@ -541,7 +618,6 @@ pub fn apply_ranking_signals(
             .or_default()
             .push(script.reason.clone());
     }
-    let tests = context.map_or(empty.clone(), |c| c.candidates_of(CandidateKind::Test));
     for test in tests.iter().filter(|t| has_prefix(&t.command, prefix)) {
         scores
             .entry(test.command.clone())
@@ -628,6 +704,7 @@ pub fn suggestion_why(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entry::command_key;
 
     #[test]
     fn config_details_are_bounded_text_not_commands() {
@@ -686,6 +763,72 @@ mod tests {
             suggestion_why(0, 1, 2, Some("rust"), None),
             Some(vec!["used in this project".to_string()])
         );
+    }
+
+    #[test]
+    fn history_commands_boosted_by_project_file() {
+        let project = ProjectContext {
+            projects: vec![Project {
+                root: "/r".into(),
+                kind: "rust".into(),
+                manifests: vec!["Cargo.toml".into(), "Makefile".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut context = RankingContext::new(&project, None, None);
+        context.candidates = vec![Candidate::new(
+            "make docs".into(),
+            CandidateKind::Script,
+            "Makefile target",
+        )];
+        let run = |context: Option<&RankingContext>| {
+            let mut scores: HashMap<String, f64> = [
+                ("make -j4 test".to_string(), 1.0),
+                ("make docs".to_string(), 1.0),
+                ("ls".to_string(), 1.0),
+                ("FOO=1 make x".to_string(), 1.0),
+                (command_key("mk test", Some("make test")), 1.0),
+            ]
+            .into();
+            let why = apply_ranking_signals(
+                &mut scores,
+                "",
+                context,
+                None,
+                &HashMap::new(),
+                &HashMap::new(),
+            );
+            (scores, why)
+        };
+        let (without, _) = run(None);
+        let (with, why) = run(Some(&context));
+        assert_eq!(without["make -j4 test"], 1.0);
+        assert_eq!(with["make -j4 test"], 1.25);
+        assert_eq!(why["make -j4 test"], ["Makefile in project"]);
+        assert_eq!(with["FOO=1 make x"], 1.25);
+        assert_eq!(with[&command_key("mk test", Some("make test"))], 1.25);
+        assert_eq!(with["ls"], 1.0);
+        assert_eq!(with["make docs"], 1.5);
+        assert!(!with.contains_key("make test"));
+        context.off.insert(Signal::Script);
+        assert_eq!(run(Some(&context)).0["make -j4 test"], 1.0);
+    }
+
+    #[test]
+    fn unlisted_npm_run_gets_no_project_file_boost() {
+        let mut context = RankingContext::default();
+        context
+            .project_programs
+            .insert("npm".into(), "package.json in project".into());
+        assert!(context.project_file_reason("npm run dev").is_some());
+        context.candidates.push(Candidate::new(
+            "npm run docs".into(),
+            CandidateKind::Script,
+            "package.json script",
+        ));
+        assert!(context.project_file_reason("npm run dev").is_none());
+        assert!(context.project_file_reason("npm install").is_some());
     }
 
     #[test]

@@ -22,7 +22,7 @@ pub fn home_dir(environment: &HashMap<String, String>) -> PathBuf {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SmcliConfig {
-    /// Apple's built-in embedding instead of Potion (`smcli init --builtin`). Not ported: Rust always uses Potion.
+    /// Legacy field (Apple's built-in embedding); `smcli init` clears it. Rust always uses Potion.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub builtin: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

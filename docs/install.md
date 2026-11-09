@@ -144,7 +144,7 @@ Then continue with [Set up your shell](#set-up-your-shell).
    Open grep with Ctrl-G? [Y/n]
    ```
 
-   Up always opens the picker. On an empty line in Bash and Zsh, Left opens the same history search as Ctrl-R and Right opens directory suggestions. A line that already has text keeps normal arrow movement. Then it offers any Ollama embedding models you have installed; the default is the
+   Up always opens the picker. On an empty line in Bash and Zsh, Left opens the same history search as Ctrl-R and Right opens directory suggestions. A line that already has text keeps normal arrow movement. The default embedding model is the
    potion-shell-16m model, installed in the `potion-shell-16m/` folder beside the executables.
 
    For scripts and dotfiles, use flags instead; they never ask:

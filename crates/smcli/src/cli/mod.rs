@@ -10,7 +10,7 @@ use smcli_core::{
 use smcli_search::setup::working_directory;
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
-// Printed for no arguments, --help and parse errors.
+// Printed for no arguments and top-level --help.
 const USAGE: &str = include_str!("../usage.txt");
 
 mod history;
@@ -129,12 +129,8 @@ enum Command {
 }
 #[derive(Args)]
 pub struct Init {
-    #[arg(long, conflicts_with_all=["potion","builtin","default"])]
-    pub model: Option<String>,
-    #[arg(long, num_args=0..=1, default_missing_value="", conflicts_with_all=["builtin","default"])]
+    #[arg(long, num_args=0..=1, default_missing_value="", conflicts_with = "default")]
     pub potion: Option<String>,
-    #[arg(long, conflicts_with = "default")]
-    pub builtin: bool,
     #[arg(long)]
     pub default: bool,
     #[arg(long, num_args=0..=1, default_missing_value="")]
@@ -142,7 +138,7 @@ pub struct Init {
 }
 impl Init {
     pub fn has_model(&self) -> bool {
-        self.model.is_some() || self.potion.is_some() || self.builtin || self.default
+        self.potion.is_some() || self.default
     }
 }
 #[derive(Args)]
@@ -249,10 +245,7 @@ pub fn run() -> Result<()> {
         print!("{USAGE}");
         return Ok(());
     }
-    let cli = Cli::try_parse_from(args).unwrap_or_else(|_| {
-        eprint!("{USAGE}");
-        std::process::exit(2)
-    });
+    let cli = Cli::parse_from(args);
     // Only commands that open the database move it; `record` must, or it would create the new one and strand history.
     if !matches!(cli.command, Command::ShellInit { .. }) {
         if let Err(error) = captured.migrate_legacy(&home, &env, |old| {
@@ -537,6 +530,14 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["smcli", "suggest", "--limit", "0"]).is_err());
         assert!(Cli::try_parse_from(["smcli", "pick", "--tldr"]).is_ok());
+        assert_eq!(
+            Cli::try_parse_from(["smcli", "--version"])
+                .err()
+                .map(|e| e.kind()),
+            Some(clap::error::ErrorKind::DisplayVersion)
+        );
+        assert!(Cli::try_parse_from(["smcli", "init", "--model", "x"]).is_err());
+        assert!(Cli::try_parse_from(["smcli", "init", "--builtin"]).is_err());
         for flag in ["--suggest", "--files", "--grep"] {
             assert!(Cli::try_parse_from(["smcli", "pick", "--tldr", flag]).is_err());
         }

@@ -775,6 +775,9 @@ pub(crate) const INTENT_FRECENCY_CAP: f64 = 0.03;
 pub(crate) const INTENT_HEAD_WEIGHT: f64 = 0.02;
 pub(crate) const INTENT_COVERAGE_WEIGHT: f64 = 0.005;
 pub(crate) const INTENT_BOOST_CAP: f64 = 0.10;
+/// Hybrid-rerank bonus per unit of query coverage for a project script or test; history run by the project's
+/// tool gets half.
+const SCRIPT_WEIGHT: f64 = 0.8;
 pub(crate) const INTENT_TASK_WEIGHT: f64 = 0.03;
 pub(crate) const INTENT_PATH_WEIGHT: f64 = 0.03;
 pub(crate) const INTENT_FILE_WEIGHT: f64 = 0.01;
@@ -924,6 +927,14 @@ pub(crate) fn rerank_intent_with_affinity(
             boost += INTENT_COVERAGE_WEIGHT * entry_coverage_prepared(&entry, &meaningful);
             if project_commands.contains(entry.command.as_str()) {
                 boost += INTENT_TASK_WEIGHT;
+            } else if entry.runs > 0
+                && let Some(reason) = signals
+                    .context
+                    .as_ref()
+                    .and_then(|c| c.project_file_reason(entry.primary()))
+            {
+                boost += INTENT_TASK_WEIGHT / 2.0;
+                why.push(reason.into());
             }
             let (available, present, _) = filesystem.get(offset).copied().unwrap_or_default();
             if available {
@@ -1123,13 +1134,24 @@ pub(crate) fn rerank_with_affinity(
             } else if covered > 0.0
                 && let Some(reason) = scripts.get(&entry.command)
             {
-                boost += 0.8 * covered;
+                boost += SCRIPT_WEIGHT * covered;
                 why.push(reason.clone());
             } else if covered > 0.0
                 && let Some(reason) = tests.get(&entry.command)
             {
-                boost += 0.8 * covered;
+                boost += SCRIPT_WEIGHT * covered;
                 why.push(reason.clone());
+            }
+            if !(hints.contains_key(&entry.command)
+                || scripts.contains_key(&entry.command)
+                || tests.contains_key(&entry.command))
+                && entry.runs > 0
+                && let Some(reason) = context.and_then(|c| c.project_file_reason(entry.primary()))
+                && let coverage = entry_coverage(&entry, &query_terms)
+                && coverage > 0.0
+            {
+                boost += SCRIPT_WEIGHT * 0.5 * coverage;
+                why.push(reason.into());
             }
             if let (Some(previous), Some(count)) = (&signals.previous, followed.get(&entry.key()))
                 && follow_total > 0.0
@@ -1336,6 +1358,106 @@ mod tests {
         assert!(edit_distance_at_most_one("installl", "install"));
         assert!(edit_distance_at_most_one("instell", "install"));
         assert!(!edit_distance_at_most_one("isntall", "install"));
+    }
+
+    #[test]
+    fn search_boosts_history_with_project_file() {
+        let hits = || {
+            vec![
+                (SearchEntry::new("make build", 3, "captured"), 0.5),
+                (SearchEntry::new("make -j4 test", 3, "captured"), 0.5),
+            ]
+        };
+        let signals = |with_file: bool, script: bool| {
+            let mut context = RankingContext::default();
+            if with_file {
+                context
+                    .project_programs
+                    .insert("make".into(), "Makefile in project".into());
+            }
+            if script {
+                context.candidates.push(smcli_core::ranking::Candidate::new(
+                    "make build".into(),
+                    CandidateKind::Script,
+                    "Makefile target",
+                ));
+            }
+            SearchSignals {
+                context: Some(context),
+                ..Default::default()
+            }
+        };
+        let order =
+            |entries: Vec<SearchEntry>| entries.into_iter().map(|e| e.command).collect::<Vec<_>>();
+        // Equal relevance, runs and exact-word bonus: without the file the tie goes to the earlier hit.
+        let competing = || {
+            vec![
+                (SearchEntry::new("cargo test", 3, "captured"), 0.5),
+                (SearchEntry::new("make test", 3, "captured"), 0.5),
+            ]
+        };
+        let plain = order(rerank(
+            competing(),
+            true,
+            "test",
+            0.0,
+            &signals(false, false),
+        ));
+        let boosted = rerank(competing(), true, "test", 0.0, &signals(true, false));
+        assert_eq!(plain[0], "cargo test");
+        assert_eq!(boosted[0].command, "make test");
+        assert!(
+            boosted[0]
+                .why
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|w| w == "Makefile in project")
+        );
+        assert!(
+            !boosted[1]
+                .why
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|w| w == "Makefile in project")
+        );
+        // An exact project script still outranks a boosted history command.
+        let with_script = rerank(
+            hits().into_iter().rev().collect(),
+            true,
+            "make build test",
+            0.0,
+            &signals(true, true),
+        );
+        assert_eq!(with_script[0].command, "make build");
+        // The intent rerank boosts too.
+        let vocabulary = HashSet::new();
+        let query = prepare_intent_query("run tests", &vocabulary, None);
+        let intent = |with_file| {
+            rerank_intent_with_affinity(
+                vec![(SearchEntry::new("make -j4 test", 3, "captured"), 0.5)],
+                &query,
+                &signals(with_file, false),
+                &HashMap::new(),
+            )
+        };
+        assert!(
+            intent(true)[0]
+                .why
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|w| w == "Makefile in project")
+        );
+        assert!(
+            !intent(false)[0]
+                .why
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|w| w == "Makefile in project")
+        );
     }
 
     #[test]

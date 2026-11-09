@@ -229,6 +229,9 @@ All 29 findings from the 2026-11-08 review are fixed on macOS, or closed with a 
 - Uninstall converts exported databases out of WAL mode so they are self-contained.
 - `run_git` sets `GIT_NO_LAZY_FETCH=1` (the person approved this on 2026-11-09).
 - Uninstall also removes `.bash3-warned` beside the database and `.moving`, and removes the binaries before the data (the person approved this on 2026-11-09).
+- Search adds the project-file boost, at half the script weight times query coverage, because a 1.25 multiple could outrank an exact project script. Suggestions keep 1.25.
+- `npm run x` gets no project-file boost when the project lists its scripts and x is not one of them, so the ranking floor holds.
+- A `dist/` build that keeps a newer installed service can differ from it in bundled model or tldr data, which degrades `@@` ranking until they match.
 
 ## Tasks
 
@@ -239,13 +242,13 @@ All 29 findings from the 2026-11-08 review are fixed on macOS, or closed with a 
 - [x] Slice 1C: filters on import and fallback `#slice-1c`
 - [x] Slice 1D: database move and uninstall `#slice-1d`
 - [x] Slice 1E: lazy-fetch hardening and uninstall follow-ups `#slice-1e`
-- [ ] Wave 2 slices 2A to 2E `#wave-2`
+- [x] Wave 2 slices 2A to 2E `#wave-2`
 - [ ] Wave 3 slices 3A to 3D `#wave-3`
 
 ### Test
 
 - [x] Wave 1 gate `#wave-1-test`
-- [ ] Wave 2 gate `#wave-2-test`
+- [x] Wave 2 gate `#wave-2-test`
 - [ ] Wave 3 gate `#wave-3-test`
 
 ### Review
@@ -273,3 +276,16 @@ All 29 findings from the 2026-11-08 review are fixed on macOS, or closed with a 
 | 2026-11-09 | Wave 1 gate     | `make test`                                                                       | Pass           | nextest 379 passed, 9 skipped; all black-box sections passed                                 |
 | 2026-11-09 | Slice 1E        | `make test-install`                                                               | Pass           | Lazy-fetch hardening and uninstall follow-ups                                                |
 | 2026-11-09 | Wave 1 gate     | `make test`                                                                       | Pass           | Final tree: nextest 379 passed, 9 skipped; all black-box sections passed                     |
+| 2026-11-09 | Slice 2A        | `make test-rust PKG=smcli-core FILTER=write_connection_enables_wal`               | Pass (1 test)  | Run by `kik3` after review                                                                   |
+| 2026-11-09 | Slice 2A        | `make test-rust PKG=smcli-core FILTER=recent_distinct_orders_by_latest_run`       | Pass (1 test)  | Run by `kik3` after review                                                                   |
+| 2026-11-09 | Slice 2B        | `make test-rust PKG=smcli-core FILTER=service_replacement`                        | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
+| 2026-11-09 | Slice 2C        | `make test-rust PKG=smcli-core FILTER=relative_insert_keeps_final_symlink`        | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
+| 2026-11-09 | Slice 2C        | `make test-rust PKG=smcli-core FILTER=import_reports_missing_source`              | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
+| 2026-11-09 | Slice 2D        | `make test-rust PKG=smcli FILTER=parse_flags_and_times`                           | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
+| 2026-11-09 | Slice 2E        | `make test-rust PKG=smcli-core FILTER=history_commands_boosted_by_project_file`   | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
+| 2026-11-09 | Slice 2E        | `make test-rust PKG=smcli-search FILTER=search_boosts_history_with_project_file`  | Fail           | Order assertion at `corpus.rs:1392`: `make -j4 test` first without the project file          |
+| 2026-11-09 | Slice 2E rerun  | `make test-rust PKG=smcli-search FILTER=search_boosts_history_with_project_file`  | Pass (1 test)  | Test isolated the boost                                                                      |
+| 2026-11-09 | Slice 2E        | `make ranking`                                                                    | Fail (3 of 5)  | Suggest MRR 0.972 below floor 1 (`npm run `); NL `npm run sto` rank 5; `make test` not run   |
+| 2026-11-09 | Slice 2E        | `make test-rust PKG=smcli-core FILTER=project_file`                               | Pass (2 tests) | Includes the unlisted `npm run` guard                                                        |
+| 2026-11-09 | Slice 2E        | `make ranking`                                                                    | Pass (5 of 5)  | Suggest MRR back to 1.000                                                                    |
+| 2026-11-09 | Wave 2 gate     | `make test`                                                                       | Pass           | nextest 387 passed, 9 skipped; all black-box sections passed                                 |

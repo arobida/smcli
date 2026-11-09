@@ -15,6 +15,13 @@ trap '"$bin" service stop >/dev/null 2>&1 || true; rm -rf "$home" "$runtime"' EX
 
 output="$("$bin")"
 [[ "$output" == 'Usage: smcli init'* ]]
+[[ "$("$bin" --version)" == smcli\ * ]]
+[[ "$("$bin" --version >/dev/null; echo $?)" == 0 ]]
+status=0
+"$bin" init --builtin > /dev/null 2> "$runtime/err" || status=$?
+[[ "$status" == 2 ]]
+"$bin" search --help | grep -q 'Usage: smcli search'
+grep -q "unexpected argument '--builtin'" "$runtime/err"
 [[ "$(HOME="$home" HISTFILE='' "$bin" history)" == 'No saved Bash or Zsh history found.' ]]
 printf '#1700000000\necho bash\n' > "$home/.bash_history"
 printf ': 1700000000:0;echo zsh\n' > "$home/.zsh_history"

@@ -66,9 +66,6 @@ pub fn run(
         choose(&mut config)?;
         config.save(path)?;
     }
-    if args.model.is_some() || args.builtin {
-        bail!("Rust supports Potion only; use --default or --potion [DIR].");
-    }
     if args.has_model() || args.keys.is_none() {
         let wanted = if args.has_model() {
             args.potion
@@ -341,9 +338,7 @@ mod tests {
 
     fn init(potion: Option<&str>) -> Init {
         Init {
-            model: None,
             potion: potion.map(str::to_owned),
-            builtin: false,
             default: false,
             keys: None,
         }

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::caller::CallerContext;
-use crate::service_location::{ServiceLocation, build};
+use crate::service_location::{ServiceLocation, build, build_parts};
 use crate::service_protocol::{
     self, Operation, ServiceRequest, ServiceResponse, decode_line, encode_line,
 };
@@ -101,7 +101,7 @@ impl ServiceClient {
         let Some(expected) = build(&self.executable) else {
             return Some(response);
         };
-        if response.build.as_ref() == Some(&expected) {
+        if !should_replace(response.build.as_deref(), &expected) {
             return Some(response);
         }
         self.replace(request, response, spawning, timeout)
@@ -362,9 +362,48 @@ impl ServiceClient {
     }
 }
 
+/// Same binary path replaces on any difference; another path only when the service build is older.
+fn should_replace(service: Option<&str>, expected: &str) -> bool {
+    if service == Some(expected) {
+        return false;
+    }
+    match (service.and_then(build_parts), build_parts(expected)) {
+        (Some((old, old_time)), Some((new, new_time))) if old != new => old_time < new_time,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_replacement_rules() {
+        let new = "/a/smcli-service|1700000000.5|3";
+        assert!(!should_replace(Some(new), new));
+        assert!(should_replace(Some("/a/smcli-service|1700000001.5|3"), new));
+        assert!(should_replace(Some("/b/smcli-service|1699999999.5|3"), new));
+        assert!(!should_replace(
+            Some("/b/smcli-service|1700000001.5|3"),
+            new
+        ));
+        assert!(should_replace(Some("garbage"), new));
+        assert!(should_replace(None, new));
+        assert!(!should_replace(
+            Some("/b/s|1700000000.5|3"),
+            "/a/s|1700000000.5|3"
+        ));
+        // 9 ns is later than 10 ns only as text.
+        assert!(!should_replace(
+            Some("/b/s|1700000000.10|3"),
+            "/a/s|1700000000.9|3"
+        ));
+        assert!(should_replace(
+            Some("/b/s|1700000000.9|3"),
+            "/a/s|1700000000.10|3"
+        ));
+    }
+
     #[test]
     fn service_executable_naming() {
         for (cli, service) in [

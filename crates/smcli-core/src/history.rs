@@ -972,7 +972,7 @@ impl CapturedHistory {
             return Ok(vec![]);
         }
         let db = self.open_connection()?;
-        let mut stmt = db.prepare("SELECT c.command, c.expanded_command, c.directory, s.shell FROM commands c JOIN sessions s ON s.id=c.session WHERE s.user=?1 ORDER BY c.started_at DESC,c.id DESC")?;
+        let mut stmt = db.prepare("SELECT c.command, c.expanded_command, c.directory, s.shell FROM commands c JOIN sessions s ON s.id=c.session WHERE s.user=?1 AND c.deleted_at IS NULL ORDER BY c.started_at DESC,c.id DESC")?;
         let mut rows = stmt.query(rusqlite::params![user])?;
         let mut kept = Vec::new();
         while let Some(row) = rows.next()? {
@@ -996,7 +996,7 @@ impl CapturedHistory {
         let mut stmt = db
             .prepare(
                 "SELECT c.directory FROM commands c JOIN sessions s ON s.id = c.session
-                 WHERE smcli_key(c.command, c.expanded_command) = ? AND s.user = ?
+                 WHERE smcli_key(c.command, c.expanded_command) = ? AND s.user = ? AND c.deleted_at IS NULL
                  ORDER BY c.started_at DESC, c.id DESC LIMIT 1",
             )
             .ok()?;
@@ -1009,9 +1009,9 @@ impl CapturedHistory {
     pub fn recent_distinct(&self, user: &str) -> Result<Vec<String>> {
         let db = self.open_connection()?;
         let mut statement = db.prepare(
-            "SELECT DISTINCT smcli_key(c.command,c.expanded_command) FROM commands c JOIN sessions s ON s.id = c.session
+            "SELECT smcli_key(c.command,c.expanded_command) AS k FROM commands c JOIN sessions s ON s.id = c.session
              WHERE s.user = ? AND c.deleted_at IS NULL AND NOT smcli_internal(COALESCE(c.expanded_command,c.command))
-             ORDER BY c.started_at DESC, c.id DESC",
+             GROUP BY k ORDER BY max(c.started_at) DESC, max(c.id) DESC",
         )?;
         Ok(statement
             .query_map([user], |r| r.get::<_, String>(0))?
@@ -1248,10 +1248,13 @@ impl CapturedHistory {
                     return Err(error);
                 }
                 db.execute_batch("COMMIT")?;
-                db.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))?;
             }
             // WAL with NORMAL sync avoids an fsync per command; a power loss can drop only the last few records.
-            db.execute_batch("PRAGMA synchronous = NORMAL")?;
+            // Set on every write connection: a database left in DELETE mode must not get NORMAL sync.
+            let mode = db.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0));
+            if mode.is_ok_and(|m| m.eq_ignore_ascii_case("wal")) {
+                db.execute_batch("PRAGMA synchronous = NORMAL")?;
+            }
         } else if version == 0 {
             bail!("Not an smcli history database: {}", path.display());
         }
@@ -1780,6 +1783,41 @@ mod tests {
         assert_eq!(parse_pipestatus(" ").unwrap(), None);
     }
 
+    #[test]
+    fn write_connection_enables_wal() {
+        let (_dir, log) = temp_db();
+        log.open_connection()
+            .unwrap()
+            .execute_batch("PRAGMA journal_mode = DELETE")
+            .unwrap();
+        let db = log.open_connection().unwrap();
+        let mode: String = db
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        let sync: i64 = db
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync, 1, "NORMAL");
+    }
+
+    #[test]
+    fn recent_distinct_orders_by_latest_run() {
+        let (_dir, log) = temp_db();
+        let db = log.open_connection().unwrap();
+        db.execute_batch("INSERT INTO sessions(id,user,host,shell) VALUES('s','u','h','zsh');
+            INSERT INTO commands(session,started_at,directory,command,exit_code) VALUES
+            ('s',1,'/','a',0),('s',2,'/','b',0),('s',3,'/','a',0);
+            INSERT INTO commands(session,started_at,directory,command,exit_code,deleted_at) VALUES ('s',4,'/','gone',0,5);").unwrap();
+        assert_eq!(log.recent_distinct("u").unwrap(), ["a", "b"]);
+        assert_eq!(
+            log.file_kind_rows("u", usize::MAX, |_| true).unwrap().len(),
+            3
+        );
+        assert_eq!(log.last_directory("a", "u").as_deref(), Some("/"));
+        assert_eq!(log.last_directory("gone", "u"), None);
+    }
+
     /// A reader holding a DELETE-journal database's shared lock makes COMMIT fail with SQLITE_BUSY after the
     /// writes succeeded; the insert must roll back so the same connection can record again.
     #[test]
@@ -1787,7 +1825,7 @@ mod tests {
         let (_dir, log) = temp_db();
         {
             let db = log.open_connection().unwrap();
-            // WAL is only enabled during migration, so a current-schema database can still be DELETE-journal.
+            // Force DELETE mode; the next write connection switches it back to WAL.
             db.execute_batch("PRAGMA journal_mode = DELETE").unwrap();
         }
         let reader = Connection::open(&log.path).unwrap();

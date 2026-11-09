@@ -7,11 +7,13 @@ use std::path::Path;
 
 fn validate_source(c: &CapturedHistory, source: &Path) -> Result<()> {
     ensure!(
+        source.try_exists()?,
+        "Import source not found: {}",
+        source.display()
+    );
+    ensure!(
         source != c.path
-            && std::fs::canonicalize(&source).ok()
-                != std::fs::canonicalize(&c.path)
-                    .ok()
-                    .filter(|_| c.path.exists()),
+            && std::fs::canonicalize(&source).ok() != std::fs::canonicalize(&c.path).ok(),
         "Cannot import history into itself"
     );
     Ok(())
@@ -346,6 +348,18 @@ mod tests {
         );
         drop(db);
         std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn import_reports_missing_source() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let dir = temporary.path();
+        let c = CapturedHistory::new(dir.join("history.db"));
+        let err = c
+            .import_legacy(&dir.join("missing.jsonl"), &capture_filter(dir)?)
+            .unwrap_err();
+        assert!(err.to_string().contains("Import source not found"));
         Ok(())
     }
 

@@ -81,6 +81,14 @@ pub fn build(executable: &Path) -> Option<String> {
     ))
 }
 
+/// Splits a `build` value into its path and (seconds, nanoseconds); nanoseconds are not zero-padded.
+pub(crate) fn build_parts(build: &str) -> Option<(&str, (i64, i64))> {
+    let mut fields = build.rsplitn(3, '|');
+    fields.next()?.parse::<u64>().ok()?;
+    let (seconds, nanos) = fields.next()?.split_once('.')?;
+    Some((fields.next()?, (seconds.parse().ok()?, nanos.parse().ok()?)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
