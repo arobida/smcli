@@ -13,8 +13,8 @@ pub struct PruneReport {
     pub commands: Vec<String>,
     pub removed_commands: usize,
     pub removed_selections: usize,
-    /// Migration backup which may still contain pruned history; callers should warn before returning.
-    pub backup: Option<PathBuf>,
+    /// Kept copies (`.v7.bak`, `.pre-xdg`) which may still contain pruned history; callers should warn about each.
+    pub backup: Vec<PathBuf>,
 }
 
 /// Deletes already committed; cleanup or compaction then failed.
@@ -23,7 +23,7 @@ pub struct PruneReport {
 pub struct PruneError {
     pub removed_commands: usize,
     pub removed_selections: usize,
-    pub backup: Option<PathBuf>,
+    pub backup: Vec<PathBuf>,
     message: String,
 }
 
@@ -124,7 +124,7 @@ impl CapturedHistory {
         let selection_removed = picks.len() + file_picks.len();
 
         let removed_commands = ids.len();
-        let mut backup = None;
+        let mut backup = Vec::new();
         if dry {
             tx.rollback()?;
         } else {
@@ -141,11 +141,13 @@ impl CapturedHistory {
                 tx.execute("DELETE FROM command_selections WHERE command=?", [command])?;
             }
             tx.commit()?;
-            let mut name = self.path.as_os_str().to_owned();
-            name.push(".v7.bak");
-            let path = PathBuf::from(name);
-            if path.exists() {
-                backup = Some(path);
+            for suffix in [".v7.bak", ".pre-xdg"] {
+                let mut name = self.path.as_os_str().to_owned();
+                name.push(suffix);
+                let path = PathBuf::from(name);
+                if path.exists() {
+                    backup.push(path);
+                }
             }
             // Commit stands. Return the backup with the maintenance error so the caller can still warn.
             if let Err(error) = finish_prune(&db, cleanup) {
@@ -230,7 +232,7 @@ mod tests {
         })?;
         assert_eq!(report.removed_commands, 1);
         assert_eq!(report.removed_selections, 1);
-        assert_eq!(report.backup, Some(backup));
+        assert_eq!(report.backup, [backup]);
         Ok(())
     }
 
@@ -253,7 +255,7 @@ mod tests {
             .downcast_ref::<PruneError>()
             .expect("post-commit error");
         assert_eq!(committed.removed_commands, 1);
-        assert_eq!(committed.backup.as_deref(), Some(backup.as_path()));
+        assert_eq!(committed.backup, [backup]);
         let message = failed.to_string();
         assert!(
             message.contains("index cleanup failed") && message.contains("boom"),

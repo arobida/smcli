@@ -20,6 +20,12 @@ pub(super) fn epoch(s: &str) -> Result<Option<f64>> {
     ensure!(value.is_finite() && value > 0.0, "Invalid time: {s}");
     Ok(Some(value))
 }
+/// `record --stdin` input: an expansion line (empty for none), then the command.
+pub(super) fn split_record_stdin(text: &str) -> Option<(Option<&str>, &str)> {
+    let (first, rest) = text.split_once('\n')?;
+    let command = rest.strip_suffix('\n')?;
+    Some(((!first.is_empty()).then_some(first), command))
+}
 pub(super) fn record(
     f: &[String],
     expanded: Option<&str>,
@@ -150,7 +156,7 @@ pub(super) fn prune(c: &CapturedHistory, filter: &CaptureFilter, dry: bool) -> R
                     "Removed {} commands and {} selections.",
                     failed.removed_commands, failed.removed_selections
                 );
-                warn_migration_backup(failed.backup.as_deref());
+                warn_migration_backup(&failed.backup);
             }
             return Err(error);
         }
@@ -168,15 +174,15 @@ pub(super) fn prune(c: &CapturedHistory, filter: &CaptureFilter, dry: bool) -> R
             "Removed {} commands and {} selections.",
             report.removed_commands, report.removed_selections
         );
-        warn_migration_backup(report.backup.as_deref());
+        warn_migration_backup(&report.backup);
     }
     Ok(())
 }
 
-fn warn_migration_backup(backup: Option<&Path>) {
-    if let Some(backup) = backup {
+fn warn_migration_backup(backups: &[PathBuf]) {
+    for backup in backups {
         eprintln!(
-            "smcli: migration backup {} may still contain pruned history; remove it manually if no longer needed.",
+            "smcli: kept backup {} may still contain pruned history; remove it manually if no longer needed.",
             backup.display()
         );
     }
@@ -268,5 +274,18 @@ mod tests {
         drop(db);
         std::fs::remove_dir_all(dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn record_stdin_splits_expansion_and_command() {
+        assert_eq!(split_record_stdin("\nls\n"), Some((None, "ls")));
+        assert_eq!(
+            split_record_stdin("ls -a\nll\n"),
+            Some((Some("ls -a"), "ll"))
+        );
+        assert_eq!(split_record_stdin("\na\nb\n\n"), Some((None, "a\nb\n")));
+        assert_eq!(split_record_stdin("ls"), None);
+        assert_eq!(split_record_stdin("exp\ncmd"), None);
+        assert_eq!(split_record_stdin("ls -a\n"), None);
     }
 }

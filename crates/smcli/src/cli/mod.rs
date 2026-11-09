@@ -8,11 +8,7 @@ use smcli_core::{
     time::{format_iso8601, now, parse_iso8601},
 };
 use smcli_search::setup::working_directory;
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 // Printed for no arguments, --help and parse errors.
 const USAGE: &str = include_str!("../usage.txt");
@@ -115,6 +111,9 @@ enum Command {
     Record {
         #[arg(long, allow_hyphen_values = true)]
         expanded: Option<String>,
+        /// Read the expansion line and the command from stdin; the last field is `-`.
+        #[arg(long, conflicts_with = "expanded")]
+        stdin: bool,
         #[arg(num_args=5..=9, allow_hyphen_values=true)]
         fields: Vec<String>,
     },
@@ -179,6 +178,10 @@ fn positive(s: &str) -> std::result::Result<usize, String> {
 pub fn print_json(value: &impl serde::Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
+}
+/// `@` completion inserts a path, so it needs a known line the path can go into.
+fn complete_allowed(lbuffer: Option<&str>, shell: &str) -> bool {
+    lbuffer.is_some_and(|b| crate::shell_quoting::insertable(b, shell))
 }
 fn directory(value: Option<String>, env: &HashMap<String, String>) -> Result<String> {
     let d = value.unwrap_or_else(|| working_directory(env));
@@ -283,22 +286,49 @@ pub fn run() -> Result<()> {
         Command::Context { json, dir } => {
             crate::context::run(&directory(dir, &env)?, json, &service)?
         }
-        Command::Record { fields, expanded } => history::record(
-            &fields,
-            expanded.as_deref(),
-            &captured,
-            &service,
-            &filter()?,
-        )?,
+        Command::Record {
+            mut fields,
+            expanded,
+            stdin,
+        } => {
+            let mut expanded = expanded;
+            if stdin {
+                ensure!(
+                    [8, 9].contains(&fields.len()) && fields.last().is_some_and(|f| f == "-"),
+                    "Invalid record arguments"
+                );
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+                let Some((exp, command)) = history::split_record_stdin(&text) else {
+                    bail!("Invalid record input");
+                };
+                expanded = exp.map(String::from);
+                *fields.last_mut().unwrap() = command.to_string();
+            }
+            history::record(
+                &fields,
+                expanded.as_deref(),
+                &captured,
+                &service,
+                &filter()?,
+            )?
+        }
         Command::Complete {
             word,
             command,
             limit,
         } => {
+            let shell = env.get("SMCLI_SHELL").map(String::as_str).unwrap_or("bash");
+            let lbuffer = env.get("SMCLI_LBUFFER").map(String::as_str);
+            if !complete_allowed(lbuffer, shell) {
+                if lbuffer.is_none() {
+                    eprintln!("smcli: reload smcli's shell-init to enable @ completion.");
+                }
+                return Ok(());
+            }
             let word = word.strip_prefix('@').unwrap_or(&word);
             let dirs_only = command.as_deref().is_some_and(pick::is_directory_command);
             let cwd = working_directory(&env);
-            let shell = env.get("SMCLI_SHELL").map(String::as_str).unwrap_or("bash");
             let mut request = ServiceRequest::new(Operation::Complete);
             request.query = Some(word.to_string());
             request.directory = Some(cwd.clone());
@@ -323,10 +353,21 @@ pub fn run() -> Result<()> {
                         .collect();
                     (paths, chosen)
                 }
-                None => (
-                    crate::complete::complete_local(Path::new(&cwd), word, dirs_only, limit),
-                    None,
-                ),
+                None => {
+                    let ignore = smcli_core::config::FileIgnore::load(&config_path, &home)?;
+                    // Canonical, like the service scope, so anchored patterns match through symlinks.
+                    let root = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone().into());
+                    (
+                        crate::complete::complete_local(
+                            &root,
+                            word,
+                            dirs_only,
+                            limit,
+                            ignore.as_ref(),
+                        ),
+                        None,
+                    )
+                }
             };
             if let Some(path) = chosen {
                 let mut r = ServiceRequest::new(Operation::Select);
@@ -414,6 +455,15 @@ pub fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn complete_allowed_needs_an_insertable_line() {
+        assert!(complete_allowed(Some(""), "bash"));
+        assert!(complete_allowed(Some("cat @"), "bash"));
+        assert!(!complete_allowed(None, "bash"));
+        assert!(!complete_allowed(Some("echo \"@"), "bash"));
+    }
 
     #[test]
     fn only_initialize_loads_the_model() -> Result<()> {

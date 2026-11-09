@@ -658,9 +658,31 @@ impl GitStatus {
 
     /// Runs Git without a shell or optional locks (so it never contends with the user's own Git), killed after
     /// `timeout` seconds. None on timeout or failure.
+    /// Status can run repo-defined programs, so fsmonitor and submodules are off, and a repo with local or
+    /// worktree `filter.*` config (clean/smudge programs) is skipped. Global filters such as LFS are fine.
     pub fn read(root: &str, timeout: f64) -> Option<Self> {
+        let config = Self::run_git(
+            &["-C", root, "config", "--show-scope", "--includes", "--list"],
+            timeout,
+        )?;
+        let untrusted_filter = config.lines().any(|line| {
+            let (scope, rest) = line.split_once('\t').unwrap_or_default();
+            matches!(scope, "local" | "worktree") && rest.starts_with("filter.")
+        });
+        if untrusted_filter {
+            return None;
+        }
         Self::run_git(
-            &["-C", root, "status", "--porcelain=v2", "--branch"],
+            &[
+                "-C",
+                root,
+                "-c",
+                "core.fsmonitor=false",
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "--ignore-submodules=all",
+            ],
             timeout,
         )
         .map(|output| Self::parse(&output, now()))
@@ -676,6 +698,8 @@ impl GitStatus {
         command
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_TERMINAL_PROMPT", "0")
+            // A partial clone must not lazy-fetch from status: that can run a repo-configured program.
+            .env("GIT_NO_LAZY_FETCH", "1")
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -945,11 +969,67 @@ let package = Package(
         );
     }
 
+    fn git(root: &str, args: &[&str]) {
+        let ok = Command::new("git")
+            .args(["-C", root, "-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    fn marker_script(root: &str) -> String {
+        let script = format!("{root}/hook.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch {root}/ran\ncat\n")).unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        script
+    }
+
+    #[test]
+    fn git_status_ignores_repo_fsmonitor() {
+        let root = tempfile_dir();
+        git(&root, &["init", "-q"]);
+        std::fs::write(format!("{root}/f"), "a").unwrap();
+        git(&root, &["add", "f"]);
+        git(&root, &["commit", "-qm", "x"]);
+        let script = marker_script(&root);
+        git(&root, &["config", "core.fsmonitor", &script]);
+        assert!(GitStatus::read(&root, 5.0).is_some());
+        assert!(!Path::new(&format!("{root}/ran")).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_status_skips_repo_filters() {
+        let root = tempfile_dir();
+        git(&root, &["init", "-q"]);
+        std::fs::write(format!("{root}/.gitattributes"), "f filter=evil\n").unwrap();
+        std::fs::write(format!("{root}/f"), "a").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "x"]);
+        let script = marker_script(&root);
+        std::fs::write(
+            format!("{root}/extra.cfg"),
+            format!("[filter \"evil\"]\n\tclean = {script}\n"),
+        )
+        .unwrap();
+        git(
+            &root,
+            &["config", "include.path", &format!("{root}/extra.cfg")],
+        );
+        std::fs::write(format!("{root}/f"), "b").unwrap(); // same size, dirty stat data
+        assert!(GitStatus::read(&root, 5.0).is_none());
+        assert!(!Path::new(&format!("{root}/ran")).exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn tempfile_dir() -> String {
         let path = std::env::temp_dir().join(format!(
-            "smcli-context-{}-{:?}",
+            "smcli-context-{}-{}",
             std::process::id(),
-            std::thread::current().id()
+            format!("{:?}", std::thread::current().id()).replace(['(', ')'], "")
         ));
         std::fs::create_dir_all(&path).unwrap();
         real_path(path.to_str().unwrap()).unwrap()

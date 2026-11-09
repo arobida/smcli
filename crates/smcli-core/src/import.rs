@@ -19,11 +19,11 @@ fn validate_source(c: &CapturedHistory, source: &Path) -> Result<()> {
 
 impl CapturedHistory {
     /// Import Atuin UUIDs and tombstones; replacement is atomic with the import.
-    /// Atuin imports retain their existing behavior of not applying capture filters.
+    /// Rows the capture filter rejects are skipped, but their tombstones still apply.
     pub fn import_atuin(
         &self,
         source: &Path,
-        _filter: &CaptureFilter,
+        filter: &CaptureFilter,
         replace: bool,
     ) -> Result<usize> {
         validate_source(self, source)?;
@@ -72,6 +72,18 @@ impl CapturedHistory {
             )?;
         }
         while let Some(r) = rows.next()? {
+            let command: String = r.get(4)?;
+            let cwd: String = r.get(5)?;
+            let deleted = r.get::<_, Option<i64>>(8)?.map(|n| n as f64 / 1e9);
+            if !filter.allows_run(&command, None, &cwd) {
+                if deleted.is_some() {
+                    tx.execute(
+                        "UPDATE commands SET deleted_at=? WHERE uuid=?",
+                        rusqlite::params![deleted, r.get::<_, String>(0)?],
+                    )?;
+                }
+                continue;
+            }
             let hostname: String = r.get(7)?;
             let (host, user) = hostname.split_once(':').unwrap_or((&hostname, "unknown"));
             let session = format!("atuin-{}", r.get::<_, String>(6)?);
@@ -83,10 +95,9 @@ impl CapturedHistory {
                 "INSERT OR IGNORE INTO sessions(id,user,host,shell) VALUES(?,?,?,?)",
                 rusqlite::params![session, user, host, shell],
             )?;
-            let command: String = r.get(4)?;
             let flags = crate::parse::command_flags(&command).join(" ");
             let duration: i64 = r.get(2)?;
-            count+=tx.execute("INSERT INTO commands(session,started_at,duration_ms,directory,command,exit_code,uuid,deleted_at,author,intent,flags) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(uuid) DO UPDATE SET deleted_at=excluded.deleted_at",rusqlite::params![session,r.get::<_,i64>(1)? as f64/1e9,if duration<0{None}else{Some(duration/1_000_000)},r.get::<_,String>(5)?,command,r.get::<_,i64>(3)?,r.get::<_,String>(0)?,r.get::<_,Option<i64>>(8)?.map(|n|n as f64/1e9),r.get::<_,Option<String>>(10)?,r.get::<_,Option<String>>(11)?,flags])?;
+            count+=tx.execute("INSERT INTO commands(session,started_at,duration_ms,directory,command,exit_code,uuid,deleted_at,author,intent,flags) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(uuid) DO UPDATE SET deleted_at=excluded.deleted_at",rusqlite::params![session,r.get::<_,i64>(1)? as f64/1e9,if duration<0{None}else{Some(duration/1_000_000)},cwd,command,r.get::<_,i64>(3)?,r.get::<_,String>(0)?,deleted,r.get::<_,Option<String>>(10)?,r.get::<_,Option<String>>(11)?,flags])?;
         }
 
         tx.commit()?;
@@ -208,6 +219,47 @@ mod tests {
         );
         drop(db);
         std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn atuin_import_applies_filters() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let dir = temporary.path().to_path_buf();
+        let source = dir.join("atuin.db");
+        let db = rusqlite::Connection::open(&source)?;
+        db.execute_batch("CREATE TABLE history(id TEXT,timestamp INTEGER,duration INTEGER,exit INTEGER,command TEXT,cwd TEXT,session TEXT,hostname TEXT,deleted_at INTEGER); INSERT INTO history VALUES('a',1700000000000000000,1,0,'secret one','/tmp','s','h:u',NULL);")?;
+        let filter = CaptureFilter::new(&SmcliConfig {
+            history_filter: Some(vec!["^secret".into()]),
+            ..Default::default()
+        })?;
+        let c = CapturedHistory::new(dir.join("history.db"));
+        c.import_atuin(&source, &filter, false)?;
+        assert!(c.export_rows()?.is_empty());
+        let sessions: i64 =
+            c.open_connection()?
+                .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))?;
+        assert_eq!(sessions, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn atuin_import_applies_filters_to_tombstones() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let dir = temporary.path().to_path_buf();
+        let source = dir.join("atuin.db");
+        let db = rusqlite::Connection::open(&source)?;
+        db.execute_batch("CREATE TABLE history(id TEXT,timestamp INTEGER,duration INTEGER,exit INTEGER,command TEXT,cwd TEXT,session TEXT,hostname TEXT,deleted_at INTEGER); INSERT INTO history VALUES('a',1700000000000000000,1,0,'secret one','/tmp','s','h:u',NULL);")?;
+        let c = CapturedHistory::new(dir.join("history.db"));
+        c.import_atuin(&source, &capture_filter(&dir)?, false)?;
+        assert_eq!(c.export_rows()?.len(), 1);
+        db.execute("UPDATE history SET deleted_at=1700000001", [])?;
+        let filter = CaptureFilter::new(&SmcliConfig {
+            history_filter: Some(vec!["^secret".into()]),
+            ..Default::default()
+        })?;
+        assert_eq!(c.import_atuin(&source, &filter, false)?, 0);
+        assert!(c.export_rows()?.is_empty());
         Ok(())
     }
 

@@ -293,7 +293,7 @@ impl CapturedHistory {
     }
 
     /// Moves a database at the legacy default to `self.path` once. The old folder holds only history.db, its
-    /// -wal/-shm, the .migration.lock and the history.db.search index (plus unrelated files, which stay). The copy is a consistent
+    /// -wal/-shm (kept beside the new one as history.db.pre-xdg*), the .migration.lock and the history.db.search index (plus unrelated files, which stay). The copy is a consistent
     /// `VACUUM INTO` renamed into place before any cleanup, so a failure leaves the old database intact and no new one;
     /// the search index folder moves last.
     /// `stop` shuts down a service still serving the old path first.
@@ -333,6 +333,7 @@ impl CapturedHistory {
         }
         {
             let db = Connection::open(&old)?;
+            db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
             db.execute("VACUUM INTO ?1", [moving.to_string_lossy().as_ref()])?;
         }
         std::fs::set_permissions(&moving, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
@@ -340,9 +341,24 @@ impl CapturedHistory {
         std::fs::rename(&moving, &self.path)?;
         // The new database is in place; what follows is cleanup and must not fail the move.
         let name = |suffix: &str| format!("history.db{suffix}");
-        for suffix in ["", "-wal", "-shm", ".migration.lock"] {
-            let _ = std::fs::remove_file(from.join(name(suffix)));
+        // Keep the old files (a terminal with the file open may still write there). Skip existing targets;
+        // a cross-volume rename fails and leaves them in place.
+        // The three files are one unit: a -wal beside a different main file would be replayed into it.
+        let kept = |suffix: &str| to.join(name(&format!(".pre-xdg{suffix}")));
+        if ["", "-wal", "-shm"].iter().all(|s| !kept(s).exists()) {
+            match std::fs::rename(from.join(name("")), kept("")) {
+                Ok(()) => {
+                    for suffix in ["-wal", "-shm"] {
+                        let _ = std::fs::rename(from.join(name(suffix)), kept(suffix));
+                    }
+                }
+                Err(e) => eprintln!(
+                    "smcli: could not keep the old database {} ({e}); it stays in place",
+                    old.display()
+                ),
+            }
         }
+        let _ = std::fs::remove_file(from.join(name(".migration.lock")));
         let index = from.join(name(".search"));
         if index.exists() && std::fs::rename(&index, to.join(name(".search"))).is_err() {
             eprintln!("smcli: could not move the search index; run `smcli reindex` to rebuild it");
@@ -1505,6 +1521,7 @@ mod tests {
             .unwrap();
         assert_eq!(stopped.as_deref(), Some(legacy.as_path()));
         assert!(!legacy.exists() && !legacy.parent().unwrap().exists());
+        assert!(target.with_file_name("history.db.pre-xdg").exists());
         drop(old);
         let moved: String = new
             .open_connection()
@@ -1514,6 +1531,40 @@ mod tests {
         assert_eq!(moved, "moved");
         new.migrate_legacy(home.path(), &none, |_| panic!("already moved"))
             .unwrap();
+    }
+
+    #[test]
+    fn legacy_existing_pre_xdg_blocks_all_renames() {
+        for seeded in ["", "-wal", "-shm"] {
+            let home = tempfile::tempdir().unwrap();
+            let legacy = CapturedHistory::legacy_location(home.path());
+            std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+            // An open connection keeps a real -wal alive across the migration.
+            let old = CapturedHistory::new(&legacy).open_connection().unwrap();
+            old.execute(
+                "INSERT INTO sessions(id,user,host,shell) VALUES('s','test','host','zsh')",
+                [],
+            )
+            .unwrap();
+            let wal = legacy.with_file_name("history.db-wal");
+            assert!(wal.exists());
+            let target = home.path().join(".local/state/smcli/history.db");
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            let kept = target.with_file_name(format!("history.db.pre-xdg{seeded}"));
+            std::fs::write(&kept, "mine").unwrap();
+            CapturedHistory::new(&target)
+                .migrate_legacy(home.path(), &HashMap::new(), |_| {})
+                .unwrap();
+            assert_eq!(std::fs::read(&kept).unwrap(), b"mine", "{seeded}");
+            assert!(legacy.exists() && wal.exists(), "{seeded}");
+            if seeded != "-wal" {
+                assert!(!target.with_file_name("history.db.pre-xdg-wal").exists());
+            }
+            if seeded != "" {
+                assert!(!target.with_file_name("history.db.pre-xdg").exists());
+            }
+            drop(old);
+        }
     }
 
     #[test]
@@ -1552,6 +1603,7 @@ mod tests {
         assert_eq!(id, "moved");
         assert!(
             !legacy.exists()
+                && target.with_file_name("history.db.pre-xdg").exists()
                 && from.join("other").exists()
                 && !from.join("history.db.search").exists()
         );
@@ -1575,6 +1627,7 @@ mod tests {
         assert!(
             target.exists()
                 && !legacy.exists()
+                && target.with_file_name("history.db.pre-xdg").exists()
                 && !legacy.parent().unwrap().join("history.db.search").exists()
         );
 

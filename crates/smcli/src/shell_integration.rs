@@ -152,14 +152,14 @@ if [[ ${_smcli_installed-} != 1 ]]; then
             (umask 077; printf '%s\n' "$_smcli_expanded" >| "$_smcli_expfile") 2>/dev/null || true
         }
         _smcli_record() {
-            # --expanded precedes the existing positional fields and is omitted without a trusted expansion.
+            # The expansion (empty unless trusted) and the command go on stdin, so neither shows in process arguments.
             local -a args
-            args=(record)
-            _smcli_safe "${_smcli_expanded-}" && args+=(--expanded "$_smcli_expanded")
-            args+=(bash "$_smcli_session" "$_smcli_directory" "$1")
+            local exp=
+            _smcli_safe "${_smcli_expanded-}" && exp=$_smcli_expanded
+            args=(record --stdin bash "$_smcli_session" "$_smcli_directory" "$1")
             [[ -n ${3-} ]] && args+=("$3")
-            args+=("$_smcli_started" "$2" "${HISTFILE-}" "$_smcli_command")
-            "$_smcli_bin" "${args[@]}" || printf 'smcli: command metadata was not saved.\n' >&2
+            args+=("$_smcli_started" "$2" "${HISTFILE-}" -)
+            builtin printf '%s\n%s\n' "$exp" "$_smcli_command" | "$_smcli_bin" "${args[@]}" || printf 'smcli: command metadata was not saved.\n' >&2
         }
         # Whether $1 matches one of the user's HISTIGNORE patterns (a bare & means "the previous line": not checked).
         _smcli_histignore() {
@@ -496,7 +496,7 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
                 fi
                 bind '"\e[0n": redraw-current-line'
             elif [[ $word == @* ]]; then
-                hits=$(SMCLI_SHELL=bash "$_smcli_complete_bin" complete --word "$word" --command "$cmd" --limit 2)
+                hits=$(SMCLI_SHELL=bash SMCLI_LBUFFER="$before" "$_smcli_complete_bin" complete --word "$word" --command "$cmd" --limit 2)
                 hit=$hits
                 if [[ $hits == *$'\n'* ]]; then
                     # Several matches: pick one in the files picker, filtered by the word.
@@ -520,19 +520,21 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
         unset _smcli_tab_custom
     else
         _smcli_complete() {
-            local cur=${COMP_WORDS[COMP_CWORD]} cmd=${COMP_WORDS[0]} line
+            local cur=${COMP_WORDS[COMP_CWORD]} cmd=${COMP_WORDS[0]} line before
+            # COMP_POINT is a byte offset on 3.2; cut in the C locale, only here so smcli keeps the user's locale.
+            before=$(LC_ALL=C; builtin printf '%s' "${COMP_LINE:0:COMP_POINT}")
             COMPREPLY=()
             # shortcut: Readline treats the second @ of @@ as a word break, so Bash 3 completion can only replace
             # one @ and a clean rewrite is impossible; the check runs first and leaves the line unchanged (today it
             # would list every file). Upgrade if Bash 3 must have command help.
-            _smcli_tldr_split "${COMP_LINE:0:COMP_POINT}" && return
+            _smcli_tldr_split "$before" && return
             [[ $cur == @* ]] || return
             while IFS= read -r line; do
                 [[ -n $line ]] && COMPREPLY+=("$line")
-            done < <(SMCLI_SHELL=bash "$_smcli_complete_bin" complete --word "$cur" --command "$cmd")
+            done < <(SMCLI_SHELL=bash SMCLI_LBUFFER="$before" "$_smcli_complete_bin" complete --word "$cur" --command "$cmd")
             if (( ${#COMPREPLY[@]} > 1 )); then
                 # Several matches: pick one in the files picker, filtered by the word.
-                local line_before=${COMP_LINE:0:COMP_POINT}
+                local line_before=$before
                 line=$(env SMCLI_SHELL=bash SMCLI_LBUFFER="$line_before" SMCLI_FILES_QUERY="${cur#@}" "$_smcli_complete_bin" pick --files </dev/tty)
                 local code=$?
                 if (( code == 12 )); then cd -- "$line"; fi
@@ -594,10 +596,10 @@ if [[ ${_smcli_installed-} != 1 ]]; then
     }
     _smcli_record() {
         local -a args
-        args=(record)
-        _smcli_safe "${_smcli_expanded-}" && args+=(--expanded "$_smcli_expanded")
-        args+=(zsh "$_smcli_session" "$_smcli_directory" "$1" "$3" "$_smcli_started" "$2" "${HISTFILE-}" "$_smcli_command")
-        "$_smcli_bin" "${args[@]}" || printf 'smcli: command metadata was not saved.\n' >&2
+        local exp=
+        _smcli_safe "${_smcli_expanded-}" && exp=$_smcli_expanded
+        args=(record --stdin zsh "$_smcli_session" "$_smcli_directory" "$1" "$3" "$_smcli_started" "$2" "${HISTFILE-}" -)
+        builtin printf '%s\n%s\n' "$exp" "$_smcli_command" | "$_smcli_bin" "${args[@]}" || printf 'smcli: command metadata was not saved.\n' >&2
     }
     _smcli_finish() {
         local exit_code=$1 pipe=$2 ended=${EPOCHREALTIME-}
@@ -805,7 +807,7 @@ if [[ -o interactive && -z ${SMCLI_NO_KEYS-} ]]; then
             return
         fi
         local -a hits
-        hits=("${(@f)${"$(SMCLI_SHELL=zsh "$_smcli_complete_bin" complete --word "$word" --command "$cmd" 2>/dev/null)"}}")
+        hits=("${(@f)${"$(SMCLI_SHELL=zsh SMCLI_LBUFFER="$LBUFFER" "$_smcli_complete_bin" complete --word "$word" --command "$cmd" 2>/dev/null)"}}")
         if (( $#hits == 1 )) && [[ -n $hits[1] ]]; then
             LBUFFER="${LBUFFER%$word}${hits[1]}"
         elif (( $#hits > 1 )); then
@@ -905,17 +907,17 @@ if not set -q _smcli_installed
         _smcli_set_expanded "$argv[1]"
     end
     function _smcli_record
-        set -l args record
+        set -l exp ''
         if _smcli_safe "$_smcli_expanded"
-            set -a args --expanded $_smcli_expanded
+            set exp $_smcli_expanded
         end
-        set -a args fish $_smcli_session $_smcli_directory $argv[1] $argv[2] $argv[3] $argv[4] '' $_smcli_command
+        set -l args record --stdin fish $_smcli_session $_smcli_directory $argv[1] $argv[2] $argv[3] $argv[4] '' -
         # Record in a disowned process so the prompt never waits.
         if test -n "$SMCLI_SYNC"
-            command $_smcli_bin $args; or echo 'smcli: command metadata was not saved.' >&2
+            builtin printf '%s\n%s\n' "$exp" "$_smcli_command" | command $_smcli_bin $args; or echo 'smcli: command metadata was not saved.' >&2
         else
             begin
-                command $_smcli_bin $args; or echo 'smcli: command metadata was not saved.' >&2
+                builtin printf '%s\n%s\n' "$exp" "$_smcli_command" | command $_smcli_bin $args; or echo 'smcli: command metadata was not saved.' >&2
             end &
             disown
         end
@@ -1068,12 +1070,12 @@ if status is-interactive; and test -z "$SMCLI_NO_KEYS"
         end
         if string match -q -- '@*' -- $token
             set -l cmd (commandline -op)
-            set -l hits (SMCLI_SHELL=fish command $_smcli_complete_bin complete --word "$token" --command $cmd[1])
+            set -l before (commandline -c | string collect)
+            set -l hits (SMCLI_SHELL=fish SMCLI_LBUFFER="$before" command $_smcli_complete_bin complete --word "$token" --command $cmd[1])
             if test (count $hits) -eq 1
                 commandline -t -- $hits[1]
             else if test (count $hits) -gt 1
                 # Several matches: pick one in the files picker, filtered by the word.
-                set -l before (commandline -c | string collect)
                 set -l chosen (env SMCLI_SHELL=fish SMCLI_LBUFFER=$before SMCLI_FILES_QUERY=(string sub -s 2 -- $token) $_smcli_complete_bin pick --files </dev/tty)
                 set -l code $status
                 if test $code -eq 12
@@ -1210,12 +1212,32 @@ mod tests {
     }
 
     #[test]
-    fn record_hooks_pass_optional_expanded_flag() {
+    fn hooks_send_record_on_stdin() {
         for shell in ["bash", "zsh", "fish"] {
             let hooks =
                 render_with_keys(shell, "smcli", true, false, false, false, false, true, true)
                     .unwrap();
-            assert!(hooks.contains("--expanded"), "{shell} missing --expanded");
+            assert!(hooks.contains("record --stdin"), "{shell} missing --stdin");
+            assert!(
+                hooks.contains("builtin printf '%s\\n%s\\n'"),
+                "{shell} missing stdin payload"
+            );
+            assert!(
+                !hooks.contains("--expanded"),
+                "{shell} still uses --expanded"
+            );
+            if shell == "fish" {
+                assert_eq!(hooks.matches("builtin printf '%s\\n%s\\n'").count(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn record_hooks_gate_expansion_length() {
+        for shell in ["bash", "zsh", "fish"] {
+            let hooks =
+                render_with_keys(shell, "smcli", true, false, false, false, false, true, true)
+                    .unwrap();
             assert!(hooks.contains("8192"), "{shell} missing the 8192-byte gate");
         }
         let bash = render_with_keys(

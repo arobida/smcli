@@ -213,7 +213,63 @@ Files: `crates/smcli-core/src/tests_discovery.rs`, `crates/smcli-service/src/tes
 - Each finding is fixed, or closed in the test log with its measurement.
 - Each wave has a passing `make test` row in the test log.
 
+## Outcome
+
+All 29 findings from the 2026-11-08 review are fixed on macOS, or closed with a measurement.
+
+## Acceptance checks
+
+- Wave 1 passes the full suite — integration: make test `#wave-1-gate`
+- Wave 2 passes the full suite — integration: make test `#wave-2-gate`
+- Wave 3 passes the full suite — integration: make test `#wave-3-gate`
+
+## Decisions
+
+- The old database files move as one unit: if any `history.db.pre-xdg` target exists, none are renamed.
+- Uninstall converts exported databases out of WAL mode so they are self-contained.
+- `run_git` sets `GIT_NO_LAZY_FETCH=1` (the person approved this on 2026-11-09).
+- Uninstall also removes `.bash3-warned` beside the database and `.moving`, and removes the binaries before the data (the person approved this on 2026-11-09).
+
+## Tasks
+
+### Build
+
+- [x] Slice 1A: untrusted repo Git status `#slice-1a`
+- [x] Slice 1B: shell hooks `#slice-1b`
+- [x] Slice 1C: filters on import and fallback `#slice-1c`
+- [x] Slice 1D: database move and uninstall `#slice-1d`
+- [x] Slice 1E: lazy-fetch hardening and uninstall follow-ups `#slice-1e`
+- [ ] Wave 2 slices 2A to 2E `#wave-2`
+- [ ] Wave 3 slices 3A to 3D `#wave-3`
+
+### Test
+
+- [x] Wave 1 gate `#wave-1-test`
+- [ ] Wave 2 gate `#wave-2-test`
+- [ ] Wave 3 gate `#wave-3-test`
+
+### Review
+
+- [ ] Person reviews the audit fixes `#person-review`
+
 ## Test log
 
-| Date | Wave or slice | Command | Result | Notes |
-| ---- | ------------- | ------- | ------ | ----- |
+| Date       | Wave or slice   | Command                                                                           | Result         | Notes                                                                                        |
+| ---------- | --------------- | --------------------------------------------------------------------------------- | -------------- | -------------------------------------------------------------------------------------------- |
+| 2026-11-09 | Slice 1A        | `make test-rust PKG=smcli-core FILTER=git_status_ignores_repo_fsmonitor`          | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
+| 2026-11-09 | Slice 1A        | `make test-rust PKG=smcli-core FILTER=git_status_skips_repo_filters`              | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
+| 2026-11-09 | Slice 1B        | `make test-rust PKG=smcli FILTER=record_stdin`                                    | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
+| 2026-11-09 | Slice 1B        | `make test-rust PKG=smcli FILTER=complete_allowed`                                | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
+| 2026-11-09 | Slice 1B        | `make test-rust PKG=smcli FILTER=hooks_send_record_on_stdin`                      | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
+| 2026-11-09 | Slice 1C        | `make test-rust PKG=smcli-core FILTER=atuin_import_applies_filters`               | Pass (2 tests) | Run by `kik3` after review fixes                                                             |
+| 2026-11-09 | Slice 1C        | `make test-rust PKG=smcli FILTER=complete_local_honors_ignore`                    | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
+| 2026-11-09 | Slice 1D        | `make test-rust PKG=smcli-core FILTER=legacy`                                     | Fail (6 of 7)  | `legacy_existing_pre_xdg_blocks_all_renames` failed at `legacy.exists() && ...-wal.exists()` |
+| 2026-11-09 | Slice 1D        | `make test-rust PKG=smcli-core FILTER=prune_reports`                              | Pass (1 test)  | Run by `kik3` after review fixes                                                             |
+| 2026-11-09 | Slice 1D rerun  | `make test-rust PKG=smcli-core FILTER=legacy_existing_pre_xdg_blocks_all_renames` | Pass (1 test)  | Test bug fixed; migration unchanged                                                          |
+| 2026-11-09 | Wave 1 gate     | `make test`                                                                       | Fail           | nextest 379 passed; install section: `legacy only: a location was left behind`               |
+| 2026-11-09 | Wave 1 gate fix | `make test-install`                                                               | Fail           | Case `both`: export refused `history.db` permissions; `make test` not run                    |
+| 2026-11-09 | Wave 1 gate fix | `make test-install`                                                               | Fail           | Case `both`: `-wal or -shm was exported` after fixture `chmod 600`; `make test` not run      |
+| 2026-11-09 | Wave 1 gate fix | `make test-install`                                                               | Pass           | Exports converted out of WAL mode                                                            |
+| 2026-11-09 | Wave 1 gate     | `make test`                                                                       | Pass           | nextest 379 passed, 9 skipped; all black-box sections passed                                 |
+| 2026-11-09 | Slice 1E        | `make test-install`                                                               | Pass           | Lazy-fetch hardening and uninstall follow-ups                                                |
+| 2026-11-09 | Wave 1 gate     | `make test`                                                                       | Pass           | Final tree: nextest 379 passed, 9 skipped; all black-box sections passed                     |

@@ -134,7 +134,7 @@ pub(super) fn health(
     }
     if let Some(old) = captured.stranded_legacy(home, env) {
         path_problems.push(format!(
-            "open shells still use an old smcli build; restart them. {} holds commands not in the main history {}",
+            "{} holds commands not in the main history {}: open shells may still use an old smcli build (restart them), or the old database could not be moved (for example, on another volume)",
             old.display(),
             captured.path.display()
         ));

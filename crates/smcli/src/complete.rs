@@ -1,16 +1,23 @@
+use smcli_core::config::FileIgnore;
 use std::path::Path;
 
 const MAX_DEPTH: usize = 6;
 const MAX_ENTRIES: usize = 20_000;
 
 /// In-process `@` completion. `word` has the leading `@` stripped by the caller.
-pub(crate) fn complete_local(cwd: &Path, word: &str, dirs_only: bool, limit: usize) -> Vec<String> {
+pub(crate) fn complete_local(
+    cwd: &Path,
+    word: &str,
+    dirs_only: bool,
+    limit: usize,
+    ignore: Option<&FileIgnore>,
+) -> Vec<String> {
     if limit == 0 {
         return Vec::new();
     }
     let mut paths = Vec::new();
     let mut n = 0;
-    walk(cwd, cwd, 0, dirs_only, &mut n, &mut paths);
+    walk(cwd, cwd, 0, dirs_only, ignore, &mut n, &mut paths);
     let glob = word.bytes().any(|b| matches!(b, b'*' | b'?' | b'['));
     let mut hits: Vec<String> = if word.is_empty() {
         paths
@@ -39,6 +46,7 @@ fn walk(
     dir: &Path,
     depth: usize,
     dirs_only: bool,
+    ignore: Option<&FileIgnore>,
     n: &mut usize,
     out: &mut Vec<String>,
 ) {
@@ -61,6 +69,9 @@ fn walk(
             continue;
         }
         let path = entry.path();
+        if ignore.is_some_and(|i| i.ignores(cwd, &path, is_dir)) {
+            continue;
+        }
         if let Ok(rel) = path.strip_prefix(cwd)
             && let Some(rel) = rel.to_str()
             && (is_dir || !dirs_only)
@@ -68,7 +79,7 @@ fn walk(
             out.push(rel.to_string());
         }
         if is_dir {
-            walk(cwd, &path, depth + 1, dirs_only, n, out);
+            walk(cwd, &path, depth + 1, dirs_only, ignore, n, out);
         }
     }
 }
@@ -121,11 +132,32 @@ mod tests {
     }
 
     #[test]
+    fn complete_local_honors_ignore() {
+        let dir = tmp();
+        touch(&dir, "keep.txt");
+        touch(&dir, "skip.txt");
+        touch(&dir, "gone/inner.txt");
+        let ignore_file = dir.join("ignore");
+        std::fs::write(&ignore_file, "skip.txt\ngone/\n").unwrap();
+        let config = dir.join("config.json");
+        std::fs::write(&config, r#"{"ignoreFile":"ignore"}"#).unwrap();
+        let ignore = FileIgnore::load(&config, &dir).unwrap();
+        let hits = complete_local(&dir, "", false, 100, ignore.as_ref());
+        assert!(hits.contains(&"keep.txt".into()));
+        assert!(
+            !hits
+                .iter()
+                .any(|h| h.contains("skip") || h.contains("gone"))
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn fuzzy_subsequence_ranks_basename_then_shorter() {
         let dir = fixture();
-        let hits = complete_local(&dir, "rnkng", false, 8);
+        let hits = complete_local(&dir, "rnkng", false, 8, None);
         assert_eq!(hits, ["crates/smcli-search/tests/ranking.rs"]);
-        let mains = complete_local(&dir, "main", false, 8);
+        let mains = complete_local(&dir, "main", false, 8, None);
         assert_eq!(mains[0], "src/main.rs");
         assert!(mains.contains(&"crates/smcli/src/main.rs".into()));
         std::fs::remove_dir_all(dir).unwrap();
@@ -134,9 +166,9 @@ mod tests {
     #[test]
     fn dirs_only_skips_files_and_ignored_trees() {
         let dir = fixture();
-        let hits = complete_local(&dir, "serv", true, 8);
+        let hits = complete_local(&dir, "serv", true, 8, None);
         assert_eq!(hits, ["crates/smcli-service/"]);
-        let all = complete_local(&dir, "", false, 100);
+        let all = complete_local(&dir, "", false, 100, None);
         assert!(all.iter().any(|p| p == "src/main.rs"));
         assert!(all.iter().all(|p| !p.starts_with("target")
             && !p.starts_with("node_modules")
@@ -151,22 +183,25 @@ mod tests {
     #[test]
     fn glob_star_star_question_and_class() {
         let dir = fixture();
-        let nested = complete_local(&dir, "src/**/*.rs", false, 8);
+        let nested = complete_local(&dir, "src/**/*.rs", false, 8, None);
         assert_eq!(nested, ["src/lib.rs", "src/main.rs"]);
-        assert!(complete_local(&dir, "*.md", false, 8).contains(&"README.md".into()));
+        assert!(complete_local(&dir, "*.md", false, 8, None).contains(&"README.md".into()));
         assert!(
-            !complete_local(&dir, "*.rs", false, 8)
+            !complete_local(&dir, "*.rs", false, 8, None)
                 .iter()
                 .any(|p| p.contains('/'))
         );
-        let ranking = complete_local(&dir, "crates/**/*.rs", false, 8);
+        let ranking = complete_local(&dir, "crates/**/*.rs", false, 8, None);
         assert!(ranking.contains(&"crates/smcli-search/tests/ranking.rs".into()));
         assert_eq!(
-            complete_local(&dir, "src/main.r[s]", false, 8),
+            complete_local(&dir, "src/main.r[s]", false, 8, None),
             ["src/main.rs"]
         );
-        assert_eq!(complete_local(&dir, "src/??b.rs", false, 8), ["src/lib.rs"]);
-        assert_eq!(complete_local(&dir, "", false, 3).len(), 3);
+        assert_eq!(
+            complete_local(&dir, "src/??b.rs", false, 8, None),
+            ["src/lib.rs"]
+        );
+        assert_eq!(complete_local(&dir, "", false, 3, None).len(), 3);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -178,7 +213,7 @@ mod tests {
         touch(&dir, "src/foo/bar/service/mod.rs");
         touch(&dir, "src/foo/bar/server.rs");
         touch(&dir, "src/main.rs");
-        let hits = complete_local(&dir, "src/**/serv*", true, 8);
+        let hits = complete_local(&dir, "src/**/serv*", true, 8, None);
         assert_eq!(hits, ["src/foo/bar/service/"]);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -187,7 +222,7 @@ mod tests {
     fn keeps_literal_backslash_in_filename() {
         let dir = tmp();
         touch(&dir, r"back\slash.unique");
-        let hits = complete_local(&dir, "unique", false, 8);
+        let hits = complete_local(&dir, "unique", false, 8, None);
         assert_eq!(hits, [r"back\slash.unique"]);
         std::fs::remove_dir_all(dir).unwrap();
     }

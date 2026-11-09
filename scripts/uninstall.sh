@@ -34,7 +34,7 @@ say() { printf '==> %s\n' "$*"; }
 die() { printf 'smcli-uninstall: %s\n' "$*" >&2; exit 1; }
 
 if [[ -z $prefix ]]; then
-    if [[ -x $here/smcli ]]; then prefix=$here; else prefix="$HOME/.local/bin"; fi
+    if [[ -x $here/smcli || -x $here/smcli-uninstall ]]; then prefix=$here; else prefix="$HOME/.local/bin"; fi
 fi
 smcli="$prefix/smcli"
 # Explicit SMCLI_DB is used as given (no canonicalize). Default matches Path::join (no // if HOME ends in /).
@@ -43,12 +43,26 @@ legacy="${HOME%/}/.local/share/smcli/history.db"
 state=${XDG_STATE_HOME:-}; [[ $state == /* ]] || state="${HOME%/}/.local/state"
 if [[ -n ${SMCLI_DB:-} && $SMCLI_DB != "$legacy" ]]; then db=$SMCLI_DB; else db="$state/smcli/history.db"; fi
 if [[ $db == "$state/smcli/history.db" && ! -e $db && -e $legacy ]]; then db=$legacy; fi
+# Only the default database touches both default locations (state, legacy and the kept pre-xdg copy);
+# a custom SMCLI_DB never does.
+state_db="$state/smcli/history.db"
+dbs=("$db"); extras=()
+if [[ $db == "$state_db" || $db == "$legacy" ]]; then
+    for extra in "$state_db" "$legacy" "$state_db.pre-xdg"; do
+        [[ $extra == "$db" ]] || { dbs+=("$extra"); extras+=("$extra"); }
+    done
+fi
 config="${SMCLI_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/smcli/config.json}"
 # A directory at any data path means misconfiguration; refuse before step 4 deletes anything.
 if [[ -z $keep_data ]]; then
-    for path in "$db" "$db-wal" "$db-shm" "$db-journal" "$db.v7.bak" "$db.migration.lock" "$config"; do
-        [[ ! -d $path ]] || die "refusing to remove $path: it is a directory"
+    for base in "${dbs[@]}"; do
+        for path in "$base" "$base-wal" "$base-shm" "$base-journal" "$base.v7.bak" "$base.migration.lock"; do
+            [[ ! -d $path ]] || die "refusing to remove $path: it is a directory"
+        done
     done
+    # Default family only (smcli writes it nowhere else); the pre-xdg files are covered by their own base in dbs.
+    (( ${#extras[@]} == 0 )) || [[ ! -d $state_db.moving ]] || die "refusing to remove $state_db.moving: it is a directory"
+    [[ ! -d $config ]] || die "refusing to remove $config: it is a directory"
 fi
 begin='# >>> smcli >>>'
 end='# <<< smcli <<<'
@@ -57,7 +71,14 @@ rc_files=("${ZDOTDIR:-$HOME}/.zshrc" "$HOME/.bashrc" "${XDG_CONFIG_HOME:-$HOME/.
 printf 'This removes smcli from %s and the smcli lines from your shell startup files.\n' "$prefix"
 if [[ -z $keep_data ]]; then
     printf 'It also deletes %s (with its search index) and %s.\n' "$db" "$(dirname "$config")"
-    [[ -n $no_export ]] && printf 'Your recorded history will NOT be exported.\n' || printf 'History is exported to %s first.\n' "$export_dir"
+    for extra in ${extras[@]+"${extras[@]}"}; do
+        [[ -e $extra ]] && printf 'It also deletes %s.\n' "$extra"
+    done
+    if [[ -n $no_export ]]; then printf 'Your recorded history will NOT be exported.\n'
+    else
+        printf 'History is exported to %s first.\n' "$export_dir"
+        printf 'Commands run in open terminals during the uninstall may be missing from the export.\n'
+    fi
 fi
 if [[ -z $yes ]]; then
     [[ -t 0 ]] || die "not a terminal; pass --yes to confirm"
@@ -66,14 +87,36 @@ if [[ -z $yes ]]; then
 fi
 
 # 1. Export, before anything is removed. A failed export stops the uninstall.
-if [[ -z $keep_data && -z $no_export && -f $db ]]; then
+# Other databases of the default family (never -wal or -shm) that exist as real files.
+present=()
+for extra in ${extras[@]+"${extras[@]}"}; do [[ -f $extra ]] && present+=("$extra"); done
+if [[ -z $keep_data && -z $no_export && ( -f $db || ${#present[@]} -gt 0 ) ]]; then
     command -v sqlite3 > /dev/null || die "sqlite3 is needed to export history; install it or pass --no-export"
     mkdir -p "$export_dir"
     chmod 700 "$export_dir"
     # A consistent copy of the live database (including recent writes still in its WAL): restorable with SMCLI_DB.
-    sqlite3 "$db" ".backup '${export_dir//\'/\'\'}/history.db'" || die "could not copy $db; nothing removed"
+    safe=${export_dir//\'/\'\'}
+    copy_db() { # $1: source, $2: name in the export
+        sqlite3 "$1" ".backup '$safe/$2'" || die "could not copy $1; nothing removed"
+        # .backup keeps WAL mode, so every later open would create sidecars or fail on read-only media.
+        [[ $(sqlite3 -noheader -list "$export_dir/$2" 'PRAGMA journal_mode=DELETE') == delete ]] \
+            || die "could not finalize $export_dir/$2; nothing removed"
+        rm -f "$export_dir/$2-wal" "$export_dir/$2-shm"
+    }
+    if [[ -f $db ]]; then
+        copy_db "$db" history.db
+    fi
+    for extra in ${present[@]+"${present[@]}"}; do
+        case $extra in
+            "$legacy") copy=history-legacy.db ;;
+            "$state_db") copy=history-state.db ;;
+            *) copy=history-pre-xdg.db ;;
+        esac
+        copy_db "$extra" "$copy"
+        chmod 600 "$export_dir/$copy"
+    done
     # Readable JSON of every recorded command with its directory, exit code, times and session.
-    if [[ -x $smcli ]]; then
+    if [[ -x $smcli && -f $db ]]; then
         SMCLI_SERVICE=off SMCLI_DB="$db" "$smcli" history --json > "$export_dir/history.json" \
             || die "could not export history as JSON; nothing removed (the copy is in $export_dir)"
     fi
@@ -148,10 +191,23 @@ for file in "${rc_files[@]}" "$HOME/.bash_profile" "$HOME/.profile"; do
         && printf 'note: %s still mentions smcli shell-init (added by hand?); remove that line yourself.\n' "$file" >&2
 done
 
+# Remove the programs first so a hook in an open terminal cannot recreate the state folder afterward.
+rm -f "$prefix/smcli" "$prefix/smcli-service"
+
 # 4. Data: database (with its WAL and shared-memory files), search index, settings, service socket.
 if [[ -z $keep_data ]]; then
-    rm -f "$db" "$db-wal" "$db-shm" "$db-journal" "$db.v7.bak" "$db.migration.lock"
-    rm -rf "$db.search"
+    for base in "${dbs[@]}"; do
+        rm -f "$base" "$base-wal" "$base-shm" "$base-journal" "$base.v7.bak" "$base.migration.lock"
+        rm -rf "$base.search"
+    done
+    if (( ${#extras[@]} )); then
+        rm -f "$state_db.moving" "$state/smcli/.legacy-move.lock" "$state/smcli/kept-keys-bash" "$state/smcli/kept-keys-zsh" \
+            "$state/smcli/kept-keys-fish" "$state/smcli/.bash3-warned" \
+            "$(dirname "$legacy")/.bash3-warned"
+        rmdir "$(dirname "$legacy")" 2>/dev/null || true
+        rmdir "$state/smcli" 2>/dev/null || true
+    fi
+    rm -f "$(dirname "$db")/.bash3-warned"
     rmdir "$(dirname "$db")" 2>/dev/null || true
     rm -f "$config"
     rmdir "$(dirname "$config")" 2>/dev/null || true
@@ -177,8 +233,7 @@ if [[ -z $keep_data ]]; then
     say "Deleted smcli's history, search index and settings"
 fi
 
-# 5. The executables, this script last.
-rm -f "$prefix/smcli" "$prefix/smcli-service"
+# 5. The rest of the install, this script last.
 rm -rf "$prefix/potion-shell-16m"
 rm -rf "$prefix/tldr"
 rm -rf "$prefix/cheat"

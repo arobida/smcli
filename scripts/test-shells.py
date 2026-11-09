@@ -1046,9 +1046,17 @@ def run_tldr(variant):
 ARGV_STUB = """#!/usr/bin/env python3
 import os, sys
 path = os.environ.get("SMCLI_ARGV_LOG")
+argv = sys.argv[1:]
+if "--stdin" in argv:
+    # Decode back to the old shape: --expanded EXP first, the command as the last field.
+    first, _, rest = sys.stdin.read().partition("\\n")
+    argv.remove("--stdin")
+    argv[-1] = rest[:-1] if rest.endswith("\\n") else rest
+    if first:
+        argv[1:1] = ["--expanded", first]
 if path:
     with open(path, "a") as handle:
-        handle.write("\\0".join(sys.argv[1:]) + "\\n")
+        handle.write("\\0".join(argv) + "\\n")
 """
 
 

@@ -59,9 +59,12 @@ bash scripts/clean-dist.sh "$dist"
 atdir="$(mktemp -d /tmp/smcli-at.XXXXXX)"
 touch "$atdir/smcli-at-probe42.txt"
 mkdir "$atdir/smcli-at-dir"
-[[ "$(cd "$atdir" && "$bin" complete --word @probe42)" == smcli-at-probe42.txt ]]
-[[ "$(cd "$atdir" && "$bin" complete --word @at-dir --command cd)" == smcli-at-dir/ ]]
-[[ -z "$(cd "$atdir" && "$bin" complete --word @probe42 --command cd)" ]]
+[[ "$(cd "$atdir" && SMCLI_LBUFFER="" "$bin" complete --word @probe42)" == smcli-at-probe42.txt ]]
+[[ "$(cd "$atdir" && SMCLI_LBUFFER="" "$bin" complete --word @at-dir --command cd)" == smcli-at-dir/ ]]
+[[ -z "$(cd "$atdir" && SMCLI_LBUFFER="" "$bin" complete --word @probe42 --command cd)" ]]
+[[ -z "$(cd "$atdir" && SMCLI_LBUFFER='echo "@' "$bin" complete --word @probe42 2>&1)" ]]
+[[ -z "$(cd "$atdir" && env -u SMCLI_LBUFFER "$bin" complete --word @probe42 2>/dev/null)" ]]
+[[ "$(cd "$atdir" && env -u SMCLI_LBUFFER "$bin" complete --word @probe42 2>&1 >/dev/null)" == *"reload smcli's shell-init"* ]]
 rm -rf "$atdir"
 # A selection rejected by both command and query is counted only once.
 prunedb="$home/.local/state/test-db/prune.db"

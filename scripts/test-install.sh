@@ -203,6 +203,53 @@ for b in t: h=((h^b)*0x100000001b3)&0xffffffffffffffff
 print(f"{h:016x}")' "$utf_db")
 [[ $fp_utf == "$fp_utf_py" ]] || fail "UTF-8 fingerprint bash=$fp_utf python=$fp_utf_py"
 
+# Default-family uninstalls in their own homes: legacy only, state + legacy + kept pre-xdg, and a custom SMCLI_DB.
+make_db() { # $1: path, $2: command to record
+    mkdir -p "$(dirname "$1")"
+    SMCLI_DB="$1.tmp" SMCLI_SERVICE=off SMCLI_SYNC=1 "$home/bin/smcli" record zsh s1 /tmp 0 "" "" "" "" "$2"
+    sqlite3 "$1.tmp" ".backup '$1'" && chmod 600 "$1" && rm -f "$1.tmp" "$1.tmp-wal" "$1.tmp-shm" "$1.tmp.migration.lock"
+}
+has_row() { [[ $(sqlite3 "$1" "SELECT count(*) FROM commands WHERE command = '$2'") == 1 ]]; }
+run_case() { # $1: name; rest: env assignments for uninstall
+    local name=$1; shift
+    c=$home/case-$name
+    mkdir -p "$c/bin"
+    cp "$home/bin/smcli" "$c/bin/smcli"
+    env -u XDG_STATE_HOME HOME="$c" "$@" bash scripts/uninstall.sh --yes --prefix "$c/bin" --export "$c/export" \
+        > "$c/out" 2>&1 || { cat "$c/out"; fail "$name: uninstall failed"; }
+}
+c=$home/case-legacy; make_db "$c/.local/share/smcli/history.db" "echo marker-legacy"
+run_case legacy
+has_row "$c/export/history.db" "echo marker-legacy" || fail "legacy only: export lacks the row"
+grep -q marker-legacy "$c/export/history.json" || fail "legacy only: JSON lacks the row"
+[[ ! -e $c/.local/share/smcli && ! -e $c/.local/state/smcli ]] || fail "legacy only: a location was left behind"
+
+c=$home/case-both
+make_db "$c/.local/state/smcli/history.db" "echo marker-state"
+make_db "$c/.local/share/smcli/history.db" "echo marker-legacy"
+make_db "$c/.local/state/smcli/history.db.pre-xdg" "echo marker-kept"
+touch "$c/.local/state/smcli/.legacy-move.lock" "$c/.local/state/smcli/kept-keys-zsh" "$c/.local/state/smcli/history.db.pre-xdg-wal"
+run_case both
+has_row "$c/export/history.db" "echo marker-state" || fail "both: export lacks the state row"
+has_row "$c/export/history-legacy.db" "echo marker-legacy" || fail "both: export lacks the legacy row"
+has_row "$c/export/history-pre-xdg.db" "echo marker-kept" || fail "both: export lacks the kept row"
+[[ -z $(ls "$c/export" | grep -E -- '-(wal|shm)$') ]] || fail "both: -wal or -shm was exported"
+[[ ! -e $c/.local/share/smcli && ! -e $c/.local/state/smcli ]] || fail "both: a location was left behind"
+
+c=$home/case-custom
+make_db "$c/.local/state/smcli/history.db" "echo marker-state"
+make_db "$c/.local/share/smcli/history.db" "echo marker-legacy"
+make_db "$c/custom/h.db" "echo marker-custom"
+touch "$c/custom/.bash3-warned" "$c/custom/h.db.moving" "$c/custom/h.db.pre-xdg"
+run_case custom SMCLI_DB="$c/custom/h.db"
+has_row "$c/export/history.db" "echo marker-custom" || fail "custom: export lacks the row"
+[[ ! -e $c/export/history-legacy.db && ! -e $c/export/history-pre-xdg.db ]] || fail "custom: exported default databases"
+[[ ! -e $c/custom/h.db ]] || fail "custom: database was not removed"
+[[ -e $c/custom/h.db.moving && -e $c/custom/h.db.pre-xdg ]] || fail "custom: removed files smcli does not own"
+[[ ! -e $c/custom/.bash3-warned ]] || fail "custom: .bash3-warned was not removed"
+has_row "$c/.local/state/smcli/history.db" "echo marker-state" && has_row "$c/.local/share/smcli/history.db" "echo marker-legacy" \
+    || fail "custom: default databases were touched"
+
 # Existing, permissive destinations must also become private.
 mkdir "$home/export"
 chmod 755 "$home/export"
