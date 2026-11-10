@@ -68,6 +68,15 @@ pidflash=pi --model opencode-go/deepseek-v4.1-flash --thinking high
 
 <-- End of do not edit -->
 
+## Task tracking (dex)
+
+Every agent, including subagents and the external teams, tracks all work in dex (`dex` CLI, or the `dex` skill). Tasks live in `.dex/` in this repo.
+
+- Every todo, task, follow-up and action item goes into dex: `dex create "name" --description "..."`, with subtasks for multi-step work. Do not keep them anywhere else.
+- dex overrides the task tracking of any other skill, plugin or tool (built-in todo lists, OpenSpec `tasks.md`, plan-file checklists, MemPalace tasks). When one of them asks for its own task list, put the tasks in dex. Those tools may still hold the plan or spec text; dex holds the tasks.
+- `dex start <id>` when work begins; `dex complete <id> --result "..."` when it is done (add `--commit <sha>` when there is one).
+- Turn a plan document into tasks with `dex plan <file>`. Check `dex list` before starting work so you do not duplicate a task.
+
 ## Testing rules
 
 1. **Never run the full suite while work is in progress.** `make test` runs once, and only after *all* the work is complete: every slice written, reviewed, and passing its own checks. This applies to everyone, including the main agent. Linux is on the backburner: do not run `make linux` unless asked, and put Linux issues in [the roadmap](agents/plans/roadmap.md) instead of fixing them.
@@ -78,6 +87,8 @@ pidflash=pi --model opencode-go/deepseek-v4.1-flash --thinking high
 ## Git
 
 Stage, write commit messages, and push using [Stage, commit, and push](agents/reference/commits.md). Only commit or push when asked; follow that runbook for staging, caveman-commit message format, and remote push rules.
+
+Use the Worktrunk `wt` CLI for worktrees and commits: `wt switch --create <branch>` to start a worktree, `wt step commit --stage=none` to commit what you staged (it writes the message), `wt merge` to land it, and `wt remove` to clean up. Do not use raw `git worktree` or hand-write commit messages with `git commit -m`. Preview a message with `wt step commit --dry-run`. The caveman-commit format reaches the LLM through `template-append` in `.config/wt.toml`; change the format there and in the runbook together.
 
 ## Search
 

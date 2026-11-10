@@ -1,0 +1,8 @@
+# Commit messages follow agents/reference/commits.md (caveman-commit).
+[commit.generation]
+template-append = """
+- Conventional Commits subject: <type>(<scope>): <imperative summary>. Types: feat, fix, refactor, perf, docs, test, chore, build, ci, style, revert.
+- Subject 50 chars or less when possible, hard cap 72, no trailing period, imperative mood.
+- Body only for non-obvious why, breaking changes, migrations, security fixes or reverts; wrap at 72, bullets with -.
+- Never write "this commit", "I", "we", "now", "currently", emoji, or AI attribution.
+"""

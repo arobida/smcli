@@ -92,17 +92,7 @@ before 2026-06-01. Old route returns 410 after that date.
 
 ## Commit
 
-Use a HEREDOC so formatting stays exact:
-
-``` sh
-git commit -m "$(cat <<'EOF'
-type(scope): imperative summary
-
-Optional body explaining why.
-
-EOF
-)"
-```
+Stage paths as above, then commit with `wt step commit --stage=none` (its default `all` stages everything, untracked junk included). The LLM writes the message in the format above (from `template-append` in `.config/wt.toml`). Preview with `wt step commit --dry-run`. Do not hand-write messages with `git commit -m`.
 
 - Do not amend unless the user explicitly asks and the amend target is safe (for example, the commit was created by you in this session, not yet pushed, and hooks are not being skipped casually).
 - Do not use `--no-verify` unless the user explicitly asks to skip hooks.
@@ -135,5 +125,5 @@ Rules:
 2. Status/diff/log inspected.
 3. Only intended paths staged; no secrets.
 4. Caveman-commit subject (and body if required) ready.
-5. Commit via HEREDOC.
+5. Commit via `wt step commit --stage=none`.
 6. Push only if requested, without forced history rewrites.
