@@ -497,7 +497,7 @@ impl HistorySearch {
         };
         let db = self.open_index(&name)?;
         let commands = db.typed::<IndexedCommand>("commands")?;
-        self.sync(&commands, corpus)?;
+        self.sync(&db, &commands, corpus)?;
         if vector_first() && !literal && !alias_query {
             let active = if has_markers && parsed_any {
                 &merged_filter
@@ -858,12 +858,13 @@ impl HistorySearch {
         let name = self.index_name();
         self.remove_files(&name);
         let db = self.open_index(&name)?;
-        self.sync(&db.typed::<IndexedCommand>("commands")?, corpus)
+        self.sync(&db, &db.typed::<IndexedCommand>("commands")?, corpus)
     }
 
     /// Brings `commands` in line with `corpus`. Returns the number of documents now indexed.
     fn sync(
         &self,
+        db: &Database,
         commands: &TypedCollection<IndexedCommand>,
         corpus: &HashMap<String, SearchEntry>,
     ) -> Result<usize> {
@@ -898,6 +899,10 @@ impl HistorySearch {
             .collect();
         if !stale.is_empty() {
             commands.delete_many(json!({"command": {"$in": stale}}))?;
+            if stale.len() >= 256 && stale.len() * 4 >= indexed.len() {
+                // Reclaim file space after deleting a substantial share of indexed commands.
+                db.compact()?;
+            }
         }
         // Same identity and embedding text: usage changes update metadata and keep the vector.
         for (command, (doc, meta)) in &indexed {
@@ -1763,6 +1768,40 @@ mod tests {
         let link_dir = root.path().join("linked-index");
         symlink(&directory, &link_dir)?;
         assert!(!inspect(&link_dir, &model, &HashMap::new()).healthy);
+        Ok(())
+    }
+
+    #[test]
+    fn sync_compacts_after_removing_most_commands() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let directory = root.path().join("index");
+        prepare_directory(&directory)?;
+        let engine = HistorySearch::new(&directory, Potion::bundled()?);
+        let corpus: HashMap<_, _> = (0..300)
+            .map(|i| {
+                let entry = SearchEntry::new(&format!("synthetic command {i}"), 1, "native");
+                (entry.key(), entry)
+            })
+            .collect();
+        let name = engine.index_name();
+        let db = engine.open_index(&name)?;
+        let commands = db.typed::<IndexedCommand>("commands")?;
+        engine.sync(&db, &commands, &corpus)?;
+        drop(commands);
+        drop(db);
+        let path = directory.join(format!("{name}.taladb"));
+        let before = path.metadata()?.len();
+        let remaining = corpus
+            .iter()
+            .take(10)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let db = engine.open_index(&name)?;
+        let commands = db.typed::<IndexedCommand>("commands")?;
+        engine.sync(&db, &commands, &remaining)?;
+        drop(commands);
+        drop(db);
+        assert!(path.metadata()?.len() < before);
         Ok(())
     }
 
