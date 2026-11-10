@@ -14,9 +14,9 @@ Working notes, reviews and reference material for agents. Nothing here is built 
 - `roadmap.md` — open work that is not scheduled: fgrep, search, capture gaps, known limits, release items and the Linux backburner.
 - `audit-fixes-2026-11-08.md` — three-wave plan to fix the 2026-11-08 audit findings on macOS.
 - `shipit-checklist.md` — licensing and distribution checklist that must pass before any public binary ships.
-- `codebase-review-fixes.md` — wave plan and agent assignments for fixing the 2026-10-30 review findings.
-- `semantic-search-accuracy.md` — design for natural-language Tab search accuracy: query correction, coverage gate, head-command boost, evidence/relevance scoring; brief in `semantic-search-accuracy-brief.md`.
-- `architecture-remediation.md` — full plan for the 2026-11-04 architecture audit (H1–H3, M4–M8, L9–L12): service-only model ownership, content-hash model identity, storage ownership, caller context and scrubbed service env, typed requests, housekeeping and the `cli.rs` split.
+- `archive/codebase-review-fixes.md` — wave plan and agent assignments for fixing the 2026-10-30 review findings.
+- `archive/semantic-search-accuracy.md` — design for natural-language Tab search accuracy: query correction, coverage gate, head-command boost, evidence/relevance scoring.
+- `archive/architecture-remediation.md` — full plan for the 2026-11-04 architecture audit (H1–H3, M4–M8, L9–L12): service-only model ownership, content-hash model identity, storage ownership, caller context and scrubbed service env, typed requests, housekeeping and the `cli.rs` split.
 
 ## reviews/
 

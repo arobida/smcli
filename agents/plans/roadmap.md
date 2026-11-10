@@ -56,7 +56,7 @@ Not a priority: do not run `make linux`, and do not let Linux issues block macOS
 - **Full suite:** `make linux` has not been confirmed passing; Docker was unavailable on the last recorded attempts. Run it first. It includes the `/proc/<pid>/environ` check in `scripts/test-service.py`, which runs only on Linux.
 - **Fish:** the historical prompt timeout in `scripts/test-shells.py` is unverified. Record the container Fish version and the prompt transcript if it recurs.
 - **musl:** the descriptor close (`close_range`, `/proc/self/fd` fallback in `service_client.rs`) is compile-checked only. Run it on a musl system with the Linux release.
-- **Earlier acceptance:** the Linux acceptance step in `build-test-efficiency.md` is unverified.
+- **Earlier acceptance:** the Linux acceptance step in `archive/build-test-efficiency.md` is unverified.
 - **Install:** `scripts/install.sh` stops on anything but macOS, so Linux users copy files by hand. Add a Linux path, or delete its unreachable Linux `stat` branch.
 - **Packaging:** decide on tarball, .deb or Homebrew-on-Linux, and apply `shipit-checklist.md` to those artifacts.
 - **File watching:** inotify needs one watch per directory, so a huge tree can hit the user's limit and leave Git status refreshing by age only (`context_cache.rs`). The recursive watch is also set up while the context cache lock is held; its cost on Linux is unmeasured.

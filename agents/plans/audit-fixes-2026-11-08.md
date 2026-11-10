@@ -201,7 +201,7 @@ Files: `crates/smcli-core/src/tests_discovery.rs`, `crates/smcli-service/src/tes
 
 - #19: delete the second delete loop in `prune.rs` and the `DISCARDED_USAGE_VERSION` exception in the newer-version check.
 - #20: delete `files_typed`, `grep_typed` and `complete_typed`, and call `search` and `complete_query` from the service.
-- #29: set the status of `semantic-search-accuracy.md` to `Shipped (vector-first)`. Mark [double-quoted-js-tests.md](double-quoted-js-tests.md) as replaced by Slice 3C. Use iwe, then `make docs`.
+- #29: set the status of `semantic-search-accuracy.md` to `Shipped (vector-first)`. Mark double-quoted-js-tests.md as replaced by Slice 3C. Use iwe, then `make docs`.
 - Check: `make build`, then `make unused`, with no new hits from these files.
 
 ### Wave 3 gate

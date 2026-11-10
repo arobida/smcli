@@ -6,10 +6,6 @@ Production scripts for building, installing, benchmarking, cleaning, and legal-n
 
 ## Interface
 
-- `ateam.sh` — dispatches a brief to a team of agents via `kero`.
-  - Usage: `bash scripts/ateam.sh <brief> <alias=command>...`
-  - `brief` may be empty, inline text, a task file, or a task directory containing `<alias>.task` files.
-  - Env overrides: `ATEAM_SHELL` (default `zsh`), `ATEAM_DIR` (default `$PWD`).
 - `bench-baseline.py` — black-box benchmark of the CLI and generated hooks with synthetic history.
   - Usage: `python3 scripts/bench-baseline.py --binary PATH [--rows N...] [--samples N] [--output PATH] [--service on|off] [--repo-files N...]`
   - Writes `dist/baseline.json` by default.
@@ -25,7 +21,6 @@ Production scripts for building, installing, benchmarking, cleaning, and legal-n
 
 ## Invariants
 
-- `ateam.sh` must be run with `bash`, not sourced from zsh.
 - `install.sh` is macOS-only; Linux installs copy binaries and `potion-shell-16m/` manually (see [`docs/install.md`](../docs/install.md)).
 - `install.sh` and `uninstall.sh` only touch the marked `# >>> smcli >>>` / `# <<< smcli <<<` block in shell startup files; hand-added `shell-init` lines are reported but not removed.
 - `gen-notices.py` only reads dependency sources and license files; it never interprets license text as legal advice.
@@ -33,7 +28,6 @@ Production scripts for building, installing, benchmarking, cleaning, and legal-n
 
 ## Side Effects
 
-- `ateam.sh`: starts `kero` sessions, sends messages, prints `alias\tsession-id` lines.
 - `bench-baseline.py`: creates temporary directories/seeds a synthetic SQLite database, imports fixture history, starts/stops `smcli-service`, allocates PTYs, writes `dist/baseline.json`.
 - `clean-dist.sh`: deletes files in `dist/`.
 - `gen-notices.py`: runs `cargo metadata`, reads crate sources and license files, overwrites `THIRD_PARTY_NOTICES.md`.
