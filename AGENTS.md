@@ -88,7 +88,7 @@ Every agent, including subagents and the external teams, tracks all work in dex 
 
 Stage, write commit messages, and push using [Stage, commit, and push](agents/reference/commits.md). Only commit or push when asked; follow that runbook for staging, caveman-commit message format, and remote push rules.
 
-Use the Worktrunk `wt` CLI for worktrees and commits: `wt switch --create <branch>` to start a worktree, `wt step commit --stage=none` to commit what you staged (it writes the message), `wt merge` to land it, and `wt remove` to clean up. Do not use raw `git worktree` or hand-write commit messages with `git commit -m`. Preview a message with `wt step commit --dry-run`. The caveman-commit format reaches the LLM through `template-append` in `.config/wt.toml`; change the format there and in the runbook together.
+Use the Worktrunk `wt` CLI for worktrees and commits: `wt switch --create <branch>` to start a worktree, `wt step commit --stage=none` to commit what you staged (Worktrunk generates the message from the diff via the LLM configured in `~/.config/worktrunk/config.toml`), then `git push`, `wt merge` to land it, and `wt remove` to clean up. Do not use raw `git worktree` or hand-write commit messages with `git commit -m`. Preview a message with `wt step commit --dry-run`. The caveman-commit format reaches the LLM through `template-append` in `.config/wt.toml`; change the format there and in the runbook together.
 
 ## Search
 
