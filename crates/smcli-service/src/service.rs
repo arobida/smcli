@@ -76,6 +76,8 @@ struct State {
     index: Option<SuggestionIndex>,
     data_version: i64,
     history_revision: u64,
+    /// Bumped on every create, rebuild or in-place change of `corpus`; the engine skips its index sync when it is unchanged.
+    corpus_generation: u64,
     last_activity: Instant,
     /// The corpus follows history writes; the engine follows model content only.
     engine: Option<(ModelId, Arc<HistorySearch>)>,
@@ -99,18 +101,19 @@ pub struct Service {
     /// Directory context from cache: discovery is a few stats, and Git status refreshes in the background.
     contexts: ContextCache,
     file_search: FileSearch,
-    /// Command-completion sync: the index, programs known after the last sync, last synced PATH, and a one-at-a-time flag.
+    /// Command-completion sync: the index, programs known after the last sync, programs looked up per PATH, and a one-at-a-time flag.
     command_sync: Mutex<CommandSync>,
 }
 
 /// State for the service-owned `@@` index sync (design: "Sync, not per-program add").
 /// `known` includes indexed, example-less and history programs from the last sync; a record
-/// re-triggers for a new program, a changed PATH, or an absent program now resolving on PATH.
+/// re-triggers for a program not yet looked up on this PATH, or an absent program now resolving on it.
 struct CommandSync {
     index: Option<Arc<CommandIndex>>,
     known: HashSet<String>,
     absent: HashSet<String>,
-    last_path: Option<String>,
+    /// Per PATH snapshot, the programs already looked up there (capped at 16 PATHs).
+    checked: HashMap<String, HashSet<String>>,
     running: bool,
 }
 
@@ -198,6 +201,7 @@ impl Service {
                     index: None,
                     data_version: version,
                     history_revision: 0,
+                    corpus_generation: 0,
                     last_activity: Instant::now(),
                     engine: None,
                     corpus: None,
@@ -212,7 +216,7 @@ impl Service {
                     index: None,
                     known: HashSet::new(),
                     absent: HashSet::new(),
-                    last_path: None,
+                    checked: HashMap::new(),
                     running: false,
                 }),
             }
@@ -423,6 +427,7 @@ impl Service {
             state.data_version = version;
             state.index = None;
             state.corpus = None;
+            state.corpus_generation += 1;
         }
         Ok(())
     }
@@ -498,6 +503,7 @@ impl Service {
             // The corpus is updated in place (a rebuild is slow at 100k runs); an unused one just stays valid.
             if let Some(corpus) = state.corpus.as_mut() {
                 corpus.state.add(&run);
+                state.corpus_generation += 1;
             }
         }
         let mut response = ServiceResponse::new(true);
@@ -534,8 +540,10 @@ impl Service {
         {
             let mut sync = self.command_sync.lock().unwrap_or_else(|e| e.into_inner());
             if sync.running
-                || (sync.known.contains(&program)
-                    && sync.last_path.as_deref() == Some(shell_path.as_str())
+                || (sync
+                    .checked
+                    .get(&shell_path)
+                    .is_some_and(|set| set.contains(&program))
                     && !newly_installed)
             {
                 return;
@@ -578,7 +586,9 @@ impl Service {
                 &smcli_search::commands::system_dirs(),
                 &shell_path,
             );
-            let runs = self.history.runs(&self.user, &self.lock().db)?;
+            let runs = self
+                .history
+                .runs(&self.user, &self.history.open_connection()?)?;
             let history: HashSet<String> = runs
                 .iter()
                 .filter_map(|run| recorded_program(&run.command, run.expanded_command.as_deref()))
@@ -588,15 +598,18 @@ impl Service {
             let mut sync = self.command_sync.lock().unwrap_or_else(|e| e.into_inner());
             sync.known = indexed.union(&empty).cloned().collect();
             sync.absent = history.difference(&sync.known).cloned().collect();
-            sync.known.extend(history);
-            sync.last_path = Some(shell_path);
+            sync.known.extend(history.iter().cloned());
+            if sync.checked.len() >= 16 && !sync.checked.contains_key(&shell_path) {
+                sync.checked.clear();
+            }
+            sync.checked.insert(shell_path, history);
             Ok(())
         })();
         self.command_sync
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .running = false;
-        // A failed sync stays unremembered (known/last_path untouched) so the next capture retries.
+        // A failed sync stays unremembered (known/checked untouched) so the next capture retries.
         let _ = result;
     }
 
@@ -635,7 +648,9 @@ impl Service {
             let refs = smcli_search::commands::source_refs(&sources);
             let index = self.command_index_locked(&engine, &refs);
             if commands {
-                let runs = self.history.runs(&self.user, &self.lock().db)?;
+                let runs = self
+                    .history
+                    .runs(&self.user, &self.history.open_connection()?)?;
                 let programs = runs
                     .iter()
                     .filter_map(|run| {
@@ -674,21 +689,38 @@ impl Service {
             prefix,
             session,
             ranking_off,
+            home,
+            config,
         } = ranked;
+        let ignore = match config {
+            Some(config) => {
+                let caller = self.caller(home, config, None, None, None, None, None);
+                // Ranking evidence is best-effort: a broken ignoreFile fails file search loudly, not suggestions.
+                smcli_core::config::FileIgnore::load(&caller.config, &caller.home).unwrap_or(None)
+            }
+            None => None,
+        };
         let mut context = self.ranking_context(&directory, session, ranking_off.as_deref());
+        let root = FileSearch::root(&directory);
         if context.uses(Signal::Tests) {
-            if let Some(root) = FileSearch::root(&directory) {
+            if let Some(root) = &root {
                 context
                     .candidates
                     .extend(crate::test_candidates::test_candidates(
                         &self.file_search,
-                        &root,
+                        root,
+                        ignore.as_ref(),
                     ));
             }
         }
-        let evidence = FileSearch::root(&directory)
-            .and_then(|root| self.file_search.ready(&root))
-            .map(crate::file_search::evidence::IndexEvidence);
+        let evidence = root.and_then(|root| {
+            let index = self.file_search.ready(&root)?;
+            Some(crate::file_search::evidence::IndexEvidence(
+                index,
+                ignore,
+                root.into(),
+            ))
+        });
         let presence = |commands: &[String]| {
             smcli_search::command_file_presence(commands, &directory, evidence.as_ref().unwrap())
         };
@@ -771,7 +803,6 @@ impl Service {
             if self.history.record_pick(
                 &query, &command, &mode, &directory, &filter, time, &state.db,
             )? {
-                state.data_version = data_version(&state.db)?;
                 if let Some(index) = state.index.as_mut() {
                     index.add_pick(&query, &command, time);
                 }
@@ -828,7 +859,7 @@ impl Service {
             sync.index = None;
             sync.known.clear();
             sync.absent.clear();
-            sync.last_path = None;
+            sync.checked.clear();
             // Free the old model before loading the new one, so two are never resident; callers hold `searching`.
             state.engine = None;
         }
@@ -914,11 +945,19 @@ impl Service {
             let lock = engine.lock_index(20)?;
             // Read native history files and stats outside `state` so records don't wait on I/O.
             let kind = context.kind().map(String::from);
-            let (entries, programs) =
+            let (entries, programs, generation) =
                 self.current_corpus(&caller, &directory, project.as_deref(), kind.as_deref())?;
-            let evidence = FileSearch::root(&directory)
-                .and_then(|root| self.file_search.ready(&root))
-                .map(crate::file_search::evidence::IndexEvidence);
+            // Best-effort, as in `ranked`: a broken ignoreFile must not fail search.
+            let ignore =
+                smcli_core::config::FileIgnore::load(&caller.config, &caller.home).unwrap_or(None);
+            let evidence = FileSearch::root(&directory).and_then(|root| {
+                let index = self.file_search.ready(&root)?;
+                Some(crate::file_search::evidence::IndexEvidence(
+                    index,
+                    ignore,
+                    root.into(),
+                ))
+            });
             // Bundled sources are fixed for this binary, so a cached index for this model is current; parsing them costs ~5MB per search.
             let cached = self
                 .command_sync
@@ -948,6 +987,7 @@ impl Service {
                     .map(|e| e as &dyn smcli_search::ProjectEvidence),
                 lock.as_ref(),
                 command_index.as_deref(),
+                generation,
             )?;
             let mut response = ServiceResponse::new(true);
             response.hits = Some(hits);
@@ -989,6 +1029,7 @@ impl Service {
     ) -> Result<(
         HashMap<String, SearchEntry>,
         HashMap<String, HashSet<String>>,
+        Option<u64>,
     )> {
         self.build_corpus(caller, directory, project, kind, || {})
     }
@@ -1003,6 +1044,7 @@ impl Service {
     ) -> Result<(
         HashMap<String, SearchEntry>,
         HashMap<String, HashSet<String>>,
+        Option<u64>,
     )> {
         let files = history_files(caller.home(), &caller.native_env())?;
         let stamp: Vec<String> = files
@@ -1026,14 +1068,18 @@ impl Service {
                     && c.native == stamp
                     && c.built.elapsed() < Duration::from_secs(300)
             }) {
-                return Ok((c.state.entries.clone(), c.state.programs.clone()));
+                return Ok((
+                    c.state.entries.clone(),
+                    c.state.programs.clone(),
+                    Some(state.corpus_generation),
+                ));
             }
             (state.data_version, state.history_revision)
         };
         let native: Vec<String> = files
             .iter()
             .filter_map(|f| f.read().ok())
-            .flat_map(|t| t.split('\n').map(String::from).collect::<Vec<_>>())
+            .flatten()
             .collect();
         let as_of = now();
         let captured = self
@@ -1046,14 +1092,18 @@ impl Service {
         let mut state = self.lock();
         Self::refresh(&mut state)?;
         // Never replace an updated cache with a snapshot taken before a committed record.
+        let mut generation = None;
         if (state.data_version, state.history_revision) == version {
             state.corpus = Some(SearchCorpus {
                 native: stamp,
                 built: Instant::now(),
                 state: corpus,
             });
+            state.corpus_generation += 1;
+            generation = Some(state.corpus_generation);
         }
-        Ok(copies)
+        // An unpublished snapshot has no generation, so the engine always syncs it.
+        Ok((copies.0, copies.1, generation))
     }
 }
 
@@ -1365,7 +1415,7 @@ mod tests {
         let sync = f.service.command_sync.lock().unwrap();
         assert!(!sync.running);
         assert!(sync.index.is_none());
-        assert!(sync.last_path.is_none());
+        assert!(sync.checked.is_empty());
         assert!(f.service.lock().engine.is_none());
     }
 
@@ -1454,7 +1504,7 @@ mod tests {
         {
             let mut sync = f.service.command_sync.lock().unwrap();
             sync.known.insert("stale".into());
-            sync.last_path = Some("stale".into());
+            sync.checked.insert("stale".into(), HashSet::new());
         }
         f.service
             .load_engine(&f.config_path(&r), || {
@@ -1464,7 +1514,7 @@ mod tests {
                 );
                 let sync = f.service.command_sync.lock().unwrap();
                 assert!(sync.known.is_empty());
-                assert!(sync.last_path.is_none());
+                assert!(sync.checked.is_empty());
             })
             .unwrap();
         let second = f.service.dispatch(&r);
@@ -1624,7 +1674,7 @@ mod tests {
             {
                 let sync = f.service.command_sync.lock().unwrap();
                 if sync.known.contains("jq")
-                    && sync.last_path.as_deref() == Some(bin.to_string_lossy().as_ref())
+                    && sync.checked.contains_key(bin.to_string_lossy().as_ref())
                 {
                     break;
                 }
@@ -1687,7 +1737,12 @@ mod tests {
         // race the sync thread's open and fail the sync.
         let changed = format!("{bin_path}:");
         loop {
-            if f.service.command_sync.lock().unwrap().last_path.as_deref() == Some(changed.as_str())
+            if f.service
+                .command_sync
+                .lock()
+                .unwrap()
+                .checked
+                .contains_key(&changed)
             {
                 break;
             }
@@ -1697,6 +1752,90 @@ mod tests {
         assert!(
             index.examples("jq").unwrap().is_some() && index.examples("tar").unwrap().is_some()
         );
+    }
+
+    /// Waits for a finished sync that looked `program` up on `path`.
+    fn wait_checked(f: &Fixture, path: &str, program: &str) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            {
+                let sync = f.service.command_sync.lock().unwrap();
+                if !sync.running
+                    && sync
+                        .checked
+                        .get(path)
+                        .is_some_and(|set| set.contains(program))
+                {
+                    return;
+                }
+            }
+            assert!(Instant::now() < deadline, "sync did not finish");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn record_on_path(f: &Fixture, event: &str, command: &str, path: &str) {
+        let mut r = f.request(Operation::Record);
+        r.event = Some(event.into());
+        r.command = Some(command.into());
+        r.shell = Some("zsh".into());
+        r.session = Some("test".into());
+        r.exit_code = Some(0);
+        r.shell_path = Some(path.into());
+        f.service.record(f.as_record(&r)).unwrap();
+    }
+
+    fn seeded_index_with_jq_bin(f: &Fixture) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let platform = smcli_search::tldr::current_platform();
+        let sources = smcli_search::commands::bundled_sources().expect("bundled tldr data");
+        let refs = smcli_search::commands::source_refs(&sources);
+        let index = f.command_index(&refs);
+        index
+            .add(
+                "tar",
+                &CommandIndex::gather(&refs, "tar", platform).expect("tar examples"),
+            )
+            .unwrap();
+        let bin = f.home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("jq"), "").unwrap();
+        std::fs::set_permissions(bin.join("jq"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin.to_string_lossy().into_owned()
+    }
+
+    /// Two shells with different PATHs each sync once, then neither re-syncs the other.
+    #[test]
+    fn alternating_paths_sync_once_each() {
+        let f = Fixture::new();
+        let a = seeded_index_with_jq_bin(&f);
+        let b = format!("{a}:");
+        record_on_path(&f, "62345678-89ab-4cde-8012-3456789abcde", "jq . x", &a);
+        wait_checked(&f, &a, "jq");
+        record_on_path(&f, "72345678-89ab-4cde-8012-3456789abcde", "jq . y", &b);
+        wait_checked(&f, &b, "jq");
+        f.service.command_sync.lock().unwrap().known.clear();
+        record_on_path(&f, "82345678-89ab-4cde-8012-3456789abcde", "jq . z", &a);
+        record_on_path(&f, "92345678-89ab-4cde-8012-3456789abcde", "jq . w", &b);
+        std::thread::sleep(Duration::from_millis(500));
+        // A re-sync would have refilled known.
+        assert!(f.service.command_sync.lock().unwrap().known.is_empty());
+    }
+
+    /// A program missed on one PATH is still discovered on another PATH that has it.
+    #[test]
+    fn program_known_elsewhere_syncs_on_new_path() {
+        let f = Fixture::new();
+        let a = seeded_index_with_jq_bin(&f);
+        let b = String::from("/nonexistent-smcli-path");
+        record_on_path(&f, "a2345678-89ab-4cde-8012-3456789abcde", "tar --help", &a);
+        wait_checked(&f, &a, "tar");
+        record_on_path(&f, "b2345678-89ab-4cde-8012-3456789abcde", "jq . x", &b);
+        wait_checked(&f, &b, "jq");
+        assert!(f.service.command_sync.lock().unwrap().absent.contains("jq"));
+        record_on_path(&f, "c2345678-89ab-4cde-8012-3456789abcde", "jq . y", &a);
+        wait_checked(&f, &a, "jq");
+        assert!(!f.service.command_sync.lock().unwrap().absent.contains("jq"));
     }
 
     /// History programs absent from PATH are remembered after a sync too.
@@ -1890,7 +2029,7 @@ mod tests {
             .build_corpus(&f.as_caller(&r), directory, None, None, || f.record())
             .unwrap();
         assert!(f.service.lock().corpus.is_none());
-        let (entries, _) = f
+        let (entries, _, _) = f
             .service
             .current_corpus(&f.as_caller(&r), directory, None, None)
             .unwrap();
@@ -1928,7 +2067,7 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(modified))
             .unwrap();
-        let (entries, _) = f
+        let (entries, _, _) = f
             .service
             .current_corpus(&f.as_caller(&r), directory, None, None)
             .unwrap();
@@ -2099,6 +2238,39 @@ mod tests {
     }
 
     #[test]
+    fn pick_keeps_outside_write_visible() {
+        let f = Fixture::new();
+        std::fs::write(f.home.join("config.toml"), "{}").unwrap();
+        let other = f.service.history.open_connection().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            other.execute_batch("BEGIN IMMEDIATE").unwrap();
+            tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            other
+                .execute_batch("CREATE TABLE outside_write (x); COMMIT")
+                .unwrap();
+        });
+        rx.recv().unwrap();
+        // refresh reads the version before the outside commit; record_pick then waits for it.
+        let response = f.service.select_command(
+            "cargo test".into(),
+            None,
+            f.home.to_string_lossy().into_owned(),
+            "suggest".into(),
+            "test".into(),
+            f.home.join("config.toml"),
+        );
+        writer.join().unwrap();
+        assert!(response.ok, "{response:?}");
+        // Re-reading the version after record_pick would swallow the outside commit.
+        let mut state = f.service.lock();
+        assert_ne!(state.data_version, data_version(&state.db).unwrap());
+        Service::refresh(&mut state).unwrap();
+        assert_eq!(state.data_version, data_version(&state.db).unwrap());
+    }
+
+    #[test]
     fn suggest_includes_project_test_candidates() {
         let f = Fixture::new();
         let project = tempfile::tempdir().unwrap();
@@ -2127,7 +2299,7 @@ mod tests {
         assert!(f.service.file_search.files(&warm).ok);
         let root = FileSearch::root(project.path().to_str().unwrap()).unwrap();
         let test_candidates =
-            crate::test_candidates::test_candidates(&f.service.file_search, &root);
+            crate::test_candidates::test_candidates(&f.service.file_search, &root, None);
         assert!(
             test_candidates
                 .iter()

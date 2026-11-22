@@ -18,7 +18,8 @@ pub struct HistoryFile {
 }
 
 impl HistoryFile {
-    pub fn read(&self) -> Result<String> {
+    /// One entry per command; zsh continuation lines and fish newlines stay inside their entry.
+    pub fn read(&self) -> Result<Vec<String>> {
         let mut bytes = std::fs::read(&self.path)?;
         if self.shell == Shell::Fish {
             let text = String::from_utf8_lossy(&bytes);
@@ -26,8 +27,7 @@ impl HistoryFile {
                 .lines()
                 .filter_map(|line| line.strip_prefix("- cmd: "))
                 .map(unquote_fish)
-                .collect::<Vec<_>>()
-                .join("\n"));
+                .collect());
         }
         if self.shell == Shell::Zsh {
             // Zsh escapes non-ASCII bytes with Meta (0x83), followed by byte XOR 32.
@@ -46,24 +46,37 @@ impl HistoryFile {
         }
         let text = String::from_utf8_lossy(&bytes);
         let mut lines: Vec<String> = text.split('\n').map(String::from).collect();
+        if lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
         if self.shell == Shell::Bash {
             lines.retain(|l| {
                 !(l.len() > 1 && l.starts_with('#') && l[1..].bytes().all(|b| b.is_ascii_digit()))
             });
-        } else {
-            let mut continued = false;
-            let count = lines.len();
-            for (index, line) in lines.iter_mut().enumerate() {
-                if !continued {
-                    *line = strip_extended_prefix(line).to_string();
+            return Ok(lines);
+        }
+        let mut entries: Vec<String> = vec![];
+        let mut continued = false;
+        for line in lines {
+            let mut part = if continued {
+                line
+            } else {
+                strip_extended_prefix(&line).to_string()
+            };
+            let joins = continued;
+            continued = part.ends_with('\\');
+            if continued {
+                part.pop();
+            }
+            match entries.last_mut() {
+                Some(last) if joins => {
+                    last.push('\n');
+                    last.push_str(&part);
                 }
-                continued = index < count - 1 && line.ends_with('\\');
-                if continued {
-                    line.pop();
-                }
+                _ => entries.push(part),
             }
         }
-        Ok(lines.join("\n"))
+        Ok(entries)
     }
 }
 
@@ -181,7 +194,7 @@ mod tests {
         std::fs::write(&sessions, "not a directory").unwrap();
         let files = history_files(dir.path(), &HashMap::new()).unwrap();
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].read().unwrap(), "echo usable\n");
+        assert_eq!(files[0].read().unwrap(), ["echo usable"]);
     }
 
     #[test]
@@ -199,7 +212,12 @@ mod tests {
         assert_eq!(files[0].shell, Shell::Fish);
         assert_eq!(
             files[0].read().unwrap(),
-            "echo plain\n\"/tmp/a b\"\necho it's quoted\nprintf a\\tb\nls"
+            [
+                "echo plain",
+                "\"/tmp/a b\"",
+                "echo it's quoted",
+                "printf a\\tb\nls"
+            ]
         );
         assert_eq!(std::fs::read_to_string(fish).unwrap(), source);
     }
@@ -217,7 +235,39 @@ mod tests {
         .unwrap();
         let files = history_files(dir.path(), &HashMap::new()).unwrap();
         assert_eq!(files.len(), 2);
-        assert_eq!(files[0].read().unwrap(), "ls -la\ngit status\n");
-        assert_eq!(files[1].read().unwrap(), "echo \nnext\ncafé\n");
+        assert_eq!(files[0].read().unwrap(), ["ls -la", "git status"]);
+        assert_eq!(files[1].read().unwrap(), ["echo \nnext", "café"]);
+    }
+
+    #[test]
+    fn zsh_multiline_is_one_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let zsh = dir.path().join(".zsh_history");
+        std::fs::write(
+            &zsh,
+            ": 1:0;for i in 1; do\\\n  echo $i\\\ndone\n: 2:0;ls\n",
+        )
+        .unwrap();
+        let files = history_files(dir.path(), &HashMap::new()).unwrap();
+        assert_eq!(
+            files[0].read().unwrap(),
+            ["for i in 1; do\n  echo $i\ndone", "ls"]
+        );
+    }
+
+    #[test]
+    fn fish_multiline_is_one_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let fish = dir.path().join("fish_history");
+        std::fs::write(
+            &fish,
+            "- cmd: for i in 1\\n  echo $i\\nend\n  when: 1\n- cmd: ls\n",
+        )
+        .unwrap();
+        let file = HistoryFile {
+            path: fish,
+            shell: Shell::Fish,
+        };
+        assert_eq!(file.read().unwrap(), ["for i in 1\n  echo $i\nend", "ls"]);
     }
 }

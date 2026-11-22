@@ -893,6 +893,7 @@ impl CapturedHistory {
             previous.as_deref(),
             &followers,
             &picks,
+            &|_| None,
         );
         let kind = context.and_then(|c| c.project_kind.as_deref());
         let mut ranked: Vec<(String, f64)> = scores.into_iter().collect();

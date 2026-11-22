@@ -20,7 +20,7 @@ pub fn home_dir(environment: &HashMap<String, String>) -> PathBuf {
 
 /// User settings written by `smcli init`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SmcliConfig {
     /// Legacy field (Apple's built-in embedding); `smcli init` clears it. Rust always uses Potion.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -168,6 +168,14 @@ impl SmcliConfig {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         use std::os::unix::fs::DirBuilderExt;
+        // Write through a symlinked config so the link survives the rename.
+        let resolved;
+        let path = if path.is_symlink() {
+            resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            resolved.as_path()
+        } else {
+            path
+        };
         let parent = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -405,6 +413,12 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_unknown_keys() {
+        let err = serde_json::from_str::<SmcliConfig>(r#"{"historyfilter":["x"]}"#).unwrap_err();
+        assert!(err.to_string().contains("historyfilter"), "{err}");
+    }
+
+    #[test]
     fn relative_config_uses_caller_working_directory() {
         let mut environment = HashMap::from([
             ("SMCLI_CONFIG".into(), "config.json".into()),
@@ -419,6 +433,23 @@ mod tests {
             SmcliConfig::location(Path::new("/h"), &environment),
             std::env::current_dir().unwrap().join("config.json")
         );
+    }
+
+    #[test]
+    fn config_save_keeps_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.json");
+        let link = dir.path().join("config.json");
+        std::fs::write(&real, "{}").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        SmcliConfig {
+            ctrl_r_key: Some(true),
+            ..Default::default()
+        }
+        .save(&link)
+        .unwrap();
+        assert!(link.is_symlink());
+        assert_eq!(SmcliConfig::load(&real).unwrap().ctrl_r_key, Some(true));
     }
 
     #[test]

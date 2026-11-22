@@ -15,15 +15,23 @@ use crate::service::Service;
 
 /// `smcli-service --db <absolute path to history.db>`. Started on demand by clients; exits when idle.
 fn main() {
-    let arguments: Vec<String> = std::env::args().skip(1).collect();
-    if arguments.len() != 2 || arguments[0] != "--db" || !arguments[1].starts_with('/') {
+    let arguments: Vec<String> = std::env::args_os()
+        .skip(1)
+        .filter_map(|a| a.into_string().ok())
+        .collect();
+    // A non-UTF-8 argument was dropped above, so the raw count no longer matches.
+    if std::env::args_os().count() != 3
+        || arguments.len() != 2
+        || arguments[0] != "--db"
+        || !arguments[1].starts_with('/')
+    {
         let _ = writeln!(
             std::io::stderr(),
             "Usage: smcli-service --db <absolute path to history.db>"
         );
         std::process::exit(2);
     }
-    let environment: HashMap<String, String> = std::env::vars().collect();
+    let environment = smcli_core::paths::utf8_environment();
     if let Err(error) = start(&arguments[1], environment) {
         let _ = writeln!(std::io::stderr(), "smcli-service: {error:#}");
         std::process::exit(1);

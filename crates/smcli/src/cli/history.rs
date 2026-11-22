@@ -101,9 +101,8 @@ pub(super) fn history(
     }
     for (path, text) in histories {
         println!("==> {} <==", path.display());
-        print!("{text}");
-        if !text.ends_with('\n') {
-            println!();
+        for entry in text {
+            println!("{entry}");
         }
     }
     if !records.is_empty() {

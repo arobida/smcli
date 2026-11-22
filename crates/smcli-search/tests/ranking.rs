@@ -1026,6 +1026,7 @@ impl World {
                 None,
                 lock.as_ref(),
                 Some(&command_index),
+                None,
             )
             .unwrap()
             .into_iter()

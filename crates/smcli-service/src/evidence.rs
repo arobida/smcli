@@ -2,7 +2,20 @@ use super::Index;
 use smcli_search::ProjectEvidence;
 use std::path::PathBuf;
 
-pub(crate) struct IndexEvidence(pub Index);
+/// Live index, the caller's `ignoreFile`, and the search root it is applied under.
+pub(crate) struct IndexEvidence(
+    pub Index,
+    pub Option<smcli_core::config::FileIgnore>,
+    pub PathBuf,
+);
+
+impl IndexEvidence {
+    fn ignored(&self, path: &std::path::Path) -> bool {
+        self.1
+            .as_ref()
+            .is_some_and(|i| i.ignores(&self.2, path, false))
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -29,7 +42,11 @@ mod tests {
             },
         )
         .unwrap();
-        let evidence = IndexEvidence(Arc::new(super::super::OwnedIndex(shared.clone())));
+        let evidence = IndexEvidence(
+            Arc::new(super::super::OwnedIndex(shared.clone())),
+            None,
+            root.path().to_path_buf(),
+        );
         assert!(shared.wait_for_scan(Duration::from_secs(10)));
         let terms = evidence.grep_terms(&["migration".into()], Duration::from_millis(20));
         assert!(terms.contains(&"migrate".into()), "{terms:?}");
@@ -45,6 +62,43 @@ mod tests {
             push_term(&mut capped, &format!("name_{i}"));
         }
         assert_eq!(capped.len(), 16);
+    }
+
+    #[test]
+    fn evidence_honors_ignore() {
+        use fff_search::{FilePicker, FilePickerOptions, SharedFilePicker, SharedFrecency};
+        use std::{sync::Arc, time::Duration};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("secret.rs"), "fn hidden_case() {}\n").unwrap();
+        std::fs::write(root.join("ignore.txt"), "secret.rs\n").unwrap();
+        let config = root.join("config.json");
+        std::fs::write(&config, r#"{"ignoreFile":"ignore.txt"}"#).unwrap();
+        let ignore = smcli_core::config::FileIgnore::load(&config, &root).unwrap();
+        let shared = SharedFilePicker::default();
+        FilePicker::new_with_shared_state(
+            shared.clone(),
+            SharedFrecency::default(),
+            FilePickerOptions {
+                base_path: root.to_string_lossy().into_owned(),
+                enable_content_indexing: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(shared.wait_for_scan(Duration::from_secs(10)));
+        let index: super::super::Index = Arc::new(super::super::OwnedIndex(shared.clone()));
+        let open = IndexEvidence(index.clone(), None, root.clone());
+        let closed = IndexEvidence(index, ignore, root.clone());
+        let names = ["hidden_case".to_string()];
+        let path = [root.join("secret.rs")];
+        let budget = Duration::from_millis(20);
+        assert_eq!(open.exists(&path), vec![true]);
+        assert_eq!(closed.exists(&path), vec![false]);
+        assert!(!open.find_identifiers(&names, budget).is_empty());
+        assert!(closed.find_identifiers(&names, budget).is_empty());
+        assert!(open.grep_terms(&names, budget).contains(&"secret".into()));
+        assert!(closed.grep_terms(&names, budget).is_empty());
     }
 
     #[test]
@@ -119,7 +173,11 @@ mod tests {
             },
         )
         .unwrap();
-        let evidence = IndexEvidence(Arc::new(super::super::OwnedIndex(shared.clone())));
+        let evidence = IndexEvidence(
+            Arc::new(super::super::OwnedIndex(shared.clone())),
+            None,
+            root.path().to_path_buf(),
+        );
         assert!(shared.wait_for_scan(Duration::from_secs(10)));
         let found = evidence.find_identifiers(
             &[
@@ -252,7 +310,7 @@ impl ProjectEvidence for IndexEvidence {
         }
         paths
             .iter()
-            .map(|path| picker.get_file_by_path(path).is_some())
+            .map(|path| !self.ignored(path) && picker.get_file_by_path(path).is_some())
             .collect()
     }
 
@@ -291,6 +349,9 @@ impl ProjectEvidence for IndexEvidence {
         for hit in &result.matches {
             if let Some(file) = result.files.get(hit.file_index) {
                 let path = file.relative_path(picker);
+                if self.ignored(&self.2.join(&path)) {
+                    continue;
+                }
                 if let Some(stem) = std::path::Path::new(&path)
                     .file_stem()
                     .and_then(|s| s.to_str())
@@ -367,7 +428,11 @@ impl ProjectEvidence for IndexEvidence {
                 let mut defined = false;
                 let mut seen = false;
                 for hit in &page.matches {
-                    if !contains_ident(&hit.line_content, name) {
+                    let hidden = page
+                        .files
+                        .get(hit.file_index)
+                        .is_some_and(|f| self.ignored(&self.2.join(f.relative_path(picker))));
+                    if hidden || !contains_ident(&hit.line_content, name) {
                         continue;
                     }
                     seen = true;
@@ -397,19 +462,22 @@ impl ProjectEvidence for IndexEvidence {
         paths
             .iter()
             .map(|path| {
-                picker.get_file_by_path(path).map_or(0.0, |file| {
-                    let status =
-                        fff_search::git::format_git_status_opt(file.git_status).unwrap_or("clean");
-                    let dirty = matches!(
-                        status,
-                        "modified" | "untracked" | "staged_new" | "staged_modified"
-                    );
-                    if dirty {
-                        1.0
-                    } else {
-                        (file.git_recency_score.max(0) as f64 / 100.0).min(1.0)
-                    }
-                })
+                picker
+                    .get_file_by_path(path)
+                    .filter(|_| !self.ignored(path))
+                    .map_or(0.0, |file| {
+                        let status = fff_search::git::format_git_status_opt(file.git_status)
+                            .unwrap_or("clean");
+                        let dirty = matches!(
+                            status,
+                            "modified" | "untracked" | "staged_new" | "staged_modified"
+                        );
+                        if dirty {
+                            1.0
+                        } else {
+                            (file.git_recency_score.max(0) as f64 / 100.0).min(1.0)
+                        }
+                    })
             })
             .collect()
     }

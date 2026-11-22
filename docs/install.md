@@ -7,7 +7,7 @@ smcli is two executables that must stay side by side:
   memory and powers the file and grep picker. `smcli` finds it in its own directory (`smcli` → `smcli-service`,
   `smcli-<build>` → `smcli-service-<build>`); set `SMCLI_SERVICE_BIN` to an absolute path to override.
 
-Both depend only on system libraries; the fff file-search library is built in. The Potion search model is shipped separately in the `potion-shell-16m/` folder beside both executables.
+Both depend only on system libraries; the fff file-search library is built in. The Potion search model is shipped separately in the `potion-shell-16m/` folder beside both executables, and the command examples in the `smcli-data/` folder (`tldr` and `cheat` inside it).
 
 Requirements: macOS 14 or later (Linux support coming soon!). Bash 4+ for the picker keys (macOS's `/bin/bash` 3.2 still records history, without
 keys), any recent Zsh, or Fish.
@@ -65,7 +65,7 @@ Open a new terminal afterwards. The rest of this page is the same steps done by 
    ``` sh
    mkdir -p ~/.local/bin
    cp smcli smcli-service ~/.local/bin/
-      cp -R potion-shell-16m ~/.local/bin/
+   cp -R potion-shell-16m smcli-data ~/.local/bin/
    ```
 
    Keep them together. Moving only `smcli` leaves it without its service: commands still work, but more slowly,

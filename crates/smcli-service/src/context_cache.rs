@@ -13,9 +13,11 @@ struct Entry {
     /// Something changed since the running refresh started.
     dirty: bool,
     started: Option<Instant>,
+    /// When the last read failed; a retry waits `max_age` after it.
+    failed_at: Option<f64>,
     touched: Instant,
     generation: u64,
-    _watcher: Option<watcher::FileWatcher>,
+    _watcher: Option<Box<dyn Send>>,
 }
 struct State {
     entries: HashMap<String, Entry>,
@@ -84,21 +86,34 @@ impl ContextCache {
             return context;
         };
         let root = &repository.root;
+        // Declared before the guard so they drop (stopping watcher threads) after the lock is released.
+        let (evicted, spare);
+        let missing = !self.inner.state.lock().unwrap().entries.contains_key(root);
+        let watcher = missing.then(|| self.watch(repository));
         let mut state = self.inner.state.lock().unwrap();
-        if !state.entries.contains_key(root) {
-            self.make_entry(&mut state, repository);
+        if state.entries.contains_key(root) {
+            spare = watcher;
+            evicted = None;
+        } else {
+            spare = None;
+            evicted = self.make_entry(&mut state, repository, watcher.flatten());
         }
         let entry = state.entries.get_mut(root).unwrap();
         entry.touched = Instant::now();
         let stale = entry
             .status
             .as_ref()
-            .is_none_or(|s| now() - s.fetched_at > self.inner.max_age);
+            .is_none_or(|s| now() - s.fetched_at > self.inner.max_age)
+            && entry
+                .failed_at
+                .is_none_or(|f| now() - f > self.inner.max_age);
         context.status = entry.status.clone();
         if (stale || entry.dirty) && !entry.refreshing {
             self.start_refresh(&mut state, root);
         }
         context.status_pending = state.entries[root].refreshing;
+        drop(state);
+        drop((evicted, spare));
         context
     }
 
@@ -111,8 +126,14 @@ impl ContextCache {
         entry.dirty = true;
     }
 
-    /// Called with the lock held.
-    fn make_entry(&self, state: &mut State, repository: &Repository) {
+    /// Called with the lock held; returns the evicted entry so the caller drops it after unlocking.
+    fn make_entry(
+        &self,
+        state: &mut State,
+        repository: &Repository,
+        watcher: Option<Box<dyn Send>>,
+    ) -> Option<Entry> {
+        let mut evicted = None;
         if state.entries.len() >= self.inner.limit
             && let Some(oldest) = state
                 .entries
@@ -120,10 +141,28 @@ impl ContextCache {
                 .min_by_key(|(_, e)| e.touched)
                 .map(|(r, _)| r.clone())
         {
-            state.entries.remove(&oldest);
+            evicted = state.entries.remove(&oldest);
         }
         state.generation += 1;
-        let watcher = {
+        state.entries.insert(
+            repository.root.clone(),
+            Entry {
+                status: None,
+                refreshing: false,
+                dirty: false,
+                started: None,
+                failed_at: None,
+                touched: Instant::now(),
+                generation: state.generation,
+                _watcher: watcher,
+            },
+        );
+        evicted
+    }
+
+    /// Built outside the lock: starting a watcher is slow, and dropping one joins its thread.
+    fn watch(&self, repository: &Repository) -> Option<Box<dyn Send>> {
+        {
             let root = repository.root.clone();
             let weak = Arc::downgrade(&self.inner);
             let mut paths = vec![root.clone()];
@@ -143,19 +182,8 @@ impl ContextCache {
                     }
                 }),
             )
-        };
-        state.entries.insert(
-            repository.root.clone(),
-            Entry {
-                status: None,
-                refreshing: false,
-                dirty: false,
-                started: None,
-                touched: Instant::now(),
-                generation: state.generation,
-                _watcher: watcher,
-            },
-        );
+            .map(|w| Box::new(w) as Box<dyn Send>)
+        }
     }
 
     /// Called with the lock held.
@@ -185,6 +213,7 @@ impl ContextCache {
                 return;
             };
             // A failed or timed-out read keeps the previous status rather than erasing it.
+            entry.failed_at = status.is_none().then(now);
             if status.is_some() {
                 entry.status = status;
             }
@@ -298,6 +327,43 @@ mod tests {
     }
 
     #[test]
+    fn failed_status_waits_max_age() {
+        let temp = tempfile::tempdir().unwrap();
+        repository(temp.path());
+        let directory = temp.path().to_str().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let cache = ContextCache::with_reader(
+            0.3,
+            Duration::from_millis(10),
+            16,
+            Arc::new(move |_| {
+                // Fails until the second call.
+                (count.fetch_add(1, Ordering::SeqCst) > 0).then(|| GitStatus::parse("", now()))
+            }),
+        );
+        let root = wait(&cache, directory).repository.unwrap().root;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            cache.inner.state.lock().unwrap().entries[&root]
+                .failed_at
+                .is_some()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!cache.context(directory).status_pending);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(cache.context(directory).status_pending);
+        wait(&cache, directory);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            cache.inner.state.lock().unwrap().entries[&root]
+                .failed_at
+                .is_none()
+        );
+    }
+
+    #[test]
     fn stale_status_and_lru_eviction() {
         let temp = tempfile::tempdir().unwrap();
         let a = temp.path().join("a");
@@ -344,6 +410,43 @@ mod tests {
         );
         wait(&cache, directory);
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn eviction_drops_watcher_outside_lock() {
+        struct Probe(std::sync::Weak<Inner>, Arc<AtomicUsize>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                if let Some(inner) = self.0.upgrade() {
+                    let held = inner.state.try_lock().is_err();
+                    self.1.store(if held { 2 } else { 1 }, Ordering::SeqCst);
+                }
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        repository(&a);
+        repository(&b);
+        let cache = ContextCache::with_reader(
+            100.0,
+            Duration::ZERO,
+            1,
+            Arc::new(|_| Some(GitStatus::parse("", now()))),
+        );
+        let root = wait(&cache, a.to_str().unwrap()).repository.unwrap().root;
+        let seen = Arc::new(AtomicUsize::new(0));
+        cache
+            .inner
+            .state
+            .lock()
+            .unwrap()
+            .entries
+            .get_mut(&root)
+            .unwrap()
+            ._watcher = Some(Box::new(Probe(Arc::downgrade(&cache.inner), seen.clone())));
+        cache.context(b.to_str().unwrap());
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "watcher dropped under lock");
     }
 
     #[test]

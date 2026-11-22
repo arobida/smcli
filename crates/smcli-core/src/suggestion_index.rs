@@ -60,6 +60,8 @@ struct Tally {
     runs: i64,
     last_run: f64,
     last_exit_code: i64,
+    /// Parsed once so a keystroke does not reparse every candidate.
+    program: Option<String>,
 }
 impl Default for Tally {
     fn default() -> Self {
@@ -68,6 +70,7 @@ impl Default for Tally {
             runs: 0,
             last_run: f64::NEG_INFINITY,
             last_exit_code: 0,
+            program: None,
         }
     }
 }
@@ -104,7 +107,7 @@ pub struct SuggestionIndex {
 impl SuggestionIndex {
     pub fn new(runs: Vec<Run>, picks: SelectionLog) -> Self {
         let mut index = Self {
-            base: runs.last().map_or_else(now, |r| r.started_at),
+            base: runs.last().map_or_else(now, |r| r.started_at.min(now())),
             commands: HashMap::new(),
             directories: HashMap::new(),
             kinds: Arc::new(Mutex::new(KindCache::new(KIND_CACHE_TTL))),
@@ -215,6 +218,12 @@ impl SuggestionIndex {
         let tally = self.commands.entry(key.clone()).or_default();
         tally.score += weight;
         tally.runs += 1;
+        if tally.program.is_none() {
+            tally.program = crate::parse::program_of(
+                primary,
+                crate::parse::CommandBreakdown::parse(primary).as_ref(),
+            );
+        }
         if run.started_at >= tally.last_run {
             tally.last_run = run.started_at;
             tally.last_exit_code = run.exit_code;
@@ -330,6 +339,7 @@ impl SuggestionIndex {
             previous.map(String::as_str),
             &followers,
             &self.picks.weights(prefix, now),
+            &|c| self.commands.get(c).and_then(|t| t.program.clone()),
         );
         if uses(context, Signal::Files)
             && uses(context, Signal::Index)
@@ -487,6 +497,20 @@ mod tests {
     use crate::config::CaptureFilter;
     use crate::history::{CapturedHistory, NewRun, user_name};
     use crate::ranking::{Candidate, CandidateKind};
+
+    #[test]
+    fn new_index_clamps_future_base() {
+        let run = Run {
+            command: "ls".into(),
+            expanded_command: None,
+            directory: "/".into(),
+            started_at: now() + 1e9,
+            exit_code: 0,
+            session: "s".into(),
+        };
+        let index = SuggestionIndex::new(vec![run], SelectionLog::default());
+        assert!(index.base <= now());
+    }
 
     #[test]
     fn snapshot_keeps_request_ranking_data() {

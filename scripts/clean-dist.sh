@@ -8,6 +8,7 @@ keep_service=$(readlink "$dist/smcli-service" 2>/dev/null)
 for f in "$dist"/smcli-*; do
     [[ -e $f || -L $f ]] || continue
     name=$(basename "$f")
+    [[ $name == smcli-data ]] && continue
     [[ $name == smcli-service || $name == "$keep_cli" || $name == "$keep_service" ]] && continue
-    rm -f "$f"
+    [[ -d $f && ! -L $f ]] || rm -f "$f"
 done

@@ -110,7 +110,11 @@ pub fn run(inline: bool) -> Result<Option<Vec<String>>> {
 fn arguments(command: &str, input: &str, shell: &str) -> Vec<String> {
     let mut args = vec![command.to_owned()];
     match command {
-        "search" => args.extend(input.split_whitespace().map(str::to_owned)),
+        "search" => {
+            // "--" keeps words like -r from being read as flags.
+            args.push("--".into());
+            args.extend(input.split_whitespace().map(str::to_owned));
+        }
         "import" => {
             let path = if input == "~" || input.starts_with("~/") {
                 std::env::var("HOME")
@@ -208,10 +212,15 @@ fn choose(mut selected: usize, inline: bool) -> Result<Option<usize>> {
 mod tests {
     use super::*;
     #[test]
+    fn menu_search_passes_literal_words() {
+        assert_eq!(arguments("search", "-r x", ""), ["search", "--", "-r", "x"]);
+    }
+
+    #[test]
     fn dispatch_arguments() {
         assert_eq!(
             arguments("search", " git   status ", ""),
-            ["search", "git", "status"]
+            ["search", "--", "git", "status"]
         );
         assert_eq!(
             arguments("shell-init", "", "/bin/fish"),

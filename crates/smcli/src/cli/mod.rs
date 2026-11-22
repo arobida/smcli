@@ -215,7 +215,7 @@ fn time(value: &str) -> Result<f64> {
         .ok_or_else(|| anyhow::anyhow!("Invalid time: {value}"))
 }
 pub fn run() -> Result<()> {
-    let env: HashMap<String, String> = std::env::vars().collect();
+    let env = smcli_core::paths::utf8_environment();
     let home = home_dir(&env);
     let mut captured = CapturedHistory::new(CapturedHistory::location(&home, &env));
     let executable = std::env::current_exe()?;
@@ -228,7 +228,7 @@ pub fn run() -> Result<()> {
         }
     }
     let filter = || CaptureFilter::new(&SmcliConfig::load(&config_path)?);
-    let mut args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if args.len() == 1 && crate::menu::is_interactive() {
         let Some(chosen) = crate::menu::run(
             SmcliConfig::load(&config_path)
@@ -239,7 +239,7 @@ pub fn run() -> Result<()> {
         else {
             return Ok(());
         };
-        args.extend(chosen);
+        args.extend(chosen.into_iter().map(Into::into));
     }
     if args.len() == 1 || (args.len() == 2 && (args[1] == "--help" || args[1] == "-h")) {
         print!("{USAGE}");
@@ -332,7 +332,14 @@ pub fn run() -> Result<()> {
                 .filter(|r| r.ok)
                 .and_then(|r| r.files)
             {
-                Some(hits) => {
+                Some(mut hits) => {
+                    hits.retain(|h| {
+                        crate::shell_quoting::insertable_name(if h.insert.is_empty() {
+                            &h.path
+                        } else {
+                            &h.insert
+                        })
+                    });
                     let chosen = (hits.len() == 1).then(|| hits[0].path.clone());
                     let paths = hits
                         .into_iter()

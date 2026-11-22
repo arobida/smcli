@@ -41,6 +41,7 @@ fn command_bridge_description_lookup_and_silent_fallbacks() {
                 None,
                 lock.as_ref(),
                 index,
+                None,
             )
             .unwrap()
     };

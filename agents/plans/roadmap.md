@@ -43,6 +43,20 @@ Open work, not scheduled. macOS is the current target. Linux is still wanted, bu
 - **Project-file boost:** the unlisted-script rule covers `<tool> run x` only, so `yarn x` can still be
   boosted when `x` is not a listed script.
 
+## Deferred from the 2026-11-22 audit
+
+Left out of [the audit-fixes plan](audit-fixes-2026-11-22.md), each with its reason:
+
+- Commands with bytes that are not UTF-8 are not recorded: storing raw bytes is a schema change, and `from_utf8_lossy` would save a different file name.
+- Search counts other users' rows: only matters after importing another user's history; decide whether search is meant to show everything first.
+- A guard for a panic in `finish_sync`: no input that panics was found.
+- `scoped_index` during a scan, `.git` as a symlink, the `-` mismatch in `declares_name`, and the Zsh `bindkey` subshell: small and unmeasured.
+- Atuin exit `-1` and relative folders: `-1` can mean an unfinished command, so decide what it should mean before changing it.
+- Test discovery reading a file swapped for a symlink between the search and the read: needs an open-then-check read; small window.
+- Absolute `PATH` entries inside a repo (for example from direnv) being used by automatic `git`: the user's own shell trusts them the same way. Slice 1F handles relative entries.
+- Suggestion index rebuilt under the state lock after outside writes: measure first.
+- Tab completion's content index in a home folder: unmeasured.
+
 ## Release
 
 - **Licensing:** choose the root `LICENSE`, settle the xdiff (LGPL) distribution route, and add the

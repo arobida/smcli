@@ -8,6 +8,8 @@ title: Codebase review — 2026-11-22
 
 This review covers commit `e8e65ff`. It changed no application code, and project tests were not run (repo rule). Six auditors each read one area: data writes, the client and service, file search and Git, shell hooks and the CLI, the search index, and ranking with install. Every finding below was checked against the code. Findings marked **reproduced** were run against `dist/smcli` (built from `d8582dc`; later commits are docs only) or in a scratch script. The [2026-11-08 review](codebase-review-2026-11-08.md) is fixed except where noted.
 
+**Status:** the findings are fixed on branch `audit-fixes-2026-11-22` per [the audit-fixes plan](../plans/audit-fixes-2026-11-22.md); deferred ones are listed in the [roadmap](../plans/roadmap.md).
+
 Codex (session `01a200d8-d20c-7852-8c55-d71d618c9725`) reviewed this report adversarially. Its verdicts were checked, and the confirmed corrections are folded in below. Its new arithmetic cases are part of finding 1, and its other missed findings are in the smaller list.
 
 ## Must fix

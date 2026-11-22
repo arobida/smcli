@@ -41,6 +41,11 @@ if "$bin" unknown > "$home/output" 2> "$home/error"; then
     exit 1
 fi
 [[ "$(HOME="$home" HISTFILE='' "$bin" search echo zsh -n 1)" == 'echo zsh'* ]]
+# Bytes that are not UTF-8: a bad environment value is skipped; a bad argument is a usage error, not a panic.
+BAD=$'\xff' "$bin" shell-init zsh | grep -q smcli
+status=0
+"$bin" search $'\xff' > /dev/null 2> "$runtime/err" || status=$?
+[[ "$status" == 2 && -s "$runtime/err" ]]
 # init --keys sets the picker keys without asking, and shell-init follows them.
 cfg="$home/keys.json"
 SMCLI_CONFIG="$cfg" "$bin" init --keys left > /dev/null
@@ -58,11 +63,13 @@ fi
 # make clean keeps the latest CLI and service pair and both symlinks.
 dist="$home/dist"
 mkdir -p "$dist"
-touch "$dist"/smcli-1-a "$dist"/smcli-service-1-a "$dist"/smcli-2-b "$dist"/smcli-service-2-b
+mkdir -p "$dist/smcli-data/tldr"
+touch "$dist/smcli-data/tldr/tldr.jsonl" "$dist"/smcli-1-a "$dist"/smcli-service-1-a "$dist"/smcli-2-b "$dist"/smcli-service-2-b
 ln -s smcli-2-b "$dist/smcli"
 ln -s smcli-service-2-b "$dist/smcli-service"
 bash scripts/clean-dist.sh "$dist"
-[[ "$(cd "$dist" && ls | tr '\n' ' ')" == 'smcli smcli-2-b smcli-service smcli-service-2-b ' ]]
+[[ "$(cd "$dist" && ls | tr '\n' ' ')" == 'smcli smcli-2-b smcli-data smcli-service smcli-service-2-b ' ]]
+[[ -f $dist/smcli-data/tldr/tldr.jsonl ]]
 atdir="$(mktemp -d /tmp/smcli-at.XXXXXX)"
 touch "$atdir/smcli-at-probe42.txt"
 mkdir "$atdir/smcli-at-dir"

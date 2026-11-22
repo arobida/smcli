@@ -20,8 +20,9 @@ release:
 	ln -sf smcli-$(STAMP) $(DIST)/smcli
 	ln -sf smcli-service-$(STAMP) $(DIST)/smcli-service
 	rm -rf $(DIST)/potion-shell-16m && cp -R Models/potion-shell-16m $(DIST)/potion-shell-16m
-	rm -rf $(DIST)/tldr && cp -R Data/tldr $(DIST)/tldr
-	rm -rf $(DIST)/cheat && cp -R Data/cheat $(DIST)/cheat
+	rm -rf $(DIST)/smcli-data && mkdir -p $(DIST)/smcli-data
+	cp -R Data/tldr $(DIST)/smcli-data/tldr
+	cp -R Data/cheat $(DIST)/smcli-data/cheat
 	@echo "Built $(DIST)/smcli-$(STAMP) (latest: $(DIST)/smcli)"
 	@echo ""
 	@echo "Try it in this shell (loads the zsh hooks from the new build):"

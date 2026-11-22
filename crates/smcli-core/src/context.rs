@@ -102,6 +102,22 @@ pub fn directory_kind(directory: &str) -> Option<String> {
     None
 }
 
+/// The Git worktree root above `directory`, found like `discover` but without reading manifests.
+pub fn repository_root(directory: &str) -> Option<String> {
+    let mut current = real_path(directory).unwrap_or_else(|| directory.to_string());
+    for _ in 0..MAX_LEVELS {
+        if let Some(repository) = ProjectContext::repository(&current) {
+            return Some(repository.root);
+        }
+        let up = parent(&current);
+        if up == current {
+            return None;
+        }
+        current = up;
+    }
+    None
+}
+
 /// `directory_kind` remembered for `ttl`: an expired or missing entry is probed again, and a deleted directory
 /// probes as unknown. The service keeps one so a long-lived index notices a manifest added or a directory removed
 /// within the ttl. It can never hold more entries than the distinct directories the index keeps.
@@ -750,6 +766,33 @@ impl GitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_root_matches_discover_including_linked_worktrees() {
+        let root = tempfile_dir();
+        let write = |file: &str, text: &str| {
+            let path = format!("{root}/{file}");
+            std::fs::create_dir_all(parent(&path)).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("main/.git/HEAD", "ref: refs/heads/main");
+        write("main/.git/worktrees/w/HEAD", "ref: refs/heads/w");
+        write("main/.git/worktrees/w/commondir", "../..");
+        write("wt/.git", &format!("gitdir: {root}/main/.git/worktrees/w"));
+        write("wt/a/b/x", "");
+        write("main/src/x", "");
+        for dir in ["main", "main/src", "wt", "wt/a/b"] {
+            let dir = format!("{root}/{dir}");
+            assert_eq!(
+                repository_root(&dir),
+                ProjectContext::discover(&dir).repository.map(|r| r.root),
+                "{dir}"
+            );
+            assert!(repository_root(&dir).is_some(), "{dir}");
+        }
+        write("plain/x", "");
+        assert_eq!(repository_root(&format!("{root}/plain")), None);
+    }
 
     #[test]
     fn directory_kind_is_the_nearest_projects_primary_kind() {

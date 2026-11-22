@@ -11,7 +11,6 @@ use smcli_core::service_protocol::FailureCode;
 #[cfg(test)]
 use smcli_core::service_protocol::ServiceRequest;
 use smcli_core::{
-    context::ProjectContext,
     paths::relative_insert,
     service_protocol::{FileHit, FileIndexInfo, ServiceResponse},
 };
@@ -125,14 +124,11 @@ impl FileSearch {
 
     /// The directory's Git worktree, or the directory itself outside Git. Real paths, so symlinks don't split instances.
     pub(crate) fn root(directory: &str) -> Option<String> {
-        ProjectContext::discover(directory)
-            .repository
-            .map(|r| r.root)
-            .or_else(|| {
-                std::fs::canonicalize(directory)
-                    .ok()
-                    .map(|p| p.to_string_lossy().into_owned())
-            })
+        smcli_core::context::repository_root(directory).or_else(|| {
+            std::fs::canonicalize(directory)
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned())
+        })
     }
 
     pub(crate) fn ready(&self, root: &str) -> Option<Index> {
@@ -282,7 +278,7 @@ impl FileSearch {
     }
 
     fn content_indexing_enabled(home: &std::path::Path, scope: &str) -> bool {
-        let in_repo = ProjectContext::discover(scope).repository.is_some();
+        let in_repo = smcli_core::context::repository_root(scope).is_some();
         if in_repo {
             return true;
         }
@@ -1388,7 +1384,7 @@ mod tests {
         search.files(&repo.request(Operation::Files, "example.txt"));
         let index = search.ready(&repo.0.to_string_lossy()).unwrap();
         use smcli_search::ProjectEvidence;
-        let evidence = evidence::IndexEvidence(index);
+        let evidence = evidence::IndexEvidence(index, None, repo.0.clone());
         assert_eq!(
             evidence.exists(&[repo.0.join("src/example.txt"), repo.0.join("missing.txt")]),
             vec![true, false]

@@ -166,7 +166,9 @@ pub(super) fn pick_tldr(
 
     let context = tldr_context(env.get("SMCLI_LBUFFER").map(String::as_str).unwrap_or(""));
     let sources = smcli_search::commands::bundled_sources().ok_or_else(|| {
-        anyhow::anyhow!("tldr data not found beside the smcli executable or in Data/tldr")
+        anyhow::anyhow!(
+            "tldr data not found in smcli-data/tldr beside the smcli executable or in Data/tldr"
+        )
     })?;
     let refs = smcli_search::commands::source_refs(&sources);
     let index = smcli_search::commands::CommandIndex::reader(

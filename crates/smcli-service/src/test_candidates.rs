@@ -16,7 +16,8 @@ use std::{
 
 struct Cached {
     at: Instant,
-    items: Vec<Candidate>,
+    /// Every source path per command, so each caller's ignore policy applies after the read.
+    items: Vec<(Candidate, Vec<String>)>,
     index: Weak<OwnedIndex>,
     dirty: Arc<AtomicBool>,
     watch: Option<fff_search::WatchId>,
@@ -113,12 +114,47 @@ mod tests {
         std::fs::write(root.join("it.js"), "it(\"double_it\", () => {});\n").unwrap();
         std::fs::write(root.join("test.ts"), "test(\"double_test\", () => {});\n").unwrap();
         let search = warm(&root);
-        let found = test_candidates(&search, root.to_str().unwrap());
+        let found = test_candidates(&search, root.to_str().unwrap(), None);
         let commands: Vec<&str> = found.iter().map(|c| c.command.as_str()).collect();
         assert_eq!(
             commands,
             ["npm test -- -t double_it", "npm test -- -t double_test"]
         );
+    }
+
+    #[test]
+    fn test_candidates_honor_ignore() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        std::fs::write(
+            root.join("skip.rs"),
+            "#[test]\nfn both_case() {}\n#[test]\nfn only_skipped() {}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("keep.rs"), "#[test]\nfn both_case() {}\n").unwrap();
+        std::fs::write(root.join("ignore.txt"), "skip.rs\n").unwrap();
+        let config = root.join("config.json");
+        std::fs::write(&config, r#"{"ignoreFile":"ignore.txt"}"#).unwrap();
+        let ignore = smcli_core::config::FileIgnore::load(&config, &root)
+            .unwrap()
+            .unwrap();
+        let search = warm(&root);
+        let r = root.to_str().unwrap();
+        let cmds = |found: Vec<Candidate>| -> Vec<String> {
+            found.into_iter().map(|c| c.command).collect()
+        };
+        for ignoring_first in [true, false] {
+            let (a, b);
+            if ignoring_first {
+                a = cmds(test_candidates(&search, r, Some(&ignore)));
+                b = cmds(test_candidates(&search, r, None));
+            } else {
+                b = cmds(test_candidates(&search, r, None));
+                a = cmds(test_candidates(&search, r, Some(&ignore)));
+            }
+            assert_eq!(a, ["cargo test both_case"]);
+            assert_eq!(b, ["cargo test both_case", "cargo test only_skipped"]);
+        }
     }
 
     #[test]
@@ -129,7 +165,7 @@ mod tests {
         let search = warm(&root);
         let root = root.to_str().unwrap();
         assert!(
-            test_candidates(&search, root)
+            test_candidates(&search, root, None)
                 .iter()
                 .any(|c| c.command == "cargo test before_case")
         );
@@ -141,7 +177,7 @@ mod tests {
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let found = test_candidates(&search, root);
+            let found = test_candidates(&search, root, None);
             if found.iter().any(|c| c.command == "cargo test after_case") {
                 assert!(found.iter().all(|c| c.command != "cargo test before_case"));
                 break;
@@ -156,7 +192,24 @@ mod tests {
 }
 
 /// shortcut: if fff cannot subscribe yet, the bounded cache expires after 30s; retry watching on refresh.
-pub fn test_candidates(search: &FileSearch, root: &str) -> Vec<Candidate> {
+pub fn test_candidates(
+    search: &FileSearch,
+    root: &str,
+    ignore: Option<&smcli_core::config::FileIgnore>,
+) -> Vec<Candidate> {
+    let keep = |items: &[(Candidate, Vec<String>)]| -> Vec<Candidate> {
+        items
+            .iter()
+            .filter(|(_, paths)| {
+                !ignore.is_some_and(|i| {
+                    paths
+                        .iter()
+                        .all(|p| i.ignores(Path::new(root), &Path::new(root).join(p), false))
+                })
+            })
+            .map(|(c, _)| c.clone())
+            .collect()
+    };
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let mut cached = cache.lock().unwrap();
     prune(&mut cached, search.capacity(), Instant::now());
@@ -170,7 +223,7 @@ pub fn test_candidates(search: &FileSearch, root: &str) -> Vec<Candidate> {
             .get(root)
             .filter(|entry| entry.index.ptr_eq(&Arc::downgrade(&index)))
         {
-            return entry.items.clone();
+            return keep(&entry.items);
         }
     }
     let dirty = Arc::new(AtomicBool::new(false));
@@ -193,7 +246,9 @@ pub fn test_candidates(search: &FileSearch, root: &str) -> Vec<Candidate> {
     let Some(picker) = guard.as_ref() else {
         return vec![];
     };
-    let mut found = vec![];
+    let mut found: std::collections::BTreeMap<String, (Candidate, Vec<String>)> =
+        Default::default();
+    let mut read = std::collections::HashSet::new();
     for pattern in [
         "#[test]",
         "#[tokio::test]",
@@ -229,16 +284,33 @@ pub fn test_candidates(search: &FileSearch, root: &str) -> Vec<Candidate> {
             } else {
                 continue;
             };
-            let text = std::fs::read_to_string(Path::new(root).join(&path)).unwrap_or_default();
+            if !read.insert(path.to_string()) {
+                continue;
+            }
+            // Size cap only; the symlink-swap race stays deferred.
+            let mut bytes = vec![];
+            if let Ok(file) = std::fs::File::open(Path::new(root).join(&path)) {
+                let _ =
+                    std::io::Read::read_to_end(&mut std::io::Read::take(file, 1 << 20), &mut bytes);
+            }
+            let text = String::from_utf8_lossy(&bytes);
             for name in test_names(&path, &text) {
                 if let Some(command) = fn_test_command(kind, &name) {
-                    found.push(Candidate::new(command, CandidateKind::Test, "project test"));
+                    found
+                        .entry(command.clone())
+                        .or_insert_with(|| {
+                            (
+                                Candidate::new(command, CandidateKind::Test, "project test"),
+                                vec![],
+                            )
+                        })
+                        .1
+                        .push(path.to_string());
                 }
             }
         }
     }
-    found.sort_by(|a, b| a.command.cmp(&b.command));
-    found.dedup_by(|a, b| a.command == b.command);
+    let found: Vec<_> = found.into_values().collect();
     drop(guard);
     entry.at = Instant::now();
     entry.items = found.clone();
@@ -246,5 +318,5 @@ pub fn test_candidates(search: &FileSearch, root: &str) -> Vec<Candidate> {
     cached.remove(root);
     prune(&mut cached, search.capacity() - 1, Instant::now());
     cached.insert(root.to_owned(), entry);
-    found
+    keep(&found)
 }

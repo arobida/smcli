@@ -213,7 +213,7 @@ if [[ -z $keep_data ]]; then
     rmdir "$(dirname "$config")" 2>/dev/null || true
     # Same FNV-1a name as service_location.rs (bytes, LC_ALL=C): only this database's socket/lock.
     service_fp=$(export LC_ALL=C; h=$((0xcbf29ce484222325)); t=$db
-        for ((i = 0; i < ${#t}; i++)); do printf -v c '%d' "'${t:i:1}"; h=$(( (h ^ c) * 0x100000001b3 )); done
+        for ((i = 0; i < ${#t}; i++)); do printf -v c '%d' "'${t:i:1}"; (( c >= 0 )) || c=$((c + 256)); h=$(( (h ^ c) * 0x100000001b3 )); done
         printf '%016x' "$h")
     # Absolute dirs only, same precedence filters as ServiceLocation::new.
     runtime_dirs=()
@@ -235,7 +235,14 @@ fi
 
 # 5. The rest of the install, this script last.
 rm -rf "$prefix/potion-shell-16m"
-rm -rf "$prefix/tldr"
-rm -rf "$prefix/cheat"
+rm -rf "$prefix/smcli-data"
+# Old layout: delete only the files smcli shipped, and the folder only if that empties it.
+for old in "tldr tldr.jsonl LICENSE.md" "cheat cheat.jsonl LICENSE.txt"; do
+    set -- $old
+    d="$prefix/$1"; shift
+    [[ -d $d && ! -L $d ]] || continue
+    for name in "$@"; do rm -f "$d/$name"; done
+    rmdir "$d" 2>/dev/null || true
+done
 say "Removed smcli. Open a new terminal (the current one keeps the old hooks until it exits)."
 rm -f "$prefix/smcli-uninstall"

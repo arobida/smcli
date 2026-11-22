@@ -34,7 +34,7 @@ done
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 
-[[ $(uname) == Darwin ]] || die "the installer is macOS-only; on Linux, copy smcli, smcli-service, the potion-shell-16m/ folder and the tldr/ folder into the same directory manually."
+[[ $(uname) == Darwin ]] || die "the installer is macOS-only; on Linux, copy smcli, smcli-service, the potion-shell-16m/ folder and the smcli-data/ folder into the same directory manually."
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ $prefix == /* ]] || prefix="$PWD/$prefix"
 
@@ -59,11 +59,11 @@ model="$from/potion-shell-16m"
 for file in model.safetensors tokenizer.json config.json; do
     [[ -s $model/$file ]] || die "missing or empty potion-shell-16m/$file beside $from/smcli"
 done
-tldr="$from/tldr"
+tldr="$from/smcli-data/tldr"
 [[ -d $tldr ]] || tldr="$here/../Data/tldr"
-[[ -s $tldr/tldr.jsonl ]] || die "missing or empty tldr/tldr.jsonl beside $from/smcli"
+[[ -s $tldr/tldr.jsonl ]] || die "missing or empty smcli-data/tldr/tldr.jsonl beside $from/smcli"
 # cheat is optional: installed when present, never an error when absent.
-cheat="$from/cheat"
+cheat="$from/smcli-data/cheat"
 [[ -d $cheat ]] || cheat="$here/../Data/cheat"
 say "Installing smcli and smcli-service to $prefix"
 mkdir -p "$prefix"
@@ -75,8 +75,9 @@ for name in smcli smcli-service; do
     xattr -d com.apple.quarantine "$stage/$name" 2>/dev/null || true
 done
 cp -RL "$model" "$stage/potion-shell-16m"
-cp -RL "$tldr" "$stage/tldr"
-[[ -s $cheat/cheat.jsonl ]] && cp -RL "$cheat" "$stage/cheat"
+mkdir "$stage/smcli-data"
+cp -RL "$tldr" "$stage/smcli-data/tldr"
+[[ -s $cheat/cheat.jsonl ]] && cp -RL "$cheat" "$stage/smcli-data/cheat"
 "$stage/smcli" --help > /dev/null || die "the staged smcli does not run"
 "$stage/smcli-service" --help > "$stage/service-help" 2>&1 && service_status=0 || service_status=$?
 [[ $service_status == 2 ]] && grep -q '^Usage: smcli-service ' "$stage/service-help" || die "the staged smcli-service does not run"
@@ -87,10 +88,16 @@ for name in smcli smcli-service; do
 done
 rm -rf "$prefix/potion-shell-16m"
 mv "$stage/potion-shell-16m" "$prefix/potion-shell-16m"
-rm -rf "$prefix/tldr"
-mv "$stage/tldr" "$prefix/tldr"
-rm -rf "$prefix/cheat"
-[[ -d $stage/cheat ]] && mv "$stage/cheat" "$prefix/cheat"
+rm -rf "$prefix/smcli-data"
+mv "$stage/smcli-data" "$prefix/smcli-data"
+# Old layout: delete only the files smcli shipped, and the folder only if that empties it.
+for old in "tldr tldr.jsonl LICENSE.md" "cheat cheat.jsonl LICENSE.txt"; do
+    set -- $old
+    d="$prefix/$1"; shift
+    [[ -d $d && ! -L $d ]] || continue
+    for name in "$@"; do rm -f "$d/$name"; done
+    rmdir "$d" 2>/dev/null || true
+done
 # The uninstaller ships with the install, so it works without the release archive or checkout.
 uninstaller="$here/uninstall.sh"
 [[ -f $uninstaller ]] && install -m 755 "$uninstaller" "$prefix/smcli-uninstall"
@@ -100,7 +107,11 @@ smcli="$prefix/smcli"
 # 2. Shell hooks, as a marked block at the end of each startup file (after tools that bind keys). Rerunning replaces it.
 begin='# >>> smcli >>>'
 end='# <<< smcli <<<'
-quoted=$(printf "'%s'" "${smcli//\'/\'\\\'\'}")
+q="'"; bs='\'
+quoted="'${smcli//$q/$q$bs$q$q}'"
+# Fish single quotes only unescape \\ and \', so double backslashes first.
+fish_path=${smcli//"$bs"/$bs$bs}
+fish_quoted="'${fish_path//$q/$bs$q}'"
 rc_file() {
     case $1 in
         zsh) printf '%s\n' "${ZDOTDIR:-$HOME}/.zshrc" ;;
@@ -111,7 +122,7 @@ rc_file() {
 hook_line() {
     case $1 in
         zsh|bash) printf 'eval "$(%s shell-init %s)"\n' "$quoted" "$1" ;;
-        fish) printf '%s shell-init fish | source\n' "$quoted" ;;
+        fish) printf '%s shell-init fish | source\n' "$fish_quoted" ;;
     esac
 }
 validate_block() {  # $1: file
@@ -159,7 +170,7 @@ write_hook() (  # $1: startup file, $2: shell
     trap 'rm -f "$tmp"' EXIT
     if [[ -f $target ]]; then
         cp -p "$target" "$tmp" || exit 1
-        awk -v b="$begin" -v e="$end" '$0 == b {skip = 1; next} skip && $0 == e {skip = 0; next} !skip' "$target" > "$tmp" || exit 1
+        awk -v b="$begin" -v e="$end" '$0 == b {skip = 1; held = 0; next} skip && $0 == e {skip = 0; next} skip {next} {if (held) print ""; held = 0} $0 == "" {held = 1; next} {print}' "$target" > "$tmp" || exit 1
     fi
     printf '\n%s\n# Added by smcli install.sh; remove with smcli-uninstall. Keep it below other tools that bind keys.\n%s\n%s\n' \
         "$begin" "$(hook_line "$2")" "$end" >> "$tmp" || exit 1

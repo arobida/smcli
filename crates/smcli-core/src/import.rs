@@ -104,7 +104,7 @@ impl CapturedHistory {
 
         tx.commit()?;
         if replace {
-            db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")?;
+            crate::prune::compact(&db)?;
         }
         Ok(count)
     }
@@ -115,11 +115,16 @@ impl CapturedHistory {
         let mut db = self.open_connection()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut count = 0;
-        for line in std::fs::read_to_string(&source)?
-            .lines()
-            .filter(|l| !l.is_empty())
-        {
-            let r: serde_json::Value = serde_json::from_str(line)?;
+        let body = std::fs::read_to_string(source)?;
+        let records: Vec<serde_json::Value> = if body.trim_start().starts_with('[') {
+            serde_json::from_str(&body)?
+        } else {
+            body.lines()
+                .filter(|l| !l.is_empty())
+                .map(serde_json::from_str)
+                .collect::<Result<_, _>>()?
+        };
+        for r in records {
             let text = |key: &str| -> Result<&str> {
                 r[key]
                     .as_str()
@@ -127,7 +132,11 @@ impl CapturedHistory {
             };
             let user = text("user")?;
             let shell = text("shell")?;
-            let session = format!("imported-{user}-{shell}");
+            let id = r.get("id").and_then(|v| v.as_str());
+            let session = match r.get("session").and_then(|v| v.as_str()) {
+                Some(s) if id.is_some() => s.to_string(),
+                _ => format!("imported-{user}-{shell}"),
+            };
             let command = text("command")?;
             let expanded = match r.get("expandedCommand") {
                 None | Some(serde_json::Value::Null) => None,
@@ -147,9 +156,44 @@ impl CapturedHistory {
             if !capture_filter.allows_run(command, expanded, directory) {
                 continue;
             }
+            let host = r
+                .get("host")
+                .and_then(|v| v.as_str())
+                .filter(|_| id.is_some());
+            let host = host.unwrap_or("unknown");
+            if let Some(id) = id {
+                let pipe: Vec<i64> = match r.get("pipestatus") {
+                    None | Some(serde_json::Value::Null) => vec![],
+                    Some(v) => serde_json::from_value(v.clone())?,
+                };
+                // Same validation as `append`.
+                ensure!(
+                    ["bash", "zsh", "fish"].contains(&shell)
+                        && (0..=255).contains(&exit_code)
+                        && directory.starts_with('/')
+                        && !command.is_empty()
+                        && !session.is_empty()
+                        && pipe.len() <= 256
+                        && pipe.iter().all(|c| (0..=255).contains(c)),
+                    "Invalid shell, directory, exit code, pipestatus, session, or empty command."
+                );
+                tx.execute(
+                    "INSERT OR IGNORE INTO sessions(id,user,host,shell) VALUES(?,?,?,?)",
+                    rusqlite::params![session, user, host, shell],
+                )?;
+                let opt = |k: &str| r.get(k).and_then(|v| v.as_str());
+                let pipe = (!pipe.is_empty()).then(|| {
+                    pipe.iter()
+                        .map(i64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                });
+                count += tx.execute("INSERT OR IGNORE INTO commands(session,started_at,duration_ms,directory,command,exit_code,uuid,author,intent,flags,pipestatus,expanded_command) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",rusqlite::params![session,stamp,r.get("durationMs").and_then(|v|v.as_i64()),directory,command,exit_code,id,opt("author"),opt("intent"),crate::parse::command_flags(expanded.unwrap_or(command)).join(" "),pipe,expanded])?;
+                continue;
+            }
             tx.execute(
-                "INSERT OR IGNORE INTO sessions(id,user,host,shell) VALUES(?,?,'unknown',?)",
-                rusqlite::params![session, user, shell],
+                "INSERT OR IGNORE INTO sessions(id,user,host,shell) VALUES(?,?,?,?)",
+                rusqlite::params![session, user, host, shell],
             )?;
             // Repeat imports must not double run counts: this import-only natural key skips a stored record.
             let exists: bool = tx.query_row(
@@ -348,6 +392,71 @@ mod tests {
         );
         drop(db);
         std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    fn same_ms_source(home: &Path) -> Result<CapturedHistory> {
+        let source = CapturedHistory::new(home.join("source.db"));
+        for command in ["git status", "git status"] {
+            let mut run = NewRun::new(command, "zsh", "/repo", 0);
+            run.started_at = Some(1_700_000_000.0);
+            run.ended_at = Some(1_700_000_000.007);
+            run.pipestatus = Some(vec![0, 1]);
+            run.session = "sess";
+            source.append(&run, "", None)?;
+        }
+        Ok(source)
+    }
+
+    #[test]
+    fn import_keeps_distinct_runs_same_millisecond() -> Result<()> {
+        let t = tempfile::tempdir()?;
+        let home = t.path();
+        let source = same_ms_source(home)?;
+        let jsonl = home.join("e.jsonl");
+        std::fs::write(
+            &jsonl,
+            source
+                .export_rows()?
+                .iter()
+                .map(|r| format!("{r}\n"))
+                .collect::<String>(),
+        )?;
+        let target = CapturedHistory::new(home.join("target.db"));
+        target.import_legacy(&jsonl, &capture_filter(home)?)?;
+        assert_eq!(target.export_rows()?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn import_history_json_round_trip() -> Result<()> {
+        let t = tempfile::tempdir()?;
+        let home = t.path();
+        let source = same_ms_source(home)?;
+        let rows = source.export_rows()?;
+        let json = home.join("e.json");
+        std::fs::write(&json, serde_json::to_string(&rows)?)?;
+        assert_eq!(source.import_legacy(&json, &capture_filter(home)?)?, 0);
+        assert_eq!(source.export_rows()?.len(), 2);
+        let target = CapturedHistory::new(home.join("target.db"));
+        target.import_legacy(&json, &capture_filter(home)?)?;
+        let back = target.export_rows()?;
+        let keep = |v: &serde_json::Value| {
+            [
+                "id",
+                "session",
+                "host",
+                "durationMs",
+                "pipestatus",
+                "command",
+                "timestamp",
+            ]
+            .map(|k| v[k].clone())
+        };
+        assert_eq!(
+            back.iter().map(keep).collect::<Vec<_>>(),
+            rows.iter().map(keep).collect::<Vec<_>>()
+        );
         Ok(())
     }
 

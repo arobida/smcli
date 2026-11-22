@@ -308,6 +308,16 @@ pub fn program_of(command: &str, parsed: Option<&CommandBreakdown>) -> Option<St
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn glob_match_pathological_is_fast() {
+        let pat = format!("{}b", "*a".repeat(11));
+        for n in [40, 320] {
+            let start = std::time::Instant::now();
+            assert!(!super::glob_match(&pat, &"a".repeat(n)));
+            assert!(start.elapsed().as_millis() < 100);
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -583,59 +593,78 @@ mod tests {
 /// Shell-like glob match supporting `**`, `*`, `?` and `[abc]` / `[a-z]` / `[!x]` classes.
 /// Both `pat` and `text` use `/` separators.
 pub fn glob_match(pat: &str, text: &str) -> bool {
+    glob_walk(pat, text, &mut std::collections::HashSet::new())
+}
+
+// Memo of (pattern, text) suffixes already known to fail keeps this polynomial.
+fn glob_walk(
+    pat: &str,
+    text: &str,
+    failed: &mut std::collections::HashSet<(usize, usize)>,
+) -> bool {
+    let key = (pat.len(), text.len());
+    if failed.contains(&key) {
+        return false;
+    }
+    let ok = glob_step(pat, text, failed);
+    if !ok {
+        failed.insert(key);
+    }
+    ok
+}
+
+fn glob_step(
+    pat: &str,
+    text: &str,
+    failed: &mut std::collections::HashSet<(usize, usize)>,
+) -> bool {
+    let next = |s: &str| s.chars().next();
     if pat.starts_with("**") {
         let rest = pat[2..].strip_prefix('/').unwrap_or(&pat[2..]);
         if rest.is_empty() {
             return true;
         }
-        let mut s = text;
-        loop {
-            if glob_match(rest, s) {
-                return true;
-            }
-            let Some(c) = s.chars().next() else {
-                return false;
-            };
-            s = &s[c.len_utf8()..];
+        if glob_walk(rest, text, failed) {
+            return true;
         }
+        return match next(text) {
+            Some(c) => glob_walk(pat, &text[c.len_utf8()..], failed),
+            None => false,
+        };
     }
-    if pat.starts_with('*') {
-        let rest = &pat[1..];
-        let mut s = text;
-        loop {
-            if glob_match(rest, s) {
-                return true;
-            }
-            match s.chars().next() {
-                Some('/') | None => return false,
-                Some(c) => s = &s[c.len_utf8()..],
-            }
+    if let Some(rest) = pat.strip_prefix('*') {
+        if glob_walk(rest, text, failed) {
+            return true;
         }
+        return match next(text) {
+            Some('/') | None => false,
+            Some(c) => glob_walk(pat, &text[c.len_utf8()..], failed),
+        };
     }
-    let Some(pc) = pat.chars().next() else {
+    let Some(pc) = next(pat) else {
         return text.is_empty();
     };
     if pc == '?' {
-        return match text.chars().next() {
+        return match next(text) {
             Some('/') | None => false,
-            Some(c) => glob_match(&pat[pc.len_utf8()..], &text[c.len_utf8()..]),
+            Some(c) => glob_walk(&pat[pc.len_utf8()..], &text[c.len_utf8()..], failed),
         };
     }
     if pc == '[' {
-        let Some(tc) = text.chars().next() else {
+        let Some(tc) = next(text) else {
             return false;
         };
         if tc == '/' {
             return false;
         }
         return match glob_class_eat(pat, tc) {
-            Some((true, rest)) => glob_match(rest, &text[tc.len_utf8()..]),
+            Some((true, rest)) => glob_walk(rest, &text[tc.len_utf8()..], failed),
             Some((false, _)) => false,
-            None => tc == '[' && glob_match(&pat[1..], &text[tc.len_utf8()..]),
+            None => tc == '[' && glob_walk(&pat[1..], &text[tc.len_utf8()..], failed),
         };
     }
-    match text.chars().next() {
-        Some(tc) if tc == pc => glob_match(&pat[pc.len_utf8()..], &text[tc.len_utf8()..]),
+    match next(text) {
+        Some(tc) if tc == pc => glob_walk(&pat[pc.len_utf8()..], &text[tc.len_utf8()..], failed),
         _ => false,
     }
 }
