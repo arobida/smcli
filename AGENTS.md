@@ -88,7 +88,7 @@ Every agent, including subagents and the external teams, tracks all work in dex 
 
 Stage, write commit messages, and push using [Stage, commit, and push](agents/reference/commits.md). Only commit or push when asked; follow that runbook for staging, caveman-commit message format, and remote push rules.
 
-Use the Worktrunk `wt` CLI for worktrees and `scripts/commit.lua` for commits: `wt switch --create <branch>` to start a worktree, `lua scripts/commit.lua` to commit what you staged (it generates the message from the diff via the LLM configured in `~/.config/worktrunk/config.toml`; see the runbook), then `git push`, `wt merge` to land it, and `wt remove` to clean up. Do not use raw `git worktree` or hand-write commit messages with `git commit -m`. Preview a message with `lua scripts/commit.lua -n`. The caveman-commit format reaches the LLM through `RULES` and `check` in `scripts/commit.lua` (and `template-append` in `.config/wt.toml` for `wt merge`); change the format in all three places and the runbook together.
+Use the Worktrunk `wt` CLI for worktrees and `scripts/commit.lua` for commits: `wt switch --create <branch>` to start a worktree, `lua scripts/commit.lua` to commit what you staged (it generates the message from the diff via the LLM configured in `~/.config/worktrunk/config.toml`; see the runbook), then `git push`, `lua scripts/commit.lua --squash` then `wt merge --no-squash` to land it, and `wt remove` to clean up. Do not use raw `git worktree` or hand-write commit messages with `git commit -m`. Preview a message with `lua scripts/commit.lua -n`. The caveman-commit format reaches the LLM through `RULES` and `check` in `scripts/commit.lua`; change the format there and in the runbook together.
 
 ## Search
 

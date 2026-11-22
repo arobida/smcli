@@ -102,6 +102,8 @@ lua scripts/commit.lua -t fix -s core -m "why" # force type/scope, give the mode
 lua scripts/commit.lua --amend -e             # rewrite HEAD's message, edit before saving
 ```
 
+To land a branch: `lua scripts/commit.lua --squash` (folds the branch's commits since `main` into one, with a fresh message), then `wt merge --no-squash`, so Worktrunk never writes a message.
+
 It asks `[y]es [e]dit [r]egenerate [n]o`; agents pass `-y`. `--help` lists every option. Do not hand-write messages with `git commit -m`.
 
 - Do not amend unless the user explicitly asks and the amend target is safe (for example, the commit was created by you in this session, not yet pushed, and hooks are not being skipped casually).

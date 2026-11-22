@@ -1,7 +1,7 @@
 #!/usr/bin/env lua
 -- Commit with an LLM-written caveman-commit message (agents/reference/commits.md).
--- The rules live here (RULES, check); keep them in step with the runbook and with
--- template-append in .config/wt.toml (used by wt merge). The model command comes from
+-- The rules live here (RULES, check); keep them in step with the runbook. Merges: --squash
+-- here, then wt merge --no-squash, so wt never writes a message. The model command comes from
 -- [commit.generation] command in ~/.config/worktrunk/config.toml (override: SMCLI_COMMIT_CMD).
 local usage = [[
 usage: lua scripts/commit.lua [options] [--] [pathspec...]
@@ -14,6 +14,8 @@ Stages nothing unless asked; the message describes, and the commit holds, what i
   -s, --scope SCOPE  force the scope
   -m, --hint TEXT    the why, passed to the model (repeatable)
   --amend            rewrite HEAD: message covers HEAD plus what is staged
+  --squash [TARGET]  fold this branch's commits since TARGET (default main) into one
+                     commit (git reset --soft to the merge base); then wt merge --no-squash
   -n, --dry-run      print the message, commit nothing
   -y, --yes          commit without asking
   -e, --edit         open the message in $EDITOR before committing
@@ -45,6 +47,9 @@ while i <= #arg do
   elseif a == "-s" or a == "--scope" then o.scope = val()
   elseif a == "-m" or a == "--hint" then table.insert(o.hints, val())
   elseif a == "--amend" then o.amend = true
+  elseif a == "--squash" then
+    o.squash = "main"
+    if arg[i + 1] and arg[i + 1]:sub(1, 1) ~= "-" then i = i + 1; o.squash = arg[i] end
   elseif a == "-n" or a == "--dry-run" then o.dry = true
   elseif a == "-y" or a == "--yes" then o.yes = true
   elseif a == "-e" or a == "--edit" then o.edit = true
@@ -61,6 +66,14 @@ local spec = ""
 for _, p in ipairs(paths) do spec = spec .. " " .. q(p) end
 
 if o.all then run("git add -A") end
+if o.squash then
+  local mb = sh("git merge-base HEAD " .. q(o.squash)):gsub("%s+$", "")
+  if mb == "" then die("no merge base with " .. o.squash) end
+  if mb == sh("git rev-parse HEAD"):gsub("%s+$", "") then die("no commits since " .. o.squash) end
+  -- Old tip stays in the reflog; this line lets the user undo with git reset.
+  io.stderr:write("squashing onto " .. mb:sub(1, 7) .. "; undo: git reset --soft " .. sh("git rev-parse --short HEAD"))
+  run("git reset --soft " .. mb)
+end
 if o.patch then run("git add -p --" .. spec)
 elseif #paths > 0 then run("git add --" .. spec) end
 
