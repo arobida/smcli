@@ -1,4 +1,4 @@
-# Commit messages follow agents/reference/commits.md (caveman-commit).
+# Commit messages follow agents/reference/commits.md (caveman-commit); keep in step with RULES in scripts/commit.lua.
 [commit.generation]
 template-append = """
 - Conventional Commits subject: <type>(<scope>): <imperative summary>. Types: feat, fix, refactor, perf, docs, test, chore, build, ci, style, revert.

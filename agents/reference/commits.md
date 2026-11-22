@@ -92,7 +92,17 @@ before 2026-06-01. Old route returns 410 after that date.
 
 ## Commit
 
-Stage paths as above, then commit with `wt step commit --stage=none` (its default `all` stages everything, untracked junk included). The LLM writes the message in the format above (from `template-append` in `.config/wt.toml`). Preview with `wt step commit --dry-run`. Do not hand-write messages with `git commit -m`.
+Commit with `lua scripts/commit.lua`. The LLM writes the message in the format above: the rules are built into the script (it checks the result and regenerates once with the breaks listed, then warns), and the model command from `[commit.generation] command` in `~/.config/worktrunk/config.toml` (override with `SMCLI_COMMIT_CMD`). It commits only what is staged, and can stage for you:
+
+``` sh
+lua scripts/commit.lua -n                     # preview the message for what is staged
+lua scripts/commit.lua crates/smcli ':!*.md'  # git add these pathspecs, then commit
+lua scripts/commit.lua -p crates/smcli        # pick hunks with git add -p, then commit
+lua scripts/commit.lua -t fix -s core -m "why" # force type/scope, give the model the why
+lua scripts/commit.lua --amend -e             # rewrite HEAD's message, edit before saving
+```
+
+It asks `[y]es [e]dit [r]egenerate [n]o`; agents pass `-y`. `--help` lists every option. Do not hand-write messages with `git commit -m`.
 
 - Do not amend unless the user explicitly asks and the amend target is safe (for example, the commit was created by you in this session, not yet pushed, and hooks are not being skipped casually).
 - Do not use `--no-verify` unless the user explicitly asks to skip hooks.
@@ -125,5 +135,5 @@ Rules:
 2. Status/diff/log inspected.
 3. Only intended paths staged; no secrets.
 4. Caveman-commit subject (and body if required) ready.
-5. Commit via `wt step commit --stage=none`.
+5. Commit via `lua scripts/commit.lua`.
 6. Push only if requested, without forced history rewrites.
