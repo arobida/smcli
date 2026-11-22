@@ -180,6 +180,8 @@ pub fn index_filter(filter: &SearchFilter) -> Option<Json> {
 pub struct HistorySearch {
     pub directory: PathBuf,
     pub potion: Potion,
+    /// Corpus generation last synced per index name; lets a caller that tracks changes skip an unchanged sync.
+    last_synced: std::sync::Mutex<HashMap<String, (u64, Option<u64>)>>,
 }
 
 /// History-index version prefix. A rebuild deletes older history indexes and leaves command-example caches alone.
@@ -359,6 +361,7 @@ impl HistorySearch {
         Self {
             directory: directory.into(),
             potion,
+            last_synced: Default::default(),
         }
     }
 
@@ -422,7 +425,7 @@ impl HistorySearch {
         lock: Option<&File>,
     ) -> Result<Vec<SearchEntry>> {
         self.search_with_command_index(
-            query, corpus, limit, filter, programs, signals, now, evidence, lock, None,
+            query, corpus, limit, filter, programs, signals, now, evidence, lock, None, None,
         )
     }
 
@@ -439,6 +442,7 @@ impl HistorySearch {
         evidence: Option<&dyn crate::ProjectEvidence>,
         lock: Option<&File>,
         command_index: Option<&crate::commands::CommandIndex>,
+        generation: Option<u64>,
     ) -> Result<Vec<SearchEntry>> {
         let plan = match plan_query(query, corpus, limit, filter, programs, signals)? {
             Ok(plan) => plan,
@@ -497,7 +501,25 @@ impl HistorySearch {
         };
         let db = self.open_index(&name)?;
         let commands = db.typed::<IndexedCommand>("commands")?;
-        self.sync(&db, &commands, corpus)?;
+        // `generation` must change whenever `corpus` could differ from the last search with it.
+        // The row count catches an index emptied or replaced behind our back.
+        let stamp = || commands.count(json!({})).ok();
+        let synced = |g| {
+            self.last_synced
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&name)
+                == Some(&(g, stamp()))
+        };
+        if !generation.is_some_and(synced) {
+            self.sync(&db, &commands, corpus)?;
+            if let Some(g) = generation {
+                self.last_synced
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(name.clone(), (g, stamp()));
+            }
+        }
         if vector_first() && !literal && !alias_query {
             let active = if has_markers && parsed_any {
                 &merged_filter
@@ -856,7 +878,12 @@ impl HistorySearch {
         _lock: &File,
     ) -> Result<usize> {
         let name = self.index_name();
+        self.last_synced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.remove_files(&name);
+        self.remove_files(&format!("{name}-typed"));
         let db = self.open_index(&name)?;
         self.sync(&db, &db.typed::<IndexedCommand>("commands")?, corpus)
     }
@@ -982,6 +1009,10 @@ impl HistorySearch {
         match open() {
             Ok(db) => Ok(db),
             Err(err) if index_cache_unusable(&err) => {
+                self.last_synced
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(name);
                 self.remove_files(name);
                 open().map_err(|retry| {
                     retry.context(format!("while rebuilding a corrupt index: {err:#}"))
@@ -1802,6 +1833,62 @@ mod tests {
         drop(commands);
         drop(db);
         assert!(path.metadata()?.len() < before);
+        Ok(())
+    }
+
+    #[test]
+    fn search_skips_sync_when_generation_unchanged() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let engine = HistorySearch::new(root.path().join("index"), Potion::bundled()?);
+        let mut corpus: HashMap<String, SearchEntry> = HashMap::new();
+        let add = |corpus: &mut HashMap<String, SearchEntry>, c: &str| {
+            let e = SearchEntry::new(c, 1, "native");
+            corpus.insert(e.key(), e);
+        };
+        add(&mut corpus, "git status");
+        let find = |corpus: &HashMap<String, SearchEntry>, g| -> Result<bool> {
+            let lock = engine.lock_index(20)?;
+            let hits = engine.search_with_command_index(
+                "docker ps",
+                corpus,
+                10,
+                &SearchFilter::default(),
+                None,
+                &SearchSignals::default(),
+                0.0,
+                None,
+                lock.as_ref(),
+                None,
+                g,
+            )?;
+            Ok(hits.iter().any(|e| e.command == "docker ps"))
+        };
+        assert!(!find(&corpus, Some(1))?);
+        add(&mut corpus, "docker ps");
+        assert!(!find(&corpus, Some(1))?);
+        assert!(find(&corpus, Some(2))?);
+        // Recovery and reindex forget the stored generation.
+        engine.reindex(&corpus)?;
+        assert!(engine.last_synced.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn reindex_removes_typed_index() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let directory = root.path().join("index");
+        std::fs::create_dir(&directory)?;
+        // The index refuses a folder others can read.
+        std::fs::set_permissions(
+            &directory,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )?;
+        let index = HistorySearch::new(&directory, Potion::bundled()?);
+        let typed = directory.join(format!("{}-typed.taladb", index.index_name()));
+        std::fs::write(&typed, b"stale")?;
+        let lock = index.lock_index(1)?.unwrap();
+        index.reindex_using_lock(&HashMap::new(), &lock)?;
+        assert!(!typed.exists());
         Ok(())
     }
 
@@ -2826,6 +2913,35 @@ mod tests {
             .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
             .sum();
         println!("long-entry sync: {sync_ms} ms, index size: {size} bytes");
+    }
+
+    #[test]
+    #[ignore = "manual timing measurement for plan 3E (#10); run with --release --nocapture"]
+    fn sync_unchanged_100k_timing() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let directory = root.path().join("index");
+        prepare_directory(&directory)?;
+        let engine = HistorySearch::new(&directory, Potion::bundled()?);
+        let corpus: HashMap<_, _> = (0..100_000)
+            .map(|i| {
+                let entry = SearchEntry::new(
+                    &format!("synthetic command {i} --flag value{i}"),
+                    1,
+                    "native",
+                );
+                (entry.key(), entry)
+            })
+            .collect();
+        let db = engine.open_index(&engine.index_name())?;
+        let commands = db.typed::<IndexedCommand>("commands")?;
+        engine.sync(&db, &commands, &corpus)?;
+        let started = std::time::Instant::now();
+        engine.sync(&db, &commands, &corpus)?;
+        println!(
+            "second sync: {:.1} ms",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        Ok(())
     }
 
     fn indexed_commands(engine: &HistorySearch) -> Vec<IndexedCommand> {

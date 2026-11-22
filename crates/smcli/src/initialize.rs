@@ -136,7 +136,9 @@ pub fn reindex(
     let count = engine.reindex_using_lock(&entries, &lock)?;
     drop(lock); // CommandIndex takes the same directory lock.
     let sources = smcli_search::commands::bundled_sources().ok_or_else(|| {
-        anyhow::anyhow!("tldr data not found beside the smcli executable or in Data/tldr")
+        anyhow::anyhow!(
+            "tldr data not found in smcli-data/tldr beside the smcli executable or in Data/tldr"
+        )
     })?;
     let refs = smcli_search::commands::source_refs(&sources);
     let index = smcli_search::commands::CommandIndex::new(

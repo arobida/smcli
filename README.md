@@ -246,7 +246,7 @@ editing, run one slice, for example `make test-rust PKG=smcli-core FILTER=histor
 Before changing shell transports or search ownership:
 
 ``` sh
-make baseline       # release CLI; synthetic 1k/10k/100k histories, raw JSON in dist/baseline.json
+make baseline       # release CLI; synthetic 1k/10k/100k histories, appends to agents/reference/baselines.jsonl
 make test-service   # service and file-search black-box checks
 ```
 

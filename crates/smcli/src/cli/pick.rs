@@ -117,7 +117,7 @@ pub(super) fn pick(
     let native = smcli_search::native::history_files(caller.home(), &caller.native_env())?
         .iter()
         .filter_map(|f| f.read().ok())
-        .flat_map(|s| s.lines().map(String::from).collect::<Vec<_>>())
+        .flatten()
         .collect();
     let mut picker = Picker::new(
         suggestions,
@@ -330,6 +330,10 @@ pub(super) fn pick(
                             ""
                         }
                     );
+                    std::process::exit(1);
+                }
+                if !crate::shell_quoting::insertable_name(&hit.insert) {
+                    eprintln!("smcli: cannot insert this name safely.");
                     std::process::exit(1);
                 }
                 println!("{}", crate::shell_quoting::quote(&hit.insert, shell));

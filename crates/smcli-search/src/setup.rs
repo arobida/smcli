@@ -23,7 +23,7 @@ pub fn corpus(
     let native: Vec<String> = history_files(home, environment)?
         .iter()
         .filter_map(|f| f.read().ok())
-        .flat_map(|text| text.split('\n').map(String::from).collect::<Vec<_>>())
+        .flatten()
         .collect();
     let stats =
         captured.command_stats(Some(&working_directory(environment)), project, kind, now)?;

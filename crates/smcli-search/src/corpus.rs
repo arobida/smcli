@@ -931,7 +931,7 @@ pub(crate) fn rerank_intent_with_affinity(
                 && let Some(reason) = signals
                     .context
                     .as_ref()
-                    .and_then(|c| c.project_file_reason(entry.primary()))
+                    .and_then(|c| c.project_file_reason(entry.primary(), None))
             {
                 boost += INTENT_TASK_WEIGHT / 2.0;
                 why.push(reason.into());
@@ -1146,7 +1146,8 @@ pub(crate) fn rerank_with_affinity(
                 || scripts.contains_key(&entry.command)
                 || tests.contains_key(&entry.command))
                 && entry.runs > 0
-                && let Some(reason) = context.and_then(|c| c.project_file_reason(entry.primary()))
+                && let Some(reason) =
+                    context.and_then(|c| c.project_file_reason(entry.primary(), None))
                 && let coverage = entry_coverage(&entry, &query_terms)
                 && coverage > 0.0
             {

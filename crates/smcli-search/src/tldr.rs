@@ -44,14 +44,22 @@ pub fn current_platform() -> &'static str {
     }
 }
 
-/// tldr lives beside the binaries in installs, or under Data/ for development and tests.
+/// tldr data lives in smcli-data/tldr beside the binaries in installs, or under Data/ for development and tests.
 pub fn bundled_dir() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok();
-    let beside = |p: Option<PathBuf>| p.and_then(|e| e.parent().map(|d| d.join("tldr")));
+    bundled_dir_in(
+        std::env::current_exe().ok().as_deref(),
+        Some(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Data")),
+    )
+}
+
+/// The checkout is a parameter so tests can leave out the Data/ fallback.
+fn bundled_dir_in(exe: Option<&Path>, checkout: Option<&Path>) -> Option<PathBuf> {
+    let beside = |e: PathBuf| e.parent().map(|d| d.join("smcli-data").join("tldr"));
     [
-        beside(exe.as_ref().and_then(|e| std::fs::canonicalize(e).ok())),
-        beside(exe),
-        Some(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Data/tldr")),
+        exe.and_then(|e| std::fs::canonicalize(e).ok())
+            .and_then(beside),
+        exe.map(Path::to_path_buf).and_then(beside),
+        checkout.map(|c| c.join("tldr")),
     ]
     .into_iter()
     .flatten()
@@ -320,4 +328,26 @@ pub fn rank_with_vectors(
         .collect::<Vec<_>>();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     ranked
+}
+
+#[cfg(test)]
+mod bundled_dir_tests {
+    use super::*;
+
+    #[test]
+    fn bundled_dir_in_uses_smcli_data_and_ignores_old_layout() {
+        let root = tempfile::tempdir().unwrap();
+        let exe = root.path().join("smcli");
+        std::fs::write(&exe, "").unwrap();
+        let old = root.path().join("tldr");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("tldr.jsonl"), "x").unwrap();
+        assert_eq!(bundled_dir_in(Some(&exe), None), None);
+        let new = std::fs::canonicalize(root.path())
+            .unwrap()
+            .join("smcli-data/tldr");
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("tldr.jsonl"), "x").unwrap();
+        assert_eq!(bundled_dir_in(Some(&exe), None), Some(new));
+    }
 }

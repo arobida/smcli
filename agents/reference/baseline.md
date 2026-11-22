@@ -20,15 +20,15 @@ Schema version is **7** (`pipestatus`, `file_selections`, `command_selections`).
 From the repository root:
 
 ``` sh
-make baseline                                 # in-process, writes dist/baseline.json
-make baseline BENCH_ARGS="--service on --output dist/baseline-service.json"   # through the service, plus repositories
+make baseline                                 # in-process, appends to agents/reference/baselines.jsonl
+make baseline BENCH_ARGS="--service on"       # through the service, plus repositories
 make baseline BENCH_ARGS="--service on --rows 1000 --repo-files 10000"        # a short service run
 make test
 ```
 
 `make baseline` builds the release CLI and writes raw samples, medians, nearest-rank
 p95s, high-water RSS, binary SHA-256, toolchain and host metadata to
-`dist/baseline.json`. It never imports or reads the user's real history. `--service on`
+`agents/reference/baselines.jsonl` (one compact line per run, per-sample arrays dropped) and rewrites `agents/reference/baseline-changes.md`, a short table of warm medians that moved at least 10% and 1 ms since the previous run in the same service mode. Keep at least two runs in the JSONL and commit both files with the change they measure. It never imports or reads the user's real history. `--service on`
 additionally records the service's resident size after each fixture (`service_rss_mib`) and runs the
 `repositories` section: a generated Git repository of 10,000 and 50,000 tracked files, measuring directory
 context, fff `files` and `grep` through the socket (cold = first request of a fresh service, warm = median).

@@ -248,6 +248,10 @@ try:
     second = service_pid()
     assert second not in (None, first), (first, second)
 
+    # A non-UTF-8 argument is a usage error.
+    bad = subprocess.run([f"{os.path.dirname(smcli)}/smcli-service", "--db", b"/tmp/\xff"], capture_output=True)
+    assert bad.returncode == 2, bad
+
     # Service unavailable and can't be started: commands fall back to in-process work.
     run("service", "stop")
     run("record", "zsh", "s", "/repo", "0", "", "", "", "no service", SMCLI_SERVICE_BIN="/nonexistent")
@@ -348,6 +352,13 @@ try:
     while services() and time.time() < deadline:
         time.sleep(0.5)
     assert services() == [], "idle service should exit"
+
+    # The service starts in "/" whatever folder the client ran from.
+    launch_dir = tempfile.mkdtemp(dir=root)
+    subprocess.run([smcli, "service", "start"], env=env, cwd=launch_dir, check=True, capture_output=True, timeout=30)
+    cwd_line = subprocess.run(["lsof", "-a", "-p", str(service_pid()), "-d", "cwd", "-Fn"], capture_output=True, text=True).stdout
+    assert "n/\n" in cwd_line + "\n", f"service cwd should be /: {cwd_line!r}"
+    run("service", "stop")
 
     # fff file and grep search: at most 2 instances, idle ones dropped after 3 s.
     run("service", "start", SMCLI_FFF_MAX="2", SMCLI_FFF_IDLE="3")

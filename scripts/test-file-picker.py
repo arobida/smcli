@@ -111,7 +111,8 @@ def run(shell, path):
 
     try:
         until(lambda t: "READY> " in t, "first prompt")
-        for token, name in NAMES.items():
+        inserted = {k: v for k, v in NAMES.items() if k != "t06"}  # t06 (backtick) is refused, checked below
+        for token, name in inserted.items():
             buffer = b""
             os.write(fd, b"printf 'GOT<%s>END\\n' ")
             os.write(fd, b"\x1b[A")  # Up opens the picker with the typed text as its history query
@@ -134,7 +135,7 @@ def run(shell, path):
             got = printed(out)[0]
             want = "./" + name if name.startswith("-") else name
             assert got == want, f"{shell}: {name!r}: shell received {got!r}, wanted {want!r}"
-        print(f"{shell}: {len(NAMES)} awkward names inserted as one word each, none executed.")
+        print(f"{shell}: {len(inserted)} awkward names inserted as one word each, none executed.")
 
         # A path longer than the row is visibly shortened in the middle; the full path is inserted.
         buffer = b""
@@ -183,6 +184,18 @@ def run(shell, path):
         got = printed(until(lambda t: printed(t), "quoted output"))
         assert got == ["x "], f"{shell}: inside quotes the line became {got!r}"
         assert not Path(repo, "PWNED").exists(), f"{shell}: command substitution in a file name ran"
+
+        # A name containing a backtick is refused: nothing inserted, the line is unchanged.
+        buffer = b""
+        os.write(fd, b"printf 'GOT<%s>END\\n' ok ")
+        choose("t06")
+        settle()
+        assert "cannot insert this name safely" in CSI.sub(b"", buffer).decode(errors="replace"), \
+            f"{shell}: no refusal for t06: {CSI.sub(b'', buffer).decode(errors='replace')!r}"
+        buffer = b""
+        os.write(fd, b"\r")
+        got = printed(until(lambda t: printed(t), "t06 output"))
+        assert got == ["ok"], f"{shell}: t06 changed the line to {got!r}"
 
         # The cursor sits after a multibyte character: the word goes exactly there, the rest of the line intact.
         buffer = b""

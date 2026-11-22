@@ -44,6 +44,9 @@ pub struct Ranked {
     pub prefix: String,
     pub session: Option<String>,
     pub ranking_off: Option<String>,
+    /// Internal (not on the wire): the caller's `ignoreFile` source.
+    pub home: Option<String>,
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -220,6 +223,12 @@ fn ranked(request: &ServiceRequest, pick: bool) -> Result<Ranked, (FailureCode, 
         },
         session: request.session.clone(),
         ranking_off: request.ranking_off.clone(),
+        home: request.home.clone(),
+        config: request
+            .config
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from),
     })
 }
 

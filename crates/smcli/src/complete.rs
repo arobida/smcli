@@ -34,6 +34,7 @@ pub(crate) fn complete_local(
     } else {
         hits.sort_by(|a, b| rank(word, a).cmp(&rank(word, b)).then(a.cmp(b)));
     }
+    hits.retain(|p| crate::shell_quoting::insertable_name(p));
     hits.truncate(limit);
     // Directories end in `/`, as the service's do.
     hits.into_iter()

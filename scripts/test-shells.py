@@ -181,8 +181,8 @@ preexec_functions=(); precmd_functions=()
 BP_PIPESTATUS=()
 __bp_interactive=0
 __bp_precmd_invoke_cmd() {
-    local last=$? pipe="${PIPESTATUS[*]}" cmd
-    BP_PIPESTATUS=($pipe)
+    local last=$? codes=("${PIPESTATUS[@]}") cmd
+    BP_PIPESTATUS=("${codes[@]}")
     for cmd in "${precmd_functions[@]}"; do
         (exit "$last"); "$cmd"
     done
@@ -225,7 +225,7 @@ def variants():
         found.append(Variant(f"bash {version} (PS0)", "bash", modern, bash_args))
         found.append(Variant(f"bash {version} (DEBUG fallback)", "bash", modern, bash_args, env={"SMCLI_BASH_HOOK": "debug"}))
         found.append(Variant(f"bash {version} (bash-preexec BP_PIPESTATUS)", "bash", modern, bash_args, prelude=BASH_PREEXEC))
-        found.append(Variant(f"bash {version} (bash-preexec without BP_PIPESTATUS)", "bash", modern, bash_args, prelude=BASH_PREEXEC.replace("    BP_PIPESTATUS=($pipe)\n", "")))
+        found.append(Variant(f"bash {version} (bash-preexec without BP_PIPESTATUS)", "bash", modern, bash_args, prelude=BASH_PREEXEC.replace('    BP_PIPESTATUS=("${codes[@]}")\n', "")))
     else:
         skipped.append("bash >= 4.4 (PS0 and bash-preexec variants)")
     if os.path.exists("/bin/bash") and not modern:
@@ -1234,6 +1234,40 @@ def run_alias_capture(variant):
             shutil.rmtree(runtime, ignore_errors=True)
 
 
+def run_hook_edges(variant):
+    """A custom IFS must not break pipe status; Bash under set -u is silent; a completion set before the hooks survives."""
+    kind = variant.kind
+    with tempfile.TemporaryDirectory() as directory:
+        home = Path(directory).resolve()
+        runtime = tempfile.mkdtemp(prefix="smcli-sh.", dir="/tmp")
+        env = new_environment(home, runtime, variant)
+        t = Terminal(variant.path, variant.args, env, str(home))
+        try:
+            t.drain()
+            setup_prompt(t, kind)
+            if variant.prelude:
+                t.send(variant.prelude)
+            if kind == "bash":
+                t.send("_t_comp() { :; }; complete -F _t_comp cd")
+            t.send(init_line(kind))
+            if kind == "bash":
+                assert "_t_comp" in t.send("complete -p cd"), variant.label
+                out = t.send("set -u; true; false; true | false; set +u")
+                assert "unbound" not in out and "smcli:" not in out, (variant.label, out)
+            t.send("IFS=,")
+            t.send("true | false")
+            records = [r for r in read_records(env) if r["command"] == "true | false" and r["exitCode"] == 1]
+            assert records, (variant.label, read_records(env))
+            # bash-preexec without BP_PIPESTATUS has no pipe statuses to report.
+            if "without BP_PIPESTATUS" not in variant.label:
+                assert records[-1].get("pipestatus") == [0, 1], (variant.label, records)
+            print(f"{variant.label}: IFS, set -u, and existing completion passed.")
+        finally:
+            t.close()
+            stop_services(env)
+            shutil.rmtree(runtime, ignore_errors=True)
+
+
 def run_at_completion(variant):
     """Tab on @word offers a cwd file; ordinary Tab and SMCLI_NO_KEYS stay the shell's."""
     kind = variant.kind
@@ -1350,7 +1384,7 @@ found = [v for v in found if only in v.label]
 # Every job owns its home, database and service runtime, so they run side by side; a failure is reported after all finish.
 jobs = []
 for variant in found:
-    jobs += [(run_variant, variant), (run_alias_capture, variant), (run_at_completion, variant), (run_tldr, variant),
+    jobs += [(run_variant, variant), (run_alias_capture, variant), (run_at_completion, variant), (run_hook_edges, variant), (run_tldr, variant),
              (run_custom_tab, variant)]
 zsh_variant = next((v for v in found if v.kind == "zsh"), None)
 if zsh_variant:

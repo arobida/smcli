@@ -111,10 +111,9 @@ impl CapturedHistory {
                 ))
             })? {
                 let (id, command, q, d) = row?;
-                // Only a rejected query removes a selection on its own; selections of a pruned command go with it.
+                // A pick goes only when its own command/folder or query is rejected.
                 let (typed, expanded) = crate::entry::command_parts(&command);
-                if commands.contains(&command)
-                    || !filter.allows_run(&typed, expanded.as_deref(), &d)
+                if !filter.allows_run(&typed, expanded.as_deref(), &d)
                     || (!q.is_empty() && !filter.allows(&q, &d))
                 {
                     picks.push(id);
@@ -171,9 +170,19 @@ impl CapturedHistory {
     }
 }
 
+/// VACUUM first so its pages reach the WAL, then truncate it; a busy checkpoint is a failure.
+pub(crate) fn compact(db: &rusqlite::Connection) -> Result<()> {
+    db.execute_batch("VACUUM")?;
+    let busy: i64 = db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+    if busy != 0 {
+        bail!("WAL checkpoint was busy");
+    }
+    Ok(())
+}
+
 fn finish_prune(db: &rusqlite::Connection, cleanup: impl FnOnce() -> Result<()>) -> Result<()> {
     let cleanup = cleanup();
-    let maintenance = db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
+    let maintenance = compact(db);
     match (cleanup, maintenance) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(cleanup), Ok(())) => {
@@ -313,6 +322,33 @@ mod tests {
     }
 
     #[test]
+    fn prune_keeps_picks_in_allowed_folder() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let c = CapturedHistory::new(temporary.path().join("history.db"));
+        let db = c.open_connection()?;
+        db.execute_batch(
+            "INSERT INTO sessions(id,user,host,shell) VALUES('s','test','unknown','zsh');
+             INSERT INTO commands(session,started_at,directory,command,exit_code) VALUES
+               ('s',1.0,'/secret','make',0),('s',2.0,'/ok','make',0);
+             INSERT INTO command_selections(query,command,kind,directory,selected_at) VALUES
+               ('m','make','search','/ok',3.0),('m','make','search','/secret',4.0);",
+        )?;
+        drop(db);
+        let filter = CaptureFilter::new(&SmcliConfig {
+            cwd_filter: Some(vec!["^/secret".into()]),
+            ..Default::default()
+        })?;
+        c.prune(&filter, false, || Ok(()))?;
+        let db = c.open_connection()?;
+        let dirs: Vec<String> = db
+            .prepare("SELECT directory FROM command_selections")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        assert_eq!(dirs, ["/ok"]);
+        Ok(())
+    }
+
+    #[test]
     fn prune_removes_file_selection_from_excluded_cwd() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let c = CapturedHistory::new(temporary.path().join("history.db"));
@@ -356,6 +392,21 @@ mod tests {
             0
         );
         std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn prune_reports_busy_checkpoint() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let captured = CapturedHistory::new(temporary.path().join("history.db"));
+        let db = captured.open_connection()?;
+        db.execute_batch("INSERT INTO sessions(id,user,host,shell) VALUES('s','t','h','bash')")?;
+        let reader = captured.open_connection()?;
+        reader.execute_batch("BEGIN; SELECT count(*) FROM sessions;")?;
+        db.execute_batch("INSERT INTO sessions(id,user,host,shell) VALUES('s2','t','h','bash')")?;
+        let error = finish_prune(&db, || Ok(())).unwrap_err().to_string();
+        assert!(error.contains("database compaction failed"), "{error}");
+        reader.execute_batch("ROLLBACK")?;
         Ok(())
     }
 

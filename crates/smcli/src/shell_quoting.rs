@@ -69,9 +69,15 @@ pub fn insertable(before: &str, shell: &str) -> bool {
     use Frame::*;
     let fish = shell == "fish";
     // shortcut: reject here-doc syntax; parse delimiters if insertion there is needed.
-    if !fish && before.replace("\\\n", "").contains("<<") {
+    let flat = before.replace("\\\n", "");
+    if !fish && flat.contains("<<") {
         return false;
     }
+    // Bash evaluates arithmetic after these, so a path there could run code.
+    if flat.contains("((") || flat.contains("$[") {
+        return false;
+    }
+    let mut brackets = 0usize;
     let chars: Vec<char> = before.chars().collect();
     let mut stack = vec![Command];
     let mut i = 0;
@@ -101,6 +107,8 @@ pub fn insertable(before: &str, shell: &str) -> bool {
                     stack.push(Brace);
                     i += 1;
                 }
+                '[' => brackets += 1,
+                ']' => brackets = brackets.saturating_sub(1),
                 '(' => stack.push(Command),
                 ')' if stack.len() > 1 && stack.last() == Some(&Command) => {
                     stack.pop();
@@ -142,7 +150,12 @@ pub fn insertable(before: &str, shell: &str) -> bool {
         }
         i += 1;
     }
-    stack.last() == Some(&Command) && !stack.contains(&Backtick)
+    brackets == 0 && stack.last() == Some(&Command) && !stack.contains(&Backtick)
+}
+
+/// A name with a substitution inside could run code when evaluated as arithmetic.
+pub fn insertable_name(name: &str) -> bool {
+    !name.contains("$(") && !name.contains('`')
 }
 
 #[cfg(test)]
@@ -159,5 +172,27 @@ mod tests {
         assert!(insertable("echo \"$(", "zsh"));
         assert!(!insertable("echo `$(", "zsh"));
         assert!(!insertable("echo \\", "fish"));
+    }
+
+    #[test]
+    fn insertable_rejects_arithmetic() {
+        for s in [
+            "echo $(( 1 + ",
+            "(( x + ",
+            "echo $[1 + ",
+            "a[1+",
+            "a=(7); echo ${a[1+(",
+            "[[ 1 -eq ",
+        ] {
+            assert!(!insertable(s, "bash"), "{s}");
+        }
+        assert!(insertable("ls [ab]* ", "bash"));
+    }
+
+    #[test]
+    fn insertable_name_rejects_substitutions() {
+        assert!(insertable_name("a b.txt"));
+        assert!(!insertable_name("a$(x)"));
+        assert!(!insertable_name("a`x`"));
     }
 }

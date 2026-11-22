@@ -142,14 +142,19 @@ impl RankingContext {
     }
 
     /// Why a command's program matches a file of the project (`Makefile in project`), unless scripts are off.
-    pub fn project_file_reason(&self, command: &str) -> Option<&str> {
+    pub fn project_file_reason(&self, command: &str, program: Option<&str>) -> Option<&str> {
         if !self.uses(Signal::Script) || self.project_programs.is_empty() {
             return None;
         }
         let (command, expanded) = crate::entry::command_parts(command);
         let text = expanded.as_deref().unwrap_or(&command);
-        let program =
-            crate::parse::program_of(text, crate::parse::CommandBreakdown::parse(text).as_ref())?;
+        let program = match program {
+            Some(p) => p.to_string(),
+            None => crate::parse::program_of(
+                text,
+                crate::parse::CommandBreakdown::parse(text).as_ref(),
+            )?,
+        };
         // `npm run x` names a script, and this project lists its own: an unlisted x gets no project evidence.
         if self.candidates.iter().any(|c| {
             c.reason == "package.json script"
@@ -260,6 +265,8 @@ pub fn candidates(context: &ProjectContext) -> Vec<Candidate> {
                 c.is_ascii() && (c.is_alphabetic() || c.is_ascii_digit() || "_.:@/-".contains(c))
             })
     };
+    // Qualify, never hide: from a subfolder, root-relative commands need the way back to the root.
+    let up = relative_root(&context.directory, &project.root);
     let manager = project.package_manager.as_deref().unwrap_or("");
     for (file, names) in &project.scripts {
         let lower = file.to_lowercase();
@@ -308,7 +315,10 @@ pub fn candidates(context: &ProjectContext) -> Vec<Candidate> {
                     }
                 }
                 "makefile" | "gnumakefile" => found.push(Candidate::new(
-                    format!("make {name}"),
+                    match &up {
+                        Some(up) => format!("make -C {up} {name}"),
+                        None => format!("make {name}"),
+                    },
                     Script,
                     "Makefile target",
                 )),
@@ -368,11 +378,19 @@ pub fn candidates(context: &ProjectContext) -> Vec<Candidate> {
         }
     }
     for file in &project.manifests {
-        for command in standard_commands(&file.to_lowercase(), project) {
+        for command in standard_commands(&file.to_lowercase(), project, up.as_deref()) {
             found.push(Candidate::new(command, Script, &format!("{file} project")));
         }
     }
     found
+}
+
+/// `..` segments from the directory up to the project root, or None at the root (or when paths cannot be resolved).
+fn relative_root(directory: &str, root: &str) -> Option<String> {
+    let directory = std::fs::canonicalize(directory).ok()?;
+    let root = std::fs::canonicalize(root).ok()?;
+    let depth = directory.strip_prefix(&root).ok()?.components().count();
+    (depth > 0).then(|| vec![".."; depth].join("/"))
 }
 
 fn script_details(file: &str, text: &str) -> HashMap<String, String> {
@@ -433,7 +451,7 @@ fn script_details(file: &str, text: &str) -> HashMap<String, String> {
 
 /// The usual commands for a manifest, whatever it declares. Fixed text: only the tool varies, and only
 /// between known names.
-fn standard_commands(file: &str, project: &Project) -> Vec<String> {
+fn standard_commands(file: &str, project: &Project, up: Option<&str>) -> Vec<String> {
     let manager = project.package_manager.as_deref().unwrap_or("");
     let has = |name: &str| project.manifests.iter().any(|m| m == name);
     let list = |items: &[&str]| items.iter().map(|s| s.to_string()).collect();
@@ -471,7 +489,15 @@ fn standard_commands(file: &str, project: &Project) -> Vec<String> {
         "gemfile" => list(&["bundle install", "bundle exec rspec"]),
         "composer.json" => list(&["composer install", "composer update"]),
         "pom.xml" => {
-            let mvn = if has("mvnw") { "./mvnw" } else { "mvn" };
+            let wrapper = |name: &str| match up {
+                Some(up) => format!("{up}/{name}"),
+                None => format!("./{name}"),
+            };
+            let mvn = if has("mvnw") {
+                wrapper("mvnw")
+            } else {
+                "mvn".into()
+            };
             vec![
                 format!("{mvn} clean install"),
                 format!("{mvn} test"),
@@ -480,9 +506,12 @@ fn standard_commands(file: &str, project: &Project) -> Vec<String> {
         }
         "build.gradle.kts" | "build.gradle" => {
             let gradle = if has("gradlew") {
-                "./gradlew"
+                match up {
+                    Some(up) => format!("{up}/gradlew"),
+                    None => "./gradlew".into(),
+                }
             } else {
-                "gradle"
+                "gradle".into()
             };
             vec![
                 format!("{gradle} build"),
@@ -594,6 +623,7 @@ pub fn apply_ranking_signals(
     previous: Option<&str>,
     followers: &HashMap<String, i64>,
     picks: &HashMap<String, f64>,
+    program_of: &dyn Fn(&str) -> Option<String>,
 ) -> HashMap<String, Vec<String>> {
     let mut why: HashMap<String, Vec<String>> = HashMap::new();
     let empty = vec![];
@@ -601,7 +631,8 @@ pub fn apply_ranking_signals(
     let tests = context.map_or(empty.clone(), |c| c.candidates_of(CandidateKind::Test));
     if let Some(context) = context {
         for (command, score) in scores.iter_mut() {
-            if let Some(reason) = context.project_file_reason(command)
+            if let Some(reason) =
+                context.project_file_reason(command, program_of(command).as_deref())
                 && !scripts.iter().chain(&tests).any(|c| &c.command == command)
             {
                 *score *= 1.25;
@@ -738,6 +769,97 @@ mod tests {
         assert!(swift["App"].contains("executableTarget App"));
     }
 
+    fn subfolder_context(
+        root: &std::path::Path,
+        sub: &str,
+        manifests: &[&str],
+        scripts: &[(&str, &str)],
+    ) -> ProjectContext {
+        ProjectContext {
+            directory: root.join(sub).to_string_lossy().into(),
+            projects: vec![Project {
+                root: root.to_string_lossy().into(),
+                manifests: manifests.iter().map(|s| s.to_string()).collect(),
+                scripts: scripts
+                    .iter()
+                    .map(|(f, n)| (f.to_string(), vec![n.to_string()]))
+                    .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn temp_tree(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("smcli-rank-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::canonicalize(&root).unwrap()
+    }
+
+    fn commands(context: &ProjectContext) -> Vec<String> {
+        candidates(context).into_iter().map(|c| c.command).collect()
+    }
+
+    #[test]
+    fn make_candidate_from_subfolder() {
+        let root = temp_tree("make");
+        let at_root = commands(&subfolder_context(&root, "", &[], &[("Makefile", "docs")]));
+        assert_eq!(at_root, ["make docs"]);
+        let sub = commands(&subfolder_context(
+            &root,
+            "a/b",
+            &[],
+            &[("Makefile", "docs")],
+        ));
+        assert_eq!(sub, ["make -C ../.. docs"]);
+        let one = commands(&subfolder_context(&root, "a", &[], &[("Makefile", "docs")]));
+        assert_eq!(one, ["make -C .. docs"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mvnw_candidate_from_subfolder() {
+        let root = temp_tree("mvnw");
+        let m = ["pom.xml", "mvnw"];
+        assert!(
+            commands(&subfolder_context(&root, "", &m, &[])).contains(&"./mvnw test".to_string())
+        );
+        assert!(
+            commands(&subfolder_context(&root, "a", &m, &[])).contains(&"../mvnw test".to_string())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gradlew_candidate_from_subfolder() {
+        let root = temp_tree("gradlew");
+        let m = ["build.gradle", "gradlew"];
+        assert!(
+            commands(&subfolder_context(&root, "", &m, &[]))
+                .contains(&"./gradlew build".to_string())
+        );
+        assert!(
+            commands(&subfolder_context(&root, "a/b", &m, &[]))
+                .contains(&"../../gradlew build".to_string())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn subfolder_candidate_through_symlink() {
+        let root = temp_tree("link");
+        std::os::unix::fs::symlink(root.join("a/b"), root.join("link")).unwrap();
+        let got = commands(&subfolder_context(
+            &root,
+            "link",
+            &[],
+            &[("Makefile", "docs")],
+        ));
+        assert_eq!(got, ["make -C ../.. docs"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn kind_comes_from_the_nearest_project_and_switches_off() {
         let project = |kind: &str| ProjectContext {
@@ -798,6 +920,7 @@ mod tests {
                 None,
                 &HashMap::new(),
                 &HashMap::new(),
+                &|_| None,
             );
             (scores, why)
         };
@@ -821,14 +944,14 @@ mod tests {
         context
             .project_programs
             .insert("npm".into(), "package.json in project".into());
-        assert!(context.project_file_reason("npm run dev").is_some());
+        assert!(context.project_file_reason("npm run dev", None).is_some());
         context.candidates.push(Candidate::new(
             "npm run docs".into(),
             CandidateKind::Script,
             "package.json script",
         ));
-        assert!(context.project_file_reason("npm run dev").is_none());
-        assert!(context.project_file_reason("npm install").is_some());
+        assert!(context.project_file_reason("npm run dev", None).is_none());
+        assert!(context.project_file_reason("npm install", None).is_some());
     }
 
     #[test]

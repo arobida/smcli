@@ -120,10 +120,35 @@ pub fn relative_insert(path: &str, root: &str, cwd: &str) -> String {
     }
 }
 
+/// The process environment, minus entries whose name or value is not UTF-8 (they are invisible to smcli).
+pub fn utf8_environment() -> HashMap<String, String> {
+    utf8_environment_from(std::env::vars_os())
+}
+
+fn utf8_environment_from(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> HashMap<String, String> {
+    vars.into_iter()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn utf8_environment_skips_bad_values() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = std::ffi::OsString::from_vec(vec![0xff]);
+        let env = utf8_environment_from([
+            ("GOOD".into(), "x".into()),
+            ("BAD".into(), bad.clone()),
+            (bad, "y".into()),
+        ]);
+        assert_eq!(env, HashMap::from([("GOOD".to_string(), "x".to_string())]));
+    }
 
     #[test]
     fn paths_fff_skips_only_non_git_roots_with_ignored_folder() {

@@ -28,7 +28,8 @@ Per the workspace architecture, **this crate does not link `fff-search`**; file/
 - The default bundled installation places `smcli`, `smcli-service` and `potion-shell-16m/` side by side. An absolute `SMCLI_SERVICE_BIN` overrides the service binary; configured `potionPath` selects another model, and development builds can fall back to the checkout model.
 - History, suggestions, completion and file pickers retain local fallbacks when the service is unavailable. History search uses keyword matching and `@@` uses word ranking; neither loads the model, and service-only fff evidence is unavailable (`src/cli/`, `LocalFileSearch`).
 - Native shell history files are read-only everywhere in the system.
-- The service client identifies the service executable by path/mtime/size and replaces a stale service (`smcli_core::service_location::build`, `service_client::ServiceClient`).
+- The service client identifies the service executable by path/mtime/size and replaces only an older or same-path service; a newer incompatible one is left running and requests fall back in-process (`smcli_core::service_location::build`, `service_client::ServiceClient`).
+- Path insertion (`shell_quoting::insertable`) refuses arithmetic and subscript contexts (`((`, `$[`, an open `[`), and `insertable_name` refuses names containing `$(` or a backtick: completion drops them and the picker inserts nothing.
 
 ## Side Effects
 

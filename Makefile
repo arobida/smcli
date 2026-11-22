@@ -20,8 +20,9 @@ release:
 	ln -sf smcli-$(STAMP) $(DIST)/smcli
 	ln -sf smcli-service-$(STAMP) $(DIST)/smcli-service
 	rm -rf $(DIST)/potion-shell-16m && cp -R Models/potion-shell-16m $(DIST)/potion-shell-16m
-	rm -rf $(DIST)/tldr && cp -R Data/tldr $(DIST)/tldr
-	rm -rf $(DIST)/cheat && cp -R Data/cheat $(DIST)/cheat
+	rm -rf $(DIST)/smcli-data && mkdir -p $(DIST)/smcli-data
+	cp -R Data/tldr $(DIST)/smcli-data/tldr
+	cp -R Data/cheat $(DIST)/smcli-data/cheat
 	@echo "Built $(DIST)/smcli-$(STAMP) (latest: $(DIST)/smcli)"
 	@echo ""
 	@echo "Try it in this shell (loads the zsh hooks from the new build):"
@@ -98,7 +99,7 @@ linux:
 		-e CARGO_TARGET_DIR=/target rust:1.99 sh -c 'apt-get update -qq && apt-get install -y -qq zsh fish python3 sqlite3 git > /dev/null && git config --global --add safe.directory "*" && curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/cargo/bin && bash scripts/test.sh'
 
 # Formats every hand-written markdown doc with iwe. Generated docs are skipped: regenerate them instead.
-GENERATED_DOCS := THIRD_PARTY_NOTICES
+GENERATED_DOCS := THIRD_PARTY_NOTICES agents/reference/baseline-changes
 docs:
 	iwe normalize $$(iwe find --limit 0 -f keys | grep -vxF $(addprefix -e ,$(GENERATED_DOCS)) | sed 's/^/-k /')
 

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -50,8 +50,10 @@ pub(super) fn indexes(
     let model = configured_model(home, env)?;
     let directory = index_directory(captured);
     let current = smcli_search::index_name(&model);
+    let sources = smcli_search::commands::bundled_sources();
+    ensure_prune_sources(prune, sources.is_some())?;
     // The command-completion index (bundled sources in priority order); absent tldr data just means it is not current.
-    let command_current = smcli_search::commands::bundled_sources().map(|sources| {
+    let command_current = sources.map(|sources| {
         let refs = smcli_search::commands::source_refs(&sources);
         smcli_search::commands::CommandIndex::reader(directory.clone(), model.clone(), &refs)
             .index_name()
@@ -78,6 +80,14 @@ pub(super) fn indexes(
     }
     if !prune && list.iter().any(|i| !i.current) {
         println!("Unused indexes belong to other models; `smcli indexes --prune` deletes them.");
+    }
+    Ok(())
+}
+
+/// Without bundled sources the command index looks unused and prune would delete it.
+fn ensure_prune_sources(prune: bool, found: bool) -> Result<()> {
+    if prune && !found {
+        bail!("Bundled command data not found; refusing to prune indexes.");
     }
     Ok(())
 }
@@ -221,6 +231,13 @@ mod tests {
     use smcli_core::service_protocol::SearchEntry;
     use smcli_search::setup::index_directory;
     use std::collections::HashMap;
+
+    #[test]
+    fn indexes_prune_refuses_without_sources() {
+        assert!(ensure_prune_sources(true, false).is_err());
+        assert!(ensure_prune_sources(true, true).is_ok());
+        assert!(ensure_prune_sources(false, false).is_ok());
+    }
 
     #[test]
     fn health_json_preserves_cli_fields_and_model_errors() -> Result<()> {

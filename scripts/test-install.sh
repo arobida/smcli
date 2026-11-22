@@ -94,6 +94,30 @@ grep -Eq '"leftKey" ?: true' "$home/.config/smcli/config.json" || fail "--keys w
 zsh -fc "source '$home/.zshrc'; typeset -f _smcli_record > /dev/null" || fail "zsh did not load the hooks"
 fish --version > /dev/null 2>&1 && { fish -c "source '$home/.config/fish/config.fish'; functions -q _smcli_record" || fail "fish did not load the hooks"; }
 
+# Reruns keep exactly one blank line before the block.
+for _ in 1 2 3; do
+    HOME="$home" bash scripts/install.sh --from "$from" --prefix "$home/bin" --shells zsh,bash,fish --keys left --yes > "$home/out" 2>&1 || { cat "$home/out"; fail "rerun failed"; }
+done
+for f in .zshrc .bashrc .config/fish/config.fish; do
+    [[ $(grep -c '^# >>> smcli >>>$' "$home/$f") == 1 ]] || fail "$f block duplicated on rerun"
+    [[ $(grep -B1 '^# >>> smcli >>>$' "$home/$f" | head -1) == "" ]] || fail "$f: no blank line before block"
+    # Blank lines directly above the block: one, even when the block is the file's only content.
+    [[ $(awk '$0 == "# >>> smcli >>>" {print n; exit} {n = ($0 == "") ? n + 1 : 0}' "$home/$f") == 1 ]] || fail "$f: blank lines pile up before block"
+done
+
+# A prefix containing a single quote must still load in every shell. Its own runtime dir, service off:
+# a service for this second database would outlive the uninstall checked at the end.
+qhome=$(mktemp -d)
+qruntime=$(mktemp -d /tmp/smcli-q.XXXXXX)
+export SMCLI_RUNTIME_DIR=$qruntime SMCLI_SERVICE=off
+HOME="$qhome" bash scripts/install.sh --from "$from" --prefix "$qhome/it's" --shells zsh,bash,fish --keys left --yes > "$qhome/out" 2>&1 || { cat "$qhome/out"; fail "install to quoted prefix failed"; }
+zsh -fc "source '$qhome/.zshrc'; typeset -f _smcli_record > /dev/null" || fail "zsh: quoted prefix did not load"
+HOME="$qhome" bash -c "source '$qhome/.bashrc'; declare -f _smcli_record > /dev/null" || fail "bash: quoted prefix did not load"
+fish --version > /dev/null 2>&1 && { HOME="$qhome" fish -c "source '$qhome/.config/fish/config.fish'; functions -q _smcli_record" || fail "fish: quoted prefix did not load"; }
+export SMCLI_RUNTIME_DIR=$runtime
+unset SMCLI_SERVICE
+rm -rf "$qhome" "$qruntime"
+
 # Malformed marker blocks are rejected and the file is preserved.
 malformed_check() {
     grep -q 'malformed smcli block' "$home/out" || fail "$1 diagnostic"
@@ -150,6 +174,21 @@ printf 'alias ll="ls -l"\n' > "$home/.zshrc"
 bash scripts/install.sh --from "$from" --prefix "$home/bin" --shells zsh --keys left --yes > "$home/out" 2>&1 \
     || { cat "$home/out"; fail "install failed restoring hooks before uninstall tests"; }
 
+# Data folders: a user's executable named tldr survives install; an old tldr/ with only smcli's files goes, one with an extra file keeps it.
+printf '#!/bin/sh\n' > "$home/bin/tldr"; chmod 755 "$home/bin/tldr"
+bash scripts/install.sh --from "$from" --prefix "$home/bin" --shells zsh --keys left --yes > "$home/out" 2>&1 \
+    || { cat "$home/out"; fail "install failed with a tldr file in the prefix"; }
+[[ -x $home/bin/tldr && -f $home/bin/smcli-data/tldr/tldr.jsonl ]] || fail "install touched the tldr file or skipped smcli-data"
+rm "$home/bin/tldr"
+mkdir "$home/bin/tldr" "$home/bin/cheat"
+touch "$home/bin/tldr/tldr.jsonl" "$home/bin/tldr/LICENSE.md" "$home/bin/cheat/cheat.jsonl" "$home/bin/cheat/mine.txt"
+bash scripts/install.sh --from "$from" --prefix "$home/bin" --shells zsh --keys left --yes > "$home/out" 2>&1 \
+    || { cat "$home/out"; fail "install failed with old data folders"; }
+[[ ! -e $home/bin/tldr ]] || fail "old tldr/ holding only smcli's files was not removed"
+[[ -f $home/bin/cheat/mine.txt && ! -e $home/bin/cheat/cheat.jsonl ]] || fail "old cheat/ lost the user's file or kept smcli's"
+rm -rf "$home/bin/cheat"
+printf '#!/bin/sh\n' > "$home/bin/tldr"; chmod 755 "$home/bin/tldr"
+
 # A missing confirmation changes nothing.
 "$home/bin/smcli-uninstall" < /dev/null > /dev/null 2>&1 && fail "uninstall without --yes should refuse"
 [[ -x $home/bin/smcli ]] || fail "refused uninstall removed files"
@@ -184,6 +223,7 @@ fnv_fp() { # bytes via LC_ALL=C, same as uninstall.sh / service_location.rs
     local LC_ALL=C
     for ((i = 0; i < ${#text}; i++)); do
         printf -v c '%d' "'${text:i:1}"
+        (( c >= 0 )) || c=$((c + 256))
         h=$(( (h ^ c) * 0x100000001b3 ))
     done
     printf '%016x' "$h"
@@ -197,7 +237,7 @@ touch "$runtime/service-${fp_b}.sock" "$runtime/service-${fp_b}.lock"
 [[ $(fnv_fp /tmp/history.db) == e325ec6f80fdf18c ]] || fail "FNV fingerprint drift vs service_location.rs"
 # UTF-8 path: bash LC_ALL=C bytes must match independent FNV-1a over UTF-8.
 utf_db=$home/café-history.db
-fp_utf=$(fnv_fp "$utf_db")
+fp_utf=$(/bin/bash -c "$(declare -f fnv_fp); fnv_fp \"\$1\"" _ "$utf_db")
 fp_utf_py=$(python3 -c 'import sys; t=sys.argv[1].encode(); h=0xcbf29ce484222325
 for b in t: h=((h^b)*0x100000001b3)&0xffffffffffffffff
 print(f"{h:016x}")' "$utf_db")
@@ -285,9 +325,10 @@ PY
 [[ $(sqlite3 "$home/export/history.db" "SELECT count(*) FROM commands WHERE command = 'echo exported-marker'") == 1 ]] \
     || fail "database copy is missing the recorded command"
 [[ -f $home/export/config.json ]] || fail "settings not exported"
-for f in bin/smcli bin/smcli-service bin/smcli-uninstall bin/potion-shell-16m .local/state/smcli .config/smcli; do
+for f in bin/smcli bin/smcli-service bin/smcli-uninstall bin/potion-shell-16m bin/smcli-data .local/state/smcli .config/smcli; do
     [[ ! -e $home/$f ]] || fail "$f was not removed"
 done
+[[ -x $home/bin/tldr ]] || fail "uninstall removed the user's tldr file"
 for f in .zshrc .bashrc .config/fish/config.fish; do
     ! grep -q smcli "$home/$f" || fail "$f still mentions smcli"
 done

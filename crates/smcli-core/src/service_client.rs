@@ -89,7 +89,8 @@ impl ServiceClient {
         let response = match self.exchange(request, spawning, timeout) {
             Ok(response) => response,
             Err(ExchangeError::Mismatch(stale))
-                if spawning || request.op == Operation::Shutdown =>
+                if request.op == Operation::Shutdown
+                    || (spawning && self.may_replace(stale.build.as_deref())) =>
             {
                 return self.replace(request, stale, spawning, timeout);
             }
@@ -105,6 +106,12 @@ impl ServiceClient {
             return Some(response);
         }
         self.replace(request, response, spawning, timeout)
+    }
+
+    /// A newer build of another binary is left running: it is unavailable to us, not stale.
+    fn may_replace(&self, service: Option<&str>) -> bool {
+        // Without our own build to compare, we cannot tell which is newer: leave it running.
+        build(&self.executable).is_some_and(|expected| should_replace(service, &expected))
     }
 
     /// Stop a service left by another build or protocol, wait for its lock, and repeat this request on the current one.
@@ -123,7 +130,8 @@ impl ServiceClient {
         let old = match self.exchange(&shutdown, false, Duration::from_secs(2)) {
             Ok(response) | Err(ExchangeError::Mismatch(response)) => response,
             Err(ExchangeError::Unavailable) => {
-                return (request.op != Operation::Shutdown).then_some(stale);
+                return (request.op != Operation::Shutdown && stale.v == service_protocol::VERSION)
+                    .then_some(stale);
             }
         };
         if let Some(pid) = old.pid {
@@ -138,7 +146,7 @@ impl ServiceClient {
         }
         // A select would count the pick twice; record is safe because its event ID makes a retry a no-op.
         if !spawning || !Self::repeatable(request.op) {
-            return Some(stale);
+            return (stale.v == service_protocol::VERSION).then_some(stale);
         }
         self.exchange(request, true, timeout).ok()
     }
@@ -206,14 +214,23 @@ impl ServiceClient {
         if let Ok(connection) = connect_unix(&self.location.socket) {
             return Some(connection);
         }
-        if !spawn || !self.launch() {
-            return None;
-        }
+        let pid = if spawn { self.launch()? } else { return None };
+        let mut running = true;
         // The winner of a concurrent start binds within milliseconds; losers exit and we reach the winner.
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
             if let Ok(connection) = connect_unix(&self.location.socket) {
                 return Some(connection);
+            }
+            if running {
+                let mut status = 0;
+                if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == pid {
+                    running = false;
+                    // Exit 0 is a lost start race: keep waiting for the winner.
+                    if !(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0) {
+                        return None;
+                    }
+                }
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -224,18 +241,18 @@ impl ServiceClient {
     /// above stdio are closed in the child so the service cannot keep a shell FIFO or redirected fd
     /// open: macOS via CLOEXEC_DEFAULT, glibc 2.34+ via `posix_spawn_file_actions_addclosefrom_np`,
     /// musl (no closefrom action) via one close action per descriptor listed in /proc/self/fd.
-    fn launch(&self) -> bool {
+    fn launch(&self) -> Option<libc::pid_t> {
         use std::os::unix::ffi::OsStrExt;
         let Ok(executable) = CString::new(self.executable.as_os_str().as_bytes()) else {
-            return false;
+            return None;
         };
         if unsafe { libc::access(executable.as_ptr(), libc::X_OK) } != 0
             || self.location.prepare().is_err()
         {
-            return false;
+            return None;
         }
         let Ok(database) = CString::new(self.database.as_os_str().as_bytes()) else {
-            return false;
+            return None;
         };
         let arguments = [executable.clone(), CString::new("--db").unwrap(), database];
         let allowed = Self::launch_environment(&self.environment);
@@ -244,7 +261,7 @@ impl ServiceClient {
             .map(|(k, v)| CString::new(format!("{k}={v}")))
             .collect()
         else {
-            return false;
+            return None;
         };
         let pointers = |strings: &[CString]| {
             strings
@@ -259,11 +276,11 @@ impl ServiceClient {
             let mut attributes = std::mem::zeroed();
             let mut actions = std::mem::zeroed();
             if libc::posix_spawnattr_init(&mut attributes) != 0 {
-                return false;
+                return None;
             }
             if libc::posix_spawn_file_actions_init(&mut actions) != 0 {
                 libc::posix_spawnattr_destroy(&mut attributes);
-                return false;
+                return None;
             }
             #[cfg(target_os = "macos")]
             // Darwin's POSIX_SPAWN_SETSID is not exposed by libc 0.2.
@@ -283,6 +300,11 @@ impl ServiceClient {
                     },
                     0,
                 );
+            }
+            #[cfg(target_os = "macos")]
+            {
+                // A relative PATH entry must not resolve to the shell's folder.
+                status |= libc::posix_spawn_file_actions_addchdir_np(&mut actions, c"/".as_ptr());
             }
             #[cfg(all(target_os = "linux", target_env = "gnu"))]
             {
@@ -309,7 +331,7 @@ impl ServiceClient {
             }
             libc::posix_spawn_file_actions_destroy(&mut actions);
             libc::posix_spawnattr_destroy(&mut attributes);
-            status == 0
+            (status == 0).then_some(pid)
         }
     }
 
@@ -376,6 +398,30 @@ fn should_replace(service: Option<&str>, expected: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_launch_returns_quickly() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("smcli-failed-launch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("fail-service");
+        std::fs::write(&bin, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let environment = HashMap::from([(
+            "SMCLI_SERVICE_BIN".to_string(),
+            bin.to_string_lossy().into_owned(),
+        )]);
+        let client = ServiceClient::new(&dir.join("db"), &environment, Path::new("/missing/smcli"));
+        let start = Instant::now();
+        assert!(client.connect(true).is_none());
+        // The full wait is 2 s; a detected exit returns well before it, even on a loaded machine.
+        assert!(
+            start.elapsed() < Duration::from_millis(1500),
+            "{:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn service_replacement_rules() {
@@ -619,6 +665,86 @@ mod tests {
         assert!(
             started.ok && started.v == service_protocol::VERSION,
             "{started:?}"
+        );
+    }
+
+    /// Answers every request with a mismatching protocol version and the given build; logs the ops.
+    fn fake_incompatible(
+        build: &str,
+        op: Operation,
+    ) -> (Option<ServiceResponse>, Vec<String>, tempfile::TempDir) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::fs::PermissionsExt;
+        let temporary = tempfile::Builder::new()
+            .prefix("smcli-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = temporary.path().join("history.db");
+        // A real file gives our build a time to compare; it is not executable, so no replacement starts.
+        let ours = temporary.path().join("smcli-service");
+        std::fs::write(&ours, "").unwrap();
+        let environment = HashMap::from([
+            (
+                "SMCLI_RUNTIME_DIR".into(),
+                temporary.path().to_string_lossy().into_owned(),
+            ),
+            (
+                "SMCLI_SERVICE_BIN".into(),
+                ours.to_string_lossy().into_owned(),
+            ),
+        ]);
+        let socket = crate::service_location::ServiceLocation::new(&database, &environment).socket;
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (seen2, stop2) = (seen.clone(), stop.clone());
+        let reply = format!(
+            "{{\"v\":{},\"ok\":false,\"build\":\"{build}\"}}\n",
+            service_protocol::VERSION - 1
+        );
+        let server = std::thread::spawn(move || {
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                let Ok((mut conn, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                conn.set_nonblocking(false).unwrap();
+                let mut line = String::new();
+                BufReader::new(&conn).read_line(&mut line).unwrap();
+                let value: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+                seen2
+                    .lock()
+                    .unwrap()
+                    .push(value["op"].as_str().unwrap_or("").to_string());
+                let _ = conn.write_all(reply.as_bytes());
+            }
+        });
+        let current = std::env::current_exe().unwrap();
+        let client = ServiceClient::new(&database, &environment, &current);
+        let response = client.send(&ServiceRequest::new(op), Some(true), Duration::from_secs(5));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().unwrap();
+        let ops = seen.lock().unwrap().clone();
+        (response, ops, temporary)
+    }
+
+    #[test]
+    fn newer_incompatible_service_is_not_replaced() {
+        let (response, ops, _dir) =
+            fake_incompatible("/other/smcli-service|9999999999.0|1", Operation::Ping);
+        assert!(response.is_none(), "{response:?}");
+        assert!(!ops.iter().any(|o| o == "shutdown"), "{ops:?}");
+    }
+
+    #[test]
+    fn older_incompatible_service_is_replaced() {
+        let (_, ops, _dir) = fake_incompatible("/other/smcli-service|1.0|1", Operation::Ping);
+        assert_eq!(
+            ops.iter().filter(|o| *o == "shutdown").count(),
+            1,
+            "{ops:?}"
         );
     }
 

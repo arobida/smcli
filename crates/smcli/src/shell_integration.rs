@@ -31,7 +31,7 @@ pub fn render_with_keys(
 ) -> Result<String> {
     // Absolute-XDG check done here (as Xdg::dir does): a relative XDG_STATE_HOME would make the DB path per-cwd.
     // The hook is eval'd at each shell start (install.sh does not cache it), so the literal is not frozen.
-    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    let env = smcli_core::paths::utf8_environment();
     let home = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_default();
@@ -161,16 +161,6 @@ if [[ ${_smcli_installed-} != 1 ]]; then
             args+=("$_smcli_started" "$2" "${HISTFILE-}" -)
             builtin printf '%s\n%s\n' "$exp" "$_smcli_command" | "$_smcli_bin" "${args[@]}" || printf 'smcli: command metadata was not saved.\n' >&2
         }
-        # Whether $1 matches one of the user's HISTIGNORE patterns (a bare & means "the previous line": not checked).
-        _smcli_histignore() {
-            local IFS=: pattern
-            local -a patterns
-            read -ra patterns <<<"${HISTIGNORE-}"
-            for pattern in "${patterns[@]}"; do
-                [[ -n $pattern && $pattern != '&' && $1 == $pattern ]] && return 0
-            done
-            return 1
-        }
         # PS0 and bash-preexec don't pass the typed text, so take it from Bash's own history. That also means
         # a line Bash kept out of history (HISTCONTROL=ignorespace/ignoreboth, HISTIGNORE) is never recorded.
         _smcli_history_command() {
@@ -183,14 +173,16 @@ if [[ ${_smcli_installed-} != 1 ]]; then
             if [[ $number == "$_smcli_history_number" ]]; then
                 # No new entry: ignoredups merged it (record it), or an exclusion dropped it (cannot tell which
                 # when one is configured, so leave it out).
-                if [[ $HISTCONTROL == *ignorespace* || $HISTCONTROL == *ignoreboth* || -n ${HISTIGNORE-} ]]; then
+                if [[ ${HISTCONTROL-} == *ignorespace* || ${HISTCONTROL-} == *ignoreboth* || -n ${HISTIGNORE-} ]]; then
                     return 1
                 fi
             fi
             _smcli_history_number=$number
         }
         _smcli_preexec() {
-            local prior_status=$2 pipe="${PIPESTATUS[*]}" entry
+            local prior_status=$2 codes=("${PIPESTATUS[@]}") entry
+            local IFS=$' \t\n'  # the hook's own splitting, whatever the user's IFS; joins with a space
+            local pipe="${codes[*]}"
             _smcli_debug_pipe=$pipe
             if [[ $_smcli_armed == 1 && $1 != _smcli_prompt && $1 != _smcli_ready && $1 != _smcli_pick && $1 != _smcli_pick_left && $1 != _smcli_pick_right && $1 != _smcli_pick_files && $1 != _smcli_pick_grep && $1 != _smcli_pick_commands && $1 != _smcli_tab ]]; then
                 _smcli_started=${EPOCHREALTIME:-$((_smcli_epoch + SECONDS))}
@@ -208,7 +200,7 @@ if [[ ${_smcli_installed-} != 1 ]]; then
                     elif [[ ${BASH_REMATCH[2]} == *"$1"* ]]; then
                         # A duplicate bash left out of history (ignoredups): the full line is the previous entry.
                         _smcli_command=${BASH_REMATCH[2]}
-                    elif [[ $HISTCONTROL == *ignorespace* || $HISTCONTROL == *ignoreboth* ]]; then
+                    elif [[ ${HISTCONTROL-} == *ignorespace* || ${HISTCONTROL-} == *ignoreboth* ]]; then
                         # Bash kept a leading-space command out of history; restore the space so smcli skips it too.
                         _smcli_command=" $1"
                     fi
@@ -226,11 +218,13 @@ if [[ ${_smcli_installed-} != 1 ]]; then
             _smcli_set_expanded "$1"
         }
         _smcli_prompt() {
-            local status=$? pipe="${PIPESTATUS[*]}" ended=${EPOCHREALTIME:-$((_smcli_epoch + SECONDS))} entry keep=1
+            local status=$? codes=("${PIPESTATUS[@]}") ended=${EPOCHREALTIME:-$((_smcli_epoch + SECONDS))} entry keep=1
+            local IFS=$' \t\n'  # the hook's own splitting, whatever the user's IFS; joins with a space
+            local pipe="${codes[*]}"
             if [[ ${1-} == exit ]]; then
                 pipe=
             elif [[ $_smcli_mode == bash-preexec ]]; then
-                if [[ ${BP_PIPESTATUS+x} ]]; then pipe=${BP_PIPESTATUS[*]}; else pipe=; fi
+                if [[ ${BP_PIPESTATUS+x} ]]; then codes=("${BP_PIPESTATUS[@]}"); pipe="${codes[*]}"; else pipe=; fi
             elif [[ $_smcli_mode == debug ]]; then
                 pipe=$_smcli_debug_pipe
             fi
@@ -541,7 +535,12 @@ if [[ $- == *i* && -z ${SMCLI_NO_KEYS-} ]]; then
                 if (( code == 10 )); then COMPREPLY=("$line"); else COMPREPLY=("$cur"); fi
             fi
         }
-        complete -o bashdefault -o default -o nospace -F _smcli_complete printf echo cd pushd z cat npm true 2>/dev/null || true
+        # Bash 3.2 has no `complete -D`; leave commands that already have a completion alone.
+        for _smcli_cmd in printf echo cd pushd z cat npm true; do
+            [[ -z $(complete -p "$_smcli_cmd" 2>/dev/null) ]] &&
+                complete -o bashdefault -o default -o nospace -F _smcli_complete "$_smcli_cmd" 2>/dev/null
+        done
+        unset _smcli_cmd
     fi
 fi"###
         }
@@ -619,11 +618,15 @@ if [[ ${_smcli_installed-} != 1 ]]; then
     # Hook arrays rather than precmd()/zshexit() themselves, so later definitions of those can't replace ours.
     # Zsh restores $? and $pipestatus before each hook; ours goes first to read them unaltered.
     _smcli_precmd() {
-        local exit_code=$? pipe="${pipestatus[*]}"
+        local exit_code=$? codes=("${pipestatus[@]}")
+        local IFS=$' \t\n'  # the hook's own splitting, whatever the user's IFS; joins with a space
+        local pipe="${codes[*]}"
         _smcli_finish "$exit_code" "$pipe"
     }
     _smcli_zshexit() {
-        local exit_code=$? pipe="${pipestatus[*]}"
+        local exit_code=$? codes=("${pipestatus[@]}")
+        local IFS=$' \t\n'  # the hook's own splitting, whatever the user's IFS; joins with a space
+        local pipe="${codes[*]}"
         _smcli_finish "$exit_code" "$pipe" exit
     }
     autoload -Uz add-zsh-hook
