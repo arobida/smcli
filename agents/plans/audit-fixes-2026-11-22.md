@@ -33,7 +33,7 @@ These choices are final for this work, so nothing stops for questions.
 - **Branch:** `wt switch --create audit-fixes-2026-11-22`. Do not commit or push unless asked. Run `cargo fmt --all` only at commit time.
 - **Writing code:** the `coder` agent on Sonnet, one slice at a time and in plan order. It also edits the test scripts named in its slice, and runs no tests.
 - **Review:** the main agent reads each slice diff. The `code-reviewer` agent reviews slices marked **review**, and reviews the combined `service.rs` diff after 2D and again after 3G, because 2A, 2C, 2D, 3C, 3E and 3G all edit it.
-- **Running tests:** only kteam (`kik3`), started by the Orchestrator, because this plan has several waves.
+- **Running tests:** only kteam (`kik3`), started in its own Rex block.
 - **Tracking:** check `dex list` first so nothing is duplicated, then `dex plan agents/plans/audit-fixes-2026-11-22.md`: one task per slice under one parent. Created as parent `cewc0d3h`, with a task per wave, one per slice, and a final gate task. Without `dex` on `PATH`, use `npx @zeeg/dex`.
 - **Docs and logging:** markdown edits go through iwe (`iwe update`, or an edit followed by `make docs`). The main agent adds each result to the [test log](#test-log).
 

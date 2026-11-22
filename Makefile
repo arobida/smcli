@@ -2,7 +2,7 @@ PYTHON ?= python3
 DIST := dist
 STAMP := $(shell date +%Y%m%d-%H%M%S)-$(shell git rev-parse --short HEAD 2>/dev/null || echo nogit)
 
-.PHONY: build release fresh install uninstall tldr cheat test test-rust test-cli test-picker test-shells test-service test-install clean run baseline ranking tldr-ranking linux docs notices unused
+.PHONY: build release fresh install uninstall tldr cheat test test-rust test-cli test-picker test-shells test-service test-ui test-install clean run baseline ranking tldr-ranking linux docs notices unused
 
 PKG ?=
 FILTER ?=
@@ -59,6 +59,10 @@ test-picker: build
 
 test-shells: build
 	$(PYTHON) scripts/test-shells.py "$$(cd "$${CARGO_TARGET_DIR:-target}/debug" && pwd)/smcli"
+
+# The pickers in a real Rex terminal (zsh).
+test-ui: build
+	rex do scripts/test-ui.lua smcli="$$(cd "$${CARGO_TARGET_DIR:-target}/debug" && pwd)/smcli"
 
 test-service: build
 	$(PYTHON) scripts/test-service.py "$$(cd "$${CARGO_TARGET_DIR:-target}/debug" && pwd)/smcli"

@@ -6,7 +6,7 @@ This file provides guidance to coding agents when working with code in this repo
 
 ## Agent Team(can be referenced by saying ateam)
 
-A native Claude agent named the **Orchestrator** runs every team below and handles all Kero commands. When you are asked to delegate, do not open sessions or drive panes yourself: choose the team and agent from the routing table, then have the Orchestrator start it, prompt it, and read the result. The Orchestrator owns `kero new`/`prompt`/`wait`/`read`/`close`; do not run them directly. The list shows two things: an alias, then the command the Orchestrator uses to open the agent.
+When you are asked to delegate, choose the team and agent from the routing table, then open it in a Rex block yourself (`rex run` to start it, `rex send` to prompt, `rex wait`/`rex capture` to read the result, `rex block close` when done; see the `rex` skill and [Rex docs](https://www.superlogical.com/rex/docs/)). The list shows two things: an alias, then the command that opens the agent.
 
 > Some agents are better at certain tasks than others (try to use free models as much as possible). Pick a team, then take the first row in its routing table that matches the job.
 
@@ -54,7 +54,7 @@ kik31pro=kimi -m kimi-code/k3.1-pro --auto
 kik3-256=kimi -m kimi-code/k3-256k --auto
 ```
 
-Effort is pinned per model by `[models."<alias>".overrides] default_effort` in `~/.kimi-code/config.toml` (`k3.1-pro` low, the rest high). Do not set global `[thinking].effort` — it overrides the main agent's model default. The Orchestrator opens each as a Kero session and drives it; for a throwaway one-shot it runs `kimi -m <model> -p "<prompt>"` without `--auto`: kimi rejects `-p` combined with `--auto` (`Cannot combine --prompt with --auto`).
+Effort is pinned per model by `[models."<alias>".overrides] default_effort` in `~/.kimi-code/config.toml` (`k3.1-pro` low, the rest high). Do not set global `[thinking].effort` — it overrides the main agent's model default. Open each in a Rex block and drive it; for a throwaway one-shot it runs `kimi -m <model> -p "<prompt>"` without `--auto`: kimi rejects `-p` combined with `--auto` (`Cannot combine --prompt with --auto`).
 
 ### Other
 
@@ -106,7 +106,7 @@ Use the Makefile for builds; don't hand-roll `cargo build` commands.
 - `make release` — same, without cleaning (faster). `make build` — debug build; `make run ARGS="..."` builds and runs the CLI.
 - `make test` — full test suite (`scripts/test.sh`): `cargo nextest run --workspace` (install: `cargo install cargo-nextest --locked`; config in `.config/nextest.toml`), then black-box CLI checks against a temp `HOME`, `SMCLI_DB` and `SMCLI_RUNTIME_DIR`.
 - Focused slices of the gate (black-box targets build automatically): `make test-rust` (`PKG=smcli-core FILTER=history`
-  narrows crate and test), `make test-cli` (CLI smoke), `make test-picker` (file + alias picker), `make test-shells` (runs checks in parallel; honors `SMCLI_TEST_ONLY`, and `SMCLI_TEST_JOBS=1` runs them one at a time), `make test-service`, `make test-install`. Match the slice to what changed: picker/menu -> `test-picker` + `test-rust PKG=smcli`, hooks -> `test-shells`, service -> `test-service`, install -> `test-install`.
+  narrows crate and test), `make test-cli` (CLI smoke), `make test-picker` (file + alias picker), `make test-shells` (runs checks in parallel; honors `SMCLI_TEST_ONLY`, and `SMCLI_TEST_JOBS=1` runs them one at a time), `make test-service`, `make test-ui` (history and file pickers in a real Rex terminal via `rex do scripts/test-ui.lua`), `make test-install`. Match the slice to what changed: picker/menu -> `test-picker` + `test-rust PKG=smcli`, hooks -> `test-shells`, service -> `test-service`, install -> `test-install`.
 - `make ranking` — scores suggest/search ranking on the fixed query set (`crates/smcli-search/tests/ranking.rs`); run after ranking changes.
 - `make linux` — full test suite on Linux in Docker (needs a running daemon). On the backburner; run only when asked.
 - `make baseline` — black-box CLI/hook benchmark (`scripts/bench-baseline.py`, see `agents/reference/baseline.md`); never reads real history.
